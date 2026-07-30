@@ -1,0 +1,772 @@
+"""同步任务运行态、停止控制与网盘文件终态后处理监控。"""
+
+import datetime
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event as ThreadEvent, Lock
+from typing import Any, Dict, List, Optional, Tuple
+
+import pytz
+from app.core.config import global_vars, settings
+from app.log import logger
+from app.schemas.types import MediaType
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+from ...core import CloudDriveCapability
+from ...core import OwnerDelegator
+
+sync_lock = Lock()
+
+
+class SyncRuntimeService(OwnerDelegator):
+    """管理同步任务运行态及离线任务生命周期。"""
+
+    def _stop_requested(self) -> bool:
+        if self._stop_event and self._stop_event.is_set():
+            return True
+        task_event = (
+            getattr(self._task_local, "stop_event", None)
+            if self._task_local is not None
+            else None
+        )
+        return bool(task_event and task_event.is_set())
+
+    def _sync_task_id(self, subscribe: Any) -> str:
+        if bool(getattr(subscribe, "_transient_target", False)):
+            return f"media:{self._sync_handler.subscription_budget_key(subscribe)}"
+        return f"subscribe:{getattr(subscribe, 'id', '')}"
+
+    @staticmethod
+    def _sync_media_key(subscribe: Any) -> Tuple[str, str, int]:
+        media_type = str(getattr(subscribe, "type", "") or "")
+        media_id = str(
+            getattr(subscribe, "tmdbid", None)
+            or getattr(subscribe, "tmdb_id", None)
+            or getattr(subscribe, "doubanid", None)
+            or getattr(subscribe, "name", "")
+        )
+        season = int(getattr(subscribe, "season", 1) or 1) if media_type == MediaType.TV.value else 0
+        return media_type, media_id, season
+
+    def _register_sync_tasks(self, subscribes: List[Any]) -> None:
+        queued_at = time.time()
+        tasks = {}
+        for subscribe in subscribes:
+            is_tv = getattr(subscribe, "type", "") == MediaType.TV.value
+            task_id = self._sync_task_id(subscribe)
+            tasks[task_id] = {
+                "id": task_id,
+                "subscribe_id": getattr(subscribe, "id", None),
+                "sub_key": (
+                    self._sync_handler.subscription_budget_key(subscribe)
+                    if bool(getattr(subscribe, "_transient_target", False))
+                    else ""
+                ),
+                "title": str(getattr(subscribe, "name", "") or "未命名订阅"),
+                "media_type": "电视剧" if is_tv else "电影",
+                "year": getattr(subscribe, "year", None) or "",
+                "season": int(getattr(subscribe, "season", 1) or 1) if is_tv else None,
+                "status": "queued",
+                "phase": "等待调度",
+                "progress": 0,
+                "transferred": 0,
+                "message": "",
+                "queued_at": queued_at,
+                "started_at": None,
+                "finished_at": None,
+                "stop_event": ThreadEvent(),
+            }
+        with self._sync_tasks_lock:
+            retained = {
+                task_id: task
+                for task_id, task in self._sync_tasks.items()
+                if task.get("status") == "postprocessing"
+            }
+            retained.update(tasks)
+            self._sync_tasks = retained
+
+    def _update_sync_task(self, task_id: str, **values: Any) -> None:
+        with self._sync_tasks_lock:
+            task = self._sync_tasks.get(task_id)
+            if task:
+                task.update(values)
+
+    def _serialize_sync_tasks(self) -> List[Dict[str, Any]]:
+        now = time.time()
+        with self._sync_tasks_lock:
+            tasks = []
+            for task in self._sync_tasks.values():
+                if task.get("status") not in {
+                    "queued", "running", "stopping", "postprocessing"
+                }:
+                    continue
+                serialized = {
+                    key: value for key, value in task.items() if key != "stop_event"
+                }
+                queued_at = float(task.get("queued_at") or now)
+                started_at = float(task.get("started_at") or 0)
+                serialized["queue_seconds"] = round(
+                    max(0.0, (started_at or now) - queued_at), 2
+                )
+                serialized["elapsed_seconds"] = round(
+                    max(0.0, now - started_at), 2
+                ) if started_at else 0
+                tasks.append(serialized)
+            return tasks
+
+    def _pending_finalize_count(self, subscribe: Any) -> int:
+        if not self._sync_handler:
+            return 0
+        normalized_id = int(getattr(subscribe, "id", 0) or 0)
+        sub_key = (
+            self._sync_handler.subscription_budget_key(subscribe)
+            if bool(getattr(subscribe, "_transient_target", False))
+            else ""
+        )
+        return sum(
+            (
+                    normalized_id > 0
+                    and int(item.get("subscribe_id") or 0) == normalized_id
+            ) or (
+                    bool(sub_key)
+                    and str(item.get("sub_key") or "") == sub_key
+            )
+            for item in self._sync_handler.get_pending_finalize_tasks()
+        )
+
+    def _refresh_postprocessing_sync_tasks(self) -> None:
+        """按持久化后处理记录恢复并刷新订阅任务状态。"""
+        pending_items = (
+            self._sync_handler.get_pending_finalize_tasks()
+            if self._sync_handler else []
+        )
+        groups: Dict[str, Dict[str, Any]] = {}
+        for item in pending_items:
+            subscribe_id = int(item.get("subscribe_id") or 0)
+            sub_key = str(item.get("sub_key") or "").strip()
+            task_id = (
+                f"subscribe:{subscribe_id}"
+                if subscribe_id > 0
+                else f"media:{sub_key}" if sub_key else ""
+            )
+            if not task_id:
+                continue
+            media_data = item.get("mediainfo") or {}
+            group = groups.setdefault(task_id, {
+                "count": 0,
+                "subscribe_id": subscribe_id if subscribe_id > 0 else None,
+                "sub_key": sub_key,
+                "title": str(media_data.get("title") or "未命名订阅"),
+                "year": media_data.get("year") or "",
+                "season": item.get("season"),
+                "queued_at": float(item.get("created_at") or time.time()),
+            })
+            group["count"] += 1
+            group["queued_at"] = min(
+                float(group["queued_at"]),
+                float(item.get("created_at") or group["queued_at"]),
+            )
+
+        now = time.time()
+        with self._sync_tasks_lock:
+            for task in self._sync_tasks.values():
+                if task.get("status") != "postprocessing":
+                    continue
+                if str(task.get("id") or "") not in groups:
+                    task.update({
+                        "status": "completed",
+                        "phase": "文件后处理已结束",
+                        "progress": 100,
+                        "pending_count": 0,
+                        "finished_at": now,
+                    })
+            for task_id, group in groups.items():
+                task = self._sync_tasks.get(task_id)
+                if task and task.get("status") in {"queued", "running", "stopping"}:
+                    continue
+                pending_count = int(group["count"])
+                values = {
+                    "status": "postprocessing",
+                    "phase": f"文件后处理中（{pending_count} 个）",
+                    "progress": 95,
+                    "pending_count": pending_count,
+                    "finished_at": None,
+                }
+                if task:
+                    task.update(values)
+                    continue
+                is_tv = bool(group.get("season"))
+                self._sync_tasks[task_id] = {
+                    "id": task_id,
+                    "subscribe_id": group["subscribe_id"],
+                    "sub_key": group["sub_key"],
+                    "title": group["title"],
+                    "media_type": "电视剧" if is_tv else "电影",
+                    "year": group["year"],
+                    "season": int(group["season"] or 1) if is_tv else None,
+                    **values,
+                    "transferred": 0,
+                    "message": "",
+                    "queued_at": group["queued_at"],
+                    "started_at": group["queued_at"],
+                    "stop_event": ThreadEvent(),
+                }
+
+    def _run_subscription_group(
+            self,
+            subscribes: List[Any],
+            history_snapshot: List[dict],
+            exclude_ids: set,
+            manual_resources: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        local_history = list(history_snapshot)
+        initial_history_count = len(local_history)
+        transfer_details: List[Dict[str, Any]] = []
+        transferred_count = 0
+
+        for subscribe in subscribes:
+            task_id = self._sync_task_id(subscribe)
+            with self._sync_tasks_lock:
+                task = self._sync_tasks.get(task_id) or {}
+                task_event = task.get("stop_event")
+            if (
+                    global_vars.is_system_stopped
+                    or (self._stop_event and self._stop_event.is_set())
+                    or (task_event and task_event.is_set())
+            ):
+                self._update_sync_task(
+                    task_id, status="stopped", phase="已停止", progress=100
+                )
+                continue
+
+            self._task_local.stop_event = task_event
+            manual_upgrade = bool(getattr(subscribe, "_manual_upgrade", False))
+            transient_target = bool(getattr(subscribe, "_transient_target", False))
+            target_episodes = getattr(subscribe, "_target_episodes", None)
+            upgrade_task = manual_upgrade or self._is_cloud_upgrade_subscribe(subscribe)
+            self._update_sync_task(
+                task_id,
+                status="running",
+                phase="建立洗版基线" if upgrade_task else "检查缺失内容",
+                progress=10,
+                message="",
+                started_at=time.time(),
+            )
+            try:
+                if getattr(subscribe, "type", "") == MediaType.MOVIE.value:
+                    task_count = self._sync_handler.process_movie_subscribe(
+                        subscribe=subscribe,
+                        history=local_history,
+                        transfer_details=transfer_details,
+                        transferred_count=0,
+                        manual_resources=manual_resources,
+                        manual_upgrade=manual_upgrade,
+                        transient_target=transient_target,
+                    )
+                else:
+                    task_count = self._sync_handler.process_tv_subscribe(
+                        subscribe=subscribe,
+                        history=local_history,
+                        transfer_details=transfer_details,
+                        transferred_count=0,
+                        exclude_ids=exclude_ids,
+                        manual_resources=manual_resources,
+                        manual_upgrade=manual_upgrade,
+                        target_episodes=target_episodes,
+                        transient_target=transient_target,
+                    )
+                transferred_count += int(task_count or 0)
+                stopped = bool(task_event and task_event.is_set())
+                pending_count = self._pending_finalize_count(subscribe)
+                self._update_sync_task(
+                    task_id,
+                    status=(
+                        "stopped" if stopped
+                        else "postprocessing" if pending_count
+                        else "completed"
+                    ),
+                    phase=(
+                        "已停止" if stopped
+                        else f"文件后处理中（{pending_count} 个）"
+                        if pending_count
+                        else f"已转存 {int(task_count or 0)} 个文件"
+                        if int(task_count or 0) > 0
+                        else "无需转存"
+                    ),
+                    progress=95 if pending_count and not stopped else 100,
+                    pending_count=pending_count,
+                    transferred=int(task_count or 0),
+                    finished_at=None if pending_count and not stopped else time.time(),
+                )
+            except Exception as error:
+                logger.error(f"订阅 {getattr(subscribe, 'name', '')} 处理异常：{error}")
+                self._update_sync_task(
+                    task_id,
+                    status="failed",
+                    phase="处理失败",
+                    progress=100,
+                    message=str(error),
+                    finished_at=time.time(),
+                )
+            finally:
+                try:
+                    del self._task_local.stop_event
+                except AttributeError:
+                    pass
+
+        return {
+            "history": local_history[initial_history_count:],
+            "transfer_details": transfer_details,
+            "transferred": transferred_count,
+        }
+
+    def _set_sync_status(
+            self,
+            status: str,
+            text: str,
+            progress: int = None,
+            context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._sync_status = status
+        self._sync_task_text = text
+        if progress is not None:
+            self._sync_progress = max(0, min(100, int(progress)))
+        if context is not None:
+            self._sync_context = dict(context)
+
+    def api_runtime_status(self, apikey: str) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        return {
+            "success": True,
+            "data": {
+                "status": self._sync_status,
+                "task": self._sync_task_text,
+                "progress": self._sync_progress,
+                "context": dict(self._sync_context),
+                "tasks": self._serialize_sync_tasks(),
+            },
+        }
+
+    def api_stop_sync(self, apikey: str) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        if not self._sync_running:
+            self.cancel_pending_subscribe_searches()
+            return {"success": True, "message": "当前没有正在处理的任务"}
+        self.cancel_pending_subscribe_searches()
+        self._stop_event.set()
+        with self._sync_tasks_lock:
+            for task in self._sync_tasks.values():
+                if task.get("status") in {"queued", "running", "stopping"}:
+                    task["status"] = "stopping"
+                    task["phase"] = "等待安全停止"
+                    task["stop_event"].set()
+        self._set_sync_status("stopping", "已收到停止请求，等待当前操作安全结束", self._sync_progress)
+        logger.info("收到快速停止请求，当前操作结束后将立即停止任务")
+        return {"success": True, "message": "已发送停止请求"}
+
+    def api_stop_sync_task(self, apikey: str, task_id: str) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        with self._sync_tasks_lock:
+            task = self._sync_tasks.get(task_id)
+            if not task:
+                return {"success": False, "message": "订阅任务不存在"}
+            if task.get("status") not in {"queued", "running", "stopping"}:
+                return {"success": True, "message": "该订阅任务已经结束"}
+            task["status"] = "stopping"
+            task["phase"] = "等待安全停止"
+            task["stop_event"].set()
+        logger.info(f"收到单任务停止请求：{task.get('title')}（{task_id}）")
+        return {"success": True, "message": f"已请求停止：{task.get('title')}"}
+
+    def _monitor_offline_task_groups(
+            self,
+            sync_handler: Any,
+            offline_service: Optional[Any],
+            kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        groups = sync_handler.get_due_offline_task_groups(
+            force=bool(kwargs.get("force")),
+            pending_keys=kwargs.get("pending_keys"),
+        )
+        shared_kwargs = dict(kwargs)
+        if (
+                any(group["needs_offline"] for group in groups)
+                and offline_service
+                and shared_kwargs.get("offline_tasks") is None
+        ):
+            snapshot = offline_service.get_offline_task_list_snapshot(force=True)
+            shared_kwargs["offline_tasks"] = snapshot.get("tasks") or []
+            shared_kwargs["offline_tasks_valid"] = bool(snapshot.get("refresh_ok"))
+
+        if len(groups) <= 1:
+            if groups:
+                shared_kwargs["pending_keys"] = set(groups[0]["pending_keys"])
+            return sync_handler.monitor_offline_strm_tasks(**shared_kwargs)
+
+        policy = getattr(getattr(self, "_cloud_drive", None), "policy", None)
+        worker_count = min(
+            len(groups),
+            max(1, int(getattr(policy, "max_concurrency", 1) or 1)),
+        )
+        logger.debug(
+            f"离线后处理并发调度：{len(groups)} 个媒体队列，并发数 {worker_count}"
+        )
+        totals = {"checked": 0, "completed": 0, "failed": 0, "pending": 0}
+        with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="cloudsubscribe-offline",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    sync_handler.monitor_offline_strm_tasks,
+                    **{
+                        **shared_kwargs,
+                        "pending_keys": set(group["pending_keys"]),
+                    },
+                ): group
+                for group in groups
+            }
+            for future in as_completed(futures):
+                group = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:
+                    logger.error(
+                        f"媒体后处理队列执行失败："
+                        f"{len(group['pending_keys'])} 个文件，{error}"
+                    )
+                    continue
+                for field in ("checked", "completed", "failed"):
+                    totals[field] += int(result.get(field) or 0)
+        totals["pending"] = len(sync_handler.get_pending_finalize_tasks())
+        return totals
+
+    def _run_offline_monitor(self, **kwargs: Any) -> Dict[str, Any]:
+        """按媒体队列并发执行网盘文件终态检查。"""
+        sync_handler = self._sync_handler
+        offline_service = self._offline_task_service()
+        if not sync_handler:
+            return {
+                "checked": 0,
+                "completed": 0,
+                "failed": 0,
+                "pending": 0,
+            }
+        if not self._offline_monitor_lock.acquire(blocking=False):
+            pending_count = len(sync_handler.get_pending_finalize_tasks())
+            logger.debug(
+                f"已有网盘文件后处理正在执行，本轮检查跳过"
+                f"（待处理 {pending_count} 个）"
+            )
+            return {
+                "checked": 0,
+                "completed": 0,
+                "failed": 0,
+                "pending": pending_count,
+                "deferred": 1,
+            }
+        try:
+            return self._monitor_offline_task_groups(
+                sync_handler, offline_service, kwargs
+            )
+        finally:
+            self._offline_monitor_lock.release()
+
+    def api_offline_tasks(self, apikey: str, refresh: bool = False) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        offline_tasks = self._offline_task_service()
+        if not offline_tasks:
+            return {"success": False, "message": "当前网盘不支持离线任务", "data": []}
+        snapshot = offline_tasks.get_offline_tasks_snapshot(force=refresh)
+        snapshot["provider"] = self._cloud_drive.key
+        snapshot["provider_name"] = self._cloud_drive.name
+        monitor_result = None
+        if refresh and self._sync_handler:
+            monitor_result = self._run_offline_monitor(
+                force=True,
+                offline_tasks=snapshot.get("tasks") or [],
+                offline_tasks_valid=bool(snapshot.get("refresh_ok")),
+            )
+        snapshot = self._merge_pending_finalize_tasks(snapshot)
+        if monitor_result is not None:
+            snapshot["monitor"] = monitor_result
+        return {
+            "success": True,
+            "message": "已手动刷新离线任务" if refresh else "已返回离线任务缓存",
+            "data": snapshot,
+        }
+
+    def _merge_pending_finalize_tasks(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(snapshot or {})
+        tasks = [dict(item) for item in (result.get("tasks") or [])]
+        pending = self._sync_handler.get_pending_finalize_tasks() if self._sync_handler else []
+        task_by_id = {
+            str(item.get("id") or "").upper(): item
+            for item in tasks
+            if item.get("id")
+        }
+        for item in pending:
+            task_id = str(item.get("task_id") or "").upper()
+            task = task_by_id.get(task_id) if task_id else None
+            pending_meta = {
+                "pending_key": item.get("pending_key"),
+                "finalize_pending": True,
+                "cloud_dir": item.get("cloud_dir"),
+                "target_name": item.get("file_name"),
+                "size": int(item.get("file_size") or (task or {}).get("size") or 0),
+                "postprocess_text": (
+                    "等待下载完成后读取真实文件并匹配"
+                    if (item.get("task_type") or "share") == "magnet"
+                    else "等待下载完成或文件处理"
+                    if (item.get("task_type") or "share") == "ed2k"
+                    else "等待系统处理、重命名和STRM"
+                ),
+            }
+            if task:
+                task.update(pending_meta)
+            else:
+                synthetic = {
+                    "id": task_id,
+                    "name": item.get("file_name") or "未命名文件",
+                    "state": "processing",
+                    "completed": False,
+                    "failed": False,
+                    "status_text": "系统处理中",
+                    "percent": 100,
+                    "add_time": int(item.get("created_at") or 0),
+                    **pending_meta,
+                }
+                tasks.insert(0, synthetic)
+        result["tasks"] = tasks
+        result["pending_count"] = len(pending)
+        return result
+
+    def api_retry_offline_tasks(
+            self,
+            apikey: str,
+            pending_keys: List[str],
+            task_ids: Optional[List[str]] = None,
+    ) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        offline_tasks = self._offline_task_service()
+        if not offline_tasks:
+            return {"success": False, "message": "当前网盘不支持离线任务"}
+        keys = {str(value).strip() for value in pending_keys if str(value).strip()}
+        normalized_task_ids = {
+            str(value).strip().upper()
+            for value in (task_ids or [])
+            if str(value).strip()
+        }
+        if not keys and not normalized_task_ids:
+            return {"success": False, "message": "请选择需要重试的任务"}
+        restarted = 0
+        restart_failed = 0
+        for task_id in normalized_task_ids:
+            try:
+                offline_tasks.restart_offline_task(task_id)
+                restarted += 1
+            except Exception as error:
+                restart_failed += 1
+                logger.error(f"重启离线任务失败 {task_id}：{error}")
+        result = {"checked": 0, "completed": 0, "failed": 0, "pending": 0}
+        if keys:
+            if not self._sync_handler:
+                return {"success": False, "message": "同步处理器未初始化"}
+            result = self._run_offline_monitor(
+                force=True,
+                pending_keys=keys,
+            )
+        return {
+            "success": restart_failed == 0,
+            "message": (
+                    f"已重启 {restarted} 个离线任务，复查 {result['checked']} 个后处理任务，"
+                    f"完成 {result['completed']} 个，仍待处理 {result['pending']} 个"
+                    + (f"，重启失败 {restart_failed} 个" if restart_failed else "")
+            ),
+            "data": {
+                **result,
+                "restarted": restarted,
+                "restart_failed": restart_failed,
+            },
+        }
+
+    def api_delete_offline_task(
+            self, apikey: str, task_id: str, pending_key: str = ""
+    ) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        offline_tasks = self._offline_task_service()
+        if not offline_tasks:
+            return {"success": False, "message": "当前网盘不支持离线任务"}
+        try:
+            normalized_id = str(task_id or "").strip().upper()
+            normalized_pending_key = str(pending_key or "").strip()
+            monitor_result = None
+            removed_pending = 0
+            if self._sync_handler and (normalized_pending_key or normalized_id):
+                removed_pending = self._sync_handler.delete_pending_finalize_tasks(
+                    {normalized_pending_key} if normalized_pending_key else set(),
+                    {normalized_id} if normalized_id else set(),
+                )
+            if normalized_id:
+                try:
+                    offline_tasks.delete_offline_task(
+                        normalized_id, delete_source_file=False
+                    )
+                except Exception:
+                    if not removed_pending:
+                        raise
+                    logger.debug(
+                        f"{self._cloud_drive.name}离线任务已不存在，继续清理待后处理记录：{normalized_id}"
+                    )
+            if self._sync_handler and normalized_id and not removed_pending:
+                snapshot = offline_tasks.get_offline_tasks_snapshot(force=False)
+                monitor_result = self._run_offline_monitor(
+                    force=True,
+                    pending_keys={normalized_id},
+                    offline_tasks=snapshot.get("tasks") or [],
+                    # 删除接口成功已经确认该任务不存在，无需再请求一次任务列表。
+                    offline_tasks_valid=True,
+                )
+            if normalized_id and removed_pending:
+                message = "离线任务和后处理任务已删除，已下载文件保留"
+            elif normalized_id:
+                message = "离线任务已删除，已下载文件保留"
+            else:
+                message = "后处理任务已删除，已下载文件保留"
+            if monitor_result and monitor_result.get("failed"):
+                message += "；目标文件不存在，下载历史已结束"
+            elif monitor_result and monitor_result.get("completed"):
+                message += "；目标文件已完成后处理"
+            return {
+                "success": True,
+                "message": message,
+                "data": {
+                    "monitor": monitor_result,
+                    "pending_deleted": removed_pending,
+                },
+            }
+        except Exception as error:
+            logger.error(f"删除离线任务失败：{error}")
+            return {"success": False, "message": str(error)}
+
+    def api_delete_offline_tasks(
+            self,
+            apikey: str,
+            task_ids: List[str],
+            pending_keys: Optional[List[str]] = None,
+    ) -> dict:
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        offline_tasks = self._offline_task_service()
+        if not offline_tasks:
+            return {"success": False, "message": "当前网盘不支持离线任务"}
+        try:
+            normalized_ids = {
+                str(value or "").strip().upper() for value in task_ids
+                if str(value or "").strip()
+            }
+            normalized_pending_keys = {
+                str(value or "").strip() for value in (pending_keys or [])
+                if str(value or "").strip()
+            }
+            removed_pending = 0
+            if self._sync_handler and (normalized_pending_keys or normalized_ids):
+                removed_pending = self._sync_handler.delete_pending_finalize_tasks(
+                    normalized_pending_keys,
+                    normalized_ids,
+                )
+            try:
+                count = offline_tasks.delete_offline_tasks(
+                    task_ids, delete_source_file=False
+                ) if task_ids else 0
+            except Exception:
+                if not removed_pending:
+                    raise
+                count = 0
+                logger.debug(
+                    f"部分{self._cloud_drive.name}离线任务已不存在，继续批量清理待后处理记录"
+                )
+            monitor_result = None
+            if self._sync_handler and normalized_ids and not removed_pending:
+                snapshot = offline_tasks.get_offline_tasks_snapshot(force=False)
+                monitor_result = self._run_offline_monitor(
+                    force=True,
+                    pending_keys=normalized_ids,
+                    offline_tasks=snapshot.get("tasks") or [],
+                    offline_tasks_valid=True,
+                )
+            return {
+                "success": True,
+                "message": (
+                        f"已删除 {count} 个离线任务"
+                        + (f"、{removed_pending} 个后处理任务" if removed_pending else "")
+                        + "，已下载文件保留"
+                ),
+                "data": {
+                    "deleted": count,
+                    "pending_deleted": removed_pending,
+                    "monitor": monitor_result,
+                },
+            }
+        except Exception as error:
+            logger.error(f"批量删除离线任务失败：{error}")
+            return {"success": False, "message": str(error)}
+
+    def _update_offline_monitor(self, pending_count: int) -> None:
+        """仅在存在待后处理文件时运行独立监控。"""
+        self._refresh_postprocessing_sync_tasks()
+        with self._offline_scheduler_lock:
+            scheduler = self._offline_scheduler
+            if pending_count > 0:
+                if scheduler and scheduler.running:
+                    scheduler.modify_job(
+                        "CloudSubscribe_OfflineMonitor",
+                        next_run_time=datetime.datetime.now(
+                            tz=pytz.timezone(settings.TZ)
+                        ) + datetime.timedelta(seconds=1),
+                    )
+                    return
+                scheduler = BackgroundScheduler(timezone=settings.TZ)
+                scheduler.add_job(
+                    func=self.monitor_offline_tasks,
+                    trigger=IntervalTrigger(minutes=1),
+                    id="CloudSubscribe_OfflineMonitor",
+                    next_run_time=datetime.datetime.now(
+                        tz=pytz.timezone(settings.TZ)
+                    ) + datetime.timedelta(seconds=5),
+                    max_instances=2,
+                    coalesce=True,
+                    replace_existing=True,
+                )
+                scheduler.start()
+                self._offline_scheduler = scheduler
+                logger.debug(f"网盘文件终态后处理监控已启动（待处理 {pending_count} 个）")
+                return
+
+            if not scheduler:
+                return
+            try:
+                scheduler.remove_all_jobs()
+                if scheduler.running:
+                    scheduler.shutdown(wait=False)
+            finally:
+                self._offline_scheduler = None
+            logger.debug("网盘文件终态后处理队列已清空，监控已停止")
+
+    def monitor_offline_tasks(self):
+        """每分钟检查是否到达任务节点，实际请求间隔由待处理任务控制。"""
+        return self._run_offline_monitor()
+
+    def _offline_task_service(self):
+        if not self._cloud_drive or not self._cloud_drive.supports(
+                CloudDriveCapability.OFFLINE_TASKS
+        ):
+            return None
+        return self._cloud_drive.require(CloudDriveCapability.OFFLINE_TASKS)

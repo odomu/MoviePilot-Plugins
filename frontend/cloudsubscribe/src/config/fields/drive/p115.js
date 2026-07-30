@@ -1,0 +1,115 @@
+import {enabled} from "../helpers.js";
+
+export function createP115Groups(options) {
+    return [
+        {
+            tab: "115",
+            title: "115账号",
+            hideHeading: true,
+            fields: [
+                {
+                    key: "account_info",
+                    type: "account",
+                    accountKey: "drive:115",
+                    data: options.accounts?.["115"] || options.account,
+                    cols: 12,
+                },
+                {
+                    key: "cookies",
+                    label: "115 Cookie",
+                    type: "password",
+                    hint: "可直接填写或点击右侧二维码按钮扫码登录",
+                    scanProvider: "115",
+                    cols: 6,
+                },
+                {
+                    key: "cloud_transfer_path",
+                    label: "网盘转存路径",
+                    type: "cloud-directory",
+                    placeholder: "/",
+                    driveProvider: "115",
+                    hint: "115 分享和 ED2K 先保存到此路径；文件完成后按 MoviePilot 规则重命名并移入网盘根目录的分类目录。",
+                    cols: 6,
+                },
+            ],
+        },
+        {
+            tab: "115",
+            title: "请求超时",
+            icon: "mdi-timer-cog-outline",
+            hint: "仅作用于 115 网盘 API；0 表示该项不限制。",
+            fields: [
+                {
+                    key: "timeout_enabled",
+                    label: "启用请求超时控制",
+                    type: "switch",
+                    cols: 12,
+                },
+                {
+                    key: "timeout_default_connect",
+                    label: "普通连接超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_default_pool",
+                    label: "普通连接池超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_default_read",
+                    label: "普通读取超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_default_write",
+                    label: "普通写入超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_slow_connect",
+                    label: "慢操作连接超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_slow_pool",
+                    label: "慢操作连接池超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_slow_read",
+                    label: "慢操作读取超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+                {
+                    key: "timeout_slow_write",
+                    label: "慢操作写入超时（秒）",
+                    type: "number",
+                    min: 0,
+                    cols: 3,
+                    show: enabled("timeout_enabled"),
+                },
+            ],
+        },
+    ]
+}

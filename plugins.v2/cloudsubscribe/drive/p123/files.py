@@ -1,0 +1,119 @@
+"""123 网盘目录、查询与文件变更能力。"""
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional
+
+from .client import P123_AVAILABLE, is_success
+from ..common import CloudDriveFileServiceBase, safe_int
+from ...core.cloud import CloudFile
+
+try:
+    from p123client.tool import iterdir
+except ImportError:
+    iterdir = None
+
+
+def cloud_file(item: Any) -> Optional[CloudFile]:
+    if not isinstance(item, Mapping):
+        return None
+    normalized = dict(item)
+    raw = normalized.get("raw")
+    raw = dict(raw) if isinstance(raw, Mapping) else normalized
+    file_id = normalized.get("id") or raw.get("FileId") or raw.get("fileId")
+    name = str(
+        normalized.get("name") or raw.get("FileName") or raw.get("fileName") or ""
+    ).strip()
+    if file_id in (None, "") or not name:
+        return None
+    is_directory = bool(
+        normalized.get("is_dir")
+        or safe_int(raw.get("Type") or raw.get("type")) == 1
+    )
+    checksum = str(
+        normalized.get("md5") or raw.get("Etag") or raw.get("etag") or ""
+    ).strip()
+    size = 0 if is_directory else safe_int(
+        normalized.get("size") or raw.get("Size") or raw.get("size")
+    )
+    s3_key_flag = str(
+        normalized.get("s3keyflag")
+        or raw.get("S3KeyFlag")
+        or raw.get("s3KeyFlag")
+        or ""
+    ).strip()
+    playback_values = {}
+    if not is_directory:
+        playback_values = {
+            "file_id": str(file_id),
+            "md5": checksum,
+            "size": str(size),
+            "s3_key_flag": s3_key_flag,
+        }
+    return CloudFile(
+        id=str(file_id),
+        name=name,
+        is_directory=is_directory,
+        size=size,
+        # 现有同步后处理使用 sha1 字段承载提供方校验和；123 返回的是 MD5。
+        sha1=checksum,
+        playback_values=playback_values,
+        native=raw,
+    )
+
+
+@dataclass
+class P123FileService(CloudDriveFileServiceBase):
+    client: Any
+    page_size: int = 100
+    root_directory_id = "0"
+    provider_name = "123"
+    _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": "0"})
+
+    def _list(self, directory_id: str) -> List[CloudFile]:
+        if not P123_AVAILABLE or iterdir is None:
+            raise RuntimeError("p123client 未安装")
+        return [
+            file_item
+            for item in iterdir(
+                self.client,
+                payload=int(directory_id or 0),
+                max_depth=1,
+                keep_raw=True,
+            )
+            if (file_item := cloud_file(item)) is not None
+        ]
+
+    def _create_folder(self, name: str, parent_id: str) -> Optional[CloudFile]:
+        response = self.client.fs_mkdir(name, parent_id=int(parent_id or 0))
+        if not self._is_success(response):
+            return None
+        data = response.get("data") or {}
+        return cloud_file(data.get("Info") or data.get("info") or data)
+
+    @staticmethod
+    def _is_success(response: Any) -> bool:
+        return is_success(response)
+
+    def rename_file(self, path: str, item: CloudFile, target_name: str) -> bool:
+        response = self.client.fs_rename_one((int(item.id), target_name))
+        return self._is_success(response)
+
+    def move_file(
+            self, item: CloudFile, save_path: str, target_name: str
+    ) -> Optional[CloudFile]:
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return None
+        response = self.client.fs_move(
+            int(item.id), parent_id=int(lookup.directory_id)
+        )
+        if not self._is_success(response):
+            return None
+        if target_name and target_name != item.name:
+            if not self.rename_file(save_path, item, target_name):
+                return None
+        return self.find_file(save_path, target_name or item.name)
+
+    def delete_file(self, file_id: str) -> bool:
+        response = self.client.fs_trash(int(file_id), event="intoRecycle")
+        return self._is_success(response)

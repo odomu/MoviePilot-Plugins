@@ -1,0 +1,545 @@
+"""转存完成后的媒体服务器入库通知与 Emby 媒体信息提取。"""
+
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from pathlib import Path
+from threading import RLock, Timer
+from typing import Any, Dict, List, Optional, Set
+
+from app.chain.mediaserver import MediaServerChain
+from app.helper.mediaserver import MediaServerHelper
+from app.log import logger
+from app.schemas import MediaInfo, RefreshMediaItem
+from app.utils.http import RequestUtils
+
+
+class EmbyMediaResolver:
+    """读取 Emby 中已入库剧集的实际文件路径，供洗版建立现有版本基线。"""
+
+    @staticmethod
+    def _item_media(service, item_id: str) -> Dict[str, Any]:
+        """直接读取 Emby 项目详情中的路径和真实媒体大小。"""
+        instance = service.instance
+        host = str(getattr(instance, "_host", "") or "").rstrip("/")
+        api_key = str(getattr(instance, "_apikey", "") or "")
+        user = str(getattr(instance, "user", "") or "")
+        if not host or not api_key or not user or not item_id:
+            return {}
+        response = RequestUtils().get_res(
+            f"{host}/emby/Users/{user}/Items/{item_id}",
+            params={"api_key": api_key},
+        )
+        if not response or response.status_code != 200:
+            return {}
+        data = response.json() or {}
+        media_sources = data.get("MediaSources") or []
+        source = next((value for value in media_sources if isinstance(value, dict)), {})
+        try:
+            size = max(0, int(data.get("Size") or source.get("Size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        return {
+            "path": str(data.get("Path") or source.get("Path") or "").strip(),
+            "size": size,
+            "item_id": str(item_id),
+        }
+
+    @staticmethod
+    def episode_media(
+            chain, mediainfo: MediaInfo, season: int
+    ) -> tuple[bool, Dict[int, Dict[str, Any]]]:
+        """返回 Emby 逐集路径和大小；不读取网盘。"""
+        services = MediaServerHelper().get_services(type_filter="emby")
+        if not services or not chain or not mediainfo:
+            return False, {}
+
+        mediaserver_chain = MediaServerChain()
+        result: Dict[int, Dict[str, Any]] = {}
+        checked = False
+        for server_name, service in services.items():
+            if service.instance.is_inactive():
+                continue
+            try:
+                exists_media = chain.media_exists(mediainfo=mediainfo, server=server_name)
+                checked = True
+                if not exists_media or not exists_media.itemid:
+                    continue
+                episode_ids = mediaserver_chain.get_season_episode_ids(
+                    server=server_name, item_id=exists_media.itemid, season=season
+                )
+                for episode, item_id in (episode_ids or {}).items():
+                    episode = int(episode)
+                    if episode not in result:
+                        result[episode] = EmbyMediaResolver._item_media(service, str(item_id))
+            except Exception as error:
+                logger.warning(
+                    f"读取 Emby 洗版基线失败：{server_name} - "
+                    f"{mediainfo.title_year} S{season:02d}，原因：{error}"
+                )
+        return checked, {episode: value for episode, value in result.items() if value.get("path")}
+
+    @staticmethod
+    def episode_snapshot(
+            chain, mediainfo: MediaInfo, season: int
+    ) -> tuple[bool, Dict[int, str]]:
+        """返回是否成功检查过可用 Emby，以及实际存在的剧集路径。"""
+        checked, media = EmbyMediaResolver.episode_media(chain, mediainfo, season)
+        return checked, {
+            episode: str(value.get("path") or "") for episode, value in media.items()
+        }
+
+    @staticmethod
+    def episode_paths(chain, mediainfo: MediaInfo, season: int) -> Dict[int, str]:
+        _, paths = EmbyMediaResolver.episode_snapshot(chain, mediainfo, season)
+        return paths
+
+    @staticmethod
+    def movie_paths(chain, mediainfo: MediaInfo) -> list[str]:
+        """读取 Emby 中已入库电影的实际文件路径，供电影洗版建立基线。"""
+        services = MediaServerHelper().get_services(type_filter="emby")
+        if not services or not chain or not mediainfo:
+            return []
+
+        paths = []
+        for server_name, service in services.items():
+            if service.instance.is_inactive():
+                continue
+            try:
+                exists_media = chain.media_exists(
+                    mediainfo=mediainfo,
+                    server=server_name,
+                )
+                if not exists_media or not exists_media.itemid:
+                    continue
+                item_path = str(
+                    EmbyMediaResolver._item_media(
+                        service, str(exists_media.itemid)
+                    ).get("path") or ""
+                ).strip()
+                if item_path and item_path not in paths:
+                    paths.append(item_path)
+            except Exception as error:
+                logger.warning(
+                    f"读取 Emby 电影洗版基线失败：{server_name} - "
+                    f"{mediainfo.title_year}，原因：{error}"
+                )
+        return paths
+
+    @staticmethod
+    def movie_media(chain, mediainfo: MediaInfo) -> list[Dict[str, Any]]:
+        """读取 Emby 电影路径和大小，作为网盘查询前的首选基线。"""
+        services = MediaServerHelper().get_services(type_filter="emby")
+        if not services or not chain or not mediainfo:
+            return []
+        result = []
+        for server_name, service in services.items():
+            if service.instance.is_inactive():
+                continue
+            try:
+                exists_media = chain.media_exists(mediainfo=mediainfo, server=server_name)
+                if not exists_media or not exists_media.itemid:
+                    continue
+                media = EmbyMediaResolver._item_media(service, str(exists_media.itemid))
+                if media.get("path") and media not in result:
+                    result.append(media)
+            except Exception as error:
+                logger.warning(
+                    f"读取 Emby 电影洗版基线失败：{server_name} - "
+                    f"{mediainfo.title_year}，原因：{error}"
+                )
+        return result
+
+    @staticmethod
+    def episode_numbers(
+            chain, mediainfo: MediaInfo, season: int
+    ) -> tuple[bool, Set[int]]:
+        """只读取 Emby 季集 ID，不逐集请求详情路径。"""
+        services = MediaServerHelper().get_services(type_filter="emby")
+        if not services or not chain or not mediainfo:
+            return False, set()
+
+        mediaserver_chain = MediaServerChain()
+        checked = False
+        episodes: Set[int] = set()
+        for server_name, service in services.items():
+            if service.instance.is_inactive():
+                continue
+            try:
+                exists_media = chain.media_exists(
+                    mediainfo=mediainfo,
+                    server=server_name,
+                )
+                checked = True
+                if not exists_media or not exists_media.itemid:
+                    continue
+                episode_ids = mediaserver_chain.get_season_episode_ids(
+                    server=server_name,
+                    item_id=exists_media.itemid,
+                    season=season,
+                )
+                episodes.update(int(episode) for episode in (episode_ids or {}))
+            except Exception as error:
+                logger.warning(
+                    f"读取 Emby 剧集清单失败：{server_name} - "
+                    f"{mediainfo.title_year} S{season:02d}，原因：{error}"
+                )
+        return checked, episodes
+
+
+class MediaServerNotifier:
+    """按媒体项通知所选媒体服务器，并可触发 Emby 提取媒体信息。"""
+
+    _BATCH_WINDOW_SECONDS = 2
+    _REFRESH_TIMEOUT_SECONDS = 60
+    _MEDIAINFO_TIMER_LIMIT = 256
+
+    def __init__(
+            self,
+            enabled: bool = False,
+            mediaservers: Optional[List[str]] = None,
+            path_mappings: str = "",
+            delay_seconds: int = 0,
+            emby_mediainfo_enabled: bool = False,
+    ):
+        self.enabled = bool(enabled)
+        self.mediaservers = list(mediaservers or [])
+        self.path_mappings = str(path_mappings or "")
+        self.delay_seconds = max(0, int(delay_seconds or 0))
+        self.emby_mediainfo_enabled = bool(emby_mediainfo_enabled)
+        self._batch_lock = RLock()
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self._batch_timer: Optional[Timer] = None
+        self._task_batch_depth = 0
+        self._closed = False
+        self._batch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cloudsubscribe-media-batch"
+        )
+        self._refresh_executor = ThreadPoolExecutor(
+            max_workers=max(1, min(len(self.mediaservers) or 1, 4)),
+            thread_name_prefix="cloudsubscribe-media-refresh",
+        )
+        self._mediainfo_timers: Dict[str, Timer] = {}
+
+    def begin_task_batch(self) -> bool:
+        """任务期间只聚合通知，禁止静默定时器提前提交。"""
+        with self._batch_lock:
+            if self._closed:
+                return False
+            self._task_batch_depth += 1
+            if self._batch_timer:
+                self._batch_timer.cancel()
+                self._batch_timer = None
+        return True
+
+    def finish_task_batch(self) -> bool:
+        """最外层任务结束后在后台提交已去重的媒体目录。"""
+        with self._batch_lock:
+            if self._task_batch_depth <= 0:
+                return True
+            self._task_batch_depth -= 1
+            if self._task_batch_depth > 0:
+                return True
+            if self._batch_timer:
+                self._batch_timer.cancel()
+                self._batch_timer = None
+            entries = list(self._pending.values())
+            self._pending.clear()
+        return self._submit_batch_async(entries)
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        normalized = str(path or "").replace("\\", "/")
+        return normalized.rstrip("/") or "/"
+
+    def _media_server_path(self, moviepilot_path: Path) -> Path:
+        source = self._normalize_path(str(moviepilot_path))
+        matches = []
+        for line in self.path_mappings.splitlines():
+            parts = [part.strip() for part in line.split("#", 1)]
+            if len(parts) != 2 or not all(parts):
+                continue
+            server_root, moviepilot_root = map(self._normalize_path, parts)
+            if source == moviepilot_root or source.startswith(f"{moviepilot_root}/"):
+                matches.append((len(moviepilot_root), server_root, moviepilot_root))
+        if not matches:
+            return Path(source)
+
+        _, server_root, moviepilot_root = max(matches, key=lambda item: item[0])
+        relative = source[len(moviepilot_root):].lstrip("/")
+        translated = f"{server_root}/{relative}" if relative else server_root
+        return Path(translated)
+
+    def notify(self, path: Path, mediainfo: MediaInfo, file_name: str = "") -> bool:
+        if not self.enabled:
+            return True
+        if not self.mediaservers:
+            logger.warning("入库通知已启用，但尚未选择媒体服务器")
+            return False
+        if not path or not mediainfo:
+            logger.warning(f"入库通知缺少媒体路径或识别信息：{file_name}")
+            return False
+
+        target_path = self._media_server_path(path)
+        target_folder = target_path.parent if target_path.suffix else target_path
+        item = RefreshMediaItem(
+            title=mediainfo.title,
+            year=mediainfo.year,
+            type=mediainfo.type,
+            category=mediainfo.category,
+            target_path=target_folder,
+        )
+        key = self._normalize_path(str(target_folder))
+        with self._batch_lock:
+            if self._closed:
+                logger.warning("入库通知器已关闭，无法继续接收通知")
+                return False
+            pending = self._pending.get(key)
+            if pending:
+                pending["paths"].add(target_path)
+            else:
+                self._pending[key] = {
+                    "item": item,
+                    "folder": target_folder,
+                    "paths": {target_path},
+                }
+            if self._task_batch_depth > 0:
+                logger.debug("入库通知批次已更新，将在当前任务结束后统一提交")
+            else:
+                if self._batch_timer:
+                    self._batch_timer.cancel()
+                wait_seconds = max(self.delay_seconds, self._BATCH_WINDOW_SECONDS)
+                self._batch_timer = Timer(wait_seconds, self._flush_pending)
+                self._batch_timer.daemon = True
+                self._batch_timer.start()
+                logger.debug(f"入库通知批次已更新，静默 {wait_seconds} 秒后提交")
+        return True
+
+    def _take_pending(self) -> List[Dict[str, Any]]:
+        with self._batch_lock:
+            entries = list(self._pending.values())
+            self._pending.clear()
+            self._batch_timer = None
+        return entries
+
+    def _flush_pending(self) -> bool:
+        return self._submit_batch_async(self._take_pending())
+
+    def _submit_batch_async(self, entries: List[Dict[str, Any]]) -> bool:
+        if not entries:
+            return True
+        try:
+            self._batch_executor.submit(self._submit_batch, entries)
+        except RuntimeError:
+            logger.warning("媒体库刷新执行器已关闭，无法提交新批次")
+            return False
+        return True
+
+    def _refresh_service(
+            self,
+            name: str,
+            service: Any,
+            items: List[RefreshMediaItem],
+    ) -> bool:
+        started_at = time.monotonic()
+        logger.info(f"开始刷新媒体库：{name} - {len(items)} 个媒体目录")
+        future = self._refresh_executor.submit(
+            service.instance.refresh_library_by_items, items
+        )
+        try:
+            future.result(timeout=self._REFRESH_TIMEOUT_SECONDS)
+        except FutureTimeoutError:
+            future.cancel()
+            logger.error(
+                f"媒体库刷新超时：{name} - 等待 "
+                f"{self._REFRESH_TIMEOUT_SECONDS} 秒仍未返回，订阅任务不受影响"
+            )
+            return False
+        except Exception as error:
+            logger.error(
+                f"媒体库刷新失败：{name} - {len(items)} 个媒体目录，"
+                f"耗时 {time.monotonic() - started_at:.2f} 秒，原因：{error}"
+            )
+            return False
+
+        elapsed = time.monotonic() - started_at
+        logger.debug(
+            f"媒体库刷新完成：{name} - {len(items)} 个媒体目录，"
+            f"耗时 {elapsed:.2f} 秒"
+        )
+        return True
+
+    def _submit_batch(self, entries: List[Dict[str, Any]]) -> bool:
+        if not entries:
+            return True
+        services = MediaServerHelper().get_services(name_filters=self.mediaservers)
+        if not services:
+            logger.warning("未找到已选择的媒体服务器实例，无法提交入库通知")
+            return False
+
+        items = [entry["item"] for entry in entries]
+        paths = list(
+            dict.fromkeys(
+                path
+                for entry in entries
+                for path in entry.get("paths", set())
+            )
+        )
+        refreshed = 0
+        submitted = 0
+        started_at = time.monotonic()
+        for name, service in services.items():
+            if service.instance.is_inactive():
+                logger.warning(f"媒体服务器未连接，跳过入库通知：{name}")
+                continue
+            if not hasattr(service.instance, "refresh_library_by_items"):
+                logger.warning(f"媒体服务器不支持按项入库通知：{name}")
+                continue
+            submitted += 1
+            if self._refresh_service(name, service, items):
+                refreshed += 1
+                if self.emby_mediainfo_enabled and service.type == "emby":
+                    for path in paths:
+                        self._schedule_emby_mediainfo(name, path, attempt=1)
+        if submitted:
+            logger.info(
+                f"媒体库刷新批次结束：成功 {refreshed}/{submitted}，"
+                f"耗时 {time.monotonic() - started_at:.2f} 秒"
+            )
+        return refreshed > 0
+
+    def close(self, flush: bool = True) -> None:
+        """停止定时器；配置重载或插件停止时后台提交尚未发送的批次。"""
+        with self._batch_lock:
+            self._closed = True
+            self._task_batch_depth = 0
+            timer = self._batch_timer
+            self._batch_timer = None
+            if timer:
+                timer.cancel()
+            entries = list(self._pending.values()) if flush else []
+            self._pending.clear()
+            mediainfo_timers = list(self._mediainfo_timers.values())
+            self._mediainfo_timers.clear()
+        for mediainfo_timer in mediainfo_timers:
+            mediainfo_timer.cancel()
+        if entries:
+            try:
+                self._batch_executor.submit(self._submit_final_batch, entries)
+            except RuntimeError:
+                self._refresh_executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            self._refresh_executor.shutdown(wait=False, cancel_futures=True)
+        self._batch_executor.shutdown(wait=False, cancel_futures=False)
+
+    def _submit_final_batch(self, entries: List[Dict[str, Any]]) -> None:
+        try:
+            self._submit_batch(entries)
+        finally:
+            self._refresh_executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _emby_connection(name: str):
+        service = MediaServerHelper().get_service(name=name, type_filter="emby")
+        if not service or service.instance.is_inactive():
+            return None
+        config = service.config.config or {}
+        host = str(config.get("host") or "").strip().rstrip("/")
+        api_key = str(config.get("apikey") or "").strip()
+        user_id = str(service.instance.get_user() or "").strip()
+        if not host or not api_key or not user_id:
+            return None
+        if not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
+        return host, api_key, user_id
+
+    def _schedule_emby_mediainfo(
+            self, name: str, path: Path, attempt: int
+    ) -> None:
+        key = f"{name}\0{path.as_posix()}"
+
+        def trigger() -> None:
+            with self._batch_lock:
+                self._mediainfo_timers.pop(key, None)
+                if self._closed:
+                    return
+            self._trigger_emby_mediainfo(name, path, attempt)
+
+        timer = Timer(
+            10 if attempt == 1 else 15,
+            trigger,
+        )
+        timer.daemon = True
+        with self._batch_lock:
+            if self._closed:
+                return
+            previous = self._mediainfo_timers.get(key)
+            if previous:
+                previous.cancel()
+            elif len(self._mediainfo_timers) >= self._MEDIAINFO_TIMER_LIMIT:
+                oldest_key = next(iter(self._mediainfo_timers))
+                self._mediainfo_timers.pop(oldest_key).cancel()
+                logger.warning(
+                    "Emby 媒体信息提取等待队列已达上限，已丢弃最早任务"
+                )
+            self._mediainfo_timers[key] = timer
+            timer.start()
+
+    def _trigger_emby_mediainfo(
+            self, name: str, path: Path, attempt: int
+    ) -> None:
+        connection = self._emby_connection(name)
+        if not connection:
+            logger.warning(f"Emby 媒体信息提取配置无效或服务未连接：{name}")
+            return
+        host, api_key, user_id = connection
+        file_path = path.as_posix()
+        try:
+            with RequestUtils(timeout=15).get_res(
+                    url=f"{host}/emby/Items",
+                    params={
+                        "Path": file_path,
+                        "Recursive": "true",
+                        "Fields": "Path",
+                        "IncludeItemTypes": "Movie,Episode,Folder,Series",
+                        "api_key": api_key,
+                    },
+            ) as response:
+                items = response.json().get("Items", []) if response else []
+            item_id = next(
+                (
+                    item.get("Id")
+                    for item in items
+                    if str(item.get("Path") or "").replace("\\", "/")
+                       == file_path
+                ),
+                None,
+            )
+            if not item_id:
+                if attempt < 4:
+                    self._schedule_emby_mediainfo(name, path, attempt + 1)
+                else:
+                    logger.warning(
+                        f"Emby 入库后仍未找到媒体项，跳过媒体信息提取：{name} - {file_path}"
+                    )
+                return
+            with RequestUtils(timeout=30).post_res(
+                    url=f"{host}/emby/Items/{item_id}/PlaybackInfo",
+                    params={
+                        "AutoOpenLiveStream": "true",
+                        "IsPlayback": "true",
+                        "api_key": api_key,
+                        "UserId": user_id,
+                    },
+            ) as response:
+                success = bool(response and response.status_code == 200)
+            if success:
+                logger.debug(f"Emby 媒体信息提取已触发：{name} - {file_path}")
+            else:
+                status_code = getattr(response, "status_code", None)
+                logger.warning(
+                    f"Emby 媒体信息提取失败：{name} - {file_path}，状态码：{status_code}"
+                )
+        except Exception as error:
+            logger.warning(f"Emby 媒体信息提取异常：{name} - {file_path}，原因：{error}")
+            if attempt < 4:
+                self._schedule_emby_mediainfo(name, path, attempt + 1)

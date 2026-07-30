@@ -1,0 +1,716 @@
+"""电视剧订阅搜索、匹配与转存流程。"""
+
+import datetime
+from typing import Any, Dict, List, Optional, Set
+
+from app.core.metainfo import MetaInfo
+from app.log import logger
+from app.schemas import MediaInfo
+from app.schemas.types import MediaType
+from app.utils.string import StringUtils
+
+from ..notification import EmbyMediaResolver
+from ...core import OwnerDelegator
+from ...utils import MediaFileParser
+
+
+class TelevisionSyncProcessor(OwnerDelegator):
+    """处理电视剧订阅同步。"""
+
+    def process_tv_subscribe(
+            self,
+            subscribe,
+            history: List[dict],
+            transfer_details: List[Dict[str, Any]],
+            transferred_count: int,
+            exclude_ids: Set[int],
+            manual_resources: Optional[List[Dict[str, Any]]] = None,
+            allow_upgrade: bool = True,
+            manual_upgrade: bool = False,
+            target_episodes: Optional[Set[int]] = None,
+            transient_target: bool = False,
+    ) -> int:
+        """
+        处理单个电视剧订阅
+
+        :param subscribe: 订阅对象
+        :param history: 历史记录列表
+        :param transfer_details: 转存详情列表
+        :param transferred_count: 当前已转存数量
+        :param exclude_ids: 排除的订阅ID集合
+        :return: 更新后的转存数量
+        """
+        try:
+            if self._stop_requested():
+                return transferred_count
+            # 原生 best_version 决定洗版订阅，插件范围进一步限制处理对象。
+            if (
+                    allow_upgrade
+                    and (manual_upgrade or self._is_cloud_upgrade_subscribe(subscribe))
+                    and not manual_resources
+            ):
+                return self._process_tv_subscribe_upgrade(
+                    subscribe=subscribe,
+                    history=history,
+                    transfer_details=transfer_details,
+                    transferred_count=transferred_count,
+                    exclude_ids=exclude_ids,
+                    target_episodes=target_episodes,
+                    manual_upgrade=manual_upgrade,
+                )
+
+            logger.debug(
+                f"📺 处理订阅：{subscribe.name} S{subscribe.season or 1:02d}，"
+                f"范围 E{subscribe.start_episode or 1:02d}-E{subscribe.total_episode or 0:02d}，"
+                f"订阅记录缺失 {subscribe.lack_episode} 集"
+            )
+
+            # 加载该订阅的历史积分花费（用 tmdb_id + 季数作为唯一标识）
+            sub_key = self.subscription_budget_key(subscribe, MediaType.TV)
+            if hasattr(self._search_handler, 'reset_sub_spent_points'):
+                self._search_handler.reset_sub_spent_points(sub_key)
+
+            # 生成元数据
+            meta = MetaInfo(subscribe.name)
+            meta.year = subscribe.year
+            meta.begin_season = subscribe.season or 1
+            meta.type = MediaType.TV
+
+            # 识别媒体信息
+            mediainfo: MediaInfo = self._recognize_media_once(
+                (
+                    "subscribe", MediaType.TV.value, subscribe.tmdbid,
+                    subscribe.doubanid, subscribe.name, subscribe.year,
+                    subscribe.season or 1, False,
+                ),
+                meta=meta,
+                mtype=MediaType.TV,
+                tmdbid=subscribe.tmdbid,
+                doubanid=subscribe.doubanid,
+                # 未完成订阅必须读取最新季集和播出日期，避免长期连载被旧缓存截断。
+                cache=False,
+            )
+
+            if not mediainfo:
+                logger.warn(f"无法识别媒体信息：{subscribe.name}")
+                return transferred_count
+
+            self._set_task_phase(subscribe, "核对播出范围", 20)
+            season = meta.begin_season or 1
+            total_ep = subscribe.total_episode or 0
+            start_ep = subscribe.start_episode or 1
+            expected_episodes = set(range(start_ep, total_ep + 1)) if total_ep >= start_ep else set()
+            missing_episodes: List[int] = []
+            target_episode_air_dates: Dict[int, str] = {}
+            calendar_entry: Optional[Dict[str, Any]] = None
+            # 收集阶段已读取平台订阅日历；这里复用结果，避免重复查询 TMDB。
+            if expected_episodes and mediainfo.tmdb_id and not manual_resources:
+                calendar_entry = self.get_tv_subscribe_calendar(
+                    subscribe, tmdb_id=mediainfo.tmdb_id
+                )
+                if calendar_entry:
+                    target_episode_air_dates = {
+                        int(episode): str(air_date)
+                        for episode, value in (
+                                calendar_entry.get("aired_episode_air_dates") or {}
+                        ).items()
+                        if (air_date := str(value or "").strip())
+                    }
+                    if calendar_entry.get("all_targets_future"):
+                        logger.debug(
+                            f"{mediainfo.title_year} S{season:02d} "
+                            "所有目标集均未播出，跳过物理校验"
+                        )
+                        return transferred_count
+                    if calendar_entry.get("unknown_episodes"):
+                        boundary = int(
+                            calendar_entry.get("unreleased_boundary_episode") or 0
+                        )
+                        boundary_reason = str(
+                            calendar_entry.get("unreleased_boundary_reason") or ""
+                        )
+                        boundary_text = ""
+                        if boundary:
+                            boundary_text = (
+                                f"，TMDB 仅返回至 E{boundary - 1:02d}，"
+                                f"按 E{boundary:02d} 未播边界过滤"
+                                if boundary_reason == "unknown_tail"
+                                else f"，按 E{boundary:02d} 未播边界过滤"
+                            )
+                        logger.debug(
+                            f"{mediainfo.title_year} S{season:02d} "
+                            f"目标集播出日期不完整"
+                            f"{boundary_text}，"
+                            "继续物理校验"
+                        )
+                else:
+                    logger.info(
+                        f"{mediainfo.title_year} S{season:02d} "
+                        "平台日历未返回剧集信息，跳过播出过滤"
+                    )
+            # 1. 先读取 Emby 实际剧集，不混入订阅 note。
+            self._set_task_phase(subscribe, "检查媒体库内容", 30)
+            emby_valid, emby_episodes = self._timed_sync_call(
+                "emby_scan",
+                EmbyMediaResolver.episode_numbers,
+                self._chain,
+                mediainfo,
+                season,
+            )
+            existing_episodes_in_resources: Set[int] = (
+                    emby_episodes & expected_episodes
+            )
+            if not emby_valid:
+                if transient_target:
+                    emby_episodes = set()
+                    logger.debug(
+                        f"{mediainfo.title_year} S{season:02d} 未读取到 Emby 数据，"
+                        "临时媒体目标继续按网盘实际内容检查"
+                    )
+                else:
+                    logger.warning(
+                        f"{mediainfo.title_year} S{season:02d} 无法读取 Emby 实际数据，"
+                        "本轮跳过且不访问115，不修改订阅进度"
+                    )
+                    return transferred_count
+            logger.debug(
+                f"Emby 实际存在剧集："
+                f"{self._format_episode_ranges(emby_episodes & expected_episodes)}"
+            )
+
+            # 2. 再读取115目标目录；不扫描本地 STRM 路径。
+            self._set_task_phase(subscribe, "检查网盘内容", 40)
+            cloud_valid, cloud_episodes, cloud_label = self._timed_sync_call(
+                "cloud_scan",
+                self._scan_cloud_resource_episodes,
+                subscribe=subscribe,
+                mediainfo=mediainfo,
+                season=season,
+                start_episode=start_ep,
+                total_episode=total_ep,
+            )
+            if not cloud_valid:
+                logger.warning(
+                    f"{mediainfo.title_year} S{season:02d} 无法读取115实际数据，"
+                    "本轮跳过，不修改订阅进度"
+                )
+                return transferred_count
+            existing_episodes_in_resources.update(cloud_episodes & expected_episodes)
+            logger.debug(
+                f"115 实际存在剧集：{cloud_label}，"
+                f"{self._format_episode_ranges(cloud_episodes & expected_episodes)}"
+            )
+
+            if expected_episodes:
+                current_note = {
+                                   int(episode) for episode in (subscribe.note or [])
+                                   if str(episode).isdigit()
+                               } & expected_episodes
+                missing_episodes = sorted(expected_episodes - existing_episodes_in_resources)
+                restored_missing = set(missing_episodes) & current_note
+                if not transient_target:
+                    self._reconcile_subscribe_physical_episodes(
+                        subscribe=subscribe,
+                        episodes=existing_episodes_in_resources,
+                        start_episode=start_ep,
+                        total_episode=total_ep,
+                    )
+                logger.debug(
+                    f"Emby 与115合并后已存在 "
+                    f"{self._format_episode_ranges(existing_episodes_in_resources)}，缺失 "
+                    f"{self._format_episode_ranges(set(missing_episodes))}"
+                )
+                if restored_missing:
+                    logger.warning(
+                        "Emby 与115均不存在，已删除订阅误标并恢复缺集："
+                        f"{self._format_episode_ranges(restored_missing)}"
+                    )
+
+            if not missing_episodes:
+                logger.info(f"{mediainfo.title_year} S{season:02d} Emby 与115已完整存在")
+                if not transient_target:
+                    self._subscribe_handler.check_and_finish_subscribe(
+                        subscribe=subscribe,
+                        mediainfo=mediainfo,
+                        success_episodes=sorted(existing_episodes_in_resources),
+                    )
+                if hasattr(self._search_handler, 'clear_sub_points'):
+                    self._search_handler.clear_sub_points(sub_key)
+                return transferred_count
+
+            # 过滤掉小于开始集数的剧集。
+            if subscribe.start_episode:
+                missing_episodes = [
+                    episode for episode in missing_episodes
+                    if episode >= subscribe.start_episode
+                ]
+
+            # 物理校验完成后，仅对已播出且实际缺失的集数继续搜索。
+            if calendar_entry:
+                unreleased_episodes = {
+                    int(episode)
+                    for episode in (
+                            calendar_entry.get("unreleased_episodes") or []
+                    )
+                }
+                not_aired = [
+                    episode
+                    for episode in missing_episodes
+                    if episode in unreleased_episodes
+                ]
+                if not_aired:
+                    missing_episodes = [
+                        episode
+                        for episode in missing_episodes
+                        if episode not in set(not_aired)
+                    ]
+                    logger.debug(
+                        f"{mediainfo.title_year} S{season:02d} 跳过未播出剧集："
+                        f"{self._format_episode_ranges(set(not_aired))}"
+                    )
+                    if not missing_episodes:
+                        defer_until = self._calendar_date(
+                            calendar_entry.get("next_air_date")
+                        )
+                        if defer_until and defer_until > datetime.date.today():
+                            self.defer_subscribe_until(
+                                subscribe,
+                                defer_until,
+                                f"缺失剧集最早于 {defer_until.isoformat()} 播出",
+                            )
+                        logger.debug(
+                            f"{mediainfo.title_year} S{season} "
+                            "所有缺失剧集均未播出，跳过"
+                        )
+                        return transferred_count
+
+            logger.debug(
+                f"{mediainfo.title_year} S{season:02d} 待转存剧集："
+                f"{self._format_episode_ranges(set(missing_episodes))}"
+            )
+
+            # 成功转存的集数列表
+            success_episodes = []
+
+            # 手动资源作为单一来源进入现有匹配转存链。
+            enabled_sources = (
+                ["manual"] if manual_resources
+                else self._search_handler.get_enabled_sources()
+            )
+
+            if not enabled_sources:
+                logger.warning(f"没有可用的搜索源，跳过 {mediainfo.title} S{season} 的搜索")
+                return transferred_count
+
+            prefetched_results = (
+                {"manual": [dict(resource) for resource in manual_resources]}
+                if manual_resources else {}
+            )
+            self._set_task_phase(subscribe, "搜索缺失剧集", 55)
+            if not manual_resources and self._search_handler.source_concurrency_enabled:
+                prefetched_results = self._search_handler.search_sources(
+                    sources=enabled_sources,
+                    mediainfo=mediainfo,
+                    media_type=MediaType.TV,
+                    season=season,
+                    target_episodes=missing_episodes,
+                    target_episode_air_dates=target_episode_air_dates,
+                    subscribe=subscribe,
+                )
+            seen_share_urls = set()
+            search_label = self._search_handler._search_label(
+                mediainfo, MediaType.TV, season
+            )
+            for source_index, source in enumerate(enabled_sources):
+                search_prefix = f"[{search_label}][{source.upper()}]"
+                if self._stop_requested():
+                    break
+                if not missing_episodes:
+                    logger.debug(f"{mediainfo.title_year} S{season} 所有缺失剧集已转存完成，不再查询后续源")
+                    break
+
+                if self._remaining_transfer_quota() <= 0:
+                    logger.info(
+                        f"已达单次同步上限 {self._max_transfer_per_sync}，剩余 {len(missing_episodes)} 集将在下次同步处理")
+                    break
+
+                logger.debug(
+                    f"🔎 {search_prefix} 开始搜索（当前缺失: "
+                    f"{len(missing_episodes)} 集）"
+                )
+                self._set_task_phase(
+                    subscribe,
+                    f"搜索 {source.upper()} 来源",
+                    55 + int((source_index + 1) / len(enabled_sources) * 15),
+                )
+
+                # 搜索当前源
+                p115_results = prefetched_results.get(source)
+                if p115_results is None:
+                    p115_results = self._search_handler.search_single_source(
+                        source=source,
+                        mediainfo=mediainfo,
+                        media_type=MediaType.TV,
+                        season=season,
+                        target_episodes=missing_episodes,
+                        target_episode_air_dates=target_episode_air_dates,
+                        subscribe=subscribe,
+                    )
+
+                if not p115_results:
+                    remaining_sources = enabled_sources[source_index + 1:]
+                    if remaining_sources:
+                        logger.debug(
+                            f"{search_prefix} 未找到资源，继续查询 "
+                            f"{remaining_sources[0].upper()}"
+                        )
+                    else:
+                        logger.debug(f"{search_prefix} 未找到资源，搜索来源已用尽")
+                    continue
+
+                logger.info(
+                    f"{search_prefix} 找到候选资源："
+                    f"{self._format_resource_summary(p115_results)}"
+                )
+
+                # 遍历搜索结果
+                for resource_index, resource in enumerate(p115_results):
+                    if self._stop_requested():
+                        break
+                    if self._remaining_transfer_quota() <= 0:
+                        logger.info(
+                            f"已达单次同步上限 {self._max_transfer_per_sync}，剩余 {len(missing_episodes)} 集将在下次同步处理")
+                        break
+                    self._set_task_phase(
+                        subscribe,
+                        f"检查候选资源 {resource_index + 1}/{len(p115_results)}",
+                        72 + int((resource_index + 1) / len(p115_results) * 16),
+                    )
+
+                    share_url = resource.get("url", "")
+                    resource_title = resource.get("title", "")
+
+                    share_url = self._resolve_candidate_resource_url(
+                        p115_results,
+                        resource_index,
+                        resource,
+                        search_label,
+                        log_prefix=search_prefix,
+                    )
+                    if self._stop_requested():
+                        break
+
+                    if not share_url:
+                        continue
+
+                    share_url = share_url.strip()
+                    if not self._is_supported_resource(resource, share_url):
+                        logger.warning(
+                            f"跳过当前同步链不支持的资源类型 "
+                            f"{self._supported_resource_type(resource, share_url)}：{resource_title}"
+                        )
+                        continue
+                    resource_urls = [share_url]
+                    if self._is_ed2k_url(share_url):
+                        for grouped_resource in p115_results:
+                            grouped_url = str(grouped_resource.get("url") or "").strip()
+                            if (
+                                    self._is_ed2k_url(grouped_url)
+                                    and grouped_url not in resource_urls
+                            ):
+                                resource_urls.append(grouped_url)
+                    resource_by_url = {
+                        str(item.get("url") or "").strip(): item
+                        for item in p115_results
+                        if str(item.get("url") or "").strip()
+                    }
+                    resource_urls = [
+                        url for url in resource_urls if url not in seen_share_urls
+                    ]
+                    if not resource_urls:
+                        logger.debug(f"跳过重复分享链接：{resource_title}")
+                        continue
+                    seen_share_urls.update(resource_urls)
+
+                    if len(resource_urls) > 1:
+                        logger.debug(
+                            f"合并检查 {len(resource_urls)} 条互补ED2K资源：{resource_title}"
+                        )
+                    else:
+                        action = "检查离线资源" if self._is_offline_url(share_url) else "检查分享"
+                        logger.debug(
+                            f"{action}：{resource_title} - "
+                            f"{self._resource_log_reference(share_url)}"
+                        )
+
+                    try:
+                        if self._is_magnet_url(share_url):
+                            if not self._validate_resource_url(
+                                    share_url,
+                                    resource_label="Magnet 链接",
+                                    log_prefix=search_prefix,
+                            ):
+                                continue
+                            preview_episodes = self._resource_preview_episodes(resource, season)
+                            if not preview_episodes:
+                                parsed_season_episode = MediaFileParser.extract_season_episode(
+                                    resource_title
+                                )
+                                if (
+                                        parsed_season_episode
+                                        and parsed_season_episode[0] == int(season)
+                                ):
+                                    preview_episodes = {parsed_season_episode[1]}
+                            target_episodes = sorted(
+                                set(missing_episodes) & preview_episodes
+                                if preview_episodes else set(missing_episodes)
+                            )
+                            if not target_episodes:
+                                logger.info(
+                                    f"Magnet 提供者元数据未覆盖当前缺集：{resource_title}"
+                                )
+                                continue
+                            if not self._reserve_transfer_slots(1):
+                                break
+                            pending_key = self._queue_magnet_package(
+                                resource,
+                                share_url,
+                                subscribe,
+                                mediainfo,
+                                season=season,
+                                target_episodes=target_episodes,
+                                sub_key=sub_key,
+                                transient_target=transient_target,
+                            )
+                            if not pending_key:
+                                self._release_transfer_slots(1)
+                                continue
+                            provider_name = str(
+                                (resource.get("magnet_metadata") or {}).get("display_name")
+                                or resource_title
+                            ).strip()
+                            history.append(self._build_transfer_history_item(
+                                mediainfo=mediainfo,
+                                subscribe=subscribe,
+                                status="下载中",
+                                share_url=share_url,
+                                file_name=provider_name,
+                                source_file_name=provider_name,
+                                cloud_dir=self._cloud_transfer_path.rstrip('/') or "/",
+                                resource=resource,
+                                season=season,
+                                target_episodes=target_episodes,
+                                finalize_key=pending_key,
+                            ))
+                            logger.info(
+                                f"Magnet 已进入下载后真实文件匹配：{provider_name}，"
+                                f"目标 {self._format_episode_ranges(set(target_episodes))}"
+                            )
+                            continue
+                        share_files = []
+                        for current_url in resource_urls:
+                            share_files.extend(self._validated_resource_files(
+                                current_url,
+                                resource_title=resource_title,
+                                target_season=(season if self._skip_other_season_dirs else None),
+                                log_prefix=search_prefix,
+                            ))
+                        if not share_files:
+                            continue
+
+                        video_count, share_episodes = self._summarize_share_episodes(
+                            share_files, season
+                        )
+                        matched_episode_numbers = set(missing_episodes) & share_episodes
+                        absent_episode_numbers = set(missing_episodes) - share_episodes
+                        logger.debug(
+                            f"分享实际包含 {video_count} 个视频，S{season:02d} 可识别集数："
+                            f"{self._format_episode_ranges(share_episodes)}；"
+                            f"当前缺失中可用：{self._format_episode_ranges(matched_episode_numbers)}"
+                        )
+                        if absent_episode_numbers:
+                            logger.debug(
+                                f"分享未包含当前缺失集数："
+                                f"{self._format_episode_ranges(absent_episode_numbers)}"
+                            )
+
+                        # 收集该分享中所有匹配的文件
+                        matched_items = []
+                        episodes_to_match = [
+                            episode for episode in missing_episodes
+                            if not share_episodes or episode in share_episodes
+                        ]
+                        matched_files = self._match_episode_files(
+                            share_files,
+                            mediainfo,
+                            subscribe,
+                            season,
+                            episodes_to_match,
+                        )
+
+                        for episode in episodes_to_match:
+                            matched_file, current_score = matched_files.get(
+                                episode, (None, 0)
+                            )
+
+                            if matched_file:
+                                file_name = matched_file.get('name', '')
+                                logger.debug(f"找到匹配文件：{file_name} -> E{episode:02d}")
+
+                                is_upgrade = False
+
+                                target_dir, target_name = self._platform_target(
+                                    self._CLOUD_MEDIA_ROOT, subscribe, mediainfo,
+                                    file_name, season, episode
+                                )
+                                matched_items.append({
+                                    "file": matched_file,
+                                    "resource": resource_by_url.get(
+                                        str(matched_file.get("url") or "").strip(), resource
+                                    ),
+                                    "episode": episode,
+                                    "score": current_score,
+                                    "is_upgrade": is_upgrade,
+                                    "target_dir": target_dir,
+                                    "target_name": target_name,
+                                })
+
+                        if not matched_items:
+                            logger.debug(f"该分享未匹配到 S{season} 的任何缺失剧集，可能是季数不匹配或文件名无法识别")
+                            continue
+
+                        self._set_task_phase(subscribe, "转存匹配剧集", 92)
+                        logger.debug(
+                            f"准备批量转存：{mediainfo.title_year} S{season:02d}，"
+                            f"{len(matched_items)} 个文件到 {self._cloud_transfer_path}"
+                        )
+                        transfer_results, reserved_slots = self._transfer_episode_items(
+                            matched_items,
+                            share_url,
+                            mediainfo,
+                            subscribe,
+                            season,
+                            sub_key,
+                            track_subscription=not transient_target,
+                        )
+                        if not transfer_results:
+                            if reserved_slots <= 0:
+                                logger.info(
+                                    f"已达单次同步上限 {self._max_transfer_per_sync}，"
+                                    f"剩余 {len(missing_episodes)} 集将在下次同步处理"
+                                )
+                            break
+                        self._set_task_phase(subscribe, "登记文件后处理", 95)
+                        batch_success_episodes = []
+                        batch_detail_episodes = []
+
+                        # 处理结果
+                        for transfer_result in transfer_results:
+                            item = transfer_result["item"]
+                            file_id = transfer_result["file_id"]
+                            episode = item["episode"]
+                            file_name = item["file"]["name"]
+                            current_score = item["score"]
+                            is_upgrade = item["is_upgrade"]
+                            success = transfer_result["success"]
+                            pending_key = transfer_result["pending_key"]
+                            item_share_url = item["file"].get("url") or share_url
+
+                            history_item = self._build_transfer_history_item(
+                                mediainfo=mediainfo,
+                                subscribe=subscribe,
+                                status=self._transfer_history_status(success, item_share_url),
+                                share_url=item_share_url,
+                                file_name=item["target_name"],
+                                source_file_name=file_name,
+                                cloud_dir=item["target_dir"],
+                                resource=item["resource"],
+                                season=season,
+                                episode=episode,
+                                file_size=int(item["file"].get("size") or 0),
+                                source_sha1=item["file"].get("sha1") or "",
+                                rule_score=current_score,
+                            )
+                            history.append(history_item)
+
+                            if success:
+                                transferred_count += 1
+                                if pending_key:
+                                    history_item["finalize_key"] = pending_key
+                                    history_item["status"] = (
+                                        "下载中" if self._is_ed2k_url(item_share_url)
+                                        else "处理中"
+                                    )
+                                if episode in missing_episodes:
+                                    missing_episodes.remove(episode)
+
+                                if not is_upgrade and not pending_key:
+                                    success_episodes.append(episode)
+
+                                score_info = f"(平台优先级:{current_score})"
+                                upgrade_info = " [洗版升级]" if is_upgrade else ""
+                                logger.debug(
+                                    f"成功转存：{mediainfo.title} S{season:02d}E{episode:02d} {score_info}{upgrade_info}")
+
+                                if not pending_key:
+                                    batch_detail_episodes.append(episode)
+
+                                batch_success_episodes.append(episode)
+                            else:
+                                logger.error(f"转存失败：{mediainfo.title} S{season:02d}E{episode:02d}")
+
+                        self._append_tv_transfer_detail(
+                            transfer_details, mediainfo, season, batch_detail_episodes
+                        )
+
+                        # 记录下载历史
+                        if batch_success_episodes:
+                            episodes_str = StringUtils.format_ep(batch_success_episodes)
+                            self._record_download_history(
+                                mediainfo=mediainfo,
+                                subscribe=subscribe,
+                                path=matched_items[0]["target_dir"],
+                                download_hash=share_url,
+                                torrent_name=resource_title,
+                                share_url=share_url,
+                                seasons=f"S{season:02d}",
+                                episodes=episodes_str,
+                            )
+
+                        if self._stop_requested() or not missing_episodes:
+                            break
+
+                    except Exception as e:
+                        logger.error(
+                            f"处理分享链接出错：{self._resource_log_reference(share_url)}，"
+                            f"错误：{str(e)}"
+                        )
+                        continue
+
+                # 当前源处理完成
+                if missing_episodes:
+                    remaining_sources = enabled_sources[source_index + 1:]
+                    if remaining_sources:
+                        logger.debug(
+                            f"{source.upper()} 处理完成，仍缺失 {len(missing_episodes)} 集，继续查询 {remaining_sources[0].upper()}")
+                    else:
+                        logger.debug(f"{source.upper()} 处理完成，仍缺失 {len(missing_episodes)} 集，搜索来源已用尽")
+
+            # 更新订阅状态
+            # 将媒体路径已存在的集数和本次成功转存的集数合并
+            self._set_task_phase(subscribe, "更新订阅进度", 96)
+            all_success_episodes = list(set(success_episodes) | existing_episodes_in_resources)
+            if all_success_episodes and not transient_target:
+                remaining_lack = self._subscribe_handler.check_and_finish_subscribe(
+                    subscribe=subscribe,
+                    mediainfo=mediainfo,
+                    success_episodes=all_success_episodes
+                )
+                if remaining_lack == 0 and hasattr(
+                        self._search_handler, "clear_sub_points"
+                ):
+                    self._search_handler.clear_sub_points(sub_key)
+
+        except Exception as e:
+            logger.error(f"处理订阅 {subscribe.name} 出错：{str(e)}")
+        return transferred_count

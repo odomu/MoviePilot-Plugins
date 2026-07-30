@@ -1,0 +1,1486 @@
+"""
+网盘订阅助手插件
+结合 MoviePilot 订阅功能，自动搜索网盘资源并同步缺失内容
+"""
+import copy
+import datetime
+import re
+from threading import Event as ThreadEvent, Lock, RLock, local
+from typing import Optional, Any, List, Dict, Tuple, Callable
+
+import pytz
+from app.api.endpoints.plugin import register_plugin_api
+from app.core.config import settings
+from app.core.event import Event, eventmanager
+from app.log import logger
+from app.plugins import _PluginBase
+from app.schemas.types import ChainEventType, EventType, NotificationType
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from .core import (
+    CloudDriveProvider,
+    CloudDriveRegistry,
+    get_component,
+    resolve_component,
+)
+from .core.api import (
+    MoviePilotRegistration,
+    HistoryApi,
+    PluginApi,
+    QRCodeService,
+)
+from .core.hook import PluginEventHandler, SubscriptionSearchHook
+from .core.services import (
+    SubscriptionControlService,
+    PlatformIntegrationService,
+    SubscriptionScoringService,
+    SyncExecutionService,
+    SyncRuntimeService,
+)
+from .drive.guangya import GuangyaClient, GuangyaDrive, create_guangya_provider
+from .drive.p115 import P115ClientManager, create_p115_provider
+from .drive.p123 import P123ClientManager, P123Drive, create_p123_provider
+from .drive.quark import QuarkClient, QuarkDrive, create_quark_provider
+from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, WebhookHandler
+from .search.butailing import ButailingClient
+from .search.hdhive import (
+    HDHiveOpenAPIClient, HDHiveOpenAPIError,
+    HDHiveTokenStore, HDHiveTokenStoreError,
+)
+from .search.juying import JuyingClient
+from .search.pansou import PanSouClient
+from .search.seedhub import SeedHubClient
+
+_COMPONENT_TYPES = (
+    PluginApi,
+    QRCodeService,
+    HistoryApi,
+    PluginEventHandler,
+    MoviePilotRegistration,
+    SyncRuntimeService,
+    SyncExecutionService,
+    SubscriptionScoringService,
+    SubscriptionControlService,
+    SubscriptionSearchHook,
+    PlatformIntegrationService,
+)
+
+
+class CloudSubscribe(_PluginBase):
+    """网盘订阅助手插件。"""
+
+    # 插件名称
+    plugin_name = "网盘订阅助手"
+    # 插件描述
+    plugin_desc = "结合 MoviePilot 订阅功能，自动搜索网盘资源并同步缺失的电影和剧集。"
+    # 插件图标
+    plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
+    # 插件版本
+    plugin_version = "1.0.0"
+    # 插件作者
+    plugin_author = "odomu"
+    # 作者主页
+    author_url = "https://github.com/odomu"
+    # 插件配置项ID前缀
+    plugin_config_prefix = "cloudsubscribe_"
+    plugin_order = 21
+    auth_level = 1
+
+    def _get_component(self, component_type):
+        return get_component(self, component_type, "_plugin_components")
+
+    def __getattr__(self, name):
+        return resolve_component(self, _COMPONENT_TYPES, name, "_plugin_components")
+
+    def get_state(self) -> bool:
+        return self._get_component(MoviePilotRegistration).get_state()
+
+    @staticmethod
+    def get_render_mode() -> Tuple[str, str]:
+        return MoviePilotRegistration.get_render_mode()
+
+    def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
+        return self._get_component(MoviePilotRegistration).get_form()
+
+    def get_page(self) -> Optional[List[dict]]:
+        return self._get_component(MoviePilotRegistration).get_page()
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return self._get_component(MoviePilotRegistration).get_api()
+
+    def get_command(self) -> List[Dict[str, Any]]:
+        return self._get_component(MoviePilotRegistration).get_command()
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        return self._get_component(MoviePilotRegistration).get_service()
+
+    def get_dashboard_meta(self) -> List[Dict[str, str]]:
+        return self._get_component(MoviePilotRegistration).get_dashboard_meta()
+
+    def get_dashboard(self, key: str = "overview", **kwargs):
+        return self._get_component(MoviePilotRegistration).get_dashboard(key, **kwargs)
+
+    def get_sidebar_nav(self) -> List[Dict[str, Any]]:
+        return self._get_component(MoviePilotRegistration).get_sidebar_nav()
+
+    def get_actions(self) -> List[Dict[str, Any]]:
+        return self._get_component(MoviePilotRegistration).get_actions()
+
+    def get_agent_tools(self) -> List[type]:
+        return self._get_component(MoviePilotRegistration).get_agent_tools()
+
+    @eventmanager.register(EventType.SubscribeAdded)
+    def on_subscribe_added(self, event: Event):
+        return self._get_component(PluginEventHandler).on_subscribe_added(event)
+
+    @eventmanager.register(EventType.SubscribeModified)
+    def on_subscribe_modified(self, event: Event):
+        return self._get_component(PluginEventHandler).on_subscribe_modified(event)
+
+    @eventmanager.register(ChainEventType.ResourceDownload)
+    def on_resource_download(self, event: Event):
+        return self._get_component(PluginEventHandler).on_resource_download(event)
+
+    @eventmanager.register(EventType.PluginAction)
+    def on_plugin_action(self, event: Event):
+        return self._get_component(PluginEventHandler).on_plugin_action(event)
+
+    # 私有变量
+    _scheduler: Optional[BackgroundScheduler] = None
+    _offline_scheduler: Optional[BackgroundScheduler] = None
+    _offline_scheduler_lock: RLock = RLock()
+    _offline_monitor_lock: Lock = Lock()
+
+    # 配置属性
+    _enabled: bool = False
+    _show_sidebar_nav: bool = True
+    _agent_enabled: bool = True
+    _onlyonce: bool = False
+    _cron: str = "0 18-23 * * *"
+    _notify: bool = False
+    _notification_type: NotificationType = NotificationType.Plugin
+    _webhook_enabled: bool = False
+    _webhook_url: str = ""
+    _webhook_method: str = "POST"
+    _webhook_timeout: int = 10
+
+    _cookies: str = ""
+    _p123_token: str = ""
+    _p123_request_timeout: int = 30
+    _quark_cookie: str = ""
+    _quark_request_timeout: int = 30
+    _guangya_access_token: str = ""
+    _guangya_refresh_token: str = ""
+    _guangya_client_id: str = ""
+    _guangya_device_id: str = ""
+    _guangya_request_timeout: int = 30
+    _cloud_drive_key: str = "115"
+    _pansou_enabled: bool = True
+    _pansou_url: str = "https://so.252035.xyz"
+    _pansou_username: str = ""
+    _pansou_password: str = ""
+    _pansou_auth_enabled: bool = False
+    _pansou_channels: Any = None
+    _pansou_plugins: Any = None
+    _pansou_cloud_types: Any = None
+    _pansou_filter_include: Any = None
+    _pansou_filter_exclude: Any = None
+    _resource_type_order: List[str] = ["115", "ed2k"]
+    _magnet_metadata_url_template: str = "https://itorrents.org/torrent/{info_hash}.torrent"
+    _pansou_concurrency: Optional[int] = None
+    _pansou_result_limit: int = 10
+    _pansou_refresh: bool = True
+    _pansou_timeout: int = 30
+    _seedhub_enabled: bool = False
+    _seedhub_result_limit: int = 20
+    _butailing_enabled: bool = False
+    _butailing_result_limit: int = 20
+    _juying_enabled: bool = False
+    _juying_username: str = ""
+    _juying_password: str = ""
+    _juying_result_limit: int = 5
+    _juying_request_interval: float = 1.0
+
+    # 订阅过滤模式："exclude" 排除模式（处理除勾选外的全部订阅）/ "include" 指定模式（仅处理勾选的订阅）
+    _subscribe_filter_mode: str = "exclude"
+    _exclude_subscribes: List[int] = []
+    _include_subscribes: List[int] = []
+    # 搜索源优先级（按列表顺序），为空时使用已启用来源的默认顺序
+    _search_source_order: List[str] = []
+    _search_cache_enabled: bool = True
+    _search_cache_ttl_minutes: int = 30
+    _search_concurrency: int = 2
+    _hdhive_candidate_limit: int = 4
+    _hdhive_request_interval: float = 2.0
+    _hdhive_torrentclaw_enabled: bool = False
+    _hdhive_torrentclaw_subtitle_languages: List[str] = ["zh"]
+
+    _hdhive_enabled: bool = False
+    _hdhive_username: str = ""
+    _hdhive_password: str = ""
+    _hdhive_query_mode: str = "api"
+    # OpenAPI 应用凭证：应用 Secret 放 X-API-Key（沿用 hdhive_api_key 配置键）
+    _hdhive_api_key: str = ""
+    _hdhive_client_id: str = ""
+    _hdhive_redirect_uri: str = ""
+    # OAuth 用户授权（授权码为一次性输入，换取 Token 后自动清空）
+    _hdhive_auth_code: str = ""
+    _hdhive_access_token: str = ""
+    _hdhive_refresh_token: str = ""
+    _hdhive_token_expires_at: float = 0
+    _hdhive_token_file: str = ""
+    _hdhive_auto_unlock: bool = False
+    _hdhive_max_unlock_points: int = 50
+    _hdhive_max_points_per_sub: int = 20
+
+    _dian115_enabled: bool = False
+    _dian115_email: str = ""
+    _dian115_password: str = ""
+    _dian115_auto_unlock: bool = False
+    _dian115_max_unlock_points: int = 50
+    _dian115_max_points_per_sub: int = 20
+    _dian115_candidate_limit: int = 4
+    _dian115_request_interval: float = 1.0
+
+    # 是否屏蔽系统订阅（True=已屏蔽系统订阅，False=已恢复系统订阅）
+    _block_system_subscribe: bool = False
+    _takeover_new_subscribes: bool = False
+    _block_platform_downloads: bool = True
+    _takeover_platform_downloads: bool = False
+
+    _max_transfer_per_sync: int = 50
+    _subscription_concurrency: int = 2
+    _batch_size: int = 20
+    _skip_other_season_dirs: bool = True
+
+    # 洗版配置
+    _upgrade_subscribe_ids: list = []
+    _last_scored_ids_hash: str = ""  # 上次评分过的ids hash值，用于保存配置时防重复触发
+    _self_heal_interval: int = 10
+    _enable_cloud_upgrade: bool = False
+    _upgrade_mode: str = "largest"
+    _local_resource_path: str = ""  # 容器内本地或挂载媒体根路径
+    _p115_transfer_path: str = "/"
+    _p123_transfer_path: str = "/"
+    _quark_transfer_path: str = "/"
+    _guangya_transfer_path: str = "/"
+    _cloud_transfer_path: str = "/"
+    _strm_generate_enabled: bool = True
+    _nfo_scrape_enabled: bool = False
+    _image_scrape_enabled: bool = False
+    _strm_base_url: str = "http://172.17.0.1:9527"
+    _strm_url_template: str = "{base_url}/d/{pickcode}?/{file_name}"
+    _media_server_refresh_enabled: bool = False
+    _media_servers: List[str] = []
+    _media_server_path_mappings: str = ""
+    _media_server_refresh_delay: int = 0
+    _emby_mediainfo_enabled: bool = False
+    _platform_transfer_history_enabled: bool = False
+    _timeout_enabled: bool = True
+    _timeout_default_connect: float = 30
+    _timeout_default_pool: float = 15
+    _timeout_default_read: float = 60
+    _timeout_default_write: float = 60
+    _timeout_slow_connect: float = 30
+    _timeout_slow_pool: float = 15
+    _timeout_slow_read: float = 300
+    _timeout_slow_write: float = 300
+    # 屏蔽态时间段（block_system_subscribe=OFF 时生效）
+    _block_start_time: str = "18:00"
+    _block_end_time: str = "23:59"
+    # 开放态时间段（block_system_subscribe=OFF 时生效，开放态内自动恢复用户站点）
+    _unblock_start_time: str = "00:00"
+    _unblock_end_time: str = "17:30"
+    # 全局配置是否已应用（安装成功首次执行时才修改MP系统配置）
+    _global_config_applied: bool = False
+
+    # 运行时对象
+    _pansou_client: Optional[PanSouClient] = None
+    _seedhub_client: Optional[SeedHubClient] = None
+    _butailing_client: Optional[ButailingClient] = None
+    _juying_client: Optional[JuyingClient] = None
+    _p115_manager: Optional[P115ClientManager] = None
+    _p123_drive: Optional[P123Drive] = None
+    _quark_drive: Optional[QuarkDrive] = None
+    _guangya_drive: Optional[GuangyaDrive] = None
+    _cloud_drive_registry: Optional[CloudDriveRegistry] = None
+    _cloud_drive: Optional[CloudDriveProvider] = None
+    _hdhive_client: Optional[Any] = None
+    _hdhive_token_store: Optional[Any] = None
+
+    # 处理器
+    _search_handler: Optional[SearchHandler] = None
+    _subscribe_handler: Optional[SubscribeHandler] = None
+    _sync_handler: Optional[SyncHandler] = None
+    _api_handler: Optional[ApiHandler] = None
+    _webhook_handler: Optional[WebhookHandler] = None
+    _subscribe_search_originals: Dict[str, Callable[..., Any]] = {}
+    _stop_event: Optional[ThreadEvent] = None
+    _sync_running: bool = False
+    _sync_status: str = "idle"
+    _sync_task_text: str = "当前没有订阅处理任务"
+    _sync_progress: int = 0
+    _sync_context: Dict[str, Any] = {}
+    _sync_run_started_at: float = 0
+    _sync_last_finished_at: float = 0
+    _sync_last_elapsed_ms: int = 0
+    _sync_tasks: Dict[str, Dict[str, Any]] = {}
+    _sync_tasks_lock: Optional[RLock] = None
+    _task_local: Optional[local] = None
+    _pending_config: Optional[Dict[str, Any]] = None
+    _applied_config: Dict[str, Any] = {}
+    _pending_config_lock: RLock = RLock()
+    _subscribe_search_queue_lock: Optional[RLock] = None
+    _subscribe_search_pending: Dict[Optional[int], bool] = {}
+    _subscribe_search_active: Dict[Optional[int], bool] = {}
+    _subscribe_search_queue_shutdown: Optional[ThreadEvent] = None
+    _subscribe_search_coordinator_running: bool = False
+    _subscribe_search_queue_revision: int = 0
+
+    # 仅校验 Cron 表达式格式，不限制任务间隔。
+
+    @staticmethod
+    def _cron_is_valid(cron_expr: str) -> bool:
+        """仅校验 cron 表达式是否合法,不再强制最小间隔"""
+        cron_expr = (cron_expr or "").strip()
+        if not cron_expr:
+            return False
+        try:
+            tz = pytz.timezone(settings.TZ)
+            CronTrigger.from_crontab(cron_expr, timezone=tz)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _resolve_notification_type(value: Any) -> NotificationType:
+        """将配置值解析为 MoviePilot 消息类型，无效值回退为插件消息。"""
+        if isinstance(value, NotificationType):
+            return value
+        configured = str(value or NotificationType.Plugin.name).strip()
+        if configured in NotificationType.__members__:
+            return NotificationType[configured]
+        for item in NotificationType:
+            if item.value == configured:
+                return item
+        logger.warning(f"未知消息通知类型：{configured}，已回退为插件")
+        return NotificationType.Plugin
+
+    def init_plugin(self, config: dict = None):
+        """宿主加载或重载插件时初始化完整运行环境。"""
+        self._apply_plugin_config(config, reset_runtime=True)
+
+    def _apply_plugin_config(
+            self, config: Optional[Dict[str, Any]], reset_runtime: bool = False
+    ) -> None:
+        """应用配置并重建相关服务；普通保存不重置同步任务状态。"""
+        config = dict(config or {})
+        hot_keys = {
+            "show_sidebar_nav",
+            "agent_enabled",
+            "notify",
+            "notification_type",
+            "webhook_enabled",
+            "webhook_url",
+            "webhook_method",
+            "webhook_timeout",
+            "media_server_refresh_enabled",
+            "media_servers",
+            "media_server_path_mappings",
+            "media_server_refresh_delay",
+            "emby_mediainfo_enabled",
+        }
+        if not reset_runtime and self._applied_config:
+            changed_keys = {
+                key for key in set(self._applied_config) | set(config)
+                if self._applied_config.get(key) != config.get(key)
+            }
+            if not changed_keys:
+                logger.info("插件配置未变化，无需重建服务")
+                return
+            if changed_keys <= hot_keys:
+                self._show_sidebar_nav = bool(config.get("show_sidebar_nav", True))
+                self._agent_enabled = bool(config.get("agent_enabled", True))
+                self._apply_notification_config(config)
+                self._applied_config = copy.deepcopy(config)
+                from app.core.plugin import PluginManager
+                PluginManager().clear_plugin_agent_tools_cache()
+                logger.info("基础开关或通知配置已热更新，网盘与搜索客户端保持运行")
+                return
+        self.stop_service(preserve_subscribe_queue=not reset_runtime)
+        self._stop_event = ThreadEvent()
+        if reset_runtime:
+            self._sync_running = False
+            self._sync_status = "idle"
+            self._sync_task_text = "当前没有订阅处理任务"
+            self._sync_progress = 0
+            self._sync_context = {}
+            self._sync_run_started_at = 0
+            self._sync_last_finished_at = 0
+            self._sync_last_elapsed_ms = 0
+            self._sync_tasks_lock = RLock()
+            self._task_local = local()
+            self._sync_tasks = {}
+            with self._pending_config_lock:
+                self._pending_config = None
+            self._subscribe_search_queue_lock = RLock()
+            self._subscribe_search_pending = {}
+            self._subscribe_search_active = {}
+            self._subscribe_search_recent = {}
+            self._subscribe_search_queue_shutdown = ThreadEvent()
+            self._subscribe_search_coordinator_running = False
+            self._subscribe_search_queue_revision = 0
+            self._subscribe_search_originals = {}
+        else:
+            if self._sync_tasks_lock is None:
+                self._sync_tasks_lock = RLock()
+            if self._task_local is None:
+                self._task_local = local()
+
+        if config:
+            self._enabled = config.get("enabled", False)
+            self._show_sidebar_nav = bool(config.get("show_sidebar_nav", True))
+            self._agent_enabled = bool(config.get("agent_enabled", True))
+
+            self._cron = (config.get("cron", self._cron) or "").strip()
+            if self._cron:
+                if not self._cron_is_valid(self._cron):
+                    logger.warning(
+                        f"Cron 表达式无效：{self._cron}，已回退默认 0 18-23 * * *"
+                    )
+                    self._cron = "0 18-23 * * *"
+
+            self._notify = config.get("notify", False)
+            self._notification_type = self._resolve_notification_type(
+                config.get("notification_type")
+            )
+            self._webhook_enabled = bool(config.get("webhook_enabled", False))
+            self._webhook_url = str(config.get("webhook_url", "") or "").strip()
+            self._webhook_method = str(config.get("webhook_method", "POST") or "POST").upper()
+            if self._webhook_method not in ("POST", "GET"):
+                self._webhook_method = "POST"
+            self._webhook_timeout = max(1, min(int(config.get("webhook_timeout", 10) or 10), 120))
+            self._onlyonce = config.get("onlyonce", False)
+            self._cookies = config.get("cookies", "")
+            self._p123_token = str(config.get("p123_token", "") or "").strip()
+            self._p123_request_timeout = max(
+                5, min(int(config.get("p123_request_timeout", 30) or 30), 300)
+            )
+            self._quark_cookie = str(config.get("quark_cookie", "") or "").strip()
+            self._quark_request_timeout = max(
+                5, min(int(config.get("quark_request_timeout", 30) or 30), 300)
+            )
+            self._guangya_access_token = str(
+                config.get("guangya_access_token", "") or ""
+            ).strip()
+            self._guangya_refresh_token = str(
+                config.get("guangya_refresh_token", "") or ""
+            ).strip()
+            self._guangya_client_id = str(
+                config.get("guangya_client_id", "") or ""
+            ).strip()
+            self._guangya_device_id = str(
+                config.get("guangya_device_id", "") or ""
+            ).strip()
+            self._guangya_request_timeout = max(
+                5, min(int(config.get("guangya_request_timeout", 30) or 30), 300)
+            )
+            self._cloud_drive_key = str(
+                config.get("cloud_drive", "115") or "115"
+            ).strip().lower()
+
+            self._pansou_enabled = config.get("pansou_enabled", True)
+            self._pansou_url = config.get("pansou_url", "https://so.252035.xyz/")
+            self._pansou_username = config.get("pansou_username", "")
+            self._pansou_password = config.get("pansou_password", "")
+            self._pansou_auth_enabled = config.get("pansou_auth_enabled", False)
+            self._pansou_channels = config.get("pansou_channels") or []
+            self._pansou_plugins = config.get("pansou_plugins") or []
+            self._pansou_cloud_types = config.get("pansou_cloud_types") or []
+            self._pansou_filter_include = config.get("pansou_filter_include") or []
+            self._pansou_filter_exclude = config.get("pansou_filter_exclude") or []
+            configured_resource_order = config.get(
+                "resource_type_order",
+                ["115", "ed2k"],
+            )
+            if not isinstance(configured_resource_order, list):
+                configured_resource_order = [configured_resource_order]
+            resource_order = list(dict.fromkeys(
+                str(item).strip().lower()
+                for item in configured_resource_order
+                if str(item).strip().lower()
+                in {"115", "123", "quark", "guangya", "ed2k", "magnet"}
+            ))
+            self._resource_type_order = resource_order
+            metadata_url_template = str(config.get(
+                "magnet_metadata_url_template",
+                "https://itorrents.org/torrent/{info_hash}.torrent",
+            ) or "").strip()
+            try:
+                if "{info_hash}" not in metadata_url_template:
+                    raise ValueError("缺少 {info_hash} 占位符")
+                probe_url = metadata_url_template.format(info_hash="0" * 40)
+                if not probe_url.lower().startswith(("http://", "https://")):
+                    raise ValueError("只允许 HTTP 或 HTTPS 地址")
+                self._magnet_metadata_url_template = metadata_url_template
+            except (KeyError, ValueError, IndexError):
+                self._magnet_metadata_url_template = (
+                    "https://itorrents.org/torrent/{info_hash}.torrent"
+                )
+                logger.warning("Magnet元数据地址模板无效，已恢复默认iTorrents地址")
+            try:
+                self._pansou_concurrency = (
+                    max(1, min(int(config.get("pansou_concurrency")), 100))
+                    if config.get("pansou_concurrency") else None
+                )
+            except (TypeError, ValueError):
+                self._pansou_concurrency = None
+            self._pansou_result_limit = max(
+                1, min(int(config.get("pansou_result_limit", 10) or 10), 100)
+            )
+            self._pansou_refresh = bool(config.get("pansou_refresh", True))
+            self._pansou_timeout = max(
+                5, min(int(config.get("pansou_timeout", 30) or 30), 120)
+            )
+            self._seedhub_enabled = bool(config.get("seedhub_enabled", False))
+            self._seedhub_result_limit = max(
+                1, min(int(config.get("seedhub_result_limit", 20) or 20), 80)
+            )
+            self._butailing_enabled = bool(config.get("butailing_enabled", False))
+            self._butailing_result_limit = max(
+                1, min(int(config.get("butailing_result_limit", 20) or 20), 80)
+            )
+            self._juying_enabled = bool(config.get("juying_enabled", False))
+            self._juying_username = str(
+                config.get("juying_username", "") or ""
+            ).strip()
+            self._juying_password = str(config.get("juying_password", "") or "")
+            self._juying_result_limit = max(
+                1, min(int(config.get("juying_result_limit", 5) or 5), 20)
+            )
+            self._juying_request_interval = max(
+                0.5, min(float(config.get("juying_request_interval", 1) or 1), 10.0)
+            )
+
+            self._subscribe_filter_mode = config.get("subscribe_filter_mode", "exclude") or "exclude"
+            self._exclude_subscribes = config.get("exclude_subscribes", []) or []
+            self._include_subscribes = config.get("include_subscribes", []) or []
+            if self._subscribe_filter_mode == "include":
+                logger.info(f"订阅过滤模式：指定模式，仅处理 {len(self._include_subscribes)} 个勾选订阅")
+
+            self._hdhive_enabled = config.get("hdhive_enabled", False)
+            self._hdhive_query_mode = str(
+                config.get("hdhive_query_mode", "api") or "api"
+            )
+            if self._hdhive_query_mode not in {"api", "web"}:
+                self._hdhive_query_mode = "web" if (
+                        config.get("hdhive_username") and config.get("hdhive_password")
+                ) else "api"
+            self._hdhive_api_key = (config.get("hdhive_api_key", "") or "").strip()
+            self._hdhive_client_id = (config.get("hdhive_client_id", "") or "").strip()
+            self._hdhive_redirect_uri = (config.get("hdhive_redirect_uri", "") or "").strip()
+            self._hdhive_auth_code = (config.get("hdhive_auth_code", "") or "").strip()
+            self._hdhive_access_token = config.get("hdhive_access_token", "")
+            self._hdhive_refresh_token = config.get("hdhive_refresh_token", "")
+            self._hdhive_token_expires_at = float(config.get("hdhive_token_expires_at", 0) or 0)
+            self._hdhive_token_file = str(config.get("hdhive_token_file", "") or "").strip()
+            self._hdhive_auto_unlock = config.get("hdhive_auto_unlock", False)
+            self._hdhive_max_unlock_points = int(config.get("hdhive_max_unlock_points", 50) or 50)
+            self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
+            self._hdhive_username = config.get("hdhive_username", "")
+            self._hdhive_password = config.get("hdhive_password", "")
+            self._dian115_enabled = bool(config.get("dian115_enabled", False))
+            self._dian115_email = str(config.get("dian115_email", "") or "").strip()
+            self._dian115_password = str(config.get("dian115_password", "") or "")
+            self._dian115_auto_unlock = bool(
+                config.get("dian115_auto_unlock", False)
+            )
+            self._dian115_max_unlock_points = max(
+                0, int(config.get("dian115_max_unlock_points", 50) or 0)
+            )
+            self._dian115_max_points_per_sub = max(
+                0, int(config.get("dian115_max_points_per_sub", 20) or 0)
+            )
+
+            self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
+            self._subscription_concurrency = max(
+                1, min(int(config.get("subscription_concurrency", 2) or 2), 5)
+            )
+            self._batch_size = int(config.get("batch_size", 20) or 20)
+            self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
+
+            # 搜索源优先级（兼容逗号分隔字符串）
+            raw_order = config.get("search_source_order", []) or []
+            if isinstance(raw_order, str):
+                self._search_source_order = [x.strip() for x in raw_order.split(",") if x.strip()]
+            else:
+                self._search_source_order = list(raw_order)
+            if self._search_source_order:
+                logger.info(f"搜索源自定义优先级：{' > '.join(self._search_source_order)}")
+            self._search_cache_enabled = bool(config.get("search_cache_enabled", True))
+            self._search_cache_ttl_minutes = max(
+                1, min(int(config.get("search_cache_ttl_minutes", 30) or 30), 1440)
+            )
+            self._search_concurrency = max(
+                1, min(int(config.get("search_concurrency", 2) or 2), 5)
+            )
+            self._hdhive_candidate_limit = max(
+                1, min(int(config.get("hdhive_candidate_limit", 4) or 4), 20)
+            )
+            self._hdhive_request_interval = max(
+                0.5, min(float(config.get("hdhive_request_interval", 2) or 2), 10.0)
+            )
+            self._dian115_candidate_limit = max(
+                1, min(int(config.get("dian115_candidate_limit", 4) or 4), 20)
+            )
+            self._dian115_request_interval = max(
+                0.2, min(float(config.get("dian115_request_interval", 1) or 1), 10.0)
+            )
+            self._hdhive_torrentclaw_enabled = bool(
+                config.get("hdhive_torrentclaw_enabled", False)
+            )
+            raw_subtitle_languages = config.get(
+                "hdhive_torrentclaw_subtitle_languages", ["zh"]
+            )
+            if isinstance(raw_subtitle_languages, str):
+                raw_subtitle_languages = re.split(r"[,，\s]+", raw_subtitle_languages)
+            self._hdhive_torrentclaw_subtitle_languages = [
+                str(language).strip().lower().replace("_", "-")
+                for language in (raw_subtitle_languages or [])
+                if str(language).strip()
+            ]
+
+            # 洗版配置
+            self._upgrade_subscribe_ids = config.get("upgrade_subscribe_ids", []) or []
+            self._self_heal_interval = int(config.get("self_heal_interval", 10))
+            self._enable_cloud_upgrade = bool(config.get("enable_cloud_upgrade", False))
+            self._upgrade_mode = str(
+                config.get("upgrade_mode", "largest") or "largest"
+            ).strip().lower()
+            if self._upgrade_mode not in {"coexist", "replace", "largest", "smallest"}:
+                self._upgrade_mode = "largest"
+            self._local_resource_path = str(config.get("local_resource_path", "") or "").strip()
+            self._p115_transfer_path = str(
+                config.get("cloud_transfer_path", "/") or "/"
+            ).strip().rstrip("/") or "/"
+            self._p123_transfer_path = str(
+                config.get("p123_transfer_path", "/") or "/"
+            ).strip().rstrip("/") or "/"
+            self._quark_transfer_path = str(
+                config.get("quark_transfer_path", "/") or "/"
+            ).strip().rstrip("/") or "/"
+            self._guangya_transfer_path = str(
+                config.get("guangya_transfer_path", "/") or "/"
+            ).strip().rstrip("/") or "/"
+            self._cloud_transfer_path = {
+                "115": self._p115_transfer_path,
+                "123": self._p123_transfer_path,
+                "quark": self._quark_transfer_path,
+                "guangya": self._guangya_transfer_path,
+            }.get(self._cloud_drive_key, "/")
+            self._strm_generate_enabled = bool(config.get("strm_generate_enabled", True))
+            self._nfo_scrape_enabled = bool(config.get("nfo_scrape_enabled", False))
+            self._image_scrape_enabled = bool(config.get("image_scrape_enabled", False))
+            self._strm_base_url = str(
+                config.get("strm_base_url", "http://172.17.0.1:9527")
+            ).strip().rstrip("/")
+            self._strm_url_template = str(
+                config.get("strm_url_template", "{base_url}/d/{pickcode}?/{file_name}")
+            ).strip()
+            self._media_server_refresh_enabled = bool(
+                config.get("media_server_refresh_enabled", False)
+            )
+            self._media_servers = list(config.get("media_servers", []) or [])
+            self._media_server_path_mappings = str(
+                config.get("media_server_path_mappings", "") or ""
+            ).strip()
+            self._media_server_refresh_delay = max(
+                0, int(config.get("media_server_refresh_delay", 0) or 0)
+            )
+            self._emby_mediainfo_enabled = bool(
+                config.get("emby_mediainfo_enabled", False)
+            )
+            self._platform_transfer_history_enabled = bool(
+                config.get("platform_transfer_history_enabled", False)
+            )
+            self._timeout_enabled = bool(config.get("timeout_enabled", True))
+            for key, default in (
+                    ("timeout_default_connect", 30),
+                    ("timeout_default_pool", 15),
+                    ("timeout_default_read", 60),
+                    ("timeout_default_write", 60),
+                    ("timeout_slow_connect", 30),
+                    ("timeout_slow_pool", 15),
+                    ("timeout_slow_read", 300),
+                    ("timeout_slow_write", 300),
+            ):
+                setattr(
+                    self,
+                    f"_{key}",
+                    max(0, float(config.get(key, default) or 0)),
+                )
+
+            # 取消屏蔽时间段配置
+            self._block_start_time = str(
+                config.get("block_start_time", self._block_start_time) or self._block_start_time)
+            self._block_end_time = str(config.get("block_end_time", self._block_end_time) or self._block_end_time)
+            self._unblock_start_time = str(
+                config.get("unblock_start_time", self._unblock_start_time) or self._unblock_start_time)
+            self._unblock_end_time = str(
+                config.get("unblock_end_time", self._unblock_end_time) or self._unblock_end_time)
+
+            self._block_system_subscribe = bool(config.get("block_system_subscribe", False))
+            self._takeover_new_subscribes = bool(
+                config.get("takeover_new_subscribes", False)
+            )
+            self._block_platform_downloads = bool(
+                config.get("block_platform_downloads", True)
+            )
+            self._takeover_platform_downloads = bool(
+                config.get("takeover_platform_downloads", False)
+            )
+
+        # 初始化客户端/handlers
+        self._init_clients()
+        self._init_handlers()
+        if self._sync_handler:
+            self._sync_handler.sync_platform_transfer_history()
+        self._update_offline_monitor(
+            len(self._sync_handler.get_pending_finalize_tasks())
+            if self._sync_handler else 0
+        )
+        if not reset_runtime:
+            self._refresh_platform_services()
+        self._install_subscribe_search_takeover()
+
+        action = "插件初始化" if reset_runtime else "插件配置已应用"
+        self._applied_config = copy.deepcopy(config)
+        from app.core.plugin import PluginManager
+        PluginManager().clear_plugin_agent_tools_cache()
+        logger.info(
+            f"{action}：屏蔽态={self._block_start_time}~{self._block_end_time}, "
+            f"开放态={self._unblock_start_time}~{self._unblock_end_time}, "
+            f"网盘洗版={'开启' if self._enable_cloud_upgrade else '关闭'}, "
+            f"洗版模式={self._upgrade_mode}, "
+            f"洗版范围={'指定订阅' if self._upgrade_subscribe_ids else '全部'}, "
+            f"当前接管态={self._is_takeover_active()}")
+
+        # 立即运行一次
+        if self._enabled or self._onlyonce:
+            if self._onlyonce:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                self._scheduler.add_job(
+                    func=self.sync_subscribes,
+                    trigger='date',
+                    run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3)
+                )
+                if self._scheduler.get_jobs():
+                    self._scheduler.start()
+
+            if self._onlyonce:
+                self._onlyonce = False
+                self._update_plugin_config()
+
+    def _apply_notification_config(self, config: Dict[str, Any]) -> None:
+        self._notify = bool(config.get("notify", False))
+        self._notification_type = self._resolve_notification_type(
+            config.get("notification_type")
+        )
+        self._webhook_enabled = bool(config.get("webhook_enabled", False))
+        self._webhook_url = str(config.get("webhook_url", "") or "").strip()
+        self._webhook_method = str(config.get("webhook_method", "POST") or "POST").upper()
+        if self._webhook_method not in {"POST", "GET"}:
+            self._webhook_method = "POST"
+        self._webhook_timeout = max(
+            1, min(int(config.get("webhook_timeout", 10) or 10), 120)
+        )
+        self._media_server_refresh_enabled = bool(
+            config.get("media_server_refresh_enabled", False)
+        )
+        self._media_servers = list(config.get("media_servers", []) or [])
+        self._media_server_path_mappings = str(
+            config.get("media_server_path_mappings", "") or ""
+        ).strip()
+        self._media_server_refresh_delay = max(
+            0, int(config.get("media_server_refresh_delay", 0) or 0)
+        )
+        self._emby_mediainfo_enabled = bool(
+            config.get("emby_mediainfo_enabled", False)
+        )
+        if self._subscribe_handler:
+            self._subscribe_handler._notify = self._notify
+            self._subscribe_handler._notification_type = self._notification_type
+        if self._sync_handler:
+            self._sync_handler.update_notification_config(
+                notify=self._notify,
+                notification_type=self._notification_type,
+                media_server_refresh_enabled=self._media_server_refresh_enabled,
+                media_servers=self._media_servers,
+                media_server_path_mappings=self._media_server_path_mappings,
+                media_server_refresh_delay=self._media_server_refresh_delay,
+                emby_mediainfo_enabled=self._emby_mediainfo_enabled,
+            )
+        self._webhook_handler = WebhookHandler(
+            enabled=self._webhook_enabled,
+            url=self._webhook_url,
+            method=self._webhook_method,
+            timeout=self._webhook_timeout,
+        )
+
+    def _p115_timeout_kwargs(self) -> Dict[str, Any]:
+        """组装 p115client 的普通与慢操作超时参数，0 表示不限制。"""
+
+        def timeout_values(prefix: str) -> Dict[str, float]:
+            values = {}
+            for name in ("connect", "pool", "read", "write"):
+                value = float(getattr(self, f"_timeout_{prefix}_{name}", 0) or 0)
+                if value > 0:
+                    values[name] = value
+            return values
+
+        return {
+            "timeout_enabled": self._timeout_enabled,
+            "default_timeout": timeout_values("default"),
+            "slow_timeout": timeout_values("slow"),
+        }
+
+    def _init_clients(self):
+        """初始化客户端"""
+        self._p115_manager = None
+        self._p123_drive = None
+        self._quark_drive = None
+        self._guangya_drive = None
+        self._cloud_drive = None
+        self._cloud_drive_registry = CloudDriveRegistry()
+        self._pansou_client = None
+        self._seedhub_client = None
+        self._butailing_client = None
+        self._juying_client = None
+        proxy = settings.PROXY
+        if proxy:
+            logger.info(f"使用 MoviePilot PROXY: {proxy}")
+
+        if self._pansou_enabled and self._pansou_url:
+            self._pansou_client = PanSouClient(
+                base_url=self._pansou_url,
+                username=self._pansou_username,
+                password=self._pansou_password,
+                auth_enabled=self._pansou_auth_enabled,
+                proxy=proxy,
+                search_timeout=self._pansou_timeout,
+                get_data_func=self.get_data,
+                save_data_func=self.save_data,
+            )
+
+        if self._seedhub_enabled:
+            self._seedhub_client = SeedHubClient(proxy=proxy)
+        if self._butailing_enabled:
+            self._butailing_client = ButailingClient(proxy=proxy)
+        if self._juying_enabled:
+            self._juying_client = JuyingClient(
+                username=self._juying_username,
+                password=self._juying_password,
+                proxy=proxy,
+                request_interval=self._juying_request_interval,
+                get_data_func=self.get_data,
+                save_data_func=self.save_data,
+            )
+            if not self._juying_username or not self._juying_password:
+                logger.warning("聚影已启用但未配置网页登录账号和密码，将无法使用聚影搜索")
+
+        # OpenAPI 模式初始化官方客户端；WebAPI 由搜索服务按需创建唯一客户端。
+        if self._hdhive_query_mode == "api":
+            self._init_hdhive_openapi_client(proxy)
+        else:
+            self._hdhive_client = None
+        if self._hdhive_enabled:
+            if self._hdhive_query_mode == "web" and (not self._hdhive_username or not self._hdhive_password):
+                logger.warning("HDHive WebAPI 已启用但未配置用户名和密码，将无法使用 HDHive 查询功能")
+            elif self._hdhive_query_mode == "api" and (not self._hdhive_client or not self._hdhive_client.is_ready):
+                logger.warning("HDHive (API 模式) 已启用但未完成 OpenAPI 应用配置和用户授权，将无法使用 HDHive 查询功能")
+            else:
+                logger.info(f"HDHive 配置已加载（模式：{self._hdhive_query_mode}）")
+
+        self._p115_manager = P115ClientManager(
+            cookies=self._cookies,
+            share_cache_ttl_minutes=self._search_cache_ttl_minutes,
+            magnet_metadata_url_template=self._magnet_metadata_url_template,
+            **self._p115_timeout_kwargs(),
+        )
+        if (
+                self._cookies
+                and self._p115_manager.check_login()
+                and not self._p115_manager.is_vip
+        ):
+            logger.warning("当前 115 账号不是会员，普通分享转存可用，ED2K 离线下载不可用")
+        self._register_p115_provider()
+        self._register_p123_provider()
+        self._register_quark_provider()
+        self._register_guangya_provider()
+
+        try:
+            self._cloud_drive = self._cloud_drive_registry.get(self._cloud_drive_key)
+        except KeyError:
+            logger.warning(
+                f"网盘提供方 {self._cloud_drive_key or '<empty>'} 未就绪，请检查对应账号配置"
+            )
+        if self._cloud_drive:
+            unsupported_types = [
+                value for value in self._resource_type_order
+                if not self._cloud_drive.supports_resource_type(value)
+            ]
+            self._resource_type_order = [
+                value for value in self._resource_type_order
+                if self._cloud_drive.supports_resource_type(value)
+            ]
+            if unsupported_types:
+                logger.info(
+                    f"当前转存网盘为 {self._cloud_drive.name}，已忽略不支持的资源类型："
+                    f"{', '.join(unsupported_types)}"
+                )
+
+    def _register_p115_provider(self) -> None:
+        """注册当前 115 客户端提供的能力，并更新活动提供方。"""
+        if not self._p115_manager:
+            return
+        if self._cloud_drive_registry is None:
+            self._cloud_drive_registry = CloudDriveRegistry()
+        self._cloud_drive_registry.register(
+            create_p115_provider(self._p115_manager), replace=True
+        )
+        if self._cloud_drive_key == "115":
+            self._cloud_drive = self._cloud_drive_registry.get("115")
+
+    def _on_quark_cookie_update(self, cookie: str) -> None:
+        cookie = str(cookie or "").strip()
+        if not cookie or cookie == self._quark_cookie:
+            return
+        self._quark_cookie = cookie
+        self._update_plugin_config()
+
+    def _register_p123_provider(self) -> None:
+        """注册 123 网盘账号、分享转存和文件操作能力。"""
+        if self._p123_drive:
+            self._p123_drive.close()
+        self._p123_drive = P123Drive(
+            client=P123ClientManager(
+                token=self._p123_token,
+                timeout=self._p123_request_timeout,
+            ),
+            metadata_url_template=self._magnet_metadata_url_template,
+        )
+        if self._cloud_drive_registry is None:
+            self._cloud_drive_registry = CloudDriveRegistry()
+        self._cloud_drive_registry.register(
+            create_p123_provider(self._p123_drive), replace=True
+        )
+        if self._cloud_drive_key == "123":
+            self._cloud_drive = self._cloud_drive_registry.get("123")
+
+    def _register_quark_provider(self) -> None:
+        """注册夸克网盘，并允许空凭证实例提供扫码入口。"""
+        if self._quark_drive:
+            self._quark_drive.close()
+        client = QuarkClient(
+            cookie=self._quark_cookie,
+            on_cookie_refresh=self._on_quark_cookie_update,
+            timeout=self._quark_request_timeout,
+        )
+        self._quark_drive = QuarkDrive(client=client)
+        if self._cloud_drive_registry is None:
+            self._cloud_drive_registry = CloudDriveRegistry()
+        self._cloud_drive_registry.register(
+            create_quark_provider(self._quark_drive), replace=True
+        )
+        if self._cloud_drive_key == "quark":
+            self._cloud_drive = self._cloud_drive_registry.get("quark")
+
+    def _on_guangya_token_update(
+            self, access_token: str, refresh_token: str
+    ) -> None:
+        self._guangya_access_token = str(access_token or "").strip()
+        self._guangya_refresh_token = str(refresh_token or "").strip()
+        self._update_plugin_config()
+
+    def _register_guangya_provider(self) -> None:
+        """注册光鸭网盘，并允许空凭证实例提供扫码入口。"""
+        if self._guangya_drive:
+            self._guangya_drive.close()
+        client = GuangyaClient(
+            access_token=self._guangya_access_token,
+            refresh_token=self._guangya_refresh_token,
+            client_id=self._guangya_client_id,
+            device_id=self._guangya_device_id,
+            on_token_refresh=self._on_guangya_token_update,
+            timeout=self._guangya_request_timeout,
+        )
+        self._guangya_client_id = client.client_id
+        self._guangya_device_id = client.device_id
+        self._guangya_drive = GuangyaDrive(
+            client=client,
+            metadata_url_template=self._magnet_metadata_url_template,
+        )
+        if self._cloud_drive_registry is None:
+            self._cloud_drive_registry = CloudDriveRegistry()
+        self._cloud_drive_registry.register(
+            create_guangya_provider(self._guangya_drive), replace=True
+        )
+        if self._cloud_drive_key == "guangya":
+            self._cloud_drive = self._cloud_drive_registry.get("guangya")
+
+    def _on_hdhive_token_update(self, tokens: Dict[str, Any]):
+        """Token 刷新后写回来源文件，并同步插件配置。"""
+        self._hdhive_access_token = str(tokens.get("access_token") or self._hdhive_access_token).strip()
+        self._hdhive_refresh_token = str(tokens.get("refresh_token") or self._hdhive_refresh_token).strip()
+        self._hdhive_token_expires_at = float(tokens.get("token_expires_at") or self._hdhive_token_expires_at or 0)
+        if self._hdhive_token_store:
+            try:
+                self._hdhive_token_store.write(tokens)
+                logger.info(f"HDHive OpenAPI: 已将刷新后的 Token 写回文件：{self._hdhive_token_file}")
+            except Exception as e:
+                logger.error(f"HDHive OpenAPI: Token 文件写回失败：{e}")
+        self._update_plugin_config()
+
+    def _init_hdhive_openapi_client(self, proxy=None):
+        """
+        初始化 HDHive OpenAPI 客户端，并处理一次性授权码换 Token
+
+        新版接入模型：
+        1. 在 HDHive 创建 OpenAPI 应用，审核通过后获得 client_id 和应用 Secret
+        2. 配置 client_id、应用 Secret、回调地址后保存，从日志中复制授权链接到浏览器完成授权
+        3. 将回调地址中的 code 参数填入"授权码"并保存，插件自动换取用户 Token
+        """
+        self._hdhive_client = None
+        self._hdhive_token_store = None
+
+        if self._hdhive_token_file:
+            try:
+                self._hdhive_token_store = HDHiveTokenStore(self._hdhive_token_file)
+                file_tokens = self._hdhive_token_store.load()
+                self._hdhive_access_token = str(file_tokens.get("access_token") or self._hdhive_access_token).strip()
+                self._hdhive_refresh_token = str(file_tokens.get("refresh_token") or self._hdhive_refresh_token).strip()
+                self._hdhive_token_expires_at = float(
+                    file_tokens.get("token_expires_at") or self._hdhive_token_expires_at or 0)
+                self._hdhive_client_id = str(self._hdhive_client_id or file_tokens.get("client_id") or "").strip()
+                self._hdhive_redirect_uri = str(
+                    self._hdhive_redirect_uri or file_tokens.get("redirect_uri") or "").strip()
+                logger.info(f"HDHive OpenAPI: 已从挂载文件加载 Token：{self._hdhive_token_file}")
+            except HDHiveTokenStoreError as e:
+                logger.error(f"HDHive OpenAPI: Token 文件不可用：{e}")
+            except Exception as e:
+                logger.error(f"HDHive OpenAPI: Token 文件解析失败：{e}")
+
+        client = HDHiveOpenAPIClient(
+            app_secret=self._hdhive_api_key,
+            client_id=self._hdhive_client_id,
+            access_token=self._hdhive_access_token,
+            refresh_token=self._hdhive_refresh_token,
+            token_expires_at=self._hdhive_token_expires_at,
+            proxy=proxy,
+            request_interval=self._hdhive_request_interval,
+            on_token_update=self._on_hdhive_token_update,
+        )
+        self._hdhive_client = client
+
+        if not client.app_secret:
+            if self._hdhive_enabled:
+                logger.warning("HDHive OpenAPI: 缺少应用 Secret；Token 已加载但无法调用官方接口")
+            return
+
+        # 一次性授权码优先换取 Token；缺少回调地址时保留授权码，待补全配置后再处理。
+        if self._hdhive_auth_code:
+            if not self._hdhive_redirect_uri:
+                logger.warning("HDHive OpenAPI: 已填写授权码但缺少回调地址，授权码已保留")
+            else:
+                try:
+                    data = client.exchange_code(self._hdhive_auth_code, self._hdhive_redirect_uri)
+                    self._hdhive_auth_code = ""
+                    scopes = data.get("scope") or " ".join(data.get("scopes") or [])
+                    logger.info(f"HDHive OpenAPI: 用户授权成功，已获取 Token（scope: {scopes}）")
+                    self._update_plugin_config()
+                except HDHiveOpenAPIError as e:
+                    logger.error(
+                        f"HDHive OpenAPI: 授权码换取 Token 失败，授权码已保留: "
+                        f"[{e.code}] {e.message} {e.description}"
+                    )
+                except Exception as e:
+                    logger.error(f"HDHive OpenAPI: 授权码换取 Token 异常，授权码已保留: {e}")
+
+        # 文件或配置可只提供 Refresh Token，且没有待处理授权码时自动换取 Access Token。
+        if not client.access_token and client.refresh_token:
+            try:
+                client.refresh_access_token()
+            except HDHiveOpenAPIError as e:
+                logger.error(
+                    f"HDHive OpenAPI: 使用 Refresh Token 获取 Access Token 失败: [{e.code}] {e.message} {e.description}")
+
+        # 未完成授权时，打印授权链接引导用户操作
+        if not client.is_ready:
+            if self._hdhive_client_id and self._hdhive_redirect_uri:
+                authorize_url = client.build_authorize_url(self._hdhive_redirect_uri)
+                logger.warning(
+                    f"HDHive OpenAPI: 尚未完成用户授权，请在浏览器打开以下链接完成授权，"
+                    f"然后将回调地址中的 code 参数填入插件配置的「授权码」并保存：\n{authorize_url}"
+                )
+            else:
+                missing = []
+                if not self._hdhive_client_id:
+                    missing.append("Client ID")
+                if not self._hdhive_redirect_uri:
+                    missing.append("回调地址")
+                if not client.access_token and not client.refresh_token:
+                    missing.append("Access/Refresh Token")
+                logger.warning(f"HDHive OpenAPI: 当前配置尚不能完成用户授权，缺少：{', '.join(missing)}")
+
+    def _init_subscribe_handler(self):
+        self._subscribe_handler = SubscribeHandler(
+            exclude_subscribes=self._exclude_subscribes,
+            notify=self._notify,
+            notification_type=self._notification_type,
+            post_message_func=self.post_message,
+            is_excluded_func=self._is_subscribe_excluded
+        )
+
+    def _init_handlers(self):
+        self._init_subscribe_handler()
+
+        self._search_handler = SearchHandler(
+            pansou_client=self._pansou_client,
+            hdhive_client=self._hdhive_client,
+            seedhub_client=self._seedhub_client,
+            butailing_client=self._butailing_client,
+            juying_client=self._juying_client,
+            pansou_enabled=self._pansou_enabled,
+            hdhive_enabled=self._hdhive_enabled,
+            dian115_enabled=self._dian115_enabled,
+            seedhub_enabled=self._seedhub_enabled,
+            butailing_enabled=self._butailing_enabled,
+            juying_enabled=self._juying_enabled,
+            hdhive_query_mode=self._hdhive_query_mode,
+            hdhive_auto_unlock=self._hdhive_auto_unlock,
+            hdhive_max_unlock_points=self._hdhive_max_unlock_points,
+            hdhive_max_points_per_sub=self._hdhive_max_points_per_sub,
+            hdhive_username=self._hdhive_username,
+            hdhive_password=self._hdhive_password,
+            dian115_email=self._dian115_email,
+            dian115_password=self._dian115_password,
+            dian115_auto_unlock=self._dian115_auto_unlock,
+            dian115_max_unlock_points=self._dian115_max_unlock_points,
+            dian115_max_points_per_sub=self._dian115_max_points_per_sub,
+            pansou_channels=self._pansou_channels,
+            pansou_plugins=self._pansou_plugins,
+            pansou_cloud_types=self._pansou_cloud_types,
+            pansou_filter_include=self._pansou_filter_include,
+            pansou_filter_exclude=self._pansou_filter_exclude,
+            resource_type_order=self._resource_type_order,
+            pansou_concurrency=self._pansou_concurrency,
+            pansou_result_limit=self._pansou_result_limit,
+            pansou_refresh=self._pansou_refresh,
+            pansou_timeout=self._pansou_timeout,
+            seedhub_result_limit=self._seedhub_result_limit,
+            butailing_result_limit=self._butailing_result_limit,
+            juying_result_limit=self._juying_result_limit,
+            search_source_order=self._search_source_order,
+            search_cache_enabled=self._search_cache_enabled,
+            search_cache_ttl_minutes=self._search_cache_ttl_minutes,
+            search_concurrency=self._search_concurrency,
+            hdhive_candidate_limit=self._hdhive_candidate_limit,
+            hdhive_request_interval=self._hdhive_request_interval,
+            dian115_candidate_limit=self._dian115_candidate_limit,
+            dian115_request_interval=self._dian115_request_interval,
+            hdhive_torrentclaw_enabled=self._hdhive_torrentclaw_enabled,
+            hdhive_torrentclaw_subtitle_languages=(
+                self._hdhive_torrentclaw_subtitle_languages
+            ),
+            enable_cloud_upgrade=self._enable_cloud_upgrade,
+            upgrade_subscribe_ids=self._upgrade_subscribe_ids,
+            should_stop=self._stop_requested,
+        )
+        # 积分花费属于业务状态，不是可丢弃的搜索缓存。
+        self._search_handler.set_data_funcs(self.get_data, self.save_data)
+        self._sync_handler = SyncHandler(
+            cloud_drive=self._cloud_drive,
+            search_handler=self._search_handler,
+            subscribe_handler=self._subscribe_handler,
+            chain=self.chain,
+            cloud_transfer_path=self._cloud_transfer_path,
+            max_transfer_per_sync=self._max_transfer_per_sync,
+            batch_size=self._batch_size,
+            skip_other_season_dirs=self._skip_other_season_dirs,
+            notify=self._notify,
+            notification_type=self._notification_type,
+            post_message_func=self.post_message,
+            get_data_func=self.get_data,
+            save_data_func=self.save_data,
+            self_heal_interval=self._self_heal_interval,
+            enable_cloud_upgrade=self._enable_cloud_upgrade,
+            upgrade_mode=self._upgrade_mode,
+            upgrade_subscribe_ids=self._upgrade_subscribe_ids,
+            local_resource_path=self._local_resource_path,
+            strm_generate_enabled=self._strm_generate_enabled,
+            nfo_scrape_enabled=self._nfo_scrape_enabled,
+            image_scrape_enabled=self._image_scrape_enabled,
+            strm_base_url=self._strm_base_url,
+            strm_url_template=self._strm_url_template,
+            media_server_refresh_enabled=self._media_server_refresh_enabled,
+            media_servers=self._media_servers,
+            media_server_path_mappings=self._media_server_path_mappings,
+            media_server_refresh_delay=self._media_server_refresh_delay,
+            emby_mediainfo_enabled=self._emby_mediainfo_enabled,
+            platform_transfer_history_enabled=(
+                self._platform_transfer_history_enabled
+            ),
+            should_stop=self._stop_requested,
+            offline_pending_changed=self._update_offline_monitor,
+            file_finalized=self._on_file_finalized,
+            task_update=self._update_sync_task,
+        )
+        self._sync_handler.reconcile_orphaned_history()
+
+        self._api_handler = ApiHandler(
+            pansou_client=self._pansou_client,
+            cloud_drive=self._cloud_drive,
+            save_path=self._cloud_transfer_path,
+            get_data_func=self.get_data,
+            save_data_func=self.save_data
+        )
+
+        self._webhook_handler = WebhookHandler(
+            enabled=self._webhook_enabled,
+            url=self._webhook_url,
+            method=self._webhook_method,
+            timeout=self._webhook_timeout,
+        )
+
+    def _on_file_finalized(
+            self,
+            transfer_details: List[Dict[str, Any]],
+            total_count: int,
+    ) -> None:
+        """离线文件真正就绪后发送一次汇总 Webhook。"""
+        if not self._webhook_handler:
+            return
+        self._webhook_handler.send_transfer_complete(
+            transfer_details=transfer_details,
+            total_count=total_count,
+        )
+
+    # 持久化配置
+
+    def _update_plugin_config(self):
+        self.update_config({
+            "enabled": self._enabled,
+            "show_sidebar_nav": self._show_sidebar_nav,
+            "agent_enabled": self._agent_enabled,
+            "cron": self._cron,
+            "notify": self._notify,
+            "notification_type": self._notification_type.name,
+            "webhook_enabled": self._webhook_enabled,
+            "webhook_url": self._webhook_url,
+            "webhook_method": self._webhook_method,
+            "webhook_timeout": self._webhook_timeout,
+            "onlyonce": self._onlyonce,
+            "cookies": self._cookies,
+            "p123_token": self._p123_token,
+            "p123_request_timeout": self._p123_request_timeout,
+            "quark_cookie": self._quark_cookie,
+            "quark_request_timeout": self._quark_request_timeout,
+            "guangya_access_token": self._guangya_access_token,
+            "guangya_refresh_token": self._guangya_refresh_token,
+            "guangya_client_id": self._guangya_client_id,
+            "guangya_device_id": self._guangya_device_id,
+            "guangya_request_timeout": self._guangya_request_timeout,
+            "cloud_drive": self._cloud_drive_key,
+            "pansou_enabled": self._pansou_enabled,
+            "pansou_url": self._pansou_url,
+            "pansou_username": self._pansou_username,
+            "pansou_password": self._pansou_password,
+            "pansou_auth_enabled": self._pansou_auth_enabled,
+            "pansou_channels": self._pansou_channels,
+            "pansou_plugins": self._pansou_plugins,
+            "pansou_cloud_types": self._pansou_cloud_types,
+            "pansou_filter_include": self._pansou_filter_include,
+            "pansou_filter_exclude": self._pansou_filter_exclude,
+            "resource_type_order": self._resource_type_order,
+            "magnet_metadata_url_template": self._magnet_metadata_url_template,
+            "pansou_concurrency": self._pansou_concurrency,
+            "pansou_result_limit": self._pansou_result_limit,
+            "pansou_refresh": self._pansou_refresh,
+            "pansou_timeout": self._pansou_timeout,
+            "seedhub_enabled": self._seedhub_enabled,
+            "seedhub_result_limit": self._seedhub_result_limit,
+            "butailing_enabled": self._butailing_enabled,
+            "butailing_result_limit": self._butailing_result_limit,
+            "juying_enabled": self._juying_enabled,
+            "juying_username": self._juying_username,
+            "juying_password": self._juying_password,
+            "juying_result_limit": self._juying_result_limit,
+            "juying_request_interval": self._juying_request_interval,
+            # HDHive 配置
+            "hdhive_enabled": self._hdhive_enabled,
+            "hdhive_query_mode": self._hdhive_query_mode,
+            "hdhive_api_key": self._hdhive_api_key,
+            "hdhive_client_id": self._hdhive_client_id,
+            "hdhive_redirect_uri": self._hdhive_redirect_uri,
+            "hdhive_auth_code": self._hdhive_auth_code,
+            "hdhive_access_token": self._hdhive_access_token,
+            "hdhive_refresh_token": self._hdhive_refresh_token,
+            "hdhive_token_expires_at": self._hdhive_token_expires_at,
+            "hdhive_token_file": self._hdhive_token_file,
+            "hdhive_auto_unlock": self._hdhive_auto_unlock,
+            "hdhive_max_unlock_points": self._hdhive_max_unlock_points,
+            "hdhive_max_points_per_sub": self._hdhive_max_points_per_sub,
+            "hdhive_username": self._hdhive_username,
+            "hdhive_password": self._hdhive_password,
+            # Dian115 配置
+            "dian115_enabled": self._dian115_enabled,
+            "dian115_email": self._dian115_email,
+            "dian115_password": self._dian115_password,
+            "dian115_auto_unlock": self._dian115_auto_unlock,
+            "dian115_max_unlock_points": self._dian115_max_unlock_points,
+            "dian115_max_points_per_sub": self._dian115_max_points_per_sub,
+            # 其他配置
+            "search_source_order": self._search_source_order,
+            "search_cache_enabled": self._search_cache_enabled,
+            "search_cache_ttl_minutes": self._search_cache_ttl_minutes,
+            "search_concurrency": self._search_concurrency,
+            "hdhive_candidate_limit": self._hdhive_candidate_limit,
+            "hdhive_request_interval": self._hdhive_request_interval,
+            "dian115_candidate_limit": self._dian115_candidate_limit,
+            "dian115_request_interval": self._dian115_request_interval,
+            "hdhive_torrentclaw_enabled": self._hdhive_torrentclaw_enabled,
+            "hdhive_torrentclaw_subtitle_languages": (
+                self._hdhive_torrentclaw_subtitle_languages
+            ),
+            "subscribe_filter_mode": self._subscribe_filter_mode,
+            "exclude_subscribes": self._exclude_subscribes,
+            "include_subscribes": self._include_subscribes,
+            "block_system_subscribe": self._block_system_subscribe,
+            "takeover_new_subscribes": self._takeover_new_subscribes,
+            "block_platform_downloads": self._block_platform_downloads,
+            "takeover_platform_downloads": self._takeover_platform_downloads,
+            "block_start_time": self._block_start_time,
+            "block_end_time": self._block_end_time,
+            "upgrade_subscribe_ids": self._upgrade_subscribe_ids,
+            "unblock_start_time": self._unblock_start_time,
+            "unblock_end_time": self._unblock_end_time,
+            "max_transfer_per_sync": self._max_transfer_per_sync,
+            "subscription_concurrency": self._subscription_concurrency,
+            "batch_size": self._batch_size,
+            "skip_other_season_dirs": self._skip_other_season_dirs,
+            "enable_cloud_upgrade": self._enable_cloud_upgrade,
+            "upgrade_mode": self._upgrade_mode,
+            "local_resource_path": self._local_resource_path,
+            "cloud_transfer_path": self._p115_transfer_path,
+            "p123_transfer_path": self._p123_transfer_path,
+            "quark_transfer_path": self._quark_transfer_path,
+            "guangya_transfer_path": self._guangya_transfer_path,
+            "strm_generate_enabled": self._strm_generate_enabled,
+            "nfo_scrape_enabled": self._nfo_scrape_enabled,
+            "image_scrape_enabled": self._image_scrape_enabled,
+            "strm_base_url": self._strm_base_url,
+            "strm_url_template": self._strm_url_template,
+            "media_server_refresh_enabled": self._media_server_refresh_enabled,
+            "media_servers": self._media_servers,
+            "media_server_path_mappings": self._media_server_path_mappings,
+            "media_server_refresh_delay": self._media_server_refresh_delay,
+            "emby_mediainfo_enabled": self._emby_mediainfo_enabled,
+            "platform_transfer_history_enabled": self._platform_transfer_history_enabled,
+            "timeout_enabled": self._timeout_enabled,
+            "timeout_default_connect": self._timeout_default_connect,
+            "timeout_default_pool": self._timeout_default_pool,
+            "timeout_default_read": self._timeout_default_read,
+            "timeout_default_write": self._timeout_default_write,
+            "timeout_slow_connect": self._timeout_slow_connect,
+            "timeout_slow_pool": self._timeout_slow_pool,
+            "timeout_slow_read": self._timeout_slow_read,
+            "timeout_slow_write": self._timeout_slow_write,
+            "self_heal_interval": self._self_heal_interval,
+        })
+
+    # 停止插件服务
+
+    def stop_service(self, preserve_subscribe_queue: bool = False):
+        """停止服务"""
+        if not preserve_subscribe_queue and self._subscribe_search_queue_lock is not None:
+            self.cancel_pending_subscribe_searches(shutdown=True)
+        if self._stop_event:
+            self._stop_event.set()
+        if self._sync_tasks_lock is not None:
+            with self._sync_tasks_lock:
+                for task in self._sync_tasks.values():
+                    stop_event = task.get("stop_event")
+                    if stop_event:
+                        stop_event.set()
+        self._restore_subscribe_search_takeover()
+        try:
+            if self._sync_handler:
+                self._sync_handler.close()
+        except Exception as error:
+            logger.debug(f"关闭媒体服务器入库通知器失败：{error}")
+        try:
+            if self._search_handler:
+                self._search_handler.close(release_cache=True)
+        except Exception as error:
+            logger.debug(f"关闭搜索客户端失败：{error}")
+        try:
+            if self._p115_manager:
+                self._p115_manager.close()
+        except Exception as error:
+            logger.debug(f"关闭115客户端缓存失败：{error}")
+        try:
+            if self._p123_drive:
+                self._p123_drive.close()
+        except Exception as error:
+            logger.debug(f"关闭123客户端失败：{error}")
+        try:
+            if self._quark_drive:
+                self._quark_drive.close()
+        except Exception as error:
+            logger.debug(f"关闭夸克客户端失败：{error}")
+        try:
+            if self._guangya_drive:
+                self._guangya_drive.close()
+        except Exception as error:
+            logger.debug(f"关闭光鸭客户端失败：{error}")
+        try:
+            components = self.__dict__.get("_plugin_components", {})
+            platform_service = components.pop(PlatformIntegrationService, None)
+            if platform_service:
+                platform_service.close()
+        except Exception as error:
+            logger.debug(f"关闭平台缓存失败：{error}")
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception:
+            pass
+
+        try:
+            if self._offline_scheduler:
+                self._offline_scheduler.remove_all_jobs()
+                if self._offline_scheduler.running:
+                    self._offline_scheduler.shutdown()
+                self._offline_scheduler = None
+        except Exception:
+            pass
+
+    @eventmanager.register(EventType.PluginReload)
+    def reload_plugin_api(self, event: Event):
+        """热重载完成后同步刷新本插件新增或变更的 API 路由。"""
+        event_data = event.event_data if event else None
+        if isinstance(event_data, dict) and event_data.get("plugin_id") == self.__class__.__name__:
+            register_plugin_api(plugin_id=self.__class__.__name__)
+
+    def api_search(self, keyword: str, apikey: str) -> dict:
+        return self._api_handler.search(keyword, apikey)
+
+    def api_transfer(self, share_url: str, save_path: str, apikey: str) -> dict:
+        return self._api_handler.transfer(share_url, save_path, apikey)
+
+    def api_list_directories(self, path: str = "/", apikey: str = "") -> dict:
+        return self._api_handler.list_directories(path, apikey)

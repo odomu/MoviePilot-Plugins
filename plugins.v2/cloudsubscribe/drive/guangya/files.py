@@ -1,0 +1,137 @@
+"""光鸭目录与文件操作能力。"""
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from ..common import CloudDriveFileServiceBase, extract_list, safe_int
+from ...core.cloud import CloudFile
+
+
+def list_data(client: Any, response: Any) -> list:
+    return extract_list(
+        client.data(response),
+        ("list", "files", "items", "records", "fileList", "infoList"),
+    )
+
+
+def cloud_file(item: Any) -> Optional[CloudFile]:
+    if not isinstance(item, dict):
+        return None
+    file_id = item.get("fileId") or item.get("id") or item.get("fid") or item.get("resId")
+    name = str(item.get("fileName") or item.get("name") or item.get("filename") or "").strip()
+    if file_id in (None, "") or not name:
+        return None
+    raw_type = item.get("type", item.get("resType", item.get("fileType", item.get("dirType"))))
+    is_directory = bool(
+        item.get("isDir")
+        or item.get("is_dir")
+        or item.get("dir")
+        or raw_type in (2, "2", "dir", "folder")
+    )
+    if raw_type in (0, 1, "0", "1", "file"):
+        is_directory = False
+    return CloudFile(
+        id=str(file_id),
+        name=name,
+        is_directory=is_directory,
+        size=0 if is_directory else safe_int(item.get("fileSize") or item.get("size")),
+        sha1=str(item.get("sha1") or ""),
+        playback_values=(
+            {
+                "file_id": str(file_id),
+                "gcid": str(item.get("gcid") or item.get("gcId") or ""),
+            }
+            if not is_directory else {}
+        ),
+        native=item,
+    )
+
+
+@dataclass
+class GuangyaFileService(CloudDriveFileServiceBase):
+    client: Any
+    page_size: int = 100
+    root_directory_id = ""
+    provider_name = "光鸭"
+    _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": ""})
+
+    def _get_file_list(
+            self, parent_id: str = "", page: int = 0, page_size: int = 100
+    ) -> Dict[str, Any]:
+        return self.client.request(
+            "POST",
+            f"{self.client.API_BASE_URL}/userres/v1/file/get_file_list",
+            json_data={
+                "parentId": parent_id or "",
+                "page": page,
+                "pageSize": page_size,
+                "orderBy": 0,
+                "sortType": 0,
+                "fileTypes": [],
+            },
+        )
+
+    def _create_folder_request(self, name: str, parent_id: str = "") -> Dict[str, Any]:
+        return self.client.request(
+            "POST",
+            f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/create_dir",
+            json_data={"dirName": name, "parentId": parent_id or "", "failIfNameExist": True},
+        )
+
+    def _list(self, directory_id: str) -> List[CloudFile]:
+        files: List[CloudFile] = []
+        page = 0
+        while True:
+            response = self._get_file_list(directory_id, page, self.page_size)
+            if not self.client.is_success(response):
+                raise RuntimeError(response.get("msg") or response.get("error") or "读取光鸭目录失败")
+            raw_items = list_data(self.client, response)
+            files.extend(item for raw in raw_items if (item := cloud_file(raw)))
+            data = self.client.data(response)
+            total = safe_int(data.get("total") if isinstance(data, dict) else 0)
+            if len(raw_items) < self.page_size or (total and len(files) >= total):
+                return files
+            page += 1
+
+    def _create_folder(self, name: str, parent_id: str) -> Optional[CloudFile]:
+        response = self._create_folder_request(name, parent_id)
+        if not self._is_success(response):
+            raise RuntimeError(response.get("msg") or response.get("error") or "创建光鸭目录失败")
+        return cloud_file(self.client.data(response))
+
+    def _is_success(self, response: Any) -> bool:
+        return self.client.is_success(response)
+
+    def rename_file(self, path: str, item: CloudFile, target_name: str) -> bool:
+        response = self.client.request(
+            "POST",
+            f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/rename",
+            json_data={"fileId": item.id, "newName": target_name},
+        )
+        return self._is_success(response)
+
+    def move_file(
+            self, item: CloudFile, save_path: str, target_name: str
+    ) -> Optional[CloudFile]:
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return None
+        moved = self.client.request(
+            "POST",
+            f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/move_file",
+            json_data={"fileIds": [item.id], "parentId": lookup.directory_id or ""},
+        )
+        if not self._is_success(moved):
+            return None
+        if target_name and target_name != item.name:
+            if not self.rename_file(save_path, item, target_name):
+                return None
+        return self.find_file(save_path, target_name or item.name)
+
+    def delete_file(self, file_id: str) -> bool:
+        response = self.client.request(
+            "POST",
+            f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/delete_file",
+            json_data={"fileIds": [file_id]},
+        )
+        return self._is_success(response)

@@ -1,0 +1,1113 @@
+"""离线任务完成检测与文件后处理。"""
+
+import copy
+import time
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from app.db import SessionFactory
+from app.db.subscribe_oper import SubscribeOper
+from app.log import logger
+from app.schemas.types import MediaType
+
+from ...core import OwnerDelegator
+from ...utils import MediaFileParser
+
+
+class OfflineTaskService(OwnerDelegator):
+    """监控待处理文件并完成重命名、STRM和历史状态更新。"""
+
+    @staticmethod
+    def _due_pending_keys(
+            pending: Dict[str, Dict[str, Any]],
+            now: float,
+            force: bool = False,
+            pending_keys: Optional[Set[str]] = None,
+    ) -> List[str]:
+        selected = set(pending_keys or [])
+        return [
+            key
+            for key, item in pending.items()
+            if (not selected or key in selected)
+               and bool(item.get("history_ready", True))
+               and now >= float(item.get("_monitor_until") or 0)
+               and (force or now >= float(item.get("next_check_at") or 0))
+        ]
+
+    @staticmethod
+    def _media_context_key(item: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+        subscribe_id = int(item.get("subscribe_id") or 0)
+        if subscribe_id > 0:
+            return "subscribe", subscribe_id
+        sub_key = str(item.get("sub_key") or "").strip()
+        if sub_key:
+            return "sub_key", sub_key
+        media_data = item.get("mediainfo") or {}
+        media_id = (
+                media_data.get("tmdb_id")
+                or media_data.get("douban_id")
+                or media_data.get("media_id")
+        )
+        if not media_id:
+            return None
+        return (
+            "media",
+            str(media_data.get("type") or ""),
+            str(media_id),
+            int(item.get("season") or 0),
+        )
+
+    @staticmethod
+    def _offline_media_group_key(
+            item: Dict[str, Any], pending_key: str
+    ) -> Tuple[Any, ...]:
+        media_data = item.get("mediainfo") or {}
+        media_type = str(media_data.get("type") or item.get("type") or "")
+        media_id = (
+                media_data.get("tmdb_id")
+                or media_data.get("douban_id")
+                or media_data.get("media_id")
+        )
+        if media_id:
+            return "media", media_type, str(media_id)
+        title = str(media_data.get("title") or item.get("title") or "").strip()
+        if title:
+            return (
+                "title",
+                media_type,
+                title.casefold(),
+                str(media_data.get("year") or item.get("year") or ""),
+            )
+        subscribe_id = int(item.get("subscribe_id") or 0)
+        if subscribe_id > 0:
+            return "subscribe", subscribe_id
+        sub_key = str(item.get("sub_key") or "").strip()
+        if sub_key:
+            return "sub_key", sub_key
+        return "pending", pending_key
+
+    def get_due_offline_task_groups(
+            self,
+            force: bool = False,
+            pending_keys: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """按媒体聚合当前到期任务；同一媒体由单个工作线程顺序处理。"""
+        if not self._get_data:
+            return []
+        with self._offline_pending_lock:
+            pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
+        due_keys = self._due_pending_keys(
+            pending, time.time(), force=force, pending_keys=pending_keys
+        )
+        groups: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for pending_key in due_keys:
+            item = pending[pending_key]
+            group_key = self._offline_media_group_key(item, pending_key)
+            group = groups.setdefault(group_key, {
+                "pending_keys": set(),
+                "needs_offline": False,
+            })
+            group["pending_keys"].add(pending_key)
+            group["needs_offline"] = group["needs_offline"] or str(
+                item.get("task_type") or "share"
+            ) in {"ed2k", "magnet"}
+        return list(groups.values())
+
+    @staticmethod
+    def _strm_file_ready(strm_path: Optional[Path]) -> bool:
+        try:
+            return bool(
+                strm_path
+                and strm_path.is_file()
+                and strm_path.stat().st_size > 0
+            )
+        except OSError:
+            return False
+
+    def _delete_upgrade_old_strm(
+            self,
+            item: Dict[str, Any],
+            replacement_path: Optional[Path] = None,
+    ) -> None:
+        """新 STRM 就绪后清理路径不同的旧版本 STRM。"""
+        if not self._strm_generator or not self._local_resource_path:
+            return
+        old_dir = str(item.get("upgrade_old_cloud_dir") or "").strip()
+        old_name = str(item.get("upgrade_old_file_name") or "").strip()
+        if not old_dir or not old_name:
+            return
+        try:
+            strm_path = self._strm_generator.local_path(
+                local_root=self._local_resource_path,
+                cloud_root=self._CLOUD_MEDIA_ROOT,
+                cloud_dir=old_dir,
+                file_name=old_name,
+            )
+            if replacement_path and (
+                    strm_path.resolve(strict=False)
+                    == replacement_path.resolve(strict=False)
+            ):
+                return
+            if strm_path.is_file():
+                strm_path.unlink()
+                logger.info(f"洗版清理旧 STRM：{strm_path}")
+        except (OSError, ValueError) as error:
+            logger.warning(f"洗版清理旧 STRM 失败：{old_dir}/{old_name}，{error}")
+
+    def _replace_upgrade_file(
+            self,
+            item: Dict[str, Any],
+            pending_key: str,
+            target_file: Any,
+            staging_dir: str,
+            file_name: str,
+            now: float,
+            directory_snapshot,
+    ) -> Optional[Any]:
+        """将新文件移入目标位置；旧文件仅临时避让，等待最终提交删除。"""
+        final_dir = str(item.get("cloud_dir") or "/").rstrip("/") or "/"
+        old_dir = str(item.get("upgrade_old_cloud_dir") or final_dir).rstrip("/") or "/"
+        old_name = str(item.get("upgrade_old_file_name") or "").strip()
+        old_id = str(item.get("upgrade_old_file_id") or "").strip()
+        backup_name = str(item.get("upgrade_backup_name") or "").strip()
+        old_file = None
+        if old_id or old_name:
+            old_valid, old_index = directory_snapshot(old_dir)
+            if old_valid:
+                old_file = next(
+                    (value for value in old_index.values()
+                     if old_id and str(getattr(value, "id", "")) == old_id),
+                    None,
+                )
+                old_file = old_file or old_index.get(old_name)
+
+        if not item.get("upgrade_old_backed_up") and old_file and (
+                str(getattr(old_file, "id", "")) != str(getattr(target_file, "id", ""))
+        ):
+            old_path = Path(old_name)
+            backup_name = backup_name or (
+                f".{old_path.stem}.cloudsubscribe-upgrade-"
+                f"{str(pending_key).replace(':', '')[:10]}.bak{old_path.suffix}"
+            )
+            logger.info(
+                f"洗版临时备份旧文件：{old_dir}/{old_name} -> {backup_name}"
+            )
+            if not self._cloud_mutations.rename_file(old_dir, old_file, backup_name):
+                logger.warning(f"洗版替换无法备份旧文件：{old_dir}/{old_name}")
+                return None
+            item["upgrade_old_backed_up"] = True
+            item["upgrade_backup_name"] = backup_name
+            item["upgrade_old_file_id"] = str(getattr(old_file, "id", "") or old_id)
+
+        if not item.get("moved_at"):
+            if target_file.name != file_name:
+                if not self._cloud_mutations.rename_file(staging_dir, target_file, file_name):
+                    if item.get("upgrade_old_backed_up") and old_file:
+                        if self._cloud_mutations.rename_file(old_dir, old_file, old_name):
+                            item.pop("upgrade_old_backed_up", None)
+                        else:
+                            logger.error(
+                                f"洗版新文件重命名失败且旧文件恢复失败：{old_dir}/{backup_name}"
+                            )
+                    self._schedule_finalize_retry(item, now)
+                    return None
+                item["staging_name"] = file_name
+                target_file = self._cloud_query.get_cached_file(staging_dir, file_name)
+                if not target_file:
+                    self._schedule_finalize_retry(item, now)
+                    return None
+            moved_file = (
+                target_file if staging_dir == final_dir
+                else self._cloud_mutations.move_file(target_file, final_dir, file_name)
+            )
+            if not moved_file:
+                if item.get("upgrade_old_backed_up") and old_file:
+                    if self._cloud_mutations.rename_file(old_dir, old_file, old_name):
+                        item.pop("upgrade_old_backed_up", None)
+                    else:
+                        logger.error(
+                            f"洗版新文件移动失败且旧文件恢复失败：{old_dir}/{backup_name}"
+                        )
+                self._schedule_finalize_retry(item, now)
+                return None
+            item["moved_at"] = now
+            target_file = moved_file
+
+        return target_file
+
+    def _delete_upgrade_old_file(
+            self,
+            item: Dict[str, Any],
+            directory_snapshot,
+    ) -> bool:
+        """新文件及 STRM 就绪后，提交洗版并删除临时避让的旧文件。"""
+        if item.get("upgrade_old_deleted") or not item.get("upgrade_old_backed_up"):
+            return True
+        old_dir = str(
+            item.get("upgrade_old_cloud_dir") or item.get("cloud_dir") or "/"
+        ).rstrip("/") or "/"
+        backup_name = str(item.get("upgrade_backup_name") or "").strip()
+        backup_id = str(item.get("upgrade_old_file_id") or "").strip()
+        if backup_id and self._cloud_mutations.delete_file(backup_id):
+            item["upgrade_old_deleted"] = True
+        elif backup_name:
+            _, backup_index = directory_snapshot(old_dir)
+            backup_file = backup_index.get(backup_name)
+            if backup_file and self._cloud_mutations.delete_file(
+                    str(getattr(backup_file, "id", ""))
+            ):
+                item["upgrade_old_deleted"] = True
+        if item.get("upgrade_old_deleted"):
+            logger.info(f"洗版完成，已删除旧文件：{old_dir}/{backup_name}")
+            return True
+        logger.warning(f"洗版新文件已就绪，旧文件删除待重试：{old_dir}/{backup_name}")
+        return False
+
+    def monitor_offline_strm_tasks(
+            self,
+            force: bool = False,
+            pending_keys: Optional[Set[str]] = None,
+            offline_tasks: Optional[List[Dict[str, Any]]] = None,
+            offline_tasks_valid: Optional[bool] = None,
+    ) -> Dict[str, int]:
+        """检查离线下载和网盘文件后处理；手动刷新可立即重试指定任务。"""
+        if (
+                not self._get_data
+                or not self._cloud_directories
+                or not self._cloud_query
+                or not self._cloud_mutations
+        ):
+            return {"checked": 0, "completed": 0, "failed": 0, "pending": 0}
+        with self._offline_pending_lock:
+            pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
+            if not pending:
+                return {"checked": 0, "completed": 0, "failed": 0, "pending": 0}
+
+            now = time.time()
+            due_keys = self._due_pending_keys(
+                pending, now, force=force, pending_keys=pending_keys
+            )
+            if not due_keys:
+                return {"checked": 0, "completed": 0, "failed": 0, "pending": len(pending)}
+
+            monitor_token = uuid.uuid4().hex
+            for key in due_keys:
+                item = pending[key]
+                item["_monitor_token"] = monitor_token
+                item["_monitor_until"] = now + self._OFFLINE_MONITOR_LEASE_SECONDS
+            self._save_offline_pending(pending)
+            pending_snapshot = copy.deepcopy(pending)
+        completed = 0
+        failed = 0
+        finalized_details: List[Dict[str, Any]] = []
+        subscription_batches: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        media_context_cache: Dict[
+            Tuple[Any, ...], Tuple[Any, Dict[str, Any]]
+        ] = {}
+
+        def queue_subscription_completion(
+                item: Dict[str, Any], media, media_data: Dict[str, Any]
+        ) -> None:
+            episode_values = (
+                    item.get("success_episodes")
+                    or item.get("notification_episodes")
+                    or ([item.get("episode")] if item.get("episode") else [])
+            )
+            episodes = set()
+            for value in episode_values:
+                try:
+                    episode = int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if episode > 0:
+                    episodes.add(episode)
+            if not media or not episodes:
+                return
+            key = (
+                int(item.get("subscribe_id") or 0),
+                int(getattr(media, "tmdb_id", 0) or 0),
+                int(item.get("season") or 0),
+                str(item.get("task_type") or "share").strip().lower(),
+            )
+            batch = subscription_batches.setdefault(key, {
+                "item": copy.deepcopy(item),
+                "mediainfo": media,
+                "media_data": dict(media_data or {}),
+                "episodes": set(),
+            })
+            batch["episodes"].update(episodes)
+
+        if due_keys:
+
+            needs_offline = any(
+                str((pending.get(key) or {}).get("task_type") or "share")
+                in {"ed2k", "magnet"}
+                for key in due_keys
+            )
+            tasks = offline_tasks
+            if needs_offline and tasks is None and self._offline_tasks:
+                snapshot = self._offline_tasks.get_offline_task_list_snapshot(
+                    force=True
+                )
+                tasks = snapshot.get("tasks") or []
+                offline_tasks_valid = bool(snapshot.get("refresh_ok"))
+            tasks_valid = bool(offline_tasks_valid)
+            task_map = {
+                str(task.get("id") or "").upper(): task
+                for task in (tasks or [])
+                if task.get("id")
+            }
+            directory_snapshots: Dict[str, Tuple[bool, Dict[str, Any]]] = {}
+
+            def directory_snapshot(cloud_dir: str) -> Tuple[bool, Dict[str, Any]]:
+                normalized_dir = str(cloud_dir or "").rstrip("/")
+                if normalized_dir in directory_snapshots:
+                    return directory_snapshots[normalized_dir]
+                lookup = self._cloud_directories.resolve_directory(normalized_dir)
+                if not lookup.checked:
+                    result = (False, {})
+                elif lookup.directory_id is None:
+                    result = (True, {})
+                else:
+                    listing = self._cloud_directories.list_directory(
+                        lookup.directory_id
+                    )
+                    if not listing.checked:
+                        result = (False, {})
+                    else:
+                        file_index = {}
+                        for file_item in listing.files:
+                            if file_item.name:
+                                file_index[file_item.name] = file_item
+                        result = (True, file_index)
+                directory_snapshots[normalized_dir] = result
+                return result
+
+            prepared_files: Dict[str, Any] = {}
+            moved_files: Dict[str, Any] = {}
+            if self._cloud_batch_mutations:
+                rename_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for pending_key in due_keys:
+                    item = pending.get(pending_key) or {}
+                    task_type = str(item.get("task_type") or "share")
+                    if task_type == "magnet" or item.get("moved_at") or (
+                            item.get("upgrade")
+                            and str(item.get("upgrade_mode") or self._upgrade_mode) != "coexist"
+                    ):
+                        continue
+                    task = task_map.get(
+                        str(item.get("task_id") or pending_key).upper()
+                    )
+                    if task_type == "ed2k" and not bool(
+                            task and task.get("completed")
+                    ):
+                        continue
+                    staging_dir = str(
+                        item.get("staging_dir") or item.get("cloud_dir") or "/"
+                    ).rstrip("/") or "/"
+                    directory_valid, file_index = directory_snapshot(staging_dir)
+                    if not directory_valid:
+                        continue
+                    staging_name = str(
+                        item.get("staging_name") or item.get("file_name") or ""
+                    )
+                    task_name = str((task or {}).get("name") or "").strip()
+                    source_file = file_index.get(staging_name) or file_index.get(task_name)
+                    source_sha1 = str(item.get("source_sha1") or "").upper()
+                    if not source_file and len(source_sha1) == 40:
+                        source_file = next(
+                            (
+                                candidate for candidate in file_index.values()
+                                if str(candidate.sha1 or "").upper() == source_sha1
+                            ),
+                            None,
+                        )
+                    if source_file:
+                        rename_groups.setdefault(staging_dir, {})[pending_key] = {
+                            "item": source_file,
+                            "target_name": str(item.get("file_name") or pending_key),
+                        }
+
+                for staging_dir, rename_items in rename_groups.items():
+                    renamed = self._cloud_batch_mutations.rename_files(
+                        staging_dir, rename_items
+                    )
+                    for pending_key, target_file in renamed.items():
+                        item = pending.get(pending_key)
+                        if not item:
+                            continue
+                        item["staging_name"] = item["file_name"]
+                        prepared_files[pending_key] = target_file
+
+                move_groups: Dict[str, Dict[str, Any]] = {}
+                for pending_key, target_file in prepared_files.items():
+                    item = pending.get(pending_key) or {}
+                    staging_dir = str(item.get("staging_dir") or "/").rstrip("/") or "/"
+                    final_dir = str(item.get("cloud_dir") or "/").rstrip("/") or "/"
+                    if staging_dir == final_dir:
+                        item["moved_at"] = now
+                        moved_files[pending_key] = target_file
+                        continue
+                    move_groups.setdefault(final_dir, {})[pending_key] = target_file
+
+                for final_dir, move_items in move_groups.items():
+                    moved = self._cloud_batch_mutations.move_files(
+                        move_items, final_dir
+                    )
+                    for pending_key, target_file in moved.items():
+                        item = pending.get(pending_key)
+                        if not item:
+                            continue
+                        item["moved_at"] = now
+                        moved_files[pending_key] = target_file
+
+            metadata_batches = {}
+            for pending_key in due_keys:
+                item = pending.get(pending_key)
+                if not item:
+                    continue
+                task_type = str(item.get("task_type") or "share")
+                file_name = str(item.get("file_name") or pending_key)
+                created_at = float(item.get("created_at") or now)
+                target_file = None
+                if task_type == "magnet":
+                    task = task_map.get(str(item.get("task_id") or "").upper())
+                    task_done = bool(task and task.get("completed"))
+                    if task and bool(task.get("failed")):
+                        reason = "Magnet 离线下载失败"
+                        self._mark_offline_history_status(pending_key, "失败", reason)
+                        pending.pop(pending_key, None)
+                        failed += 1
+                        continue
+                    if not task_done:
+                        if now - created_at >= self._FILE_FINALIZE_TIMEOUT:
+                            reason = "Magnet 离线下载超过24小时未完成"
+                            self._mark_offline_history_status(pending_key, "失败", reason)
+                            pending.pop(pending_key, None)
+                            failed += 1
+                        else:
+                            self._schedule_finalize_retry(item, now)
+                        continue
+                    finalized = self._finalize_magnet_package(item, pending_key)
+                    if finalized is None:
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                    pending.pop(pending_key, None)
+                    if finalized:
+                        finalized_details.extend(finalized)
+                        completed += len(finalized)
+                    else:
+                        failed += 1
+                    continue
+                if task_type == "ed2k":
+                    task = task_map.get(str(item.get("task_id") or pending_key).upper())
+                    task_done = bool(
+                        item.get("moved_at") or (task and task.get("completed"))
+                    )
+                    if task and bool(task.get("failed")):
+                        reason = "离线下载失败"
+                        logger.error(f"{reason}：{file_name}")
+                        self._mark_offline_history_status(pending_key, "失败", reason)
+                        pending.pop(pending_key, None)
+                        failed += 1
+                        continue
+                    if task is not None and not task_done:
+                        if now - created_at >= self._OFFLINE_TIMEOUT:
+                            reason = "离线下载超过30分钟未完成"
+                            logger.error(f"{reason}：{file_name}")
+                            self._mark_offline_history_status(pending_key, "失败", reason)
+                            pending.pop(pending_key, None)
+                            failed += 1
+                            continue
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                    if not task_done and task is None and tasks_valid:
+                        staging_dir = str(
+                            item.get("staging_dir") or item.get("cloud_dir") or "/"
+                        )
+                        directory_valid, file_index = directory_snapshot(staging_dir)
+                        if directory_valid and not file_index:
+                            reason = "离线任务及目标文件均不存在"
+                            logger.warning(f"{reason}：{file_name}")
+                            self._mark_offline_history_status(pending_key, "失败", reason)
+                            pending.pop(pending_key, None)
+                            failed += 1
+                            continue
+                    if not task_done:
+                        if now - created_at >= self._OFFLINE_TIMEOUT:
+                            reason = "离线下载超过30分钟未完成"
+                            logger.error(f"{reason}：{file_name}")
+                            self._mark_offline_history_status(pending_key, "失败", reason)
+                            pending.pop(pending_key, None)
+                            failed += 1
+                            continue
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                    item.setdefault("download_completed_at", now)
+
+                already_moved = bool(item.get("moved_at"))
+                staging_dir = str(
+                    item.get("cloud_dir") if already_moved
+                    else item.get("staging_dir") or item.get("cloud_dir") or "/"
+                ).rstrip("/") or "/"
+                staging_name = (
+                    file_name if already_moved
+                    else str(item.get("staging_name") or file_name)
+                )
+                target_file = moved_files.get(pending_key) or prepared_files.get(pending_key)
+                if target_file:
+                    file_index = {}
+                else:
+                    directory_valid, file_index = directory_snapshot(staging_dir)
+                    if not directory_valid:
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                task_name = (
+                    str((task or {}).get("name") or "").strip()
+                    if task_type == "ed2k"
+                    else ""
+                )
+                target_file = (
+                        target_file
+                        or file_index.get(staging_name)
+                        or file_index.get(task_name)
+                )
+                source_sha1 = str(item.get("source_sha1") or "").upper()
+                if not target_file and source_sha1:
+                    target_file = next(
+                        (
+                            candidate for candidate in file_index.values()
+                            if str(candidate.sha1 or "").upper() == source_sha1
+                        ),
+                        None,
+                    )
+                if not target_file and not already_moved:
+                    final_dir = str(item.get("cloud_dir") or "/").rstrip("/") or "/"
+                    if final_dir != staging_dir:
+                        final_valid, final_index = directory_snapshot(final_dir)
+                        if final_valid:
+                            final_candidate = final_index.get(file_name)
+                            candidate_sha1 = str(
+                                getattr(final_candidate, "sha1", "") or ""
+                            ).upper()
+                            if (
+                                    final_candidate
+                                    and source_sha1
+                                    and candidate_sha1 != source_sha1
+                            ):
+                                final_candidate = None
+                            if not final_candidate and source_sha1:
+                                final_candidate = next(
+                                    (
+                                        candidate for candidate in final_index.values()
+                                        if str(candidate.sha1 or "").upper() == source_sha1
+                                    ),
+                                    None,
+                                )
+                            if final_candidate:
+                                target_file = final_candidate
+                                item["moved_at"] = now
+                                already_moved = True
+                                staging_dir = final_dir
+                                logger.info(
+                                    f"后处理在最终目录找到已移动文件，继续生成STRM："
+                                    f"{final_dir}/{file_name}"
+                                )
+                if not target_file:
+                    ready_at = float(item.get("download_completed_at") or created_at)
+                    if now - ready_at >= self._FILE_FINALIZE_TIMEOUT:
+                        reason = "网盘文件已保存但24小时内仍无法在转存路径定位"
+                        self._mark_offline_history_status(pending_key, "失败", reason)
+                        pending.pop(pending_key, None)
+                        failed += 1
+                    else:
+                        self._schedule_finalize_retry(item, now)
+                    continue
+
+                if item.get("upgrade") and str(
+                        item.get("upgrade_mode") or self._upgrade_mode
+                ) != "coexist":
+                    replaced_file = self._replace_upgrade_file(
+                        item=item,
+                        pending_key=pending_key,
+                        target_file=target_file,
+                        staging_dir=staging_dir,
+                        file_name=file_name,
+                        now=now,
+                        directory_snapshot=directory_snapshot,
+                    )
+                    if not replaced_file:
+                        continue
+                    target_file = replaced_file
+                    already_moved = True
+
+                if not already_moved:
+                    if target_file.name != file_name:
+                        if not self._cloud_mutations.rename_file(
+                                staging_dir, target_file, file_name
+                        ):
+                            self._schedule_finalize_retry(item, now)
+                            continue
+                        item["staging_name"] = file_name
+                        target_file = self._cloud_query.get_cached_file(
+                            staging_dir, file_name
+                        )
+                        if not target_file:
+                            self._schedule_finalize_retry(item, now)
+                            continue
+                    final_dir = str(item["cloud_dir"]).rstrip("/") or "/"
+                    if staging_dir != final_dir:
+                        moved_file = self._cloud_mutations.move_file(
+                            target_file, item["cloud_dir"], file_name
+                        )
+                    else:
+                        moved_file = target_file
+                    if not moved_file:
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                    target_file = moved_file
+                    item["moved_at"] = now
+
+                context_key = self._media_context_key(item)
+                cached_context = (
+                    media_context_cache.get(context_key) if context_key else None
+                )
+                if cached_context:
+                    media, media_data = cached_context
+                    item["mediainfo"] = media_data
+                else:
+                    media, media_data = self._restore_pending_media_context(
+                        item, pending_key
+                    )
+                    resolved_key = context_key or self._media_context_key(item)
+                    if resolved_key and media:
+                        media_context_cache[resolved_key] = (media, media_data)
+                if media:
+                    try:
+                        batch_key = (
+                            getattr(media, "type", None),
+                            getattr(media, "tmdb_id", None),
+                            int(item.get("season") or 0),
+                        )
+                        batch = metadata_batches.setdefault(
+                            batch_key,
+                            {"mediainfo": media, "season": item.get("season"), "items": []},
+                        )
+                        batch["items"].append({
+                            "cloud_dir": item["cloud_dir"],
+                            "file_name": file_name,
+                            "notification_episodes": (
+                                [item.get("episode")] if item.get("episode") else []
+                            ),
+                        })
+                    except Exception as error:
+                        logger.warning(f"后处理元数据解析失败：{file_name}，{error}")
+
+                if not self._strm_generate_enabled or not self._strm_generator or not self._local_resource_path:
+                    if item.get("upgrade") and str(
+                            item.get("upgrade_mode") or self._upgrade_mode
+                    ) != "coexist":
+                        if not self._delete_upgrade_old_file(item, directory_snapshot):
+                            self._schedule_finalize_retry(item, now)
+                            continue
+                        self._delete_upgrade_old_strm(item)
+                    queue_subscription_completion(item, media, media_data)
+                    detail = self._notify_pending_file_finalized(
+                        item,
+                        pending_key,
+                        None,
+                        mediainfo=media,
+                        media_data=media_data,
+                        finish_subscription=media is None,
+                    )
+                    if detail:
+                        finalized_details.append(detail)
+                    self._mark_offline_history_status(pending_key, "成功")
+                    logger.debug(f"文件后处理完成：{file_name}（未启用 STRM）")
+                    pending.pop(pending_key, None)
+                    completed += 1
+                    continue
+
+                strm_path = self._generate_strm(
+                    item["cloud_dir"], file_name, target_file=target_file
+                )
+                if strm_path and not self._strm_file_ready(strm_path):
+                    logger.error(f"STRM 生成后文件不存在或为空：{strm_path}")
+                    strm_path = None
+                if strm_path:
+                    if item.get("upgrade") and str(
+                            item.get("upgrade_mode") or self._upgrade_mode
+                    ) != "coexist":
+                        if not self._delete_upgrade_old_file(item, directory_snapshot):
+                            self._schedule_finalize_retry(item, now)
+                            continue
+                        self._delete_upgrade_old_strm(
+                            item, replacement_path=strm_path
+                        )
+                    if not self._strm_file_ready(strm_path):
+                        logger.error(f"洗版后 STRM 文件不存在或为空：{strm_path}")
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                    queue_subscription_completion(item, media, media_data)
+                    detail = self._notify_pending_file_finalized(
+                        item,
+                        pending_key,
+                        strm_path,
+                        mediainfo=media,
+                        media_data=media_data,
+                        finish_subscription=media is None,
+                    )
+                    if detail:
+                        finalized_details.append(detail)
+                    self._mark_offline_history_status(pending_key, "成功")
+                    logger.debug(f"文件后处理完成并生成 STRM：{strm_path}")
+                    pending.pop(pending_key, None)
+                    completed += 1
+                    continue
+
+                ready_at = float(item.get("download_completed_at") or created_at)
+                if now - ready_at >= self._FILE_FINALIZE_TIMEOUT:
+                    reason = "文件已下载但24小时内仍无法生成 STRM"
+                    self._mark_offline_history_status(pending_key, "失败", reason)
+                    pending.pop(pending_key, None)
+                    failed += 1
+                else:
+                    self._schedule_finalize_retry(item, now)
+
+            for batch in metadata_batches.values():
+                self._scrape_metadata_batch(
+                    batch["items"], batch["mediainfo"], season=batch["season"]
+                )
+
+            for batch in subscription_batches.values():
+                completion_item = batch["item"]
+                completion_item["success_episodes"] = sorted(batch["episodes"])
+                completion_item["notification_episodes"] = sorted(
+                    batch["episodes"]
+                )
+                self._finish_pending_subscription(
+                    completion_item,
+                    batch["media_data"],
+                    mediainfo=batch["mediainfo"],
+                )
+
+        with self._offline_pending_lock:
+            current_pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
+            for pending_key in due_keys:
+                original_item = pending_snapshot.get(pending_key)
+                processed_item = pending.get(pending_key)
+                current_item = current_pending.get(pending_key)
+                if current_item is None or original_item is None:
+                    continue
+                if current_item.get("_monitor_token") != monitor_token:
+                    continue
+                generation = (
+                    original_item.get("created_at"),
+                    original_item.get("share_url"),
+                    original_item.get("file_name"),
+                    original_item.get("task_type"),
+                )
+                current_generation = (
+                    current_item.get("created_at"),
+                    current_item.get("share_url"),
+                    current_item.get("file_name"),
+                    current_item.get("task_type"),
+                )
+                if generation != current_generation:
+                    continue
+                if processed_item is None:
+                    current_pending.pop(pending_key, None)
+                    continue
+                processed_item.pop("_monitor_token", None)
+                processed_item.pop("_monitor_until", None)
+                for field in set(original_item) | set(processed_item):
+                    if original_item.get(field) == processed_item.get(field):
+                        continue
+                    if field in processed_item:
+                        current_item[field] = copy.deepcopy(processed_item[field])
+                    else:
+                        current_item.pop(field, None)
+            self._save_offline_pending(current_pending)
+            pending_count = len(current_pending)
+        result = {
+            "checked": len(due_keys),
+            "completed": completed,
+            "failed": failed,
+            "pending": pending_count,
+        }
+        self._send_finalized_batch(finalized_details)
+        self._notify_offline_pending_changed(result["pending"])
+        return result
+
+    def _finalize_magnet_package(
+            self, item: Dict[str, Any], pending_key: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """读取完成后的真实文件树，只移动实际匹配的媒体文件。"""
+        mediainfo, media_data = self._restore_pending_media_context(item, pending_key)
+        if not mediainfo:
+            return []
+        subscribe_id = int(item.get("subscribe_id") or 0)
+        with SessionFactory() as db:
+            subscribe = SubscribeOper(db=db).get(subscribe_id) if subscribe_id else None
+        if not subscribe and item.get("transient_target"):
+            subscribe = SimpleNamespace(**(item.get("target_subscribe") or {}))
+        if not subscribe:
+            self._mark_offline_history_status(
+                pending_key, "失败", "Magnet 下载完成时订阅已不存在"
+            )
+            return []
+
+        files = self._cloud_query.list_files_recursive(item.get("cloud_dir"), max_depth=6)
+        video_files = [
+            file_item for file_item in files
+            if MediaFileParser.is_video(str(file_item.get("name") or ""))
+        ]
+        if not video_files:
+            logger.debug(f"Magnet 已完成但真实文件树尚未就绪：{item.get('file_name')}")
+            return None
+
+        def directory_snapshot(cloud_dir: str) -> Tuple[bool, Dict[str, Any]]:
+            lookup = self._cloud_directories.resolve_directory(cloud_dir)
+            if not lookup.checked:
+                return False, {}
+            if lookup.directory_id is None:
+                return True, {}
+            listing = self._cloud_directories.list_directory(lookup.directory_id)
+            if not listing.checked:
+                return False, {}
+            return True, {value.name: value for value in listing.files if value.name}
+
+        matched: List[Tuple[Optional[int], Any, int]] = []
+        season = item.get("season")
+        if mediainfo.type == MediaType.TV:
+            target_episodes = []
+            for value in item.get("target_episodes") or []:
+                try:
+                    episode = int(str(value or "0"))
+                except ValueError:
+                    continue
+                if episode > 0:
+                    target_episodes.append(episode)
+            episode_files = self._match_episode_files(
+                video_files,
+                mediainfo,
+                subscribe,
+                max(1, int(season or 1)),
+                target_episodes,
+            )
+            matched = [
+                (episode, episode_files[episode][0], episode_files[episode][1])
+                for episode in target_episodes
+                if episode_files.get(episode, (None, 0))[0]
+            ]
+        else:
+            movie_file, movie_score = self._match_movie_file(
+                video_files, mediainfo, subscribe
+            )
+            if movie_file:
+                matched = [(None, movie_file, movie_score)]
+
+        if not matched:
+            reason = "Magnet 下载完成，但真实文件名未匹配当前订阅"
+            logger.warning(f"{reason}：{item.get('file_name')}")
+            self._mark_offline_history_status(pending_key, "失败", reason)
+            return []
+
+        history_records = []
+        details = []
+        success_episodes = []
+        resource = item.get("resource") or {}
+        share_url = str(item.get("share_url") or "")
+        upgrade_baseline = item.get("upgrade_baseline") or {}
+        for episode, source_file, current_score in matched:
+            source_name = str(source_file.get("name") or "")
+            baseline_key = str(episode) if episode else "movie"
+            old_baseline = upgrade_baseline.get(baseline_key) or {}
+            is_upgrade = bool(old_baseline)
+            source_size = self._resource_size_bytes(source_file.get("size"))
+            if is_upgrade:
+                should_upgrade, reason = self._should_upgrade_candidate(
+                    int(old_baseline.get("score") or 0),
+                    current_score,
+                    int(old_baseline.get("size") or 0),
+                    source_size,
+                )
+                if not should_upgrade:
+                    label = f"E{int(episode):02d}" if episode else mediainfo.title
+                    logger.info(f"Magnet 下载后洗版候选跳过 {label}：{reason}")
+                    continue
+            cloud_dir, target_name = self._platform_target(
+                self._CLOUD_MEDIA_ROOT,
+                subscribe,
+                mediainfo,
+                source_name,
+                season=max(1, int(season or 1)) if episode else None,
+                episode=episode,
+            )
+            mode = str(item.get("upgrade_mode") or self._upgrade_mode)
+            if is_upgrade and mode == "coexist":
+                target_name = self._coexist_target_name(
+                    target_name, source_name, source_size, source_file.get("sha1") or ""
+                )
+            if is_upgrade and mode != "coexist":
+                old_dir = str(old_baseline.get("cloud_dir") or "").strip()
+                old_name = str(old_baseline.get("file_name") or "").strip()
+                old_file_id = str(old_baseline.get("file_id") or "").strip()
+                if not old_dir or not old_name:
+                    old_dir, old_name = self._platform_target(
+                        self._CLOUD_MEDIA_ROOT,
+                        subscribe,
+                        mediainfo,
+                        old_name or source_name,
+                        season=max(1, int(season or 1)) if episode else None,
+                        episode=episode,
+                    )
+                if not old_file_id:
+                    old_file = self._cloud_query.get_cached_file(old_dir, old_name)
+                    old_file_id = str(getattr(old_file, "id", "") or "")
+                replace_item = {
+                    **item,
+                    "cloud_dir": cloud_dir,
+                    "file_name": target_name,
+                    "upgrade_old_cloud_dir": old_dir,
+                    "upgrade_old_file_name": old_name,
+                    "upgrade_old_file_id": old_file_id,
+                }
+                source_dir = str(
+                    (getattr(source_file, "native", None) or {}).get("_cloud_dir")
+                    or item.get("cloud_dir") or "/"
+                ).rstrip("/") or "/"
+                moved = self._replace_upgrade_file(
+                    replace_item,
+                    f"{pending_key}:{baseline_key}",
+                    source_file,
+                    source_dir,
+                    target_name,
+                    time.time(),
+                    directory_snapshot,
+                )
+            else:
+                moved = self._cloud_mutations.move_file(
+                    source_file, cloud_dir, target_name
+                )
+            if not moved:
+                continue
+            self._scrape_metadata(
+                cloud_dir,
+                target_name,
+                mediainfo,
+                season=season,
+                episode=episode,
+            )
+            strm_path = None
+            if self._strm_generate_enabled and self._strm_generator and self._local_resource_path:
+                strm_path = self._generate_strm(
+                    cloud_dir, target_name, target_file=moved, lookup_target=False
+                )
+                if strm_path:
+                    if is_upgrade and mode != "coexist":
+                        if not self._delete_upgrade_old_file(
+                                replace_item, directory_snapshot
+                        ):
+                            logger.warning(
+                                f"Magnet 洗版旧文件删除失败：{target_name}"
+                            )
+                            continue
+                        self._delete_upgrade_old_strm(
+                            replace_item, replacement_path=strm_path
+                        )
+                    self._media_server_notifier.notify(
+                        path=strm_path, mediainfo=mediainfo, file_name=target_name
+                    )
+            elif self._local_resource_path:
+                if is_upgrade and mode != "coexist":
+                    if not self._delete_upgrade_old_file(
+                            replace_item, directory_snapshot
+                    ):
+                        logger.warning(
+                            f"Magnet 洗版旧文件删除失败：{target_name}"
+                        )
+                        continue
+                    self._delete_upgrade_old_strm(replace_item)
+                notify_path = self._resolve_resource_season_dir(
+                    self._local_resource_path,
+                    subscribe,
+                    mediainfo,
+                    max(1, int(season or 1)),
+                )
+                if notify_path:
+                    self._media_server_notifier.notify(
+                        path=notify_path, mediainfo=mediainfo, file_name=target_name
+                    )
+            if episode:
+                success_episodes.append(int(episode))
+            else:
+                success_episodes.append(1)
+            episode_fields = (
+                {"season": int(season or 1), "episode": int(episode)}
+                if episode else {}
+            )
+            record = self._build_transfer_history_item(
+                mediainfo=mediainfo,
+                subscribe=subscribe,
+                status="成功",
+                share_url=share_url,
+                file_name=target_name,
+                source_file_name=source_name,
+                cloud_dir=cloud_dir,
+                resource=resource,
+                file_size=source_size,
+                source_sha1=str(source_file.get("sha1") or ""),
+                rule_score=current_score,
+                upgrade=is_upgrade,
+                **episode_fields,
+            )
+            history_records.append(record)
+            detail = {
+                "type": record["type"],
+                "title": mediainfo.title,
+                "year": mediainfo.year,
+                "image": mediainfo.get_poster_image(),
+                "file_name": target_name,
+            }
+            if episode:
+                detail.update({"season": int(season or 1), "episodes": [int(episode)]})
+            details.append(detail)
+
+        if not history_records:
+            return None
+        with self._offline_pending_lock:
+            history = [
+                record for record in (self._get_data("history") or [])
+                if str(record.get("finalize_key") or "") != pending_key
+            ]
+            history.extend(history_records)
+            self._save_data("history", history)
+        self._record_platform_transfer_histories(history_records)
+        item["success_episodes"] = (
+            [] if item.get("transient_target") else success_episodes
+        )
+        item["notification_episodes"] = success_episodes if mediainfo.type == MediaType.TV else []
+        if not item.get("transient_target"):
+            self._finish_pending_subscription(
+                item, media_data, mediainfo=mediainfo
+            )
+        logger.info(
+            f"Magnet 下载后文件匹配完成：移动 {len(history_records)} 个文件，"
+            f"未匹配内容保留在隔离目录"
+        )
+        return details
+
+    def _schedule_finalize_retry(self, item: Dict[str, Any], now: float) -> None:
+        check_index = min(
+            int(item.get("check_index") or 0) + 1,
+            len(self._OFFLINE_CHECK_DELAYS) - 1,
+        )
+        item["check_index"] = check_index
+        item["next_check_at"] = now + self._OFFLINE_CHECK_DELAYS[check_index]
+        logger.debug(
+            f"文件后处理尚未完成：{item.get('file_name')}，"
+            f"{self._OFFLINE_CHECK_DELAYS[check_index] // 60}分钟后复查"
+        )

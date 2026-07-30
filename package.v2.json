@@ -1,0 +1,16 @@
+{
+  "CloudSubscribe": {
+    "name": "网盘订阅助手",
+    "description": "按网盘能力搜索、推荐并同步 MoviePilot 订阅缺失内容。",
+    "labels": "订阅,网盘,115,STRM,智能体",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png",
+    "author": "odomu",
+    "level": 1,
+    "release": true,
+    "system_version": ">=2.14.6",
+    "history": {
+      "v1.0.0": "支持订阅搜索、资源推荐、网盘转存、离线下载、STRM生成、网盘洗版和平台集成。"
+    }
+  }
+}

@@ -1,0 +1,181 @@
+name: Build and Release Plugins
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_directory:
+        description: 插件源码根目录
+        required: true
+        type: choice
+        options:
+          - plugins
+          - plugins.v2
+        default: plugins.v2
+      plugin_id:
+        description: package*.json 中的插件 ID
+        required: true
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - package*.json
+
+concurrency:
+  group: release-plugins-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect-plugins:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.plugins }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect plugins to release
+        id: detect
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          INPUT_PLUGIN_ID: ${{ inputs.plugin_id }}
+          INPUT_SOURCE_DIRECTORY: ${{ inputs.source_directory }}
+        run: |
+          set -euo pipefail
+          plugins="$(python3 .github/scripts/get_plugin_meta.py)"
+          echo "$plugins" | jq .
+          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    needs: detect-plugins
+    if: ${{ needs.detect-plugins.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(needs.detect-plugins.outputs.matrix) }}
+
+    name: Release ${{ matrix.plugin.id }} v${{ matrix.plugin.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ matrix.plugin.has_frontend }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build frontend
+        if: ${{ matrix.plugin.has_frontend }}
+        env:
+          FRONTEND_DIR: ${{ matrix.plugin.frontend_directory }}
+          PLUGIN_DIR: ${{ matrix.plugin.source_directory }}/${{ matrix.plugin.directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "$FRONTEND_DIR/pnpm-lock.yaml" ]; then
+            package_manager="$(node -p "require('./$FRONTEND_DIR/package.json').packageManager || ''")"
+            if [[ "$package_manager" != pnpm@* ]]; then
+              echo "package.json must pin packageManager to pnpm@<version>: $FRONTEND_DIR"
+              exit 1
+            fi
+            corepack enable
+            corepack prepare "$package_manager" --activate
+            pnpm --dir "$FRONTEND_DIR" install --frozen-lockfile
+            pnpm --dir "$FRONTEND_DIR" build
+          elif [ -f "$FRONTEND_DIR/package-lock.json" ]; then
+            npm --prefix "$FRONTEND_DIR" ci
+            npm --prefix "$FRONTEND_DIR" run build
+          elif [ -f "$FRONTEND_DIR/yarn.lock" ]; then
+            package_manager="$(node -p "require('./$FRONTEND_DIR/package.json').packageManager || ''")"
+            if [[ "$package_manager" != yarn@* ]]; then
+              echo "package.json must pin packageManager to yarn@<version>: $FRONTEND_DIR"
+              exit 1
+            fi
+            corepack enable
+            corepack prepare "$package_manager" --activate
+            yarn --cwd "$FRONTEND_DIR" install --immutable || \
+              yarn --cwd "$FRONTEND_DIR" install --frozen-lockfile
+            yarn --cwd "$FRONTEND_DIR" build
+          else
+            echo "Frontend lockfile not found in $FRONTEND_DIR"
+            exit 1
+          fi
+
+          if [ "$FRONTEND_DIR" != "$PLUGIN_DIR" ] && [ -d "$FRONTEND_DIR/dist" ]; then
+            rm -rf "$PLUGIN_DIR/dist"
+            cp -R "$FRONTEND_DIR/dist" "$PLUGIN_DIR/dist"
+          fi
+
+          if [ ! -f "$PLUGIN_DIR/dist/assets/remoteEntry.js" ]; then
+            echo "Missing frontend entry: $PLUGIN_DIR/dist/assets/remoteEntry.js"
+            exit 1
+          fi
+
+      - name: Replace existing release version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ matrix.plugin.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Replacing existing release and tag: $TAG_NAME"
+            gh release delete "$TAG_NAME" --cleanup-tag --yes
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "Removing existing tag: $TAG_NAME"
+            git push origin ":refs/tags/$TAG_NAME"
+          fi
+
+      - name: Package plugin
+        env:
+          SOURCE_DIRECTORY: ${{ matrix.plugin.source_directory }}
+          PLUGIN_DIRECTORY: ${{ matrix.plugin.directory }}
+          ASSET_NAME: ${{ matrix.plugin.asset_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$SOURCE_DIRECTORY/$PLUGIN_DIRECTORY/__init__.py"
+          (
+            cd "$SOURCE_DIRECTORY"
+            zip -r "$GITHUB_WORKSPACE/$ASSET_NAME" "$PLUGIN_DIRECTORY" \
+              -x '*/__pycache__/*' '*.pyc' '*.pyo' '*/node_modules/*'
+          )
+
+      - name: Validate release archive
+        env:
+          ASSET_NAME: ${{ matrix.plugin.asset_name }}
+          PLUGIN_DIRECTORY: ${{ matrix.plugin.directory }}
+          HAS_FRONTEND: ${{ matrix.plugin.has_frontend }}
+        shell: python
+        run: |
+          import os
+          import zipfile
+
+          asset = os.environ["ASSET_NAME"]
+          plugin_dir = os.environ["PLUGIN_DIRECTORY"]
+          required = {f"{plugin_dir}/__init__.py"}
+          if os.environ["HAS_FRONTEND"].lower() == "true":
+              required.add(f"{plugin_dir}/dist/assets/remoteEntry.js")
+
+          with zipfile.ZipFile(asset) as archive:
+              names = set(archive.namelist())
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"Release archive is missing: {missing}")
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.plugin.tag_name }}
+          name: ${{ matrix.plugin.name }} v${{ matrix.plugin.version }}
+          body: ${{ matrix.plugin.notes }}
+          files: ${{ matrix.plugin.asset_name }}
