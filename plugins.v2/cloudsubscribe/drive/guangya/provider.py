@@ -9,6 +9,7 @@ from .client import GuangyaClient
 from .files import GuangyaFileService
 from .offline import GuangyaOfflineService
 from .share import GuangyaShareService
+from .upload import GuangyaUploadService
 from ...core.cloud import (
     CloudDriveCapability,
     CloudDrivePolicy,
@@ -49,6 +50,7 @@ def create_guangya_provider(drive: GuangyaDrive) -> CloudDriveProvider:
         drive.client, files, drive.metadata_url_template
     )
     share = GuangyaShareService(drive.client, files, offline)
+    upload = GuangyaUploadService(drive.client, files)
     playback_reference = GuangyaPlaybackReference()
     return CloudDriveProvider(
         key="guangya",
@@ -64,6 +66,7 @@ def create_guangya_provider(drive: GuangyaDrive) -> CloudDriveProvider:
             CloudDriveCapability.FILE_QUERY: files,
             CloudDriveCapability.FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
+            CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.QRCODE_AUTH: drive.client,
         },
         policy=CloudDrivePolicy(

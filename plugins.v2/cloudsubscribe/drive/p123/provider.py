@@ -7,6 +7,7 @@ from .client import P123ClientManager
 from .files import P123FileService
 from .offline import P123OfflineService
 from .share import P123ShareService
+from .upload import P123UploadService
 from ...core.cloud import (
     CloudDriveCapability,
     CloudDrivePolicy,
@@ -48,6 +49,7 @@ def create_p123_provider(drive: P123Drive) -> CloudDriveProvider:
     offline = P123OfflineService(
         drive.client, files, drive.metadata_url_template
     )
+    upload = P123UploadService(drive.client, files)
     playback_reference = P123PlaybackReference()
     return CloudDriveProvider(
         key="123",
@@ -64,6 +66,7 @@ def create_p123_provider(drive: P123Drive) -> CloudDriveProvider:
             CloudDriveCapability.FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
             CloudDriveCapability.OFFLINE_TASKS: offline,
+            CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.QRCODE_AUTH: drive.client,
         },
         policy=CloudDrivePolicy(

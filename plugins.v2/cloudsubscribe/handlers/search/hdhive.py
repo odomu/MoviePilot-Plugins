@@ -104,6 +104,7 @@ class HDHiveSearchService(OwnerDelegator):
                     self._hdhive_password,
                     proxy,
                     self._hdhive_request_interval,
+                    self._hdhive_unlocks_per_minute,
             ):
                 if client:
                     client.close()
@@ -112,6 +113,7 @@ class HDHiveSearchService(OwnerDelegator):
                     password=self._hdhive_password,
                     proxy=proxy,
                     request_interval=self._hdhive_request_interval,
+                    unlocks_per_minute=self._hdhive_unlocks_per_minute,
                 )
                 self._hdhive_web_client = client
                 self._hdhive_web_resources = None
@@ -366,15 +368,20 @@ class HDHiveSearchService(OwnerDelegator):
             candidates = []
             for resource in enabled_resources:
                 candidate = dict(resource)
-                candidate["update_time"] = resource.get("created_at", "")
+                candidate["update_time"] = (
+                        resource.get("updated_at")
+                        or resource.get("posted_at")
+                        or resource.get("created_at")
+                        or ""
+                )
                 candidate["is_official"] = bool(resource.get("is_official"))
                 candidate["need_unlock"] = not bool(resource.get("is_unlocked")) and resource.get("unlock_points") != 0
                 candidates.append(candidate)
-            # OpenAPI 卡片标题同样是发布者备注。这里只按资源类型、官组、
-            # 可访问状态和积分预排序，实际文件名在转存阶段交给平台规则。
-            resources = self._prefilter_resource_order(candidates)[
-                : self._hdhive_candidate_limit
-            ]
+            # 更新时间决定首选候选；同时间再沿用类型、可用性、官组和积分顺序。
+            resources = sorted(
+                self._prefilter_resource_order(candidates),
+                key=self._hdhive_update_sort_key,
+            )[: self._hdhive_candidate_limit]
             available_resources = []
             request_failures = 0
             missing_slug_count = 0

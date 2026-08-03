@@ -9,7 +9,11 @@
           show-arrows
           class="section-tabs mb-4"
       >
-        <v-tab v-for="tab in section.subtabs" :key="tab.value" :value="tab.value">
+        <v-tab
+            v-for="tab in section.subtabs"
+            :key="tab.value"
+            :value="tab.value"
+        >
           <v-icon :icon="tab.icon" size="small" class="mr-2"/>
           {{ tab.title }}
         </v-tab>
@@ -41,7 +45,10 @@
                   :compact="Boolean(field.compact)"
                   :loading="refreshingAccount === field.accountKey"
                   :refreshable="Boolean(field.accountKey)"
-                  :disabled="Boolean(refreshingAccount) && refreshingAccount !== field.accountKey"
+                  :disabled="
+                  Boolean(refreshingAccount) &&
+                  refreshingAccount !== field.accountKey
+                "
                   @refresh="emit('refresh-account', field.accountKey)"
               />
               <v-alert
@@ -59,7 +66,7 @@
                     class="text-caption mb-1"
                 >
                   • {{ line }}
-                  </div>
+                </div>
               </v-alert>
               <v-btn
                   v-else-if="field.type === 'test-source'"
@@ -67,11 +74,75 @@
                   variant="tonal"
                   prepend-icon="mdi-flask-outline"
                   :loading="testingSource === field.source"
-                  :disabled="Boolean(testingSource) && testingSource !== field.source"
+                  :disabled="
+                  Boolean(testingSource) && testingSource !== field.source
+                "
                   @click="emit('test-source', field.source)"
               >
                 {{ field.label }}
               </v-btn>
+              <div
+                  v-else-if="field.type === 'hdhive-oauth'"
+                  class="hdhive-oauth-panel"
+              >
+                <div class="d-flex align-center flex-wrap ga-2 mb-2">
+                  <v-chip
+                      size="small"
+                      variant="tonal"
+                      :color="config.hdhive_access_token ? 'success' : 'warning'"
+                  >
+                    {{
+                      config.hdhive_access_token
+                          ? "已获取用户 Token"
+                          : "尚未完成用户授权"
+                    }}
+                  </v-chip>
+                  <span class="text-caption text-medium-emphasis">
+                    授权范围：query unlock
+                  </span>
+                </div>
+                <v-text-field
+                    v-if="config.hdhive_response_mode !== 'postmessage'"
+                    v-model="config.hdhive_oauth_callback"
+                    label="授权完成后的完整回调 URL"
+                    hint="请粘贴同时包含 code 和 state 的完整地址；插件会校验 state 后在服务端换取 Token。"
+                    persistent-hint
+                    clearable
+                    density="compact"
+                    variant="outlined"
+                    hide-details="auto"
+                    class="mb-2"
+                />
+                <div class="d-flex flex-wrap ga-2">
+                  <v-btn
+                      color="primary"
+                      variant="tonal"
+                      prepend-icon="mdi-open-in-new"
+                      :loading="hdhiveOauthAction === 'start'"
+                      :disabled="
+                      Boolean(hdhiveOauthAction) &&
+                      hdhiveOauthAction !== 'start'
+                    "
+                      @click="emit('hdhive-oauth-start')"
+                  >
+                    打开 HDHive 授权页
+                  </v-btn>
+                  <v-btn
+                      v-if="config.hdhive_response_mode !== 'postmessage'"
+                      color="success"
+                      variant="tonal"
+                      prepend-icon="mdi-shield-check-outline"
+                      :loading="hdhiveOauthAction === 'exchange'"
+                      :disabled="
+                      Boolean(hdhiveOauthAction) ||
+                      !String(config.hdhive_oauth_callback || '').trim()
+                    "
+                      @click="emit('hdhive-oauth-exchange')"
+                  >
+                    校验回调并完成授权
+                  </v-btn>
+                </div>
+              </div>
               <v-switch
                   v-else-if="field.type === 'switch'"
                   v-model="config[field.key]"
@@ -146,7 +217,9 @@
                       color="primary"
                       size="small"
                       title="浏览网盘目录"
-                      @click="emit('browse-directory', field.key, field.driveProvider)"
+                      @click="
+                      emit('browse-directory', field.key, field.driveProvider)
+                    "
                   />
                 </template>
               </v-text-field>
@@ -210,28 +283,35 @@ const props = defineProps({
   config: {type: Object, required: true},
   refreshingAccount: {type: String, default: ""},
   testingSource: {type: String, default: ""},
+  hdhiveOauthAction: {type: String, default: ""},
 });
 const emit = defineEmits([
   "scan",
   "browse-directory",
   "test-source",
   "refresh-account",
+  "hdhive-oauth-start",
+  "hdhive-oauth-exchange",
 ]);
 const activeSubtab = ref(props.section.subtabs?.[0]?.value || "");
-const availableGroups = computed(() => props.section.groups.filter(
+const availableGroups = computed(() =>
+    props.section.groups.filter(
     (group) => !group.show || group.show(props.config),
-));
-const leadingGroupCount = computed(() => availableGroups.value.filter(
-    (group) => group.beforeTabs,
-).length);
+    ),
+);
+const leadingGroupCount = computed(
+    () => availableGroups.value.filter((group) => group.beforeTabs).length,
+);
 const visibleGroups = computed(() => {
-  const leadingGroups = availableGroups.value.filter((group) => group.beforeTabs);
+  const leadingGroups = availableGroups.value.filter(
+      (group) => group.beforeTabs,
+  );
   const tabGroups = availableGroups.value.filter(
-      (group) => !group.beforeTabs && (
-          !props.section.subtabs?.length ||
-          !group.tab ||
-          group.tab === activeSubtab.value
-      ),
+      (group) =>
+          !group.beforeTabs &&
+          (!props.section.subtabs?.length ||
+              !group.tab ||
+              group.tab === activeSubtab.value),
   );
   return [...leadingGroups, ...tabGroups];
 });
@@ -306,5 +386,12 @@ const visibleGroups = computed(() => {
 
 .config-switch :deep(.v-input__details) {
   padding-inline: 4px;
+}
+
+.hdhive-oauth-panel {
+  padding: 12px;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 8px;
+  background: rgba(var(--v-theme-primary), 0.035);
 }
 </style>

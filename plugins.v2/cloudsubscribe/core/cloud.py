@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, FrozenSet, Iterable, Iterator, Mapping, Protocol, runtime_checkable
+from functools import wraps
+from threading import BoundedSemaphore, local
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, Mapping, Optional, Protocol, runtime_checkable
 
 
 class CloudDriveCapability(str, Enum):
@@ -19,6 +21,7 @@ class CloudDriveCapability(str, Enum):
     BATCH_FILE_MUTATION = "batch_file_mutation"
     PLAYBACK_REFERENCE = "playback_reference"
     OFFLINE_TASKS = "offline_tasks"
+    LOCAL_UPLOAD = "local_upload"
     QRCODE_AUTH = "qrcode_auth"
     CACHE_MAINTENANCE = "cache_maintenance"
 
@@ -250,7 +253,7 @@ class PlaybackReferenceOperations(Protocol):
 @runtime_checkable
 class OfflineTaskOperations(Protocol):
     def get_offline_task_list_snapshot(
-            self, force: bool = False
+            self, force: bool = False, task_ids: Optional[set[str]] = None
     ) -> Dict[str, Any]: ...
 
     def get_offline_tasks_snapshot(self, force: bool = False) -> Dict[str, Any]: ...
@@ -260,6 +263,18 @@ class OfflineTaskOperations(Protocol):
     def delete_offline_task(self, task_id: str, **kwargs: Any) -> bool: ...
 
     def delete_offline_tasks(self, task_ids: list, **kwargs: Any) -> int: ...
+
+
+@runtime_checkable
+class LocalUploadOperations(Protocol):
+    def upload_file(
+            self,
+            local_path: str,
+            save_path: str,
+            target_name: str = "",
+            file_sha1: str = "",
+            progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool: ...
 
 
 @runtime_checkable
@@ -288,6 +303,7 @@ CAPABILITY_CONTRACTS = {
     CloudDriveCapability.BATCH_FILE_MUTATION: BatchFileMutationOperations,
     CloudDriveCapability.PLAYBACK_REFERENCE: PlaybackReferenceOperations,
     CloudDriveCapability.OFFLINE_TASKS: OfflineTaskOperations,
+    CloudDriveCapability.LOCAL_UPLOAD: LocalUploadOperations,
     CloudDriveCapability.QRCODE_AUTH: QrCodeAuthOperations,
     CloudDriveCapability.CACHE_MAINTENANCE: CacheMaintenanceOperations,
 }
@@ -308,6 +324,44 @@ def _implements_contract(service: Any, contract: type) -> bool:
     return True
 
 
+class _ProviderIoGate:
+    """限制同一 provider 的顶层网盘 IO，并允许同线程嵌套调用。"""
+
+    def __init__(self, max_concurrency: int):
+        self._semaphore = BoundedSemaphore(max(1, int(max_concurrency or 1)))
+        self._local = local()
+
+    def call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        depth = int(getattr(self._local, "depth", 0) or 0)
+        if depth:
+            return func(*args, **kwargs)
+        with self._semaphore:
+            self._local.depth = depth + 1
+            try:
+                return func(*args, **kwargs)
+            finally:
+                self._local.depth = depth
+
+
+class _ProviderServiceProxy:
+    """为能力对象的公开方法统一注入 provider IO 并发门。"""
+
+    def __init__(self, service: Any, gate: _ProviderIoGate):
+        self._service = service
+        self._gate = gate
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._service, name)
+        if name.startswith("_") or not callable(value):
+            return value
+
+        @wraps(value)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            return self._gate.call(value, *args, **kwargs)
+
+        return guarded
+
+
 @dataclass(frozen=True)
 class CloudDriveProvider:
     """一个网盘及其实际具备的能力集合。
@@ -322,6 +376,10 @@ class CloudDriveProvider:
     resource_types: FrozenSet[str] = frozenset()
     config_prefix: str = ""
     policy: CloudDrivePolicy = field(default_factory=CloudDrivePolicy)
+    _io_gate: _ProviderIoGate = field(init=False, repr=False, compare=False)
+    _service_proxies: Mapping[CloudDriveCapability, Any] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         key = str(self.key or "").strip().lower()
@@ -336,6 +394,28 @@ class CloudDriveProvider:
                 for value in self.resource_types
                 if str(value or "").strip()
             ),
+        )
+        io_gate = _ProviderIoGate(self.policy.max_concurrency)
+        io_capabilities = {
+            CloudDriveCapability.SHARE_TRANSFER,
+            CloudDriveCapability.OFFLINE_DOWNLOAD,
+            CloudDriveCapability.DIRECTORY_READ,
+            CloudDriveCapability.FILE_QUERY,
+            CloudDriveCapability.FILE_MUTATION,
+            CloudDriveCapability.CHECKSUM_RENAME,
+            CloudDriveCapability.BATCH_FILE_MUTATION,
+            CloudDriveCapability.OFFLINE_TASKS,
+            CloudDriveCapability.LOCAL_UPLOAD,
+        }
+        object.__setattr__(self, "_io_gate", io_gate)
+        object.__setattr__(
+            self,
+            "_service_proxies",
+            {
+                capability: _ProviderServiceProxy(service, io_gate)
+                for capability, service in self.services.items()
+                if capability in io_capabilities
+            },
         )
         for capability, service in self.services.items():
             contract = CAPABILITY_CONTRACTS.get(capability)
@@ -362,7 +442,7 @@ class CloudDriveProvider:
             raise CloudDriveCapabilityError(
                 f"{self.name}不支持能力：{capability.value}"
             )
-        return service
+        return self._service_proxies.get(capability, service)
 
 
 class CloudDriveRegistry:

@@ -8,6 +8,7 @@ from typing import Dict, FrozenSet
 from .client import QuarkClient
 from .files import QuarkFileService
 from .share import QuarkShareService
+from .upload import QuarkUploadService
 from ...core.cloud import (
     CloudDriveCapability,
     CloudDrivePolicy,
@@ -44,6 +45,7 @@ class QuarkPlaybackReference:
 def create_quark_provider(drive: QuarkDrive) -> CloudDriveProvider:
     files = QuarkFileService(drive.client, drive.page_size)
     share = QuarkShareService(drive.client, files)
+    upload = QuarkUploadService(drive.client, files)
     playback_reference = QuarkPlaybackReference()
     return CloudDriveProvider(
         key="quark",
@@ -58,6 +60,7 @@ def create_quark_provider(drive: QuarkDrive) -> CloudDriveProvider:
             CloudDriveCapability.FILE_QUERY: files,
             CloudDriveCapability.FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
+            CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.QRCODE_AUTH: QuarkClient,
         },
         policy=CloudDrivePolicy(

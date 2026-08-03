@@ -82,6 +82,10 @@ class SyncRuntimeService(OwnerDelegator):
                 task_id: task
                 for task_id, task in self._sync_tasks.items()
                 if task.get("status") == "postprocessing"
+                   or (
+                           task.get("task_kind") == "pt_upgrade"
+                           and task.get("status") in {"queued", "running", "stopping"}
+                   )
             }
             retained.update(tasks)
             self._sync_tasks = retained
@@ -113,6 +117,16 @@ class SyncRuntimeService(OwnerDelegator):
                     max(0.0, now - started_at), 2
                 ) if started_at else 0
                 tasks.append(serialized)
+            status_order = {
+                "running": 0,
+                "stopping": 1,
+                "postprocessing": 2,
+                "queued": 3,
+            }
+            tasks.sort(key=lambda task: (
+                status_order.get(str(task.get("status") or ""), 9),
+                -float(task.get("started_at") or task.get("queued_at") or 0),
+            ))
             return tasks
 
     def _pending_finalize_count(self, subscribe: Any) -> int:
@@ -161,8 +175,17 @@ class SyncRuntimeService(OwnerDelegator):
                 "year": media_data.get("year") or "",
                 "season": item.get("season"),
                 "queued_at": float(item.get("created_at") or time.time()),
+                "task_kind": (
+                    "pt_upgrade"
+                    if str(item.get("share_url") or "").lower().startswith("pt://")
+                    else "cloud_upgrade" if item.get("upgrade") else "subscribe"
+                ),
             })
             group["count"] += 1
+            if str(item.get("share_url") or "").lower().startswith("pt://"):
+                group["task_kind"] = "pt_upgrade"
+            elif item.get("upgrade") and group["task_kind"] == "subscribe":
+                group["task_kind"] = "cloud_upgrade"
             group["queued_at"] = min(
                 float(group["queued_at"]),
                 float(item.get("created_at") or group["queued_at"]),
@@ -188,6 +211,7 @@ class SyncRuntimeService(OwnerDelegator):
                 pending_count = int(group["count"])
                 values = {
                     "status": "postprocessing",
+                    "task_kind": group["task_kind"],
                     "phase": f"文件后处理中（{pending_count} 个）",
                     "progress": 95,
                     "pending_count": pending_count,
@@ -249,6 +273,7 @@ class SyncRuntimeService(OwnerDelegator):
                 task_id,
                 status="running",
                 phase="建立洗版基线" if upgrade_task else "检查缺失内容",
+                task_kind="cloud_upgrade" if upgrade_task else "subscribe",
                 progress=10,
                 message="",
                 started_at=time.time(),
@@ -360,9 +385,12 @@ class SyncRuntimeService(OwnerDelegator):
         with self._sync_tasks_lock:
             for task in self._sync_tasks.values():
                 if task.get("status") in {"queued", "running", "stopping"}:
+                    stop_event = task.get("stop_event")
+                    if not stop_event:
+                        continue
                     task["status"] = "stopping"
                     task["phase"] = "等待安全停止"
-                    task["stop_event"].set()
+                    stop_event.set()
         self._set_sync_status("stopping", "已收到停止请求，等待当前操作安全结束", self._sync_progress)
         logger.info("收到快速停止请求，当前操作结束后将立即停止任务")
         return {"success": True, "message": "已发送停止请求"}
@@ -376,9 +404,12 @@ class SyncRuntimeService(OwnerDelegator):
                 return {"success": False, "message": "订阅任务不存在"}
             if task.get("status") not in {"queued", "running", "stopping"}:
                 return {"success": True, "message": "该订阅任务已经结束"}
+            stop_event = task.get("stop_event")
+            if not stop_event:
+                return {"success": False, "message": "当前任务不支持停止"}
             task["status"] = "stopping"
             task["phase"] = "等待安全停止"
-            task["stop_event"].set()
+            stop_event.set()
         logger.info(f"收到单任务停止请求：{task.get('title')}（{task_id}）")
         return {"success": True, "message": f"已请求停止：{task.get('title')}"}
 
@@ -398,7 +429,14 @@ class SyncRuntimeService(OwnerDelegator):
                 and offline_service
                 and shared_kwargs.get("offline_tasks") is None
         ):
-            snapshot = offline_service.get_offline_task_list_snapshot(force=True)
+            target_ids = set().union(*(
+                set(group.get("task_ids") or set())
+                for group in groups if group.get("needs_offline")
+            ))
+            snapshot = offline_service.get_offline_task_list_snapshot(
+                force=True,
+                task_ids=target_ids,
+            )
             shared_kwargs["offline_tasks"] = snapshot.get("tasks") or []
             shared_kwargs["offline_tasks_valid"] = bool(snapshot.get("refresh_ok"))
 
@@ -736,11 +774,11 @@ class SyncRuntimeService(OwnerDelegator):
                 scheduler = BackgroundScheduler(timezone=settings.TZ)
                 scheduler.add_job(
                     func=self.monitor_offline_tasks,
-                    trigger=IntervalTrigger(minutes=1),
+                    trigger=IntervalTrigger(seconds=20),
                     id="CloudSubscribe_OfflineMonitor",
                     next_run_time=datetime.datetime.now(
                         tz=pytz.timezone(settings.TZ)
-                    ) + datetime.timedelta(seconds=5),
+                    ) + datetime.timedelta(seconds=3),
                     max_instances=2,
                     coalesce=True,
                     replace_existing=True,
@@ -761,7 +799,7 @@ class SyncRuntimeService(OwnerDelegator):
             logger.debug("网盘文件终态后处理队列已清空，监控已停止")
 
     def monitor_offline_tasks(self):
-        """每分钟检查是否到达任务节点，实际请求间隔由待处理任务控制。"""
+        """轻量检查到期节点，实际网盘请求间隔由待处理任务控制。"""
         return self._run_offline_monitor()
 
     def _offline_task_service(self):

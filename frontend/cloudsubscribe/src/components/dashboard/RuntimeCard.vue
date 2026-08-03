@@ -30,6 +30,17 @@
               S{{ String(task.season).padStart(2, "0") }}
             </span>
             <v-chip
+                v-if="
+                task.task_kind === 'pt_upgrade' ||
+                task.task_kind === 'cloud_upgrade'
+              "
+                size="x-small"
+                variant="outlined"
+                :color="task.task_kind === 'pt_upgrade' ? 'warning' : 'primary'"
+            >
+              {{ task.task_kind === "pt_upgrade" ? "PT 洗版" : "网盘洗版" }}
+            </v-chip>
+            <v-chip
                 :color="taskColor(task.status)"
                 size="x-small"
                 variant="tonal"
@@ -43,18 +54,31 @@
                     ? task.message || task.phase || "处理失败"
                     : task.phase || "等待调度"
               }}</span>
+            <span
+                v-if="
+                task.task_kind === 'pt_upgrade' && Number(task.total || 0) > 0
+              "
+                class="task-transfer text-caption text-medium-emphasis"
+            >
+              {{ formatSize(task.transferred) }} /
+              {{ formatSize(task.total) }} ·
+              {{ formatSpeed(task.upload_speed) }}
+            </span>
           </div>
           <v-progress-linear
               class="task-progress"
               :model-value="Number(task.progress || 0)"
-              :indeterminate="['running', 'stopping', 'postprocessing'].includes(task.status)"
+              :indeterminate="
+              task.task_kind !== 'pt_upgrade' &&
+              ['running', 'stopping', 'postprocessing'].includes(task.status)
+            "
               :color="taskColor(task.status)"
               height="5"
               rounded
           />
         </div>
         <v-btn
-            v-if="canStop(task.status)"
+            v-if="canStop(task)"
             icon="mdi-stop-circle-outline"
             color="warning"
             variant="text"
@@ -74,7 +98,7 @@
         />
         <v-icon
             v-else
-            :icon="resultIcon(task.status)"
+            :icon="resultIcon(task.status, task.task_kind)"
             :color="taskColor(task.status)"
             size="small"
         />
@@ -131,8 +155,8 @@ const postprocessingCount = computed(
     () => tasks.value.filter((task) => task.status === "postprocessing").length,
 );
 
-function canStop(status) {
-  return ["queued", "running", "stopping"].includes(status);
+function canStop(task) {
+  return ["queued", "running", "stopping"].includes(task?.status);
 }
 
 function taskStatus(status) {
@@ -163,14 +187,32 @@ function taskColor(status) {
   );
 }
 
-function resultIcon(status) {
+function resultIcon(status, taskKind) {
+  if (taskKind === "pt_upgrade" && status === "running") {
+    return "mdi-cloud-upload-outline";
+  }
   return status === "postprocessing"
       ? "mdi-cog-sync-outline"
       : status === "completed"
       ? "mdi-check-circle"
       : status === "failed"
-          ? "mdi-alert-circle"
-          : "mdi-stop-circle";
+              ? "mdi-alert-circle"
+              : "mdi-stop-circle";
+}
+
+function formatSize(value) {
+  let size = Math.max(0, Number(value || 0));
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatSpeed(value) {
+  return `${formatSize(value)}/s`;
 }
 </script>
 
@@ -244,6 +286,11 @@ function resultIcon(status) {
   white-space: nowrap;
 }
 
+.task-transfer {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .task-progress {
   margin-top: 5px;
 }
@@ -267,6 +314,12 @@ function resultIcon(status) {
 
   .task-line {
     flex-wrap: wrap;
+  }
+
+  .task-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 }
 </style>

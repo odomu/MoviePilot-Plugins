@@ -4,9 +4,11 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin
@@ -41,6 +43,10 @@ class HDHiveClient:
     _LOGIN_ACTION_TTL = 60 * 60
     _RISK_COOLDOWN_SECONDS = 60
     _SERVER_ERROR_COOLDOWN_SECONDS = 5
+    _UNLOCK_WINDOW_SECONDS = 60.0
+    _UNLOCK_STATE_LOCK = threading.RLock()
+    _UNLOCK_HISTORIES: Dict[str, deque] = {}
+    _UNLOCK_LOCKS: Dict[str, threading.RLock] = {}
     _LOGIN_CHUNK_RE = re.compile(
         r"static/chunks/app/\(auth\)/login/page-[^\\\"']+\.js"
     )
@@ -66,6 +72,7 @@ class HDHiveClient:
             password: str,
             proxy: Any = None,
             request_interval: float = 2.0,
+            unlocks_per_minute: int = 5,
             timeout: int = 30,
     ):
         if not CURL_CFFI_AVAILABLE:
@@ -77,6 +84,12 @@ class HDHiveClient:
         self._password = str(password or "")
         self._proxies = normalize_proxies(proxy)
         self._timeout = max(5, min(int(timeout or 30), 120))
+        self._unlocks_per_minute = max(
+            1, min(int(unlocks_per_minute or 5), 5)
+        )
+        self._first_unlock_ready_at = (
+                time.monotonic() + random.uniform(3.0, 8.0)
+        )
         self._session_key = hashlib.sha256(
             f"{self.BASE_URL}\0{self._username}".encode("utf-8")
         ).hexdigest()
@@ -119,7 +132,7 @@ class HDHiveClient:
 
     def matches_config(
             self, username: str, password: str, proxy: Any,
-            request_interval: float,
+            request_interval: float, unlocks_per_minute: int,
     ) -> bool:
         """判断现有认证会话能否复用于当前配置。"""
         return (
@@ -128,6 +141,8 @@ class HDHiveClient:
                 and self._proxies == normalize_proxies(proxy)
                 and self._request_gate.request_interval
                 == max(0.5, min(float(request_interval or 2.0), 10.0))
+                and self._unlocks_per_minute
+                == max(1, min(int(unlocks_per_minute or 5), 5))
         )
 
     def close(self) -> None:
@@ -157,6 +172,27 @@ class HDHiveClient:
         )
 
     def _raw_request(self, method: str, path: str, **kwargs):
+        cooldown_remaining = self._request_gate.cooldown_remaining
+        if cooldown_remaining > 0:
+            status = self._request_gate.cooldown_status
+            raise HDHiveWebError(
+                f"HDHive WebAPI 处于 HTTP {status or '服务端'} 冷却期，"
+                f"跳过请求（剩余 {int(cooldown_remaining + 0.999)} 秒）",
+                code="rate_limited" if status in {403, 429} else "server_cooldown",
+                status_code=status,
+            )
+        request_headers = dict(kwargs.pop("headers", {}) or {})
+        try:
+            csrf_token = str(
+                self._session.cookies.get_dict().get("csrf_access_token") or ""
+            ).strip()
+        except Exception:
+            csrf_token = ""
+        if csrf_token and "x-csrf-token" not in {
+            str(key).lower() for key in request_headers
+        }:
+            # 与站点前端及 pure-api-client.mjs 保持一致。
+            request_headers["x-csrf-token"] = csrf_token
         try:
             return gated_idempotent_request(
                 self._request_gate,
@@ -165,6 +201,7 @@ class HDHiveClient:
                 urljoin(f"{self.BASE_URL}/", str(path or "").lstrip("/")),
                 proxies=self._proxies,
                 timeout=self._timeout,
+                headers=request_headers,
                 **kwargs,
             )
         except requests.exceptions.RequestException as error:
@@ -373,6 +410,10 @@ class HDHiveClient:
     def _requires_signed_response(cls, path: str) -> bool:
         if path in cls._SIGNED_RESPONSE_PATHS:
             return True
+        return cls._is_unlock_path(path)
+
+    @staticmethod
+    def _is_unlock_path(path: str) -> bool:
         return bool(re.fullmatch(
             r"/api/customer/(?:resources|music_resources)/[^/]+/unlock",
             path,
@@ -380,7 +421,76 @@ class HDHiveClient:
             r"/api/customer/tv-follow/packs/[^/]+/unlock", path
         ))
 
+    def _unlock_lock(self) -> threading.RLock:
+        with self._UNLOCK_STATE_LOCK:
+            return self._UNLOCK_LOCKS.setdefault(
+                self._session_key, threading.RLock()
+            )
+
+    def _wait_for_unlock_slot(self) -> None:
+        """按账户限制解锁频率，遵守站点每分钟最多五次的约束。"""
+        human_interval = (
+                self._UNLOCK_WINDOW_SECONDS / self._unlocks_per_minute
+                + random.uniform(1.0, 4.0)
+        )
+        while True:
+            with self._UNLOCK_STATE_LOCK:
+                history = self._UNLOCK_HISTORIES.setdefault(
+                    self._session_key, deque()
+                )
+                now = time.monotonic()
+                while (
+                        history
+                        and now - history[0] >= self._UNLOCK_WINDOW_SECONDS
+                ):
+                    history.popleft()
+                wait_seconds = max(self._first_unlock_ready_at - now, 0.0)
+                if history:
+                    wait_seconds = max(
+                        wait_seconds,
+                        human_interval - (now - history[-1]),
+                    )
+                if len(history) >= self._unlocks_per_minute:
+                    wait_seconds = max(
+                        wait_seconds,
+                        self._UNLOCK_WINDOW_SECONDS - (now - history[0]),
+                    )
+            if wait_seconds <= 0:
+                return
+            logger.debug(
+                f"HDHive 解锁接口按节奏等待 {wait_seconds:.1f} 秒"
+            )
+            time.sleep(wait_seconds)
+
+    def _record_unlock_attempt(self) -> None:
+        with self._UNLOCK_STATE_LOCK:
+            history = self._UNLOCK_HISTORIES.setdefault(
+                self._session_key, deque()
+            )
+            now = time.monotonic()
+            while history and now - history[0] >= self._UNLOCK_WINDOW_SECONDS:
+                history.popleft()
+            history.append(now)
+
     def _signed_request(
+            self,
+            method: str,
+            path: str,
+            body: bytes = b"",
+            headers: Optional[Dict[str, str]] = None,
+            retry: bool = True,
+    ):
+        if self._is_unlock_path(path):
+            with self._unlock_lock():
+                self._wait_for_unlock_slot()
+                return self._signed_request_once(
+                    method, path, body=body, headers=headers, retry=retry
+                )
+        return self._signed_request_once(
+            method, path, body=body, headers=headers, retry=retry
+        )
+
+    def _signed_request_once(
             self,
             method: str,
             path: str,
@@ -402,9 +512,19 @@ class HDHiveClient:
             "X-HDH-Sig": signature,
             "X-HDH-Kid": self._security.KID,
         })
-        response = self._raw_request(
-            method, path, headers=request_headers, data=body or None
-        )
+        is_unlock = self._is_unlock_path(path)
+        try:
+            response = self._raw_request(
+                method, path, headers=request_headers, data=body or None
+            )
+        except HDHiveWebError as error:
+            if is_unlock and error.code not in {
+                "rate_limited", "server_cooldown"
+            }:
+                self._record_unlock_attempt()
+            raise
+        if is_unlock:
+            self._record_unlock_attempt()
         response_body = bytes(response.content or b"")
         response_signature = str(response.headers.get("X-HDH-RSig") or "")
         if response_signature:
@@ -419,6 +539,26 @@ class HDHiveClient:
                     "HDHive 响应签名校验失败", code="response_signature_invalid"
                 )
         elif response.status_code != 401 and self._requires_signed_response(path):
+            if response.status_code >= 400:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                error_value = payload.get("error") if isinstance(payload, dict) else None
+                message = str(
+                    error_value.get("message")
+                    if isinstance(error_value, dict)
+                    else payload.get("message") if isinstance(payload, dict) else ""
+                ).strip()
+                raise HDHiveWebError(
+                    f"HDHive 受保护接口请求失败："
+                    f"{message or f'HTTP {response.status_code}'}",
+                    code=(
+                        "rate_limited"
+                        if response.status_code == 429 else "request_failed"
+                    ),
+                    status_code=response.status_code,
+                )
             raise HDHiveWebError(
                 "HDHive 受保护接口未返回响应签名",
                 code="response_signature_required",

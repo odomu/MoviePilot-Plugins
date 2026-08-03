@@ -96,6 +96,41 @@ class PluginEventHandler(OwnerDelegator):
         logger.debug(f"已接管平台资源下载：{torrent_info.title}")
         return True
 
+    def _has_pending_cloud_target(
+            self,
+            subscribes: list,
+            seasons: list,
+            episodes: list,
+    ) -> bool:
+        """判断平台资源是否与正在处理的网盘订阅目标重叠。"""
+        subscribe_ids = {
+            int(getattr(subscribe, "id", 0) or 0) for subscribe in subscribes
+        }
+        subscribe_ids.discard(0)
+        if not subscribe_ids or not self._sync_handler:
+            return False
+        season_set = {int(value) for value in (seasons or []) if int(value) > 0}
+        episode_set = {int(value) for value in (episodes or []) if int(value) > 0}
+        for item in self._sync_handler.get_pending_finalize_tasks():
+            if int(item.get("subscribe_id") or 0) not in subscribe_ids:
+                continue
+            pending_season = int(item.get("season") or 0)
+            if season_set and pending_season and pending_season not in season_set:
+                continue
+            pending_episodes = {
+                int(value)
+                for value in (
+                        item.get("target_episodes")
+                        or item.get("success_episodes")
+                        or item.get("notification_episodes")
+                        or ([item.get("episode")] if item.get("episode") else [])
+                )
+                if int(value) > 0
+            }
+            if not episode_set or not pending_episodes or episode_set & pending_episodes:
+                return True
+        return False
+
     def _get_subscribe_id_from_event(self, event: Event) -> Optional[int]:
         if not event or not event.event_data:
             return None
@@ -125,6 +160,25 @@ class PluginEventHandler(OwnerDelegator):
             return
         logger.debug(f"订阅配置已修改，不改写站点：subscribe_id={sid}")
         return
+
+    def on_transfer_complete(self, event: Event):
+        """MoviePilot PT 整理完成后异步进入网盘洗版上传。"""
+        if (
+                not event
+                or not self._enabled
+                or not self._enable_pt_upgrade
+                or not self._sync_handler
+        ):
+            return
+        event_data = event.event_data or {}
+        if not event_data.get("downloader") or not event_data.get("download_hash"):
+            return
+        Thread(
+            target=self._sync_handler.process_pt_upgrade,
+            args=(dict(event_data),),
+            daemon=True,
+            name="cloudsubscribe-pt-upgrade",
+        ).start()
 
     def _post_command_message(self, event_data: dict, title: str, text: str) -> None:
         self.post_message(
@@ -256,7 +310,7 @@ class PluginEventHandler(OwnerDelegator):
         if not all_subs:
             return
 
-        # 接管时段内，本插件负责的订阅不允许 MoviePilot 同时提交 PT 下载。
+        # 接管时段内，按平台下载策略处理本插件负责的订阅。
         managed_subscribes = [
             subscribe for subscribe in all_subs
             if not self._is_subscribe_excluded(subscribe.id)
@@ -267,25 +321,33 @@ class PluginEventHandler(OwnerDelegator):
             and len(managed_subscribes) == len(all_subs)
         )
         episode_list = event_data.episodes or meta.episode_list or []
+        policy = self._platform_download_policy
+
+        if all_plugin_managed and policy == "allow":
+            if self._has_pending_cloud_target(
+                    managed_subscribes, season_list, episode_list
+            ):
+                event_data.cancel = True
+                event_data.source = "CloudSubscribe-重复资源拦截"
+                event_data.reason = "同一订阅季集已有网盘任务正在处理，已阻止重复下载"
+                logger.debug(f"已阻止平台重复下载：{torrent.title}")
+            return
 
         is_tv = media_type == MediaType.TV.value
         can_match = bool(episode_list) if is_tv else True
-        if (
-                all_plugin_managed
-                and self._takeover_platform_downloads
-                and can_match
-        ):
+        if all_plugin_managed and policy == "cloud":
             subscribe = managed_subscribes[0]
             takeover_success = False
-            try:
-                takeover_success = self._takeover_platform_download(
-                    event_data=event_data,
-                    subscribe=subscribe,
-                    season=int(season_list[0] or 1),
-                    episodes=sorted({int(value) for value in episode_list}),
-                )
-            except Exception as error:
-                logger.error(f"接管平台资源下载异常：{error}")
+            if can_match:
+                try:
+                    takeover_success = self._takeover_platform_download(
+                        event_data=event_data,
+                        subscribe=subscribe,
+                        season=int(season_list[0] or 1),
+                        episodes=sorted({int(value) for value in episode_list}),
+                    )
+                except Exception as error:
+                    logger.error(f"接管平台资源下载异常：{error}")
             event_data.cancel = True
             event_data.source = "CloudSubscribe-平台资源下载接管"
             event_data.reason = (
@@ -294,7 +356,7 @@ class PluginEventHandler(OwnerDelegator):
             )
             return
 
-        if all_plugin_managed and self._block_platform_downloads:
+        if all_plugin_managed and policy == "block":
             sub_name = all_subs[0].name if all_subs else "未知"
             event_data.cancel = True
             event_data.source = "CloudSubscribe-平台资源下载拦截"

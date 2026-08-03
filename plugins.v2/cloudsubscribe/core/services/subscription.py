@@ -22,30 +22,6 @@ class SubscriptionControlService(OwnerDelegator):
             return subscribe_id not in set(self._include_subscribes or [])
         return subscribe_id in set(self._exclude_subscribes or [])
 
-    def _is_time_in_unblock(self, time_str: str = None) -> bool:
-        """
-        判断指定时间（或当前时间）是否在取消屏蔽时间段内。
-        仅在 block_system_subscribe=OFF 时生效。
-        支持跨天时段（如 22:00 ~ 06:00）。
-        """
-        if self._block_system_subscribe:
-            # 屏蔽系统订阅开启时，不按时间段判断（始终接管）
-            return False
-        if not self._unblock_start_time or not self._unblock_end_time:
-            return False
-
-        tz = pytz.timezone(settings.TZ)
-        now = datetime.datetime.now(tz=tz).strftime("%H:%M")
-        check = time_str or now
-
-        u_start = self._unblock_start_time.strip()
-        u_end = self._unblock_end_time.strip()
-
-        if u_start < u_end:
-            return u_start <= check <= u_end
-        else:
-            return check >= u_start or check <= u_end
-
     def _is_time_in_block(self, time_str: str = None) -> bool:
         """
         判断指定时间（或当前时间）是否在屏蔽时间段内。
@@ -74,8 +50,6 @@ class SubscriptionControlService(OwnerDelegator):
             return False
         if self._block_system_subscribe:
             return True
-        if self._is_time_in_unblock():
-            return False
         return self._is_time_in_block()
 
     def _is_cloud_upgrade_subscribe(self, subscribe) -> bool:

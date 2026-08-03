@@ -19,7 +19,8 @@ on:
     branches:
       - main
     paths:
-      - package*.json
+      - package.json
+      - package.v2.json
 
 concurrency:
   group: release-plugins-${{ github.ref }}
@@ -28,6 +29,7 @@ concurrency:
 jobs:
   detect-plugins:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.detect.outputs.plugins }}
     steps:
@@ -54,6 +56,7 @@ jobs:
     needs: detect-plugins
     if: ${{ needs.detect-plugins.outputs.matrix != '[]' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     strategy:

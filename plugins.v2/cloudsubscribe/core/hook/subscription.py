@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Tuple
 from app.chain.subscribe import SubscribeChain
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
+
 from .. import OwnerDelegator
 
 
@@ -108,11 +109,8 @@ class SubscriptionSearchHook(OwnerDelegator):
             progress_callback=progress_callback,
         )
 
-    def _dispatch_subscribe_refresh(
-            self,
-            progress_callback: Optional[Callable[..., None]] = None,
-    ):
-        """接管态阻止 RSS/PT 刷新再次进入 MoviePilot 全量订阅匹配。"""
+    def _dispatch_subscribe_refresh(self, progress_callback: Optional[Callable[..., None]] = None, ):
+        """按平台下载策略决定接管态是否继续 MoviePilot RSS/PT 刷新。"""
         if not self._is_takeover_active():
             return SubscribeChain().refresh(progress_callback=progress_callback)
 

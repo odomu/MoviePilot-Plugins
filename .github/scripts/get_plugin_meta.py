@@ -24,6 +24,7 @@ def read_package(path: Path, revision: str | None = None) -> dict[str, Any]:
             content = subprocess.check_output(
                 ["git", "show", f"{revision}:{path.as_posix()}"],
                 text=True,
+                encoding="utf-8",
                 stderr=subprocess.DEVNULL,
             )
         except subprocess.CalledProcessError:
@@ -118,9 +119,19 @@ def manual_plugins() -> list[dict[str, Any]]:
 
 
 def changed_package_files(before: str, after: str) -> list[Path]:
-    output = subprocess.check_output(
-        ["git", "diff", "--name-only", before, after], text=True
-    )
+    try:
+        output = subprocess.check_output(
+            ["git", "diff", "--name-only", before, after],
+            text=True,
+            encoding="utf-8",
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as error:
+        # 强推或改写历史后，GitHub 事件中的 before 可能不在 checkout 中。
+        # 工作流仅由 package*.json 触发，此时重新检查当前清单即可安全恢复发布。
+        detail = (error.stderr or "").strip()
+        log(f"[Warn] 无法读取提交范围 {before}..{after}，改为检查当前插件清单：{detail}")
+        return sorted(Path.cwd().glob("package*.json"))
     return [
         Path(name)
         for name in output.splitlines()

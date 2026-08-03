@@ -77,7 +77,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -141,6 +141,10 @@ class CloudSubscribe(_PluginBase):
     @eventmanager.register(ChainEventType.ResourceDownload)
     def on_resource_download(self, event: Event):
         return self._get_component(PluginEventHandler).on_resource_download(event)
+
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event):
+        return self._get_component(PluginEventHandler).on_transfer_complete(event)
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event: Event):
@@ -213,17 +217,19 @@ class CloudSubscribe(_PluginBase):
     _search_concurrency: int = 2
     _hdhive_candidate_limit: int = 4
     _hdhive_request_interval: float = 2.0
+    _hdhive_unlocks_per_minute: int = 5
     _hdhive_torrentclaw_enabled: bool = False
     _hdhive_torrentclaw_subtitle_languages: List[str] = ["zh"]
 
     _hdhive_enabled: bool = False
     _hdhive_username: str = ""
     _hdhive_password: str = ""
-    _hdhive_query_mode: str = "api"
+    _hdhive_query_mode: str = "web"
     # OpenAPI 应用凭证：应用 Secret 放 X-API-Key（沿用 hdhive_api_key 配置键）
     _hdhive_api_key: str = ""
     _hdhive_client_id: str = ""
     _hdhive_redirect_uri: str = ""
+    _hdhive_response_mode: str = "redirect"
     # OAuth 用户授权（授权码为一次性输入，换取 Token 后自动清空）
     _hdhive_auth_code: str = ""
     _hdhive_access_token: str = ""
@@ -246,8 +252,7 @@ class CloudSubscribe(_PluginBase):
     # 是否屏蔽系统订阅（True=已屏蔽系统订阅，False=已恢复系统订阅）
     _block_system_subscribe: bool = False
     _takeover_new_subscribes: bool = False
-    _block_platform_downloads: bool = True
-    _takeover_platform_downloads: bool = False
+    _platform_download_policy: str = "block"
 
     _max_transfer_per_sync: int = 50
     _subscription_concurrency: int = 2
@@ -259,6 +264,7 @@ class CloudSubscribe(_PluginBase):
     _last_scored_ids_hash: str = ""  # 上次评分过的ids hash值，用于保存配置时防重复触发
     _self_heal_interval: int = 10
     _enable_cloud_upgrade: bool = False
+    _enable_pt_upgrade: bool = False
     _upgrade_mode: str = "largest"
     _local_resource_path: str = ""  # 容器内本地或挂载媒体根路径
     _p115_transfer_path: str = "/"
@@ -289,9 +295,6 @@ class CloudSubscribe(_PluginBase):
     # 屏蔽态时间段（block_system_subscribe=OFF 时生效）
     _block_start_time: str = "18:00"
     _block_end_time: str = "23:59"
-    # 开放态时间段（block_system_subscribe=OFF 时生效，开放态内自动恢复用户站点）
-    _unblock_start_time: str = "00:00"
-    _unblock_end_time: str = "17:30"
     # 全局配置是否已应用（安装成功首次执行时才修改MP系统配置）
     _global_config_applied: bool = False
 
@@ -376,6 +379,36 @@ class CloudSubscribe(_PluginBase):
     ) -> None:
         """应用配置并重建相关服务；普通保存不重置同步任务状态。"""
         config = dict(config or {})
+        original_config = dict(config)
+        legacy_download_keys = (
+            "block_platform_downloads", "takeover_platform_downloads"
+        )
+        if (
+                "platform_download_policy" not in config
+                and any(key in config for key in legacy_download_keys)
+        ):
+            config["platform_download_policy"] = (
+                "cloud"
+                if bool(config.get("takeover_platform_downloads", False))
+                else "block"
+                if bool(config.get("block_platform_downloads", True))
+                else "allow"
+            )
+        for deprecated_key in (
+                *legacy_download_keys, "unblock_start_time", "unblock_end_time"
+        ):
+            config.pop(deprecated_key, None)
+        if "platform_download_policy" in config:
+            policy = str(config.get("platform_download_policy") or "block").strip().lower()
+            if policy not in {"allow", "block", "cloud"}:
+                logger.warning(f"未知平台下载策略：{policy}，已回退为阻止平台下载")
+                policy = "block"
+            config["platform_download_policy"] = policy
+        if config != original_config:
+            if self.update_config(config):
+                logger.info("订阅接管配置已迁移为新平台下载策略")
+            else:
+                logger.warning("订阅接管配置迁移持久化失败，本次运行仍使用迁移后配置")
         hot_keys = {
             "show_sidebar_nav",
             "agent_enabled",
@@ -571,15 +604,18 @@ class CloudSubscribe(_PluginBase):
 
             self._hdhive_enabled = config.get("hdhive_enabled", False)
             self._hdhive_query_mode = str(
-                config.get("hdhive_query_mode", "api") or "api"
+                config.get("hdhive_query_mode", "web") or "web"
             )
             if self._hdhive_query_mode not in {"api", "web"}:
-                self._hdhive_query_mode = "web" if (
-                        config.get("hdhive_username") and config.get("hdhive_password")
-                ) else "api"
+                self._hdhive_query_mode = "web"
             self._hdhive_api_key = (config.get("hdhive_api_key", "") or "").strip()
             self._hdhive_client_id = (config.get("hdhive_client_id", "") or "").strip()
             self._hdhive_redirect_uri = (config.get("hdhive_redirect_uri", "") or "").strip()
+            self._hdhive_response_mode = str(
+                config.get("hdhive_response_mode", "redirect") or "redirect"
+            ).strip().lower()
+            if self._hdhive_response_mode not in {"redirect", "postmessage"}:
+                self._hdhive_response_mode = "redirect"
             self._hdhive_auth_code = (config.get("hdhive_auth_code", "") or "").strip()
             self._hdhive_access_token = config.get("hdhive_access_token", "")
             self._hdhive_refresh_token = config.get("hdhive_refresh_token", "")
@@ -631,6 +667,9 @@ class CloudSubscribe(_PluginBase):
             self._hdhive_request_interval = max(
                 0.5, min(float(config.get("hdhive_request_interval", 2) or 2), 10.0)
             )
+            self._hdhive_unlocks_per_minute = max(
+                1, min(int(config.get("hdhive_unlocks_per_minute", 5) or 5), 5)
+            )
             self._dian115_candidate_limit = max(
                 1, min(int(config.get("dian115_candidate_limit", 4) or 4), 20)
             )
@@ -655,6 +694,7 @@ class CloudSubscribe(_PluginBase):
             self._upgrade_subscribe_ids = config.get("upgrade_subscribe_ids", []) or []
             self._self_heal_interval = int(config.get("self_heal_interval", 10))
             self._enable_cloud_upgrade = bool(config.get("enable_cloud_upgrade", False))
+            self._enable_pt_upgrade = bool(config.get("enable_pt_upgrade", False))
             self._upgrade_mode = str(
                 config.get("upgrade_mode", "largest") or "largest"
             ).strip().lower()
@@ -721,24 +761,17 @@ class CloudSubscribe(_PluginBase):
                     max(0, float(config.get(key, default) or 0)),
                 )
 
-            # 取消屏蔽时间段配置
+            # 订阅接管时段配置
             self._block_start_time = str(
                 config.get("block_start_time", self._block_start_time) or self._block_start_time)
             self._block_end_time = str(config.get("block_end_time", self._block_end_time) or self._block_end_time)
-            self._unblock_start_time = str(
-                config.get("unblock_start_time", self._unblock_start_time) or self._unblock_start_time)
-            self._unblock_end_time = str(
-                config.get("unblock_end_time", self._unblock_end_time) or self._unblock_end_time)
 
             self._block_system_subscribe = bool(config.get("block_system_subscribe", False))
             self._takeover_new_subscribes = bool(
                 config.get("takeover_new_subscribes", False)
             )
-            self._block_platform_downloads = bool(
-                config.get("block_platform_downloads", True)
-            )
-            self._takeover_platform_downloads = bool(
-                config.get("takeover_platform_downloads", False)
+            self._platform_download_policy = str(
+                config.get("platform_download_policy", "block") or "block"
             )
 
         # 初始化客户端/handlers
@@ -759,8 +792,8 @@ class CloudSubscribe(_PluginBase):
         from app.core.plugin import PluginManager
         PluginManager().clear_plugin_agent_tools_cache()
         logger.info(
-            f"{action}：屏蔽态={self._block_start_time}~{self._block_end_time}, "
-            f"开放态={self._unblock_start_time}~{self._unblock_end_time}, "
+            f"{action}：接管时段={self._block_start_time}~{self._block_end_time}, "
+            f"平台下载策略={self._platform_download_policy}, "
             f"网盘洗版={'开启' if self._enable_cloud_upgrade else '关闭'}, "
             f"洗版模式={self._upgrade_mode}, "
             f"洗版范围={'指定订阅' if self._upgrade_subscribe_ids else '全部'}, "
@@ -1118,7 +1151,10 @@ class CloudSubscribe(_PluginBase):
         # 未完成授权时，打印授权链接引导用户操作
         if not client.is_ready:
             if self._hdhive_client_id and self._hdhive_redirect_uri:
-                authorize_url = client.build_authorize_url(self._hdhive_redirect_uri)
+                authorize_url = client.build_authorize_url(
+                    self._hdhive_redirect_uri,
+                    response_mode=self._hdhive_response_mode,
+                )
                 logger.warning(
                     f"HDHive OpenAPI: 尚未完成用户授权，请在浏览器打开以下链接完成授权，"
                     f"然后将回调地址中的 code 参数填入插件配置的「授权码」并保存：\n{authorize_url}"
@@ -1187,6 +1223,7 @@ class CloudSubscribe(_PluginBase):
             search_concurrency=self._search_concurrency,
             hdhive_candidate_limit=self._hdhive_candidate_limit,
             hdhive_request_interval=self._hdhive_request_interval,
+            hdhive_unlocks_per_minute=self._hdhive_unlocks_per_minute,
             dian115_candidate_limit=self._dian115_candidate_limit,
             dian115_request_interval=self._dian115_request_interval,
             hdhive_torrentclaw_enabled=self._hdhive_torrentclaw_enabled,
@@ -1215,6 +1252,7 @@ class CloudSubscribe(_PluginBase):
             save_data_func=self.save_data,
             self_heal_interval=self._self_heal_interval,
             enable_cloud_upgrade=self._enable_cloud_upgrade,
+            enable_pt_upgrade=self._enable_pt_upgrade,
             upgrade_mode=self._upgrade_mode,
             upgrade_subscribe_ids=self._upgrade_subscribe_ids,
             local_resource_path=self._local_resource_path,
@@ -1323,6 +1361,7 @@ class CloudSubscribe(_PluginBase):
             "hdhive_api_key": self._hdhive_api_key,
             "hdhive_client_id": self._hdhive_client_id,
             "hdhive_redirect_uri": self._hdhive_redirect_uri,
+            "hdhive_response_mode": self._hdhive_response_mode,
             "hdhive_auth_code": self._hdhive_auth_code,
             "hdhive_access_token": self._hdhive_access_token,
             "hdhive_refresh_token": self._hdhive_refresh_token,
@@ -1347,6 +1386,7 @@ class CloudSubscribe(_PluginBase):
             "search_concurrency": self._search_concurrency,
             "hdhive_candidate_limit": self._hdhive_candidate_limit,
             "hdhive_request_interval": self._hdhive_request_interval,
+            "hdhive_unlocks_per_minute": self._hdhive_unlocks_per_minute,
             "dian115_candidate_limit": self._dian115_candidate_limit,
             "dian115_request_interval": self._dian115_request_interval,
             "hdhive_torrentclaw_enabled": self._hdhive_torrentclaw_enabled,
@@ -1358,18 +1398,16 @@ class CloudSubscribe(_PluginBase):
             "include_subscribes": self._include_subscribes,
             "block_system_subscribe": self._block_system_subscribe,
             "takeover_new_subscribes": self._takeover_new_subscribes,
-            "block_platform_downloads": self._block_platform_downloads,
-            "takeover_platform_downloads": self._takeover_platform_downloads,
+            "platform_download_policy": self._platform_download_policy,
             "block_start_time": self._block_start_time,
             "block_end_time": self._block_end_time,
             "upgrade_subscribe_ids": self._upgrade_subscribe_ids,
-            "unblock_start_time": self._unblock_start_time,
-            "unblock_end_time": self._unblock_end_time,
             "max_transfer_per_sync": self._max_transfer_per_sync,
             "subscription_concurrency": self._subscription_concurrency,
             "batch_size": self._batch_size,
             "skip_other_season_dirs": self._skip_other_season_dirs,
             "enable_cloud_upgrade": self._enable_cloud_upgrade,
+            "enable_pt_upgrade": self._enable_pt_upgrade,
             "upgrade_mode": self._upgrade_mode,
             "local_resource_path": self._local_resource_path,
             "cloud_transfer_path": self._p115_transfer_path,

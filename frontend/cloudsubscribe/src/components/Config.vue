@@ -21,8 +21,7 @@
             title="返回详情"
             @click="emit('switch')"
         >返回详情
-        </v-btn
-        >
+        </v-btn>
         <v-btn
             class="config-header-action"
             variant="text"
@@ -31,8 +30,7 @@
             title="关闭"
             @click="emit('close')"
         >关闭
-        </v-btn
-        >
+        </v-btn>
       </v-card-title>
       <v-card-text class="pa-0 config-body">
         <v-tabs
@@ -64,10 +62,13 @@
                   :config="config"
                   :refreshing-account="refreshingAccount"
                   :testing-source="testingSource"
+                  :hdhive-oauth-action="hdhiveOauthAction"
                   @scan="openQrCode"
                   @browse-directory="openDirectoryPicker"
                   @test-source="openSourceTest"
                   @refresh-account="refreshAccount"
+                  @hdhive-oauth-start="startHdhiveOAuth"
+                  @hdhive-oauth-exchange="exchangeHdhiveOAuth"
               />
             </section>
           </div>
@@ -83,7 +84,12 @@
         />
         <v-slide-y-transition>
           <div v-if="saving" class="save-state" aria-live="polite">
-            <v-progress-circular indeterminate size="16" width="2" color="primary"/>
+            <v-progress-circular
+                indeterminate
+                size="16"
+                width="2"
+                color="primary"
+            />
             正在保存配置
           </div>
         </v-slide-y-transition>
@@ -97,8 +103,7 @@
             :loading="saving"
             @click="save"
         >保存配置
-        </v-btn
-        >
+        </v-btn>
       </v-card-actions>
     </v-card>
     <QrCodeDialog
@@ -114,10 +119,14 @@
         :initial-path="directoryField ? config[directoryField] : '/'"
         @select="selectDirectory"
     />
-    <v-dialog v-model="sourceTestVisible" max-width="640" class="source-test-dialog">
+    <v-dialog
+        v-model="sourceTestVisible"
+        max-width="640"
+        class="source-test-dialog"
+    >
       <v-card
           class="source-test-card"
-          :class="{'source-test-card--results': tmdbSearched || testSubmitted}"
+          :class="{ 'source-test-card--results': tmdbSearched || testSubmitted }"
       >
         <v-card-title class="source-test-header d-flex align-center ga-2">
           <v-icon icon="mdi-flask-outline" color="primary"/>
@@ -157,7 +166,10 @@
                 />
               </v-col>
             </v-row>
-            <div v-if="tmdbSearched && !testSubmitted" class="source-test-tmdb mt-3">
+            <div
+                v-if="tmdbSearched && !testSubmitted"
+                class="source-test-tmdb mt-3"
+            >
               <div class="text-caption text-medium-emphasis mb-2">
                 选择 TMDB 条目后将立即测试 {{ sourceNames[sourceTest.source] }}
               </div>
@@ -176,7 +188,11 @@
                 </div>
               </div>
               <div v-else class="source-test-tmdb-scroll">
-                <v-list v-if="tmdbCandidates.length" density="compact" lines="two">
+                <v-list
+                    v-if="tmdbCandidates.length"
+                    density="compact"
+                    lines="two"
+                >
                   <v-list-item
                       v-for="item in tmdbCandidates"
                       :key="`${item.media_type}-${item.tmdb_id}`"
@@ -190,8 +206,14 @@
                     <template #prepend>
                       <v-avatar rounded="lg" size="48" color="surface-variant">
                         <v-img v-if="item.poster" :src="item.poster" cover/>
-                        <v-icon v-else
-                                :icon="item.media_type === 'movie' ? 'mdi-movie-open-outline' : 'mdi-television-classic'"/>
+                        <v-icon
+                            v-else
+                            :icon="
+                            item.media_type === 'movie'
+                              ? 'mdi-movie-open-outline'
+                              : 'mdi-television-classic'
+                          "
+                        />
                       </v-avatar>
                     </template>
                     <template #append>
@@ -202,7 +224,12 @@
                           size="20"
                           width="2"
                       />
-                      <v-chip v-else size="x-small" variant="tonal" color="primary">
+                      <v-chip
+                          v-else
+                          size="x-small"
+                          variant="tonal"
+                          color="primary"
+                      >
                         TMDB {{ item.tmdb_id }}
                       </v-chip>
                     </template>
@@ -251,7 +278,11 @@
                 </v-tab>
               </v-tabs>
               <div class="source-test-result-scroll">
-                <v-list v-if="filteredTestItems.length" density="compact" class="source-test-result-list">
+                <v-list
+                    v-if="filteredTestItems.length"
+                    density="compact"
+                    class="source-test-result-list"
+                >
                   <v-list-item
                       v-for="(item, index) in filteredTestItems"
                       :key="`${item.title}-${index}`"
@@ -266,13 +297,28 @@
                             color="primary"
                             :href="item.source_url || undefined"
                             :target="item.source_url ? '_blank' : undefined"
-                            :rel="item.source_url ? 'noopener noreferrer' : undefined"
+                            :rel="
+                            item.source_url ? 'noopener noreferrer' : undefined
+                          "
                         >
-                          {{ item.source_name || testResult.source_name || "未知来源" }}
-                          <v-icon v-if="item.source_url" icon="mdi-open-in-new" size="12" class="ml-1"/>
+                          {{
+                            item.source_name ||
+                            testResult.source_name ||
+                            "未知来源"
+                          }}
+                          <v-icon
+                              v-if="item.source_url"
+                              icon="mdi-open-in-new"
+                              size="12"
+                              class="ml-1"
+                          />
                         </v-chip>
                         <v-chip size="x-small" variant="tonal">
-                          {{ item.resource_type_name || item.resource_type || "未知类型" }}
+                          {{
+                            item.resource_type_name ||
+                            item.resource_type ||
+                            "未知类型"
+                          }}
                         </v-chip>
                         <v-chip
                             v-if="testItemStatus(item)"
@@ -286,7 +332,7 @@
                           {{ item.size || "大小未知" }}
                         </span>
                         <v-chip
-                            v-for="tag in (item.tags || [])"
+                            v-for="tag in item.tags || []"
                             :key="`${item.title}-${tag}`"
                             size="x-small"
                             variant="outlined"
@@ -311,7 +357,11 @@
                 variant="flat"
                 prepend-icon="mdi-magnify"
                 :loading="searchingTmdb"
-                :disabled="Boolean(testingSource) || searchingTmdb || !String(sourceTest.title || '').trim()"
+                :disabled="
+                Boolean(testingSource) ||
+                searchingTmdb ||
+                !String(sourceTest.title || '').trim()
+              "
             >
               搜索资源
             </v-btn>
@@ -328,14 +378,19 @@
     >
       {{ message }}
       <template #actions>
-        <v-btn icon="mdi-close" size="small" variant="text" @click="messageVisible = false"/>
+        <v-btn
+            icon="mdi-close"
+            size="small"
+            variant="text"
+            @click="messageVisible = false"
+        />
       </template>
     </v-snackbar>
   </div>
 </template>
 
 <script setup>
-import {computed, onMounted, reactive, ref, watch} from "vue";
+import {computed, onBeforeUnmount, onMounted, reactive, ref, watch,} from "vue";
 import QrCodeDialog from "./dialogs/QrCodeDialog.vue";
 import CloudDirectoryDialog from "./dialogs/CloudDirectoryDialog.vue";
 import ConfigSection from "./config/ConfigSection.vue";
@@ -357,6 +412,7 @@ const qrVisible = ref(false),
     directoryProvider = ref("115"),
     saving = ref(false),
     refreshingAccount = ref(""),
+    hdhiveOauthAction = ref(""),
     testingSource = ref(""),
     searchingTmdb = ref(false),
     tmdbSearched = ref(false),
@@ -370,6 +426,7 @@ const qrVisible = ref(false),
     message = ref(""),
     messageType = ref("success"),
     messageVisible = ref(false);
+let hdhiveOauthWindow = null;
 const options = reactive({
   subscribes: [],
   mediaservers: [],
@@ -387,14 +444,22 @@ const testResourceTabs = computed(() => {
       : [];
   if (!types.length) return [];
   return [
-    {value: "all", title: "全部", count: Number(testResult.value?.count || 0)},
+    {
+      value: "all",
+      title: "全部",
+      count: Number(testResult.value?.count || 0),
+    },
     ...types,
   ];
 });
 const filteredTestItems = computed(() => {
-  const items = Array.isArray(testResult.value?.items) ? testResult.value.items : [];
+  const items = Array.isArray(testResult.value?.items)
+      ? testResult.value.items
+      : [];
   if (activeTestResourceType.value === "all") return items;
-  return items.filter((item) => item.resource_type === activeTestResourceType.value);
+  return items.filter(
+      (item) => item.resource_type === activeTestResourceType.value,
+  );
 });
 const testChannelSummary = computed(() => {
   const source = testResult.value?.source_name || "搜索渠道";
@@ -414,24 +479,44 @@ const sourceNames = {
 };
 const sourceTestConfigKeys = {
   pansou: [
-    "pansou_url", "pansou_username", "pansou_password",
-    "pansou_auth_enabled", "pansou_channels", "pansou_plugins",
-    "pansou_cloud_types", "pansou_filter_include", "pansou_filter_exclude",
-    "pansou_concurrency", "pansou_result_limit", "pansou_timeout",
+    "pansou_url",
+    "pansou_username",
+    "pansou_password",
+    "pansou_auth_enabled",
+    "pansou_channels",
+    "pansou_plugins",
+    "pansou_cloud_types",
+    "pansou_filter_include",
+    "pansou_filter_exclude",
+    "pansou_concurrency",
+    "pansou_result_limit",
+    "pansou_timeout",
   ],
   hdhive: [
-    "hdhive_query_mode", "hdhive_api_key", "hdhive_client_id",
-    "hdhive_access_token", "hdhive_refresh_token", "hdhive_token_expires_at",
-    "hdhive_username", "hdhive_password", "hdhive_candidate_limit",
-    "hdhive_request_interval", "hdhive_torrentclaw_enabled",
+    "hdhive_query_mode",
+    "hdhive_api_key",
+    "hdhive_client_id",
+    "hdhive_access_token",
+    "hdhive_refresh_token",
+    "hdhive_token_expires_at",
+    "hdhive_username",
+    "hdhive_password",
+    "hdhive_candidate_limit",
+    "hdhive_request_interval",
+    "hdhive_unlocks_per_minute",
+    "hdhive_torrentclaw_enabled",
     "hdhive_torrentclaw_subtitle_languages",
   ],
   dian115: [
-    "dian115_email", "dian115_password", "dian115_candidate_limit",
+    "dian115_email",
+    "dian115_password",
+    "dian115_candidate_limit",
     "dian115_request_interval",
   ],
   juying: [
-    "juying_username", "juying_password", "juying_result_limit",
+    "juying_username",
+    "juying_password",
+    "juying_result_limit",
     "juying_request_interval",
   ],
   seedhub: ["seedhub_result_limit"],
@@ -464,19 +549,16 @@ function applyOptions(data) {
   options.cloudDrives = Array.isArray(data.cloud_drives)
       ? data.cloud_drives
       : [];
-  options.account = data.account && typeof data.account === "object"
-      ? data.account
-      : {};
-  options.accounts = data.accounts && typeof data.accounts === "object"
-      ? data.accounts
-      : {};
-  options.searchAccounts = data.search_accounts &&
-  typeof data.search_accounts === "object"
+  options.account =
+      data.account && typeof data.account === "object" ? data.account : {};
+  options.accounts =
+      data.accounts && typeof data.accounts === "object" ? data.accounts : {};
+  options.searchAccounts =
+      data.search_accounts && typeof data.search_accounts === "object"
       ? data.search_accounts
       : {};
-  options.pansou = data.pansou && typeof data.pansou === "object"
-      ? data.pansou
-      : {};
+  options.pansou =
+      data.pansou && typeof data.pansou === "object" ? data.pansou : {};
   [
     "pansou_channels",
     "pansou_plugins",
@@ -501,7 +583,10 @@ function notify(text, type = "success") {
 function testItemStatus(item) {
   if (item?.is_unlocked) return {label: "已解锁", color: "success"};
   if (item?.need_unlock) {
-    return {label: `${Number(item.unlock_points || 0)} 积分`, color: "warning"};
+    return {
+      label: `${Number(item.unlock_points || 0)} 积分`,
+      color: "warning",
+    };
   }
   if (item?.is_free) return {label: "免费", color: "success"};
   if (item?.need_access) return {label: "待获取", color: "info"};
@@ -522,10 +607,9 @@ function tmdbCandidateSubtitle(item) {
 function sourceTestConfig(source) {
   const keys = ["resource_type_order", ...(sourceTestConfigKeys[source] || [])];
   return Object.fromEntries(
-      keys.filter((key) => key in config && config[key] !== undefined).map((key) => [
-        key,
-        JSON.parse(JSON.stringify(config[key])),
-      ]),
+      keys
+          .filter((key) => key in config && config[key] !== undefined)
+          .map((key) => [key, JSON.parse(JSON.stringify(config[key]))]),
   );
 }
 
@@ -568,7 +652,9 @@ async function loadOptions() {
 }
 
 async function refreshAccount(accountKey, {silent = false} = {}) {
-  const normalizedKey = String(accountKey || "").trim().toLowerCase();
+  const normalizedKey = String(accountKey || "")
+      .trim()
+      .toLowerCase();
   if (!normalizedKey || refreshingAccount.value) return;
   refreshingAccount.value = normalizedKey;
   try {
@@ -582,9 +668,8 @@ async function refreshAccount(accountKey, {silent = false} = {}) {
     }
     const data = response.data?.data || response.data || {};
     const [category, source] = String(data.key || normalizedKey).split(":", 2);
-    const account = data.account && typeof data.account === "object"
-        ? data.account
-        : {};
+    const account =
+        data.account && typeof data.account === "object" ? data.account : {};
     if (category === "drive") {
       options.accounts = {...options.accounts, [source]: account};
       if (String(config.cloud_drive || "") === source) {
@@ -594,9 +679,13 @@ async function refreshAccount(accountKey, {silent = false} = {}) {
       options.searchAccounts = {...options.searchAccounts, [source]: account};
     }
     if (!silent) {
-      notify(response.message || (data.limited
-          ? "刷新过于频繁，已显示最近一次账户信息"
-          : "账户信息已刷新"), data.limited ? "warning" : "success");
+      notify(
+          response.message ||
+          (data.limited
+              ? "刷新过于频繁，已显示最近一次账户信息"
+              : "账户信息已刷新"),
+          data.limited ? "warning" : "success",
+      );
     }
   } catch (error) {
     if (!silent) {
@@ -612,11 +701,10 @@ async function save() {
   saving.value = true;
   messageVisible.value = false;
   try {
+    const payload = JSON.parse(JSON.stringify(config));
+    delete payload.hdhive_oauth_callback;
     const response = unwrapResponse(
-        await api.post(
-            "plugin/CloudSubscribe/config/save",
-            JSON.parse(JSON.stringify(config)),
-        ),
+        await api.post("plugin/CloudSubscribe/config/save", payload),
     );
     if (response.success === false) {
       throw new Error(response.message || "保存配置失败");
@@ -632,6 +720,99 @@ async function save() {
   } finally {
     saving.value = false;
   }
+}
+
+function hdhiveOAuthPayload() {
+  return {
+    client_id: String(config.hdhive_client_id || "").trim(),
+    app_secret: String(config.hdhive_api_key || "").trim(),
+    redirect_uri: String(config.hdhive_redirect_uri || "").trim(),
+    response_mode: String(config.hdhive_response_mode || "redirect").trim(),
+    scope: "query unlock",
+  };
+}
+
+async function startHdhiveOAuth() {
+  if (hdhiveOauthAction.value) return;
+  const oauthPopup = window.open(
+      "about:blank",
+      "hdhive-openapi-oauth",
+      "width=560,height=760,noopener=no",
+  );
+  hdhiveOauthAction.value = "start";
+  try {
+    const response = unwrapResponse(
+        await api.post(
+            "plugin/CloudSubscribe/hdhive/oauth/start",
+            hdhiveOAuthPayload(),
+        ),
+    );
+    if (response.success === false) {
+      throw new Error(response.message || "生成 HDHive 授权链接失败");
+    }
+    const data = response.data?.data || response.data || {};
+    if (!data.authorize_url) throw new Error("HDHive 授权链接为空");
+    if (oauthPopup) {
+      oauthPopup.location.href = data.authorize_url;
+      hdhiveOauthWindow = oauthPopup;
+    } else {
+      window.open(data.authorize_url, "_blank", "noopener,noreferrer");
+    }
+    notify(response.message || "HDHive 授权页已打开");
+  } catch (error) {
+    if (oauthPopup && !oauthPopup.closed) oauthPopup.close();
+    notify(`发起 HDHive 授权失败：${error.message || error}`, "error");
+  } finally {
+    hdhiveOauthAction.value = "";
+  }
+}
+
+async function exchangeHdhiveOAuth(callbackData = {}) {
+  if (hdhiveOauthAction.value) return;
+  hdhiveOauthAction.value = "exchange";
+  try {
+    const response = unwrapResponse(
+        await api.post("plugin/CloudSubscribe/hdhive/oauth/exchange", {
+          ...hdhiveOAuthPayload(),
+          callback: String(config.hdhive_oauth_callback || "").trim(),
+          code: String(callbackData.code || "").trim(),
+          state: String(callbackData.state || "").trim(),
+        }),
+    );
+    if (response.success === false) {
+      throw new Error(response.message || "HDHive 用户授权失败");
+    }
+    const data = response.data?.data || response.data || {};
+    config.hdhive_access_token = data.access_token || "";
+    config.hdhive_refresh_token = data.refresh_token || "";
+    config.hdhive_token_expires_at = Number(data.token_expires_at || 0);
+    config.hdhive_auth_code = "";
+    config.hdhive_oauth_callback = "";
+    if (hdhiveOauthWindow && !hdhiveOauthWindow.closed)
+      hdhiveOauthWindow.close();
+    hdhiveOauthWindow = null;
+    notify(
+        data.warning || "HDHive OpenAPI 授权成功，请保存配置使 Token 生效",
+        data.warning ? "warning" : "success",
+    );
+  } catch (error) {
+    notify(`完成 HDHive 授权失败：${error.message || error}`, "error");
+  } finally {
+    hdhiveOauthAction.value = "";
+  }
+}
+
+function handleHdhiveOAuthMessage(event) {
+  if (event.origin !== "https://hdhive.com") return;
+  const payload = event.data;
+  if (
+      !payload ||
+      payload.source !== "hdhive-openapi" ||
+      payload.type !== "authorization_response" ||
+      String(payload.client_id || "") !== String(config.hdhive_client_id || "")
+  )
+    return;
+  exchangeHdhiveOAuth(payload);
 }
 
 function openSourceTest(source) {
@@ -708,7 +889,8 @@ async function testSource(candidate) {
     notify(response.message || "搜索渠道测试完成");
   } catch (e) {
     const status = Number(e?.response?.status || 0);
-    testError.value = status === 502
+    testError.value =
+        status === 502
         ? `${sourceNames[sourceTest.source] || "搜索渠道"} 测试请求被网关中断（HTTP 502），请检查渠道服务状态及反向代理超时`
         : e?.response?.data?.message || e.message || String(e);
   } finally {
@@ -718,12 +900,18 @@ async function testSource(candidate) {
 }
 
 onMounted(async () => {
+  window.addEventListener("message", handleHdhiveOAuthMessage);
   emit("layout", {maxWidth: "62rem"});
   try {
     await loadOptions();
   } catch (e) {
     notify(`加载配置选项失败：${e.message || e}`, "warning");
   }
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("message", handleHdhiveOAuthMessage);
+  if (hdhiveOauthWindow && !hdhiveOauthWindow.closed) hdhiveOauthWindow.close();
 });
 
 watch(
@@ -739,8 +927,8 @@ watch(
       const drive = options.cloudDrives.find((item) => item.value === provider);
       if (!drive?.resource_types) return;
       const supported = new Set(drive.resource_types);
-      config.resource_type_order = (config.resource_type_order || []).filter((value) =>
-          supported.has(value),
+      config.resource_type_order = (config.resource_type_order || []).filter(
+          (value) => supported.has(value),
       );
     },
 );

@@ -27,6 +27,7 @@ from .baseline import UpgradeBaselineService
 from .history import HistoryService
 from .movie import MovieSyncProcessor
 from .offline import OfflineTaskService
+from .pt_upgrade import PtUpgradeService
 from .rule_scoring import UpgradeRuleScoringService
 from .television import TelevisionSyncProcessor
 from .upgrade import UpgradeService
@@ -51,6 +52,7 @@ _COMPONENT_TYPES = (
     UpgradeBaselineService,
     UpgradeRuleScoringService,
     UpgradeService,
+    PtUpgradeService,
 )
 
 
@@ -58,7 +60,7 @@ class SyncHandler:
     """同步处理器"""
 
     _OFFLINE_PENDING_KEY = "pending_offline_strm_v1"
-    _OFFLINE_CHECK_DELAYS = (60, 180, 300, 600, 600)
+    _OFFLINE_CHECK_DELAYS = (10, 20, 40, 60, 120, 300)
     _OFFLINE_TIMEOUT = 30 * 60
     _FILE_FINALIZE_TIMEOUT = 24 * 60 * 60
     _OFFLINE_MONITOR_LEASE_SECONDS = 15 * 60
@@ -68,6 +70,11 @@ class SyncHandler:
     _SUBSCRIBE_DEFER_CACHE_LIMIT = 512
     _SUBSCRIBE_CALENDAR_CACHE_LIMIT = 512
     _CLOUD_MEDIA_ROOT = "/"
+    _OFFLINE_RESOURCE_URL_RE = re.compile(
+        r"ed2k://\|file\|[^|\r\n]+\|\d+\|[0-9A-Fa-f]{32}"
+        r"(?:\|(?:h|p)=[^|\r\n]+)*\|/|magnet:\?[^\s\r\n]+",
+        re.IGNORECASE,
+    )
 
     def _get_component(self, component_type):
         return get_component(self, component_type, "_handler_components")
@@ -92,6 +99,7 @@ class SyncHandler:
             save_data_func: Callable = None,
             self_heal_interval: int = 10,
             enable_cloud_upgrade: bool = False,
+            enable_pt_upgrade: bool = False,
             upgrade_mode: str = "largest",
             upgrade_subscribe_ids: Optional[List[int]] = None,
             local_resource_path: str = "",
@@ -129,6 +137,7 @@ class SyncHandler:
         :param save_data_func: 保存数据的函数
         :param self_heal_interval: 自愈检查间隔（分钟）
         :param enable_cloud_upgrade: 启用网盘洗版
+        :param enable_pt_upgrade: 启用 MoviePilot PT 整理后上传洗版
         :param upgrade_mode: 洗版文件处理模式
         :param local_resource_path: 容器内可访问的本地或挂载媒体根路径
         :param strm_generate_enabled: 转存成功后是否直接生成 STRM
@@ -174,6 +183,9 @@ class SyncHandler:
         self._offline_tasks = self._optional_cloud_service(
             CloudDriveCapability.OFFLINE_TASKS
         )
+        self._cloud_upload = self._optional_cloud_service(
+            CloudDriveCapability.LOCAL_UPLOAD
+        )
         self._search_handler = search_handler
         self._subscribe_handler = subscribe_handler
         self._chain = chain
@@ -192,6 +204,9 @@ class SyncHandler:
         self._save_data = save_data_func
         self._self_heal_interval = self_heal_interval
         self._enable_cloud_upgrade = enable_cloud_upgrade
+        self._enable_pt_upgrade = bool(enable_pt_upgrade)
+        if self._enable_pt_upgrade and not self._cloud_upload:
+            logger.warning("PT洗版已启用，但当前网盘不支持本地文件上传")
         self._upgrade_subscribe_ids = list(upgrade_subscribe_ids or [])
         self._upgrade_mode = (
             str(upgrade_mode or "largest").strip().lower()
@@ -266,6 +281,8 @@ class SyncHandler:
         self._file_finalized = file_finalized
         self._task_update = task_update
         self._offline_pending_lock = threading.RLock()
+        self._pt_upgrade_lock = threading.RLock()
+        self._pt_upgrade_active = set()
         self._platform_history_lock = threading.RLock()
         self._transfer_budget_lock = threading.RLock()
         self._transfer_budget_used = 0
@@ -289,6 +306,16 @@ class SyncHandler:
         self._subscribe_calendar_cache: OrderedDict[
             Tuple[Any, ...], Dict[str, Any]
         ] = OrderedDict()
+        self._baseline_cache_lock = threading.RLock()
+        self._baseline_transfer_cache: Dict[
+            Tuple[Any, ...], Dict[int, List[Dict[str, Any]]]
+        ] = {}
+        self._baseline_plugin_cache: Dict[
+            Tuple[Any, ...], Dict[int, List[Dict[str, Any]]]
+        ] = {}
+        self._baseline_emby_cache: Dict[
+            Tuple[Any, ...], Dict[int, Dict[str, Any]]
+        ] = {}
 
     def _is_cloud_upgrade_subscribe(self, subscribe: Any) -> bool:
         """判断订阅是否属于插件网盘洗版范围。"""
@@ -339,6 +366,10 @@ class SyncHandler:
             self._resource_season_dir_cache.clear()
         with self._platform_root_lock:
             self._platform_root_cache.clear()
+        with self._baseline_cache_lock:
+            self._baseline_transfer_cache.clear()
+            self._baseline_plugin_cache.clear()
+            self._baseline_emby_cache.clear()
 
     @staticmethod
     def _calendar_date(value: Any) -> Optional[datetime.date]:
@@ -2175,24 +2206,32 @@ class SyncHandler:
         }
 
     @staticmethod
-    def _expand_unlocked_resource_urls(
+    def _expand_resource_urls(
             resources: List[Dict[str, Any]],
             resource_index: int,
             resource: Dict[str, Any],
-            unlocked: Any,
+            value: Any,
     ) -> str:
-        """一次解锁返回多条链接时展开候选，后续条目不重复计算积分。"""
-        raw_urls = unlocked if isinstance(unlocked, (list, tuple)) else [unlocked]
+        """展开列表或字符串中的多条离线链接，后续条目不重复计算积分。"""
+        raw_values = value if isinstance(value, (list, tuple)) else [value]
         urls = []
-        for value in raw_urls:
-            url = str(value or "").strip()
-            if url and url not in urls:
-                urls.append(url)
+        for raw_value in raw_values:
+            text = str(raw_value or "").replace("｜", "|").strip()
+            if not text:
+                continue
+            matches = list(SyncHandler._OFFLINE_RESOURCE_URL_RE.finditer(text))
+            extracted = [match.group(0).strip() for match in matches]
+            remainder = SyncHandler._OFFLINE_RESOURCE_URL_RE.sub("", text).strip()
+            candidates = extracted if extracted and not remainder else [text]
+            for url in candidates:
+                if url not in urls:
+                    urls.append(url)
         if not urls:
             return ""
 
         resource["url"] = urls[0]
         resource["need_unlock"] = False
+        resource["need_access"] = False
         if len(urls) > 1:
             expanded = []
             for url in urls[1:]:
@@ -2203,8 +2242,8 @@ class SyncHandler:
             resources[resource_index + 1:resource_index + 1] = expanded
             source_name = str(resource.get("source") or "资源源").upper()
             logger.debug(
-                f"{source_name} 同一资源解锁得到 {len(urls)} 条链接，"
-                "已按单次积分展开处理"
+                f"{source_name} 同一资源包含 {len(urls)} 条链接，"
+                "已展开处理且积分仅计一次"
             )
         return urls[0]
 
@@ -2218,10 +2257,14 @@ class SyncHandler:
     ) -> str:
         """统一处理积分搜索源的延迟解锁，并展开一次返回的多条链接。"""
         share_url = str(resource.get("url") or "").strip()
-        if share_url or not (
+        if share_url:
+            return self._expand_resource_urls(
+                resources, resource_index, resource, share_url
+            )
+        if not (
                 resource.get("need_unlock") or resource.get("need_access")
         ):
-            return share_url
+            return ""
         slug = str(resource.get("slug") or "").strip()
         if not slug:
             return ""
@@ -2276,7 +2319,7 @@ class SyncHandler:
                     f"{prefix}未能取得 {source_label} 资源链接：{resource_title}"
                 )
             return ""
-        return self._expand_unlocked_resource_urls(
+        return self._expand_resource_urls(
             resources, resource_index, resource, unlocked
         )
 

@@ -146,13 +146,38 @@ class HDHiveOpenAPIClient:
                 cache.pop(item, None)
         cache[key] = (now + ttl, copy.deepcopy(value))
 
-    def build_authorize_url(self, redirect_uri: str, scope: str = "", state: str = "") -> str:
-        """生成用户授权页 URL"""
+    def build_authorize_url(
+            self,
+            redirect_uri: str,
+            scope: str = "",
+            state: str = "",
+            response_mode: str = "redirect",
+    ) -> str:
+        """生成用户授权页 URL。state 必须由调用方保存并在回调时校验。"""
+        if not self.client_id:
+            raise HDHiveOpenAPIError("400", "缺少 OpenAPI Client ID")
+        redirect_uri = str(redirect_uri or "").strip()
+        parsed_redirect = urllib.parse.urlparse(redirect_uri)
+        if (
+                parsed_redirect.scheme not in {"http", "https"}
+                or not parsed_redirect.netloc
+                or parsed_redirect.fragment
+        ):
+            raise HDHiveOpenAPIError(
+                "400", "OAuth Redirect URI 必须是无 fragment 的完整 HTTP/HTTPS 地址"
+            )
+        response_mode = str(response_mode or "redirect").strip().lower()
+        if response_mode not in {"redirect", "postmessage"}:
+            raise HDHiveOpenAPIError(
+                "400", "当前插件仅支持 redirect 或 postmessage 授权回调"
+            )
+        state = str(state or "").strip() or secrets.token_urlsafe(32)
         params = {
             "client_id": self.client_id,
             "redirect_uri": redirect_uri,
             "scope": scope or self.DEFAULT_SCOPE,
-            "state": state or secrets.token_hex(16),
+            "state": state,
+            "response_mode": response_mode,
         }
         return f"{self.base_url}/openapi/authorize?{urllib.parse.urlencode(params)}"
 
@@ -172,6 +197,10 @@ class HDHiveOpenAPIClient:
                 "redirect_uri": (redirect_uri or "").strip(),
             },
         )
+        if not str(data.get("access_token") or "").strip():
+            raise HDHiveOpenAPIError(
+                "INVALID_TOKEN_RESPONSE", "HDHive OAuth Token 响应缺少 Access Token"
+            )
         self._apply_token_set(data)
         return data
 
@@ -187,6 +216,10 @@ class HDHiveOpenAPIClient:
             "/api/public/openapi/oauth/refresh",
             {"refresh_token": self.refresh_token},
         )
+        if not str(data.get("access_token") or "").strip():
+            raise HDHiveOpenAPIError(
+                "INVALID_TOKEN_RESPONSE", "HDHive OAuth Refresh 响应缺少 Access Token"
+            )
         self._apply_token_set(data)
         logger.info("HDHive OpenAPI: 用户 Access Token 刷新成功")
         return data

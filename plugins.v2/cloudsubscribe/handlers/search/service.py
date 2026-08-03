@@ -68,7 +68,7 @@ class SearchHandler:
             juying_enabled: bool = False,
             hdhive_username: str = "",
             hdhive_password: str = "",
-            hdhive_query_mode: str = "api",
+            hdhive_query_mode: str = "web",
             hdhive_auto_unlock: bool = False,
             hdhive_max_unlock_points: int = 50,
             hdhive_max_points_per_sub: int = 20,
@@ -96,6 +96,7 @@ class SearchHandler:
             search_concurrency: int = 2,
             hdhive_candidate_limit: int = 4,
             hdhive_request_interval: float = 2.0,
+            hdhive_unlocks_per_minute: int = 5,
             dian115_candidate_limit: int = 4,
             dian115_request_interval: float = 1.0,
             hdhive_torrentclaw_enabled: bool = False,
@@ -134,11 +135,9 @@ class SearchHandler:
         self._juying_enabled = bool(juying_enabled)
         self._hdhive_username = hdhive_username
         self._hdhive_password = hdhive_password
-        self._hdhive_query_mode = str(hdhive_query_mode or "api")
+        self._hdhive_query_mode = str(hdhive_query_mode or "web")
         if self._hdhive_query_mode not in {"api", "web"}:
-            self._hdhive_query_mode = (
-                "web" if hdhive_username and hdhive_password else "api"
-            )
+            self._hdhive_query_mode = "web"
         self._hdhive_auto_unlock = hdhive_auto_unlock
         self._hdhive_web_client = None
         self._hdhive_web_resources = None
@@ -216,6 +215,9 @@ class SearchHandler:
         self._hdhive_candidate_limit = max(1, min(int(hdhive_candidate_limit or 4), 20))
         self._hdhive_request_interval = max(
             0.5, min(float(hdhive_request_interval or 2.0), 10.0)
+        )
+        self._hdhive_unlocks_per_minute = max(
+            1, min(int(hdhive_unlocks_per_minute or 5), 5)
         )
         self._dian115_candidate_limit = max(
             1, min(int(dian115_candidate_limit or 4), 20)
@@ -812,6 +814,10 @@ class SearchHandler:
             key=lambda item: self._resource_sort_key(item, season, targets),
         )
 
+    def _hdhive_update_sort_key(self, resource: Dict[str, Any]) -> tuple:
+        """HDHive 最新更新时间优先，其余规则作为稳定的次级顺序。"""
+        return (-self._resource_timestamp(resource.get("update_time")),)
+
     @staticmethod
     def _resource_filter_title(resource: Dict[str, Any]) -> str:
         """将搜索源的结构化发布信息还原为 MoviePilot 可识别的规则标题。"""
@@ -1173,7 +1179,9 @@ class SearchHandler:
         ordered = self._prefilter_resource_order(
             results, season=season, target_episodes=target_episodes
         )
-        if source == "hdhive" or not apply_platform_rules:
+        if source == "hdhive":
+            return sorted(ordered, key=self._hdhive_update_sort_key)
+        if not apply_platform_rules:
             return ordered
         return self._filter_by_platform_rules(
             ordered,

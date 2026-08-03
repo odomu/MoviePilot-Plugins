@@ -86,6 +86,20 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "手动刷新单个账户信息卡片",
             },
             {
+                "path": "/hdhive/oauth/start",
+                "endpoint": self.api_vue_hdhive_oauth_start,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "生成HDHive OpenAPI用户授权链接",
+            },
+            {
+                "path": "/hdhive/oauth/exchange",
+                "endpoint": self.api_vue_hdhive_oauth_exchange,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "校验HDHive OAuth回调并换取用户Token",
+            },
+            {
                 "path": "/cloud/directories",
                 "endpoint": self.api_vue_cloud_directories,
                 "methods": ["GET"],

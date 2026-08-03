@@ -129,6 +129,7 @@ class RequestGate:
         self._serial_requests = bool(serial_requests)
         self._last_request_at = 0.0
         self._cooldown_until = 0.0
+        self._cooldown_status = 0
         self._lock = threading.RLock()
 
     @property
@@ -138,6 +139,17 @@ class RequestGate:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def cooldown_remaining(self) -> float:
+        """返回当前冷却剩余秒数，供调用方决定等待或快速失败。"""
+        with self._lock:
+            return max(0.0, self._cooldown_until - time.monotonic())
+
+    @property
+    def cooldown_status(self) -> int:
+        with self._lock:
+            return self._cooldown_status if self._cooldown_until > time.monotonic() else 0
 
     def run(self, request: Callable):
         """在同一把门锁内执行请求，确保所有接口共用限速。"""
@@ -190,9 +202,10 @@ class RequestGate:
                 self._server_error_cooldown_seconds
                 if status >= 500 else self._risk_cooldown_seconds
             )
-        self._cooldown_until = max(
-            self._cooldown_until, time.monotonic() + seconds
-        )
+        cooldown_until = time.monotonic() + seconds
+        if cooldown_until >= self._cooldown_until:
+            self._cooldown_until = cooldown_until
+            self._cooldown_status = status
         logger.warning(
             f"{self._name} 触发 HTTP {status} 风控，冷却 {seconds} 秒"
         )

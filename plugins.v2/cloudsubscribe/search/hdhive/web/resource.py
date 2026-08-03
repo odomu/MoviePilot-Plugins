@@ -181,9 +181,11 @@ class HDHiveResourceService:
                 "GET",
                 f"/tmdb/{normalized_type}/{int(tmdb_id)}",
                 headers={
-                    "accept": "text/x-component",
-                    "rsc": "1",
-                    "next-url": "/",
+                    "accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "*/*;q=0.8"
+                    ),
+                    "cache-control": "no-cache",
                     "referer": f"{self._client.BASE_URL}/",
                 },
             )
@@ -196,7 +198,18 @@ class HDHiveResourceService:
                     code="schema_changed",
                 )
             detail_path = redirect_match.group(1).replace("\\/", "/")
-            detail_response = self._client.request("GET", detail_path)
+            detail_response = self._client.request(
+                "GET",
+                detail_path,
+                headers={
+                    "accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "*/*;q=0.8"
+                    ),
+                    "cache-control": "no-cache",
+                    "referer": f"{self._client.BASE_URL}/",
+                },
+            )
             group_data = self._parse_group_data(
                 self._client.response_text(detail_response)
             )
@@ -363,12 +376,12 @@ class HDHiveResourceService:
         detail_rows = sorted(
             matched_rows,
             key=lambda row: (
+                -self._resource_timestamp(self._resource_update_time(row)),
                 type_order.get(self._resource_type(row), len(type_order)),
                 not self._is_free_resource(row),
                 row.get("is_official") is not True,
                 *coverage_order[id(row)],
                 self._unlock_points(row),
-                -self._resource_timestamp(row.get("updated_at")),
             ),
         )
         if magnet_filter:
@@ -398,7 +411,7 @@ class HDHiveResourceService:
             detail_path = HDHiveResourceService._resource_detail_path(
                 resource_type, slug
             )
-            update_time = str(row.get("updated_at") or "")
+            update_time = self._resource_update_time(row)
             resource_time = HDHiveResourceService._resource_timestamp(update_time)
             if (
                     earliest_air_time and resource_time
@@ -499,7 +512,6 @@ class HDHiveResourceService:
         normalized_type = str(resource_type or "").strip().lower()
         if not normalized_slug or normalized_type not in HDHIVE_DETAIL_RESOURCE_TYPES:
             raise HDHiveWebError("HDHive 资源标识或类型无效", code="invalid_resource")
-        detail_path = self._resource_detail_path(normalized_type, normalized_slug)
         listed_points = max(0, int(unlock_points or 0))
         endpoint = f"/api/customer/resources/{normalized_slug}/unlock"
         response = self._client.signed_request(
@@ -508,9 +520,6 @@ class HDHiveResourceService:
             body=b"",
             headers={
                 "accept": "application/json",
-                "content-type": "application/json",
-                "origin": self._client.BASE_URL,
-                "referer": f"{self._client.BASE_URL}{detail_path}",
             },
         )
         try:
@@ -520,11 +529,11 @@ class HDHiveResourceService:
                 "HDHive 解锁响应格式异常", code="unlock_invalid_response"
             ) from error
         data = payload.get("data") if isinstance(payload, dict) else None
-        if (
-                response.status_code >= 400
-                or not isinstance(payload, dict)
-                or not payload.get("success")
-                or not isinstance(data, dict)
+        if not (
+                response.status_code < 400
+                and isinstance(payload, dict)
+                and payload.get("success")
+                and isinstance(data, dict)
         ):
             error_value = payload.get("error") if isinstance(payload, dict) else None
             error_message = (
@@ -533,7 +542,14 @@ class HDHiveResourceService:
             message = str(
                 payload.get("message") or error_message
                 if isinstance(payload, dict) else ""
-            )
+            ).strip()
+            if any(marker in message for marker in ("页面过期", "请刷新页面")):
+                self._resource_cache.clear()
+                raise HDHiveWebError(
+                    f"HDHive 资源页面已过期，已停止自动重试：{message}",
+                    code="page_expired",
+                    status_code=response.status_code,
+                )
             raise HDHiveWebError(
                 f"HDHive 获取资源失败：{message or f'HTTP {response.status_code}'}",
                 code="unlock_failed",
@@ -629,6 +645,15 @@ class HDHiveResourceService:
             return parsed.timestamp()
         except ValueError:
             return 0
+
+    @staticmethod
+    def _resource_update_time(row: Dict[str, Any]) -> str:
+        return str(
+            row.get("updated_at")
+            or row.get("posted_at")
+            or row.get("created_at")
+            or ""
+        )
 
     @staticmethod
     def _episode_range(start: int, end: int) -> List[int]:

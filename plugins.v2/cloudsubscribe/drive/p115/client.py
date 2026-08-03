@@ -16,6 +16,7 @@ from .offline import OfflineDownloadService
 from .path_cache import PathCache
 from .rate_limiter import RateLimiter
 from .share import ShareService
+from .upload import P115UploadService
 from ...core import get_component, resolve_component
 from ...utils import DEFAULT_METADATA_URL_TEMPLATE
 
@@ -51,6 +52,7 @@ class P115ClientWithTimeout(P115Client if P115_AVAILABLE else object):
         "share_receive",
         "share_snap",
         "clouddownload_task_add_urls",
+        "upload_file",
     }
     NO_TIMEOUT_METHODS = {
         "login_qrcode",
@@ -98,7 +100,9 @@ class P115ClientWithTimeout(P115Client if P115_AVAILABLE else object):
         return wrapper
 
 
-_COMPONENT_TYPES = (ShareService, OfflineDownloadService, P115FileService)
+_COMPONENT_TYPES = (
+    ShareService, OfflineDownloadService, P115FileService, P115UploadService
+)
 
 
 class P115ClientManager:

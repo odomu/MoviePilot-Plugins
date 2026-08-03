@@ -3,10 +3,12 @@
 import ast
 import asyncio
 import inspect
+import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from threading import RLock, Thread
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from app.chain.mediaserver import MediaServerChain
 from app.core.config import settings
@@ -36,6 +38,8 @@ _ACCOUNT_REFRESH_GUARD = TTLCache(maxsize=16, ttl=30)
 _ACCOUNT_INFO_LOCK = RLock()
 _ACCOUNT_INFO_DATA_KEY = "account_info_cache"
 _SEARCH_TEST_TIMEOUT_SECONDS = 30
+_HDHIVE_OAUTH_PENDING = TTLCache(maxsize=16, ttl=10 * 60)
+_HDHIVE_OAUTH_LOCK = RLock()
 
 
 class PluginApi(OwnerDelegator):
@@ -64,6 +68,7 @@ class PluginApi(OwnerDelegator):
         "subscription_concurrency": (1, 5),
         "pansou_result_limit": (1, 100),
         "hdhive_candidate_limit": (1, 20),
+        "hdhive_unlocks_per_minute": (1, 5),
     }
     _SEARCH_TEST_CONFIG_FIELDS = {
         "pansou": frozenset({
@@ -78,6 +83,7 @@ class PluginApi(OwnerDelegator):
             "hdhive_access_token", "hdhive_refresh_token",
             "hdhive_token_expires_at", "hdhive_username", "hdhive_password",
             "hdhive_candidate_limit", "hdhive_request_interval",
+            "hdhive_unlocks_per_minute",
             "hdhive_torrentclaw_enabled",
             "hdhive_torrentclaw_subtitle_languages",
         }),
@@ -253,6 +259,7 @@ class PluginApi(OwnerDelegator):
         from ...search.juying import JuyingClient
 
         client = None
+        close_client = False
         try:
             if source == "hdhive":
                 if not self._hdhive_enabled:
@@ -260,23 +267,38 @@ class PluginApi(OwnerDelegator):
                         "connected": False,
                         "error": "启用并保存 HDHive 配置后读取账户信息",
                     }
-                if not self._hdhive_username or not self._hdhive_password:
-                    if self._hdhive_query_mode == "web":
+                if self._hdhive_query_mode == "api":
+                    if not self._hdhive_client or not self._hdhive_client.is_ready:
                         return {
                             "connected": False,
-                            "error": "请填写 HDHive 用户名和密码并保存配置",
+                            "error": "请先完成 HDHive OpenAPI 用户授权并保存配置",
                         }
+                    data = self._hdhive_client.get_me().get("data") or {}
+                    level = str(data.get("level") or "").strip().lower()
+                    return self._search_account_card(source, {
+                        "name": data.get("nickname") or data.get("username"),
+                        "avatar": data.get("avatar_url"),
+                        "points": data.get("points"),
+                        "level": level,
+                        "is_vip": level in {"vip", "forever_vip"},
+                        "signin_days": data.get("signin_days_total"),
+                        "share_count": data.get("share_num"),
+                        "status": "suspended" if data.get("is_blocked") else "active",
+                    })
+                if not self._hdhive_username or not self._hdhive_password:
                     return {
                         "connected": False,
-                        "error": "HDHive OpenAPI 未提供个人信息接口，可配置网页账号读取",
+                        "error": "请填写 HDHive 用户名和密码并保存配置",
                     }
                 client = HDHiveClient(
                     username=self._hdhive_username,
                     password=self._hdhive_password,
                     proxy=settings.PROXY,
                     request_interval=self._hdhive_request_interval,
+                    unlocks_per_minute=self._hdhive_unlocks_per_minute,
                     timeout=10,
                 )
+                close_client = True
             elif source == "dian115":
                 if not self._dian115_enabled:
                     return {
@@ -297,6 +319,7 @@ class PluginApi(OwnerDelegator):
                     get_data_func=self.get_data,
                     save_data_func=self.save_data,
                 )
+                close_client = True
             elif source == "juying":
                 if not self._juying_enabled:
                     return {
@@ -317,6 +340,7 @@ class PluginApi(OwnerDelegator):
                     get_data_func=self.get_data,
                     save_data_func=self.save_data,
                 )
+                close_client = True
             else:
                 raise ValueError("不支持的搜索账户")
             return self._search_account_card(source, client.get_account_info())
@@ -327,7 +351,7 @@ class PluginApi(OwnerDelegator):
                 "error": "账户信息读取失败，请检查登录凭据或稍后重试",
             }
         finally:
-            if client:
+            if client and close_client:
                 client.close()
 
     def _load_drive_account(
@@ -440,6 +464,147 @@ class PluginApi(OwnerDelegator):
         except Exception as error:
             logger.debug(f"手动刷新账户信息失败：{error}")
             return {"success": False, "message": f"刷新账户信息失败：{error}"}
+
+    @staticmethod
+    def _hdhive_oauth_values(payload: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        """校验授权发起和换 Token 共用的 OpenAPI 参数。"""
+        client_id = str(payload.get("client_id") or "").strip()
+        redirect_uri = str(payload.get("redirect_uri") or "").strip()
+        response_mode = str(payload.get("response_mode") or "redirect").strip().lower()
+        requested_scopes = [
+            value for value in str(payload.get("scope") or "query unlock").split()
+            if value in {"query", "unlock"}
+        ]
+        scopes = list(dict.fromkeys(requested_scopes))
+        if "query" not in scopes:
+            scopes.insert(0, "query")
+        if not client_id:
+            raise ValueError("请填写 HDHive OpenAPI Client ID")
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.fragment:
+            raise ValueError("OAuth Redirect URI 必须是无 fragment 的完整 HTTP/HTTPS 地址")
+        if response_mode not in {"redirect", "postmessage"}:
+            raise ValueError("当前插件仅支持 redirect 或 postmessage 授权回调")
+        return client_id, redirect_uri, " ".join(scopes), response_mode
+
+    def api_vue_hdhive_oauth_start(self, payload: Dict[str, Any]) -> dict:
+        """生成带服务端 state 记录的 HDHive OpenAPI 授权链接。"""
+        from ...search.hdhive import HDHiveOpenAPIClient
+
+        try:
+            payload = dict(payload or {})
+            client_id, redirect_uri, scope, response_mode = self._hdhive_oauth_values(payload)
+            state = secrets.token_urlsafe(32)
+            client = HDHiveOpenAPIClient(
+                app_secret="",
+                client_id=client_id,
+                proxy=settings.PROXY,
+                request_interval=self._hdhive_request_interval,
+            )
+            try:
+                authorize_url = client.build_authorize_url(
+                    redirect_uri=redirect_uri,
+                    scope=scope,
+                    state=state,
+                    response_mode=response_mode,
+                )
+            finally:
+                client.close()
+            with _HDHIVE_OAUTH_LOCK:
+                _HDHIVE_OAUTH_PENDING[state] = {
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "scope": scope,
+                    "response_mode": response_mode,
+                }
+            return {
+                "success": True,
+                "message": "HDHive 授权页已准备，请在 10 分钟内完成授权",
+                "data": {
+                    "authorize_url": authorize_url,
+                    "state": state,
+                    "response_mode": response_mode,
+                    "expires_in": 600,
+                },
+            }
+        except Exception as error:
+            return {"success": False, "message": str(error)}
+
+    def api_vue_hdhive_oauth_exchange(self, payload: Dict[str, Any]) -> dict:
+        """校验 OAuth state，使用授权码换 Token 并返回当前用户摘要。"""
+        from ...search.hdhive import HDHiveOpenAPIClient, HDHiveOpenAPIError
+
+        client = None
+        try:
+            payload = dict(payload or {})
+            client_id, redirect_uri, _scope, response_mode = self._hdhive_oauth_values(payload)
+            app_secret = str(payload.get("app_secret") or "").strip()
+            if not app_secret:
+                raise ValueError("请填写 HDHive OpenAPI 应用 Secret")
+
+            code = str(payload.get("code") or "").strip()
+            state = str(payload.get("state") or "").strip()
+            callback = str(payload.get("callback") or "").strip()
+            if callback:
+                parsed_callback = urlparse(callback)
+                query = parsed_callback.query if parsed_callback.scheme else callback.lstrip("?")
+                values = parse_qs(query, keep_blank_values=True)
+                code = str((values.get("code") or [code])[0] or "").strip()
+                state = str((values.get("state") or [state])[0] or "").strip()
+            if not code or not state:
+                raise ValueError("请粘贴包含 code 和 state 的完整回调 URL")
+
+            with _HDHIVE_OAUTH_LOCK:
+                pending = _HDHIVE_OAUTH_PENDING.get(state)
+            if not pending:
+                raise ValueError("授权 state 已失效，请重新打开授权页")
+            if (
+                    pending.get("client_id") != client_id
+                    or pending.get("redirect_uri") != redirect_uri
+                    or pending.get("response_mode") != response_mode
+            ):
+                raise ValueError("授权回调与发起授权时的应用配置不一致")
+
+            client = HDHiveOpenAPIClient(
+                app_secret=app_secret,
+                client_id=client_id,
+                proxy=settings.PROXY,
+                request_interval=self._hdhive_request_interval,
+            )
+            token_data = client.exchange_code(code, redirect_uri)
+            warning = ""
+            user = {}
+            try:
+                user = client.get_me().get("data") or {}
+            except HDHiveOpenAPIError as error:
+                warning = f"Token 已获取，但读取授权用户失败：[{error.code}] {error.message}"
+            with _HDHIVE_OAUTH_LOCK:
+                _HDHIVE_OAUTH_PENDING.pop(state, None)
+            return {
+                "success": True,
+                "message": "HDHive OpenAPI 用户授权成功",
+                "data": {
+                    "access_token": client.access_token,
+                    "refresh_token": client.refresh_token,
+                    "token_expires_at": client.token_expires_at,
+                    "expires_in": token_data.get("expires_in") or 0,
+                    "refresh_expires_in": token_data.get("refresh_expires_in") or 0,
+                    "scope": token_data.get("scope") or pending.get("scope") or "",
+                    "scopes": token_data.get("scopes") or [],
+                    "user": user,
+                    "warning": warning,
+                },
+            }
+        except HDHiveOpenAPIError as error:
+            return {
+                "success": False,
+                "message": f"[{error.code}] {error.message} {error.description}".strip(),
+            }
+        except Exception as error:
+            return {"success": False, "message": str(error)}
+        finally:
+            if client:
+                client.close()
 
     @cached(cache=_UI_OPTIONS_CACHE)
     def api_vue_ui_options(self) -> dict:
@@ -617,11 +782,9 @@ class PluginApi(OwnerDelegator):
             return [value]
 
         proxy = settings.PROXY
-        hdhive_query_mode = str(config.get("hdhive_query_mode") or "api")
+        hdhive_query_mode = str(config.get("hdhive_query_mode") or "web")
         if hdhive_query_mode not in {"api", "web"}:
-            hdhive_query_mode = "web" if (
-                    config.get("hdhive_username") and config.get("hdhive_password")
-            ) else "api"
+            hdhive_query_mode = "web"
         hdhive_client = None
         if source == "hdhive" and hdhive_query_mode == "api":
             hdhive_client = HDHiveOpenAPIClient(
@@ -746,6 +909,9 @@ class PluginApi(OwnerDelegator):
             ),
             hdhive_request_interval=float(
                 config.get("hdhive_request_interval", 2) or 2
+            ),
+            hdhive_unlocks_per_minute=int(
+                config.get("hdhive_unlocks_per_minute", 5) or 5
             ),
             dian115_candidate_limit=min(
                 4, int(config.get("dian115_candidate_limit", 4) or 4)

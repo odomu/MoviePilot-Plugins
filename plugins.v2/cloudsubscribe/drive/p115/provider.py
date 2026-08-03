@@ -12,6 +12,7 @@ from .files import (
 )
 from .offline import OfflineDownloadService
 from .share import ShareService
+from .upload import P115UploadService
 from ...core.cloud import (
     CloudDriveCapability,
     CloudDrivePolicy,
@@ -47,6 +48,7 @@ def create_p115_provider(manager: Any) -> CloudDriveProvider:
     files = manager._get_component(P115FileService)
     share = manager._get_component(ShareService)
     offline = manager._get_component(OfflineDownloadService)
+    upload = manager._get_component(P115UploadService)
     directory_reader = P115DirectoryReader(files)
     file_query = P115FileQuery(files)
     file_mutation = P115FileMutation(files)
@@ -69,6 +71,7 @@ def create_p115_provider(manager: Any) -> CloudDriveProvider:
             CloudDriveCapability.BATCH_FILE_MUTATION: batch_mutation,
             CloudDriveCapability.PLAYBACK_REFERENCE: P115PlaybackReference(),
             CloudDriveCapability.OFFLINE_TASKS: offline,
+            CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.QRCODE_AUTH: manager.__class__,
             CloudDriveCapability.CACHE_MAINTENANCE: cache_maintenance,
         },
