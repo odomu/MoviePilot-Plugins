@@ -14,6 +14,24 @@ from ...core import OwnerDelegator
 
 class UpgradeBaselineService(OwnerDelegator):
     @staticmethod
+    def _copy_episode_items(
+            value: Dict[int, List[Dict[str, Any]]]
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        return {
+            int(episode): [dict(item) for item in items]
+            for episode, items in value.items()
+        }
+
+    @staticmethod
+    def _baseline_key(subscribe, season: int) -> tuple:
+        return (
+            int(getattr(subscribe, "tmdbid", 0) or 0),
+            str(getattr(subscribe, "name", "") or "").casefold(),
+            str(getattr(subscribe, "year", "") or ""),
+            int(season or 1),
+        )
+
+    @staticmethod
     def _record_value(record: Any, key: str, default: Any = None) -> Any:
         if isinstance(record, dict):
             return record.get(key, default)
@@ -56,6 +74,11 @@ class UpgradeBaselineService(OwnerDelegator):
         """一次查询整季整理历史，按集建立文件候选索引。"""
         from app.db.transferhistory_oper import TransferHistoryOper
 
+        cache_key = self._baseline_key(subscribe, season)
+        with self._baseline_cache_lock:
+            cached = self._baseline_transfer_cache.get(cache_key)
+            if cached is not None:
+                return self._copy_episode_items(cached)
         tmdbid = getattr(subscribe, "tmdbid", None)
         with SessionFactory() as db:
             oper = TransferHistoryOper(db=db)
@@ -92,12 +115,21 @@ class UpgradeBaselineService(OwnerDelegator):
             for episode in self._episode_numbers(
                     self._record_value(record, "episodes")):
                 episode_files.setdefault(episode, []).append(item)
+        with self._baseline_cache_lock:
+            self._baseline_transfer_cache[cache_key] = self._copy_episode_items(
+                episode_files
+            )
         return episode_files
 
     def _plugin_history_episode_files(
             self, subscribe, season: int
     ) -> Dict[int, List[Dict[str, Any]]]:
         """按显式 episode 字段读取插件转存历史，不依赖 STRM 文件名。"""
+        cache_key = self._baseline_key(subscribe, season)
+        with self._baseline_cache_lock:
+            cached = self._baseline_plugin_cache.get(cache_key)
+            if cached is not None:
+                return self._copy_episode_items(cached)
         tmdbid = self._int_or_zero(getattr(subscribe, "tmdbid", 0))
         title = str(getattr(subscribe, "name", "") or "")
         episode_files: Dict[int, List[Dict[str, Any]]] = {}
@@ -124,6 +156,10 @@ class UpgradeBaselineService(OwnerDelegator):
                 "cloud_dir": str(record.get("cloud_dir") or "").strip(),
                 "source": "插件转存记录",
             })
+        with self._baseline_cache_lock:
+            self._baseline_plugin_cache[cache_key] = self._copy_episode_items(
+                episode_files
+            )
         return episode_files
 
     def _build_episode_baseline(
@@ -148,11 +184,28 @@ class UpgradeBaselineService(OwnerDelegator):
             if isinstance(item, dict):
                 candidates.setdefault(episode_number, []).append(dict(item))
 
-        _, emby_media = self._emby_media_resolver.episode_media(
-            chain=self._chain,
-            mediainfo=mediainfo,
-            season=season,
+        emby_key = (
+            *self._baseline_key(subscribe, season),
+            int(getattr(mediainfo, "tmdb_id", 0) or 0),
         )
+        with self._baseline_cache_lock:
+            cached_emby = self._baseline_emby_cache.get(emby_key)
+        if cached_emby is None:
+            _, emby_media = self._emby_media_resolver.episode_media(
+                chain=self._chain,
+                mediainfo=mediainfo,
+                season=season,
+            )
+            with self._baseline_cache_lock:
+                self._baseline_emby_cache[emby_key] = {
+                    int(episode): dict(item)
+                    for episode, item in emby_media.items()
+                }
+        else:
+            emby_media = {
+                int(episode): dict(item)
+                for episode, item in cached_emby.items()
+            }
         for episode, media_item in emby_media.items():
             media_file = Path(str(media_item.get("path") or ""))
             file_size = self._int_or_zero(media_item.get("size"))
@@ -168,12 +221,17 @@ class UpgradeBaselineService(OwnerDelegator):
             })
 
         baseline: Dict[int, Dict[str, Any]] = {}
+        score_cache: Dict[tuple, int] = {}
         for episode, items in candidates.items():
             scored = []
             for item in items:
-                score = self._get_mp_rule_score(
-                    item["file_name"], item["file_size"], subscribe, season, mediainfo
-                )
+                score_key = (item["file_name"], int(item["file_size"] or 0))
+                score = score_cache.get(score_key)
+                if score is None:
+                    score = self._get_mp_rule_score(
+                        item["file_name"], item["file_size"], subscribe, season, mediainfo
+                    )
+                    score_cache[score_key] = score
                 scored.append({**item, "score": score, "rule_score": score})
             if scored:
                 baseline[int(episode)] = max(

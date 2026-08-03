@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 from threading import RLock
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Set
 from urllib.parse import unquote
 
 from app.log import logger
@@ -184,8 +184,22 @@ class P123OfflineService:
                 self._refresh_ok = False
                 return [dict(task) for task in self._tasks]
 
-    def get_offline_task_list_snapshot(self, force: bool = False) -> Dict[str, Any]:
+    def get_offline_task_list_snapshot(
+            self,
+            force: bool = False,
+            task_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
         tasks = self._load_tasks(force=force)
+        normalized_ids = {
+            str(value or "").strip().upper()
+            for value in (task_ids or set())
+            if str(value or "").strip()
+        }
+        if normalized_ids:
+            tasks = [
+                task for task in tasks
+                if str(task.get("id") or "").strip().upper() in normalized_ids
+            ]
         with self._lock:
             return {
                 "tasks": tasks,

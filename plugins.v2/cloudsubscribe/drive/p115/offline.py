@@ -3,7 +3,7 @@
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote
 
 from app.log import logger
@@ -88,7 +88,7 @@ class OfflineDownloadService(OwnerDelegator):
                 self._format_offline_task(task)
                 for task in clouddownload_iter(
                     self.client,
-                    cooldown=2,
+                    cooldown=0.2,
                     type="web",
                     **self._ios_request_kwargs(app=False),
                 )
@@ -146,8 +146,26 @@ class OfflineDownloadService(OwnerDelegator):
             "failed": "下载失败",
         }.get(state, "处理中")
 
-    def get_offline_task_list_snapshot(self, force: bool = False) -> Dict[str, Any]:
-        """读取供后处理共享的任务列表快照，不请求离线额度。"""
+    def get_offline_task_list_snapshot(
+            self,
+            force: bool = False,
+            task_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """读取任务快照；后处理可按 Hash 定向查询，避免全量翻页。"""
+        normalized_ids = {
+            normalized
+            for value in (task_ids or set())
+            if (normalized := self._normalize_hash(value))
+        }
+        if normalized_ids:
+            tasks, refresh_ok = self._get_offline_tasks_by_hashes(normalized_ids)
+            return {
+                "tasks": tasks,
+                "updated_at": time.time(),
+                "cache_ttl": 0,
+                "refresh_ok": refresh_ok,
+                "targeted": True,
+            }
         tasks = self.get_offline_tasks(force=force)
         with self._offline_task_lock:
             updated_at = self._offline_task_cache_time
@@ -158,6 +176,59 @@ class OfflineDownloadService(OwnerDelegator):
             "cache_ttl": self.OFFLINE_TASK_CACHE_TTL,
             "refresh_ok": refresh_ok,
         }
+
+    def _get_offline_tasks_by_hashes(
+            self, task_ids: Set[str]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """使用 get_user_task 按 info_hash 直接读取任务，不扫描任务列表。"""
+        with self._offline_task_lock:
+            found = {
+                task_id: dict(task)
+                for task in self._offline_task_cache
+                if (task_id := self._normalize_hash(task.get("id"))) in task_ids
+            }
+        if found.keys() >= task_ids:
+            return list(found.values()), True
+        refresh_ok = True
+        try:
+            for task_id in task_ids - found.keys():
+                self.rate_limiter.wait()
+                self._api_call_count += 1
+                response = self.client.clouddownload_task(
+                    task_id,
+                    type="web",
+                    **self._ios_request_kwargs(app=False),
+                )
+                if not isinstance(response, dict):
+                    refresh_ok = False
+                    continue
+                raw_task = response.get("data") or response.get("task") or response
+                if not isinstance(raw_task, dict):
+                    continue
+                normalized = self._normalize_hash(
+                    raw_task.get("info_hash") or raw_task.get("id")
+                )
+                if normalized != task_id:
+                    continue
+                found[task_id] = self._format_offline_task(raw_task)
+        except Exception as error:
+            logger.warning(f"定向读取 115 离线任务失败，继续使用缓存：{error}")
+            return list(found.values()), False
+
+        with self._offline_task_lock:
+            cache_index = {
+                task_id: index
+                for index, task in enumerate(self._offline_task_cache)
+                if (task_id := self._normalize_hash(task.get("id")))
+            }
+            for task_id, task in found.items():
+                index = cache_index.get(task_id)
+                if index is None:
+                    self._offline_task_cache.insert(0, dict(task))
+                else:
+                    self._offline_task_cache[index] = dict(task)
+                self._offline_task_status[task_id] = str(task.get("state") or "")
+        return list(found.values()), refresh_ok
 
     def get_offline_tasks_snapshot(self, force: bool = False) -> Dict[str, Any]:
         """读取前端展示所需的任务列表和离线额度。"""

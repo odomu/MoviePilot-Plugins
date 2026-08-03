@@ -530,10 +530,10 @@ class SyncExecutionService(OwnerDelegator):
 
         completed_subscribes = 0
         if grouped_subscribes:
+            # 任务可先完成识别和基线预处理，
             worker_count = min(
                 self._subscription_concurrency,
                 len(grouped_subscribes),
-                self._cloud_drive.policy.max_concurrency,
             )
             logger.debug(
                 f"订阅并发调度：{total_subscribes} 个订阅，"

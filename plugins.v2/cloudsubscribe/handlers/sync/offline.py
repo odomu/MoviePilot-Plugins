@@ -108,11 +108,15 @@ class OfflineTaskService(OwnerDelegator):
             group = groups.setdefault(group_key, {
                 "pending_keys": set(),
                 "needs_offline": False,
+                "task_ids": set(),
             })
             group["pending_keys"].add(pending_key)
             group["needs_offline"] = group["needs_offline"] or str(
                 item.get("task_type") or "share"
             ) in {"ed2k", "magnet"}
+            task_id = str(item.get("task_id") or "").strip().upper()
+            if task_id:
+                group["task_ids"].add(task_id)
         return list(groups.values())
 
     @staticmethod
@@ -348,8 +352,14 @@ class OfflineTaskService(OwnerDelegator):
             )
             tasks = offline_tasks
             if needs_offline and tasks is None and self._offline_tasks:
+                target_ids = {
+                    str((pending.get(key) or {}).get("task_id") or "").strip().upper()
+                    for key in due_keys
+                    if str((pending.get(key) or {}).get("task_id") or "").strip()
+                }
                 snapshot = self._offline_tasks.get_offline_task_list_snapshot(
-                    force=True
+                    force=True,
+                    task_ids=target_ids,
                 )
                 tasks = snapshot.get("tasks") or []
                 offline_tasks_valid = bool(snapshot.get("refresh_ok"))

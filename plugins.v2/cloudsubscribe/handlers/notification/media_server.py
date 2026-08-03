@@ -67,10 +67,24 @@ class EmbyMediaResolver:
                 episode_ids = mediaserver_chain.get_season_episode_ids(
                     server=server_name, item_id=exists_media.itemid, season=season
                 )
-                for episode, item_id in (episode_ids or {}).items():
-                    episode = int(episode)
-                    if episode not in result:
-                        result[episode] = EmbyMediaResolver._item_media(service, str(item_id))
+                missing = [
+                    (int(episode), str(item_id))
+                    for episode, item_id in (episode_ids or {}).items()
+                    if int(episode) not in result
+                ]
+                if missing:
+                    with ThreadPoolExecutor(
+                            max_workers=min(6, len(missing)),
+                            thread_name_prefix="cloudsubscribe-emby-baseline",
+                    ) as executor:
+                        media_items = executor.map(
+                            lambda value: (
+                                value[0],
+                                EmbyMediaResolver._item_media(service, value[1]),
+                            ),
+                            missing,
+                        )
+                        result.update(media_items)
             except Exception as error:
                 logger.warning(
                     f"读取 Emby 洗版基线失败：{server_name} - "
