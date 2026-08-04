@@ -63,12 +63,15 @@
                   :refreshing-account="refreshingAccount"
                   :testing-source="testingSource"
                   :hdhive-oauth-action="hdhiveOauthAction"
+                  :refreshing-webhook-key="refreshingWebhookKey"
                   @scan="openQrCode"
                   @browse-directory="openDirectoryPicker"
                   @test-source="openSourceTest"
                   @refresh-account="refreshAccount"
                   @hdhive-oauth-start="startHdhiveOAuth"
                   @hdhive-oauth-exchange="exchangeHdhiveOAuth"
+                  @copy-text="copyText"
+                  @refresh-webhook-key="refreshMediaLibraryWebhookKey"
               />
             </section>
           </div>
@@ -413,6 +416,7 @@ const qrVisible = ref(false),
     saving = ref(false),
     refreshingAccount = ref(""),
     hdhiveOauthAction = ref(""),
+    refreshingWebhookKey = ref(false),
     testingSource = ref(""),
     searchingTmdb = ref(false),
     tmdbSearched = ref(false),
@@ -512,12 +516,14 @@ const sourceTestConfigKeys = {
     "dian115_password",
     "dian115_candidate_limit",
     "dian115_request_interval",
+    "dian115_unlocks_per_minute",
   ],
   juying: [
     "juying_username",
     "juying_password",
     "juying_result_limit",
     "juying_request_interval",
+    "juying_unlocks_per_minute",
   ],
   seedhub: ["seedhub_result_limit"],
   butailing: ["butailing_result_limit"],
@@ -578,6 +584,59 @@ function notify(text, type = "success") {
   message.value = text;
   messageType.value = type;
   messageVisible.value = true;
+}
+
+async function copyText(value) {
+  const text = String(value || "");
+  if (!text) return;
+  try {
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch (_) {
+        // 局域网 HTTP 页面可能暴露 API 但拒绝调用，继续使用兼容方式。
+      }
+    }
+    if (!copied) {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      const copied = document.execCommand("copy");
+      document.body.removeChild(input);
+      if (!copied) throw new Error("浏览器拒绝访问剪贴板");
+    }
+    notify("Webhook URL 已复制");
+  } catch (error) {
+    notify(`复制失败：${error.message || error}`, "error");
+  }
+}
+
+async function refreshMediaLibraryWebhookKey() {
+  if (refreshingWebhookKey.value) return;
+  refreshingWebhookKey.value = true;
+  try {
+    const response = unwrapResponse(
+        await api.post("plugin/CloudSubscribe/media-library/webhook/key/refresh", {}),
+    );
+    if (response.success === false) {
+      throw new Error(response.message || "刷新 Webhook Key 失败");
+    }
+    const data = response.data?.data || response.data || {};
+    const newKey = String(data.media_library_webhook_key || "").trim();
+    if (!newKey) throw new Error("服务端未返回新的 Webhook Key");
+    config.media_library_webhook_key = newKey;
+    notify(response.message || "Webhook Key 已刷新");
+  } catch (error) {
+    notify(`刷新 Webhook Key 失败：${error.message || error}`, "error");
+  } finally {
+    refreshingWebhookKey.value = false;
+  }
 }
 
 function testItemStatus(item) {

@@ -54,6 +54,9 @@ class SyncRuntimeService(OwnerDelegator):
         tasks = {}
         for subscribe in subscribes:
             is_tv = getattr(subscribe, "type", "") == MediaType.TV.value
+            preparation = getattr(
+                subscribe, "_cloudsubscribe_preparation", {}
+            ) or {}
             task_id = self._sync_task_id(subscribe)
             tasks[task_id] = {
                 "id": task_id,
@@ -67,6 +70,9 @@ class SyncRuntimeService(OwnerDelegator):
                 "media_type": "电视剧" if is_tv else "电影",
                 "year": getattr(subscribe, "year", None) or "",
                 "season": int(getattr(subscribe, "season", 1) or 1) if is_tv else None,
+                "target_episodes": (
+                    preparation.get("aired_target_episodes", []) if is_tv else []
+                ),
                 "status": "queued",
                 "phase": "等待调度",
                 "progress": 0,
@@ -402,14 +408,76 @@ class SyncRuntimeService(OwnerDelegator):
             task = self._sync_tasks.get(task_id)
             if not task:
                 return {"success": False, "message": "订阅任务不存在"}
+            if task.get("status") == "postprocessing":
+                task_snapshot = dict(task)
+            else:
+                task_snapshot = None
             if task.get("status") not in {"queued", "running", "stopping"}:
-                return {"success": True, "message": "该订阅任务已经结束"}
-            stop_event = task.get("stop_event")
-            if not stop_event:
-                return {"success": False, "message": "当前任务不支持停止"}
-            task["status"] = "stopping"
-            task["phase"] = "等待安全停止"
-            stop_event.set()
+                if not task_snapshot:
+                    return {"success": True, "message": "该订阅任务已经结束"}
+            if task_snapshot:
+                task["status"] = "stopping"
+                task["phase"] = "正在停止文件后处理"
+            else:
+                stop_event = task.get("stop_event")
+                if not stop_event:
+                    return {"success": False, "message": "当前任务不支持停止"}
+                task["status"] = "stopping"
+                task["phase"] = "等待安全停止"
+                stop_event.set()
+
+        if task_snapshot:
+            subscribe_id = int(task_snapshot.get("subscribe_id") or 0)
+            sub_key = str(task_snapshot.get("sub_key") or "").strip()
+            pending_keys = {
+                str(item.get("pending_key") or "")
+                for item in self._sync_handler.get_pending_finalize_tasks()
+                if (
+                           subscribe_id > 0
+                           and int(item.get("subscribe_id") or 0) == subscribe_id
+                   ) or (
+                           bool(sub_key)
+                           and str(item.get("sub_key") or "") == sub_key
+                   )
+            } if self._sync_handler else set()
+            try:
+                removed = self._sync_handler.delete_pending_finalize_tasks(
+                    pending_keys
+                ) if self._sync_handler and pending_keys else 0
+            except Exception as error:
+                with self._sync_tasks_lock:
+                    current = self._sync_tasks.get(task_id)
+                    if current:
+                        current.update({
+                            "status": "postprocessing",
+                            "phase": task_snapshot.get("phase")
+                                     or "文件后处理中",
+                        })
+                logger.error(
+                    f"停止文件后处理任务失败：{task_snapshot.get('title')}，{error}"
+                )
+                return {"success": False, "message": f"停止后处理失败：{error}"}
+            with self._sync_tasks_lock:
+                current = self._sync_tasks.get(task_id)
+                if current:
+                    current.update({
+                        "status": "stopped",
+                        "phase": "文件后处理已停止",
+                        "progress": 100,
+                        "pending_count": 0,
+                        "finished_at": time.time(),
+                    })
+            logger.info(
+                f"已停止文件后处理任务：{task_snapshot.get('title')}，"
+                f"移除 {removed} 个待处理文件，保留网盘离线任务和文件"
+            )
+            return {
+                "success": True,
+                "message": (
+                    f"已停止后处理：{task_snapshot.get('title')}，"
+                    "115离线任务和文件已保留"
+                ),
+            }
         logger.info(f"收到单任务停止请求：{task.get('title')}（{task_id}）")
         return {"success": True, "message": f"已请求停止：{task.get('title')}"}
 
@@ -429,13 +497,8 @@ class SyncRuntimeService(OwnerDelegator):
                 and offline_service
                 and shared_kwargs.get("offline_tasks") is None
         ):
-            target_ids = set().union(*(
-                set(group.get("task_ids") or set())
-                for group in groups if group.get("needs_offline")
-            ))
             snapshot = offline_service.get_offline_task_list_snapshot(
                 force=True,
-                task_ids=target_ids,
             )
             shared_kwargs["offline_tasks"] = snapshot.get("tasks") or []
             shared_kwargs["offline_tasks_valid"] = bool(snapshot.get("refresh_ok"))

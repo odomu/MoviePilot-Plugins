@@ -105,9 +105,14 @@ class TelevisionSyncProcessor(OwnerDelegator):
             calendar_entry: Optional[Dict[str, Any]] = None
             # 收集阶段已读取平台订阅日历；这里复用结果，避免重复查询 TMDB。
             if expected_episodes and mediainfo.tmdb_id and not manual_resources:
-                calendar_entry = self.get_tv_subscribe_calendar(
-                    subscribe, tmdb_id=mediainfo.tmdb_id
-                )
+                preparation = getattr(
+                    subscribe, "_cloudsubscribe_preparation", {}
+                ) or {}
+                calendar_entry = preparation.get("calendar")
+                if not calendar_entry:
+                    calendar_entry = self.get_tv_subscribe_calendar(
+                        subscribe, tmdb_id=mediainfo.tmdb_id
+                    )
                 if calendar_entry:
                     target_episode_air_dates = {
                         int(episode): str(air_date)

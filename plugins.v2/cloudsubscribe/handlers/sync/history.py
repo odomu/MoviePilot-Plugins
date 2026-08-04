@@ -550,7 +550,11 @@ class HistoryService(OwnerDelegator):
             ]
         return self._record_platform_transfer_histories(records, reconcile=True)
 
-    def append_history_records(self, records: List[Dict[str, Any]]) -> int:
+    def append_history_records(
+            self,
+            records: List[Dict[str, Any]],
+            reopen_terminal: bool = False,
+    ) -> int:
         """合并新增历史，并原子激活对应的网盘文件后处理任务。"""
         if not records or not self._get_data or not self._save_data:
             return 0
@@ -584,6 +588,7 @@ class HistoryService(OwnerDelegator):
                 if (
                         current_status in {"成功", "失败"}
                         and incoming_status not in {"成功", "失败"}
+                        and not reopen_terminal
                 ):
                     merged["status"] = current_status
                     for state_key in ("finalize_key", "failure_reason"):
@@ -2123,7 +2128,10 @@ class HistoryService(OwnerDelegator):
                     mediainfo=mediainfo,
                     success_episodes=success_episodes,
                 )
-        self._save_data("history", history)
+        if pending_key:
+            self.append_history_records([record], reopen_terminal=True)
+        else:
+            self._save_data("history", history)
         if record["status"] == "成功":
             self._record_platform_transfer_histories([record])
         logger.info(

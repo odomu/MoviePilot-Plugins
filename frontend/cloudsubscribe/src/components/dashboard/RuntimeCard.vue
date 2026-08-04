@@ -87,15 +87,6 @@
             title="停止此任务"
             @click="emit('stop-task', task.id)"
         />
-        <v-btn
-            v-else-if="task.status === 'postprocessing'"
-            icon="mdi-folder-sync-outline"
-            color="primary"
-            variant="text"
-            size="x-small"
-            title="管理后处理任务"
-            @click="emit('manage-postprocessing')"
-        />
         <v-icon
             v-else
             :icon="resultIcon(task.status, task.task_kind)"
@@ -136,7 +127,7 @@ const props = defineProps({
   runtime: {type: Object, required: true},
   active: Boolean,
 });
-const emit = defineEmits(["stop-task", "manage-postprocessing"]);
+const emit = defineEmits(["stop-task"]);
 const active = computed(() => props.active);
 const tasks = computed(() =>
     (props.runtime.tasks || []).filter((task) =>
@@ -156,7 +147,9 @@ const postprocessingCount = computed(
 );
 
 function canStop(task) {
-  return ["queued", "running", "stopping"].includes(task?.status);
+  return ["queued", "running", "stopping", "postprocessing"].includes(
+      task?.status,
+  );
 }
 
 function taskStatus(status) {

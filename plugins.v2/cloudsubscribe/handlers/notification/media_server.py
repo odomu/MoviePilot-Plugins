@@ -6,7 +6,6 @@ from pathlib import Path
 from threading import RLock, Timer
 from typing import Any, Dict, List, Optional, Set
 
-from app.chain.mediaserver import MediaServerChain
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.schemas import MediaInfo, RefreshMediaItem

@@ -162,7 +162,7 @@ export function createHdhiveGroups(options = {}) {
             tab: "hdhive",
             title: "HDHive 搜索与风控",
             icon: "mdi-shield-search",
-            hint: "资源缓存减少重复访问；认证、资源查询和解锁共用限速与风控冷却。",
+            hint: "资源缓存减少重复访问；WebAPI 每分钟最多请求 10 次，异常页面会触发 10 分钟保护冷却。",
             show: enabled("hdhive_enabled"),
             fields: [
                 {
@@ -180,7 +180,7 @@ export function createHdhiveGroups(options = {}) {
                     label: "请求访问间隔",
                     hint: "OpenAPI 与 WebAPI 的认证、查询和解锁共用统一限速，并自动加入随机抖动",
                     type: "number",
-                    min: 0.5,
+                    min: 2,
                     max: 10,
                     step: 0.5,
                     suffix: "秒",
@@ -190,7 +190,7 @@ export function createHdhiveGroups(options = {}) {
                 {
                     key: "hdhive_unlocks_per_minute",
                     label: "每分钟解锁次数",
-                    hint: "仅限制 WebAPI 解锁接口，默认 5 次；按账户使用滚动窗口、首次等待和随机间隔",
+                    hint: "仅限制 WebAPI 受保护接口，默认 2 次；按账户使用滚动窗口、首次等待和随机间隔",
                     type: "number",
                     min: 1,
                     max: 5,

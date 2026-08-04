@@ -62,10 +62,10 @@ export function createBasicSection(cloudDriveItems) {
                         type: "select",
                         items: [
                             {title: "允许 MoviePilot 下载并整理", value: "allow"},
-                            {title: "阻止 MoviePilot 下载", value: "block"},
+                            {title: "阻止 MoviePilot 搜索及下载", value: "block"},
                             {title: "转为网盘离线下载", value: "cloud"},
                         ],
-                        hint: "仅在接管态作用于插件管理的订阅。允许模式会保留 MoviePilot 的 PT/RSS 自动匹配、下载和整理，但同一季集已有网盘任务时仍会阻止重复下载。网盘模式接管失败时也不会放行平台下载。",
+                        hint: "仅在接管态生效。阻止模式会在站点请求前终止 MoviePilot 平台搜索，并阻止插件管理订阅的下载；允许模式保留 PT/RSS 自动匹配、下载和整理，但同一季集已有网盘任务时仍会阻止重复下载；网盘模式接管失败时也不会放行平台下载。",
                         cols: 8,
                     },
                     {

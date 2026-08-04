@@ -99,6 +99,17 @@ export function createDian115Groups(options = {}) {
                     show: enabled("dian115_enabled"),
                 },
                 {
+                    key: "dian115_unlocks_per_minute",
+                    label: "每分钟解锁次数",
+                    hint: "仅限制解锁接口；免费取链接也计入，默认 6 次。",
+                    type: "number",
+                    min: 1,
+                    max: 10,
+                    suffix: "次",
+                    cols: 6,
+                    show: enabled("dian115_enabled"),
+                },
+                {
                     key: "dian115_request_interval",
                     label: "请求间隔",
                     hint: "所有 Dian115 接口共享该基础间隔，并自动加入随机抖动。",

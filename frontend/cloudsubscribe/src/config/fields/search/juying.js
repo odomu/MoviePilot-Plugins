@@ -63,6 +63,17 @@ export function createJuyingGroups(options = {}) {
                     show: enabled("juying_enabled"),
                 },
                 {
+                    key: "juying_unlocks_per_minute",
+                    label: "每分钟解锁次数",
+                    hint: "仅限制资源访问，默认 8 次。",
+                    type: "number",
+                    min: 1,
+                    max: 12,
+                    suffix: "次",
+                    cols: 6,
+                    show: enabled("juying_enabled"),
+                },
+                {
                     key: "juying_request_interval",
                     label: "请求访问间隔",
                     hint: "登录、影片查询、资源分页和票据兑换共用统一限速，并自动加入随机抖动。",

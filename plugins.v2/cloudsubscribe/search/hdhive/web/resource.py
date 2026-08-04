@@ -177,7 +177,7 @@ class HDHiveResourceService:
                         f"{len(cached)} 条原始资源"
                     )
                     return copy.deepcopy(cached)
-            redirect_response = self._client.request(
+            detail_path = self._client.request(
                 "GET",
                 f"/tmdb/{normalized_type}/{int(tmdb_id)}",
                 headers={
@@ -188,17 +188,9 @@ class HDHiveResourceService:
                     "cache-control": "no-cache",
                     "referer": f"{self._client.BASE_URL}/",
                 },
+                response_handler=self._detail_path_from_response,
             )
-            redirect_match = self._NEXT_REDIRECT_RE.search(
-                self._client.response_text(redirect_response)
-            )
-            if not redirect_match:
-                raise HDHiveWebError(
-                    "HDHive TMDB 入口未返回最终详情路径",
-                    code="schema_changed",
-                )
-            detail_path = redirect_match.group(1).replace("\\/", "/")
-            detail_response = self._client.request(
+            group_data = self._client.request(
                 "GET",
                 detail_path,
                 headers={
@@ -209,9 +201,7 @@ class HDHiveResourceService:
                     "cache-control": "no-cache",
                     "referer": f"{self._client.BASE_URL}/",
                 },
-            )
-            group_data = self._parse_group_data(
-                self._client.response_text(detail_response)
+                response_handler=self._group_data_from_response,
             )
             requested = set(enabled_types)
             rows = [
@@ -227,6 +217,30 @@ class HDHiveResourceService:
             rows = HDHiveResourceService._deduplicate(rows)
             self._resource_cache.set(cache_key, copy.deepcopy(rows))
             return rows
+
+    def _detail_path_from_response(self, response) -> str:
+        redirect_match = self._NEXT_REDIRECT_RE.search(
+            self._client.response_text(response)
+        )
+        if redirect_match:
+            return redirect_match.group(1).replace("\\/", "/")
+        self._client.activate_risk_cooldown("TMDB 入口响应异常保护")
+        raise HDHiveWebError(
+            "HDHive TMDB 入口响应异常，已进入 600 秒风险保护冷却",
+            code="rate_limited",
+        )
+
+    def _group_data_from_response(self, response) -> Dict[str, Any]:
+        try:
+            return self._parse_group_data(self._client.response_text(response))
+        except HDHiveWebError as error:
+            if error.code != "schema_changed":
+                raise
+            self._client.activate_risk_cooldown("详情页异常保护")
+            raise HDHiveWebError(
+                "HDHive 详情页响应异常，已进入 600 秒风险保护冷却",
+                code="rate_limited",
+            ) from error
 
     def _load_torrentclaw_rows(
             self, media_type: str, tmdb_id: int, log_prefix: str
@@ -514,14 +528,22 @@ class HDHiveResourceService:
             raise HDHiveWebError("HDHive 资源标识或类型无效", code="invalid_resource")
         listed_points = max(0, int(unlock_points or 0))
         endpoint = f"/api/customer/resources/{normalized_slug}/unlock"
-        response = self._client.signed_request(
+        return self._client.signed_request(
             "POST",
             endpoint,
             body=b"",
             headers={
                 "accept": "application/json",
             },
+            response_handler=lambda response: self._unlock_response(
+                response, listed_points, normalized_type
+            ),
         )
+
+    def _unlock_response(
+            self, response, listed_points: int, normalized_type: str
+    ) -> Dict[str, Any]:
+        """在客户端串行锁内解析解锁结果并及时启动风险保护。"""
         try:
             payload = response.json()
         except ValueError as error:
@@ -545,6 +567,9 @@ class HDHiveResourceService:
             ).strip()
             if any(marker in message for marker in ("页面过期", "请刷新页面")):
                 self._resource_cache.clear()
+                self._client.activate_risk_cooldown(
+                    "资源页面过期保护", seconds=60
+                )
                 raise HDHiveWebError(
                     f"HDHive 资源页面已过期，已停止自动重试：{message}",
                     code="page_expired",

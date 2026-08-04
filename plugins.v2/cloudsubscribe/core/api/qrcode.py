@@ -100,8 +100,8 @@ class QRCodeService(OwnerDelegator):
             credentials = self._apply_qrcode_credentials(key, result)
             self._update_plugin_config()
             self._init_handlers()
-            from .vue import _UI_OPTIONS_CACHE
-            _UI_OPTIONS_CACHE.clear()
+            from .page import clear_ui_options_cache
+            clear_ui_options_cache()
             logger.info(f"{key} 扫码登录成功")
             return {
                 "success": True,

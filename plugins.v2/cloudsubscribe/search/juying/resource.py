@@ -299,7 +299,9 @@ class JuyingResourceService:
             raise JuyingError("聚影资源缺少访问票据", "juying_ticket_expired")
         try:
             payload = self._client.request_json(
-                "POST", self._access_path(raw, resource_id),
+                "POST",
+                self._access_path(raw, resource_id),
+                protected_access=True,
                 json={"access_ticket": ticket},
             )
         except JuyingError as error:
@@ -309,8 +311,12 @@ class JuyingResourceService:
             refreshed_ticket = str((refreshed or {}).get("access_ticket") or "").strip()
             if not refreshed_ticket or refreshed_ticket == ticket:
                 raise
-            payload = self._client.request_json("POST", self._access_path(refreshed or {}, resource_id),
-                                                json={"access_ticket": refreshed_ticket})
+            payload = self._client.request_json(
+                "POST",
+                self._access_path(refreshed or {}, resource_id),
+                protected_access=True,
+                json={"access_ticket": refreshed_ticket},
+            )
         target = str(payload.get("target") or "").strip()
         if not target:
             raise JuyingError("聚影资源链接为空", "juying_empty_link")

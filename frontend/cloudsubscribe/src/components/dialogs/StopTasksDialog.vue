@@ -11,7 +11,7 @@
         </div>
         <div v-else>确认停止当前订阅任务？</div>
         <v-alert type="warning" variant="tonal" density="compact" class="mt-3">
-          任务将在安全节点停止，已完成的处理不会回退。
+          {{ stopHint }}
         </v-alert>
       </v-card-text>
       <v-card-actions>
@@ -26,6 +26,8 @@
 </template>
 
 <script setup>
+import {computed} from "vue";
+
 const props = defineProps({
   modelValue: Boolean,
   task: {type: Object, default: null},
@@ -33,6 +35,11 @@ const props = defineProps({
   loading: Boolean,
 });
 const emit = defineEmits(["update:modelValue", "confirm"]);
+const stopHint = computed(() =>
+    props.task?.status === "postprocessing"
+        ? "将停止插件文件后处理；离线任务、已下载文件和STRM均会保留。"
+        : "任务将在安全节点停止，已完成的处理不会回退。",
+);
 
 function close() {
   if (!props.loading) emit("update:modelValue", false);

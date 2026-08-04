@@ -5,6 +5,7 @@
 import copy
 import datetime
 import re
+import secrets
 from threading import Event as ThreadEvent, Lock, RLock, local
 from typing import Optional, Any, List, Dict, Tuple, Callable
 
@@ -25,10 +26,16 @@ from .core import (
     resolve_component,
 )
 from .core.api import (
+    AccountApi,
+    ConfigApi,
     MoviePilotRegistration,
     HistoryApi,
-    PluginApi,
+    MediaLibraryApi,
+    PageApi,
     QRCodeService,
+    RuntimeApi,
+    SearchApi,
+    SyncApi,
 )
 from .core.hook import PluginEventHandler, SubscriptionSearchHook
 from .core.services import (
@@ -53,7 +60,13 @@ from .search.pansou import PanSouClient
 from .search.seedhub import SeedHubClient
 
 _COMPONENT_TYPES = (
-    PluginApi,
+    PageApi,
+    AccountApi,
+    SearchApi,
+    ConfigApi,
+    SyncApi,
+    RuntimeApi,
+    MediaLibraryApi,
     QRCodeService,
     HistoryApi,
     PluginEventHandler,
@@ -77,7 +90,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -205,6 +218,7 @@ class CloudSubscribe(_PluginBase):
     _juying_password: str = ""
     _juying_result_limit: int = 5
     _juying_request_interval: float = 1.0
+    _juying_unlocks_per_minute: int = 8
 
     # 订阅过滤模式："exclude" 排除模式（处理除勾选外的全部订阅）/ "include" 指定模式（仅处理勾选的订阅）
     _subscribe_filter_mode: str = "exclude"
@@ -216,8 +230,8 @@ class CloudSubscribe(_PluginBase):
     _search_cache_ttl_minutes: int = 30
     _search_concurrency: int = 2
     _hdhive_candidate_limit: int = 4
-    _hdhive_request_interval: float = 2.0
-    _hdhive_unlocks_per_minute: int = 5
+    _hdhive_request_interval: float = 5.0
+    _hdhive_unlocks_per_minute: int = 2
     _hdhive_torrentclaw_enabled: bool = False
     _hdhive_torrentclaw_subtitle_languages: List[str] = ["zh"]
 
@@ -248,6 +262,7 @@ class CloudSubscribe(_PluginBase):
     _dian115_max_points_per_sub: int = 20
     _dian115_candidate_limit: int = 4
     _dian115_request_interval: float = 1.0
+    _dian115_unlocks_per_minute: int = 6
 
     # 是否屏蔽系统订阅（True=已屏蔽系统订阅，False=已恢复系统订阅）
     _block_system_subscribe: bool = False
@@ -282,6 +297,8 @@ class CloudSubscribe(_PluginBase):
     _media_server_path_mappings: str = ""
     _media_server_refresh_delay: int = 0
     _emby_mediainfo_enabled: bool = False
+    _platform_media_sync_enabled: bool = False
+    _media_library_webhook_key: str = ""
     _platform_transfer_history_enabled: bool = False
     _timeout_enabled: bool = True
     _timeout_default_connect: float = 30
@@ -319,6 +336,7 @@ class CloudSubscribe(_PluginBase):
     _api_handler: Optional[ApiHandler] = None
     _webhook_handler: Optional[WebhookHandler] = None
     _subscribe_search_originals: Dict[str, Callable[..., Any]] = {}
+    _platform_search_originals: Dict[str, Callable[..., Any]] = {}
     _stop_event: Optional[ThreadEvent] = None
     _sync_running: bool = False
     _sync_status: str = "idle"
@@ -409,6 +427,14 @@ class CloudSubscribe(_PluginBase):
                 logger.info("订阅接管配置已迁移为新平台下载策略")
             else:
                 logger.warning("订阅接管配置迁移持久化失败，本次运行仍使用迁移后配置")
+        webhook_key = str(config.get("media_library_webhook_key", "") or "").strip()
+        if len(webhook_key) < 16:
+            webhook_key = secrets.token_hex(8)
+            config["media_library_webhook_key"] = webhook_key
+            if self.update_config(config):
+                logger.info("已生成媒体库 Webhook 固定 Key")
+            else:
+                logger.warning("媒体库 Webhook 固定 Key 持久化失败，本次运行临时使用")
         hot_keys = {
             "show_sidebar_nav",
             "agent_enabled",
@@ -423,6 +449,8 @@ class CloudSubscribe(_PluginBase):
             "media_server_path_mappings",
             "media_server_refresh_delay",
             "emby_mediainfo_enabled",
+            "platform_media_sync_enabled",
+            "media_library_webhook_key",
         }
         if not reset_runtime and self._applied_config:
             changed_keys = {
@@ -465,6 +493,7 @@ class CloudSubscribe(_PluginBase):
             self._subscribe_search_coordinator_running = False
             self._subscribe_search_queue_revision = 0
             self._subscribe_search_originals = {}
+            self._platform_search_originals = {}
         else:
             if self._sync_tasks_lock is None:
                 self._sync_tasks_lock = RLock()
@@ -595,6 +624,9 @@ class CloudSubscribe(_PluginBase):
             self._juying_request_interval = max(
                 0.5, min(float(config.get("juying_request_interval", 1) or 1), 10.0)
             )
+            self._juying_unlocks_per_minute = max(
+                1, min(int(config.get("juying_unlocks_per_minute", 8) or 8), 12)
+            )
 
             self._subscribe_filter_mode = config.get("subscribe_filter_mode", "exclude") or "exclude"
             self._exclude_subscribes = config.get("exclude_subscribes", []) or []
@@ -665,16 +697,19 @@ class CloudSubscribe(_PluginBase):
                 1, min(int(config.get("hdhive_candidate_limit", 4) or 4), 20)
             )
             self._hdhive_request_interval = max(
-                0.5, min(float(config.get("hdhive_request_interval", 2) or 2), 10.0)
+                2.0, min(float(config.get("hdhive_request_interval", 5) or 5), 10.0)
             )
             self._hdhive_unlocks_per_minute = max(
-                1, min(int(config.get("hdhive_unlocks_per_minute", 5) or 5), 5)
+                1, min(int(config.get("hdhive_unlocks_per_minute", 2) or 2), 3)
             )
             self._dian115_candidate_limit = max(
                 1, min(int(config.get("dian115_candidate_limit", 4) or 4), 20)
             )
             self._dian115_request_interval = max(
                 0.2, min(float(config.get("dian115_request_interval", 1) or 1), 10.0)
+            )
+            self._dian115_unlocks_per_minute = max(
+                1, min(int(config.get("dian115_unlocks_per_minute", 6) or 6), 10)
             )
             self._hdhive_torrentclaw_enabled = bool(
                 config.get("hdhive_torrentclaw_enabled", False)
@@ -741,6 +776,12 @@ class CloudSubscribe(_PluginBase):
             self._emby_mediainfo_enabled = bool(
                 config.get("emby_mediainfo_enabled", False)
             )
+            self._platform_media_sync_enabled = bool(
+                config.get("platform_media_sync_enabled", False)
+            )
+            self._media_library_webhook_key = str(
+                config.get("media_library_webhook_key", "") or ""
+            ).strip()
             self._platform_transfer_history_enabled = bool(
                 config.get("platform_transfer_history_enabled", False)
             )
@@ -841,6 +882,12 @@ class CloudSubscribe(_PluginBase):
         self._emby_mediainfo_enabled = bool(
             config.get("emby_mediainfo_enabled", False)
         )
+        self._platform_media_sync_enabled = bool(
+            config.get("platform_media_sync_enabled", False)
+        )
+        self._media_library_webhook_key = str(
+            config.get("media_library_webhook_key", "") or ""
+        ).strip()
         if self._subscribe_handler:
             self._subscribe_handler._notify = self._notify
             self._subscribe_handler._notification_type = self._notification_type
@@ -916,6 +963,7 @@ class CloudSubscribe(_PluginBase):
                 password=self._juying_password,
                 proxy=proxy,
                 request_interval=self._juying_request_interval,
+                unlocks_per_minute=self._juying_unlocks_per_minute,
                 get_data_func=self.get_data,
                 save_data_func=self.save_data,
             )
@@ -1226,6 +1274,7 @@ class CloudSubscribe(_PluginBase):
             hdhive_unlocks_per_minute=self._hdhive_unlocks_per_minute,
             dian115_candidate_limit=self._dian115_candidate_limit,
             dian115_request_interval=self._dian115_request_interval,
+            dian115_unlocks_per_minute=self._dian115_unlocks_per_minute,
             hdhive_torrentclaw_enabled=self._hdhive_torrentclaw_enabled,
             hdhive_torrentclaw_subtitle_languages=(
                 self._hdhive_torrentclaw_subtitle_languages
@@ -1355,6 +1404,7 @@ class CloudSubscribe(_PluginBase):
             "juying_password": self._juying_password,
             "juying_result_limit": self._juying_result_limit,
             "juying_request_interval": self._juying_request_interval,
+            "juying_unlocks_per_minute": self._juying_unlocks_per_minute,
             # HDHive 配置
             "hdhive_enabled": self._hdhive_enabled,
             "hdhive_query_mode": self._hdhive_query_mode,
@@ -1389,6 +1439,7 @@ class CloudSubscribe(_PluginBase):
             "hdhive_unlocks_per_minute": self._hdhive_unlocks_per_minute,
             "dian115_candidate_limit": self._dian115_candidate_limit,
             "dian115_request_interval": self._dian115_request_interval,
+            "dian115_unlocks_per_minute": self._dian115_unlocks_per_minute,
             "hdhive_torrentclaw_enabled": self._hdhive_torrentclaw_enabled,
             "hdhive_torrentclaw_subtitle_languages": (
                 self._hdhive_torrentclaw_subtitle_languages
@@ -1424,6 +1475,8 @@ class CloudSubscribe(_PluginBase):
             "media_server_path_mappings": self._media_server_path_mappings,
             "media_server_refresh_delay": self._media_server_refresh_delay,
             "emby_mediainfo_enabled": self._emby_mediainfo_enabled,
+            "platform_media_sync_enabled": self._platform_media_sync_enabled,
+            "media_library_webhook_key": self._media_library_webhook_key,
             "platform_transfer_history_enabled": self._platform_transfer_history_enabled,
             "timeout_enabled": self._timeout_enabled,
             "timeout_default_connect": self._timeout_default_connect,
@@ -1452,6 +1505,13 @@ class CloudSubscribe(_PluginBase):
                     if stop_event:
                         stop_event.set()
         self._restore_subscribe_search_takeover()
+        try:
+            components = self.__dict__.get("_plugin_components", {})
+            media_library_api = components.get(MediaLibraryApi)
+            if media_library_api:
+                media_library_api.close()
+        except Exception as error:
+            logger.debug(f"关闭媒体库 Webhook 同步调度器失败：{error}")
         try:
             if self._sync_handler:
                 self._sync_handler.close()

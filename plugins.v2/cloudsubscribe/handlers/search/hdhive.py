@@ -16,6 +16,7 @@ from ...search.hdhive import (
     HDHIVE_RESOURCE_TYPES,
     HDHiveClient,
     HDHiveResourceService,
+    HDHiveWebError,
 )
 
 
@@ -278,6 +279,17 @@ class HDHiveSearchService(OwnerDelegator):
                 )
             return results
 
+        except HDHiveWebError as e:
+            message = (
+                f"{locals().get('search_prefix', f'[{mediainfo.title}][HDHIVE]')} "
+                f"WebAPI 查询失败：{e}，"
+                f"耗时={time.monotonic() - locals().get('started', time.monotonic()):.2f}s"
+            )
+            if e.code in {"rate_limited", "server_cooldown"}:
+                logger.debug(message)
+            else:
+                logger.error(message)
+            return None
         except Exception as e:
             logger.error(
                 f"{locals().get('search_prefix', f'[{mediainfo.title}][HDHIVE]')} "

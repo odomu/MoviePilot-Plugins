@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from ..http_client import (
+    AccountActionGate,
     CURL_CFFI_AVAILABLE,
     RequestGate,
     gated_idempotent_request,
@@ -53,6 +54,7 @@ class Dian115Client:
             password: str,
             proxy: Any = None,
             request_interval: float = 1.0,
+            unlocks_per_minute: int = 6,
             timeout: int = 30,
             get_data_func: Optional[Callable] = None,
             save_data_func: Optional[Callable] = None,
@@ -84,6 +86,12 @@ class Dian115Client:
             server_error_cooldown_seconds=self._SERVER_ERROR_COOLDOWN_SECONDS,
             challenge_detector=self._is_challenge_response,
         )
+        self._unlock_gate = AccountActionGate(
+            "Dian115 解锁接口",
+            f"dian115:{self._email.casefold()}",
+            max_actions=unlocks_per_minute,
+            maximum_actions=10,
+        )
         self._restore_auth_cookie()
 
     @property
@@ -92,7 +100,7 @@ class Dian115Client:
 
     def matches_config(
             self, email: str, password: str, proxy: Any,
-            request_interval: float,
+            request_interval: float, unlocks_per_minute: int,
     ) -> bool:
         return (
                 self._email == str(email or "").strip()
@@ -100,6 +108,8 @@ class Dian115Client:
                 and self._proxies == normalize_proxies(proxy)
                 and self._request_gate.request_interval
                 == max(0.2, min(float(request_interval or 1.0), 10.0))
+                and self._unlock_gate.max_actions
+                == max(1, min(int(unlocks_per_minute or 6), 10))
         )
 
     def close(self) -> None:
@@ -200,16 +210,34 @@ class Dian115Client:
         return cf_mitigated == "challenge" or "text/html" in content_type
 
     def _raw_request(self, method: str, path: str, **kwargs):
-        try:
-            return gated_idempotent_request(
-                self._request_gate,
-                self._session.request,
-                method,
-                urljoin(f"{self.BASE_URL}/", path.lstrip("/")),
-                proxies=self._proxies,
-                timeout=self._timeout,
-                **kwargs,
+        cooldown_remaining = self._request_gate.cooldown_remaining
+        if cooldown_remaining > 0:
+            status = self._request_gate.cooldown_status
+            raise Dian115Error(
+                f"Dian115 处于风控冷却期，跳过请求"
+                f"（剩余 {int(cooldown_remaining + 0.999)} 秒）",
+                code=("rate_limited" if status in {0, 403, 429}
+                      else "server_cooldown"),
+                status_code=status,
             )
+        try:
+            def request():
+                return gated_idempotent_request(
+                    self._request_gate,
+                    self._session.request,
+                    method,
+                    urljoin(f"{self.BASE_URL}/", path.lstrip("/")),
+                    proxies=self._proxies,
+                    timeout=self._timeout,
+                    **kwargs,
+                )
+
+            if (
+                    str(method or "").strip().upper() == "POST"
+                    and path == "/api/portal/unlock"
+            ):
+                return self._unlock_gate.run(request)
+            return request()
         except requests.exceptions.RequestException as error:
             raise Dian115Error(f"Dian115 请求失败：{error}") from error
 

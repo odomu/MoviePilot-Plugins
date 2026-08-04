@@ -99,7 +99,6 @@
                 :runtime="runtime"
                 :active="active"
                 @stop-task="confirmStopTask"
-                @manage-postprocessing="offlineVisible = true"
             />
           </div>
           <div v-show="mainTab === 'history'" class="page-pane history-pane">

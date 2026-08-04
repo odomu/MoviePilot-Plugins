@@ -35,6 +35,7 @@ class Dian115SearchService(OwnerDelegator):
                     self._dian115_password,
                     proxy,
                     self._dian115_request_interval,
+                    self._dian115_unlocks_per_minute,
             ):
                 if client:
                     client.close()
@@ -43,6 +44,7 @@ class Dian115SearchService(OwnerDelegator):
                     password=self._dian115_password,
                     proxy=proxy,
                     request_interval=self._dian115_request_interval,
+                    unlocks_per_minute=self._dian115_unlocks_per_minute,
                     get_data_func=self._dian115_get_data_func,
                     save_data_func=self._dian115_save_data_func,
                 )

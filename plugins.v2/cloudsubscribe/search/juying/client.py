@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Optional
 from app.log import logger
 
 from ..http_client import (
+    AccountActionGate,
     RequestGate,
     gated_idempotent_request,
     gated_request,
@@ -44,6 +45,7 @@ class JuyingClient:
             proxy: Any = None,
             request_timeout: int = 30,
             request_interval: float = 1.0,
+            unlocks_per_minute: int = 8,
             get_data_func: Optional[Callable] = None,
             save_data_func: Optional[Callable] = None,
     ):
@@ -63,6 +65,12 @@ class JuyingClient:
             "聚影",
             request_interval=request_interval,
             minimum_interval=0.5,
+        )
+        self._access_gate = AccountActionGate(
+            "聚影解锁接口",
+            f"juying:{self.username.casefold()}",
+            max_actions=unlocks_per_minute,
+            maximum_actions=12,
         )
         self._restore_token()
 
@@ -142,6 +150,7 @@ class JuyingClient:
                 self._session.request,
                 "GET",
                 f"{self.base_url}/api/csrf/",
+                retry_connection_errors=False,
                 proxies=self._proxies,
                 timeout=(8, self._request_timeout),
             )
@@ -182,6 +191,7 @@ class JuyingClient:
             method: str,
             path: str,
             retry_auth: bool = True,
+            protected_access: bool = False,
             **kwargs: Any,
     ) -> Dict[str, Any]:
         self._login()
@@ -189,15 +199,21 @@ class JuyingClient:
         headers.update(self._csrf_headers())
         headers["X-App-User-Token"] = self._token
         try:
-            response = gated_idempotent_request(
-                self._request_gate,
-                self._session.request,
-                method,
-                f"{self.base_url}{path}",
-                headers=headers,
-                proxies=self._proxies,
-                timeout=(8, self._request_timeout),
-                **kwargs,
+            def request():
+                return gated_idempotent_request(
+                    self._request_gate,
+                    self._session.request,
+                    method,
+                    f"{self.base_url}{path}",
+                    retry_connection_errors=False,
+                    headers=headers,
+                    proxies=self._proxies,
+                    timeout=(8, self._request_timeout),
+                    **kwargs,
+                )
+
+            response = (
+                self._access_gate.run(request) if protected_access else request()
             )
         except requests.exceptions.RequestException as error:
             raise JuyingError(
@@ -211,7 +227,13 @@ class JuyingClient:
         if response.status_code == 401 and retry_auth:
             self._set_token()
             self._login(force=True)
-            return self._request(method, path, retry_auth=False, **kwargs)
+            return self._request(
+                method,
+                path,
+                retry_auth=False,
+                protected_access=protected_access,
+                **kwargs,
+            )
         if response.status_code == 429:
             retry_after = response.headers.get("retry-after") or ""
             try:
@@ -245,10 +267,18 @@ class JuyingClient:
             raise JuyingError("聚影返回数据格式异常", "juying_schema_changed")
         return payload
 
-    def request_json(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
+    def request_json(
+            self,
+            method: str,
+            path: str,
+            protected_access: bool = False,
+            **kwargs,
+    ) -> Dict[str, Any]:
         """执行带登录态的聚影 JSON 请求。"""
         with self._lock:
-            return self._request(method, path, **kwargs)
+            return self._request(
+                method, path, protected_access=protected_access, **kwargs
+            )
 
     def get_account_info(self) -> Dict[str, Any]:
         """读取当前聚影账户及可用积分。"""

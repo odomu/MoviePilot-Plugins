@@ -1,5 +1,6 @@
-"""MoviePilot 订阅搜索调度钩子。"""
+"""MoviePilot 订阅与平台搜索钩子。"""
 
+from functools import wraps
 from typing import Callable, List, Optional, Tuple
 
 from app.chain.subscribe import SubscribeChain
@@ -13,10 +14,19 @@ class SubscriptionSearchHook(OwnerDelegator):
     """按接管时段分流 MoviePilot 订阅搜索，并精确恢复原函数。"""
 
     _JOB_IDS = ("subscribe_search", "new_subscribe_search", "subscribe_refresh")
+    _PLATFORM_SEARCH_METHODS = {
+        "search_by_id": "sync",
+        "search_by_title": "sync",
+        "async_search_by_id": "async",
+        "async_search_by_title": "async",
+        "async_search_by_title_stream": "stream",
+        "async_search_by_id_stream": "stream",
+    }
 
     def _install_subscribe_search_takeover(self) -> None:
         if not self._enabled:
             return
+        self._install_platform_search_block()
         try:
             from app.scheduler import Scheduler
 
@@ -48,6 +58,7 @@ class SubscriptionSearchHook(OwnerDelegator):
             logger.warning(f"安装 MoviePilot 订阅搜索路由失败：{error}")
 
     def _restore_subscribe_search_takeover(self) -> None:
+        self._restore_platform_search_block()
         originals = dict(self._subscribe_search_originals or {})
         if not originals:
             return
@@ -66,6 +77,107 @@ class SubscriptionSearchHook(OwnerDelegator):
             logger.warning(f"恢复 MoviePilot 订阅搜索路由失败：{error}")
         finally:
             self._subscribe_search_originals = {}
+
+    def _install_platform_search_block(self) -> None:
+        """挂接平台公开资源搜索入口，在 block 策略生效时提前终止。"""
+        try:
+            from app.chain.search import SearchChain
+
+            installed = []
+            for method_name, method_type in self._PLATFORM_SEARCH_METHODS.items():
+                current = getattr(SearchChain, method_name, None)
+                if not callable(current):
+                    logger.warning(f"MoviePilot 搜索入口不存在：SearchChain.{method_name}")
+                    continue
+                if getattr(current, "__cloudsubscribe_owner__", None) is self:
+                    continue
+
+                original = getattr(
+                    current, "__cloudsubscribe_original__", current
+                )
+                self._platform_search_originals.setdefault(method_name, original)
+                wrapper = self._create_platform_search_wrapper(
+                    method_name=method_name,
+                    method_type=method_type,
+                    original=original,
+                )
+                setattr(SearchChain, method_name, wrapper)
+                installed.append(method_name)
+            if installed:
+                logger.info(
+                    "MoviePilot 平台搜索阻止器已安装：" + ", ".join(installed)
+                )
+        except Exception as error:
+            logger.warning(f"安装 MoviePilot 平台搜索阻止器失败：{error}")
+
+    def _restore_platform_search_block(self) -> None:
+        """仅恢复当前插件实例安装的平台搜索方法。"""
+        originals = dict(self._platform_search_originals or {})
+        if not originals:
+            return
+        try:
+            from app.chain.search import SearchChain
+
+            for method_name, original in originals.items():
+                current = getattr(SearchChain, method_name, None)
+                if getattr(current, "__cloudsubscribe_owner__", None) is self:
+                    setattr(SearchChain, method_name, original)
+        except Exception as error:
+            logger.warning(f"恢复 MoviePilot 平台搜索入口失败：{error}")
+        finally:
+            self._platform_search_originals = {}
+
+    def _create_platform_search_wrapper(
+            self,
+            method_name: str,
+            method_type: str,
+            original: Callable,
+    ) -> Callable:
+        owner = self
+
+        if method_type == "stream":
+            @wraps(original)
+            async def stream_wrapper(chain, *args, **kwargs):
+                if owner._is_platform_search_blocked():
+                    yield {
+                        "type": "done",
+                        "stage": "done",
+                        "value": 100,
+                        "text": "网盘订阅接管中，已阻止 MoviePilot 平台搜索",
+                        "items": [],
+                        "total_items": 0,
+                    }
+                    return
+                async for event in original(chain, *args, **kwargs):
+                    yield event
+
+            wrapper = stream_wrapper
+        elif method_type == "async":
+            @wraps(original)
+            async def async_wrapper(chain, *args, **kwargs):
+                if owner._is_platform_search_blocked():
+                    return []
+                return await original(chain, *args, **kwargs)
+
+            wrapper = async_wrapper
+        else:
+            @wraps(original)
+            def sync_wrapper(chain, *args, **kwargs):
+                if owner._is_platform_search_blocked():
+                    return []
+                return original(chain, *args, **kwargs)
+
+            wrapper = sync_wrapper
+
+        wrapper.__cloudsubscribe_owner__ = self
+        wrapper.__cloudsubscribe_original__ = original
+        return wrapper
+
+    def _is_platform_search_blocked(self) -> bool:
+        return (
+                self._platform_download_policy == "block"
+                and self._is_takeover_active()
+        )
 
     def _dispatch_subscribe_search(
             self,

@@ -64,6 +64,113 @@ class SyncExecutionService(OwnerDelegator):
         )
         return media_type, media_id, season
 
+    def _prepare_searchable_subscribes(
+            self, subscribes: List[Any]
+    ) -> Tuple[List[Any], int]:
+        """统一准备媒体身份、目标集和播出日历，供任务线程直接复用。"""
+        prepared = []
+        unresolved_count = 0
+        for subscribe in subscribes:
+            try:
+                has_tmdb_id = int(
+                    getattr(subscribe, "tmdbid", 0) or 0
+                ) > 0
+            except (TypeError, ValueError):
+                has_tmdb_id = False
+            repaired = has_tmdb_id or bool(
+                self._sync_handler
+                and self._sync_handler.repair_subscribe_tmdb_id(subscribe)
+            )
+            if not repaired:
+                unresolved_count += 1
+                logger.warning(
+                    "订阅缺少 TMDB ID 且自动修复失败，任务创建前跳过："
+                    f"#{getattr(subscribe, 'id', '')} "
+                    f"{getattr(subscribe, 'name', '')} "
+                    f"({getattr(subscribe, 'year', '')})"
+                )
+                continue
+
+            is_tv = getattr(subscribe, "type", "") == MediaType.TV.value
+            start_episode = (
+                int(getattr(subscribe, "start_episode", 1) or 1)
+                if is_tv else 0
+            )
+            total_episode = (
+                int(getattr(subscribe, "total_episode", 0) or 0)
+                if is_tv else 0
+            )
+            expected_episodes = (
+                set(range(start_episode, total_episode + 1))
+                if is_tv and total_episode >= start_episode else set()
+            )
+            calendar_entry = (
+                self._sync_handler.get_tv_subscribe_calendar(subscribe)
+                if self._sync_handler and expected_episodes else None
+            )
+            unreleased_episodes = {
+                int(episode)
+                for episode in (
+                        (calendar_entry or {}).get("unreleased_episodes") or []
+                )
+            }
+            preparation = {
+                "tmdb_id": int(getattr(subscribe, "tmdbid", 0) or 0),
+                "calendar": calendar_entry,
+                "expected_episodes": sorted(expected_episodes),
+                "aired_target_episodes": sorted(
+                    expected_episodes - unreleased_episodes
+                ),
+                "unreleased_episodes": sorted(unreleased_episodes),
+                "all_targets_future": bool(
+                    calendar_entry
+                    and calendar_entry.get("all_targets_future")
+                ),
+                "defer_until": str(
+                    (calendar_entry or {}).get("defer_until") or ""
+                ),
+            }
+            setattr(subscribe, "_cloudsubscribe_preparation", preparation)
+            prepared.append(subscribe)
+        return prepared, unresolved_count
+
+    def _deduplicate_subscribes(
+            self, subscribes: List[Any]
+    ) -> Tuple[List[Any], int]:
+        """按媒体身份保留最早订阅，并输出可定位的重复卡片明细。"""
+        grouped: Dict[Tuple[str, str, int], List[Any]] = {}
+        for subscribe in subscribes:
+            grouped.setdefault(self._sync_media_key(subscribe), []).append(subscribe)
+
+        canonical = []
+        duplicate_count = 0
+        duplicate_details = []
+        for group in grouped.values():
+            ordered = sorted(
+                group,
+                key=lambda item: int(getattr(item, "id", 0) or 0),
+            )
+            canonical.append(ordered[0])
+            duplicates = ordered[1:]
+            duplicate_count += len(duplicates)
+            if duplicates:
+                duplicate_details.append(
+                    f"{getattr(ordered[0], 'name', '')}：保留 "
+                    f"#{getattr(ordered[0], 'id', '')}，跳过 "
+                    + ", ".join(
+                        f"#{getattr(item, 'id', '')}" for item in duplicates
+                    )
+                )
+        if duplicate_count:
+            details = "；".join(duplicate_details[:10])
+            if len(duplicate_details) > 10:
+                details += f"；另有 {len(duplicate_details) - 10} 组"
+            logger.warning(
+                f"发现 {duplicate_count} 个同媒体重复订阅，本轮仅处理最早创建的订阅卡片："
+                f"{details}"
+            )
+        return canonical, duplicate_count
+
     def queue_subscribe_search(
             self,
             subscribe_id: Optional[int],
@@ -368,13 +475,15 @@ class SyncExecutionService(OwnerDelegator):
         excluded_count = 0
         deferred_count = 0
         postprocessing_count = 0
+        unresolved_tmdb_count = 0
         active_subscribes = []
         transient_request = bool(manual_target or upgrade_request)
         if manual_resources or transient_request:
-            active_subscribes = all_subscribes
-            if self._sync_handler and not transient_request:
-                for subscribe in active_subscribes:
-                    self._sync_handler.repair_subscribe_tmdb_id(subscribe)
+            active_subscribes, _ = self._deduplicate_subscribes(all_subscribes)
+            if transient_request:
+                active_subscribes, unresolved_tmdb_count = (
+                    self._prepare_searchable_subscribes(active_subscribes)
+                )
         else:
             pending_subscribe_ids = {
                 int(item.get("subscribe_id") or 0)
@@ -384,6 +493,7 @@ class SyncExecutionService(OwnerDelegator):
                 )
                 if int(item.get("subscribe_id") or 0) > 0
             }
+            candidates = []
             for subscribe in all_subscribes:
                 subscribe_id_value = int(getattr(subscribe, "id", 0) or 0)
                 if self._is_subscribe_excluded(subscribe_id_value):
@@ -404,53 +514,37 @@ class SyncExecutionService(OwnerDelegator):
                         f"下次检查日期 {defer_entry.get('defer_until')}"
                     )
                     continue
-                if self._sync_handler:
-                    self._sync_handler.repair_subscribe_tmdb_id(subscribe)
-                calendar_entry = (
-                    self._sync_handler.get_tv_subscribe_calendar(subscribe)
-                    if self._sync_handler
-                       and getattr(subscribe, "type", "") == MediaType.TV.value
-                    else None
+                candidates.append(subscribe)
+
+            candidates, _ = self._deduplicate_subscribes(candidates)
+            prepared, unresolved_tmdb_count = self._prepare_searchable_subscribes(
+                candidates
+            )
+            if prepared:
+                logger.debug(
+                    f"订阅批量预处理完成：{len(prepared)} 个唯一订阅"
                 )
-                if calendar_entry and calendar_entry.get("all_targets_future"):
+            for subscribe in prepared:
+                preparation = getattr(
+                    subscribe, "_cloudsubscribe_preparation", {}
+                ) or {}
+                if preparation.get("all_targets_future"):
                     deferred_count += 1
                     logger.debug(
                         f"订阅日历过滤，跳过本轮收集："
                         f"{getattr(subscribe, 'name', '')}，"
-                        f"最早播出日期 {calendar_entry.get('defer_until')}"
+                        f"最早播出日期 {preparation.get('defer_until')}"
                     )
                     continue
                 active_subscribes.append(subscribe)
-        grouped_subscribes: Dict[Tuple[str, str, int], List[Any]] = {}
-        for subscribe in active_subscribes:
-            grouped_subscribes.setdefault(
-                self._sync_media_key(subscribe), []
-            ).append(subscribe)
-        canonical_subscribes = []
-        duplicate_subscribe_count = 0
-        for group in grouped_subscribes.values():
-            canonical_subscribes.append(min(
-                group,
-                key=lambda item: int(getattr(item, "id", 0) or 0),
-            ))
-            duplicate_subscribe_count += len(group) - 1
-        if duplicate_subscribe_count:
-            logger.warning(
-                f"发现 {duplicate_subscribe_count} 个同媒体重复订阅，"
-                "本轮仅处理最早创建的订阅卡片"
-            )
-        active_subscribes = canonical_subscribes
-        grouped_subscribes = {
-            self._sync_media_key(subscribe): [subscribe]
-            for subscribe in active_subscribes
-        }
         skipped_count = len(all_subscribes) - len(active_subscribes)
         total_subscribes = len(active_subscribes)
         if not active_subscribes:
             self._register_sync_tasks([])
             logger.debug(
                 f"订阅收集完成，无需搜索：排除 {excluded_count} 个，"
-                f"延期 {deferred_count} 个，后处理 {postprocessing_count} 个"
+                f"延期 {deferred_count} 个，后处理 {postprocessing_count} 个，"
+                f"缺少 TMDB ID {unresolved_tmdb_count} 个"
             )
             return True
 
@@ -530,10 +624,10 @@ class SyncExecutionService(OwnerDelegator):
 
         completed_subscribes = 0
         if grouped_subscribes:
-            # 任务可先完成识别和基线预处理，
             worker_count = min(
                 self._subscription_concurrency,
                 len(grouped_subscribes),
+                self._cloud_drive.policy.max_concurrency,
             )
             logger.debug(
                 f"订阅并发调度：{total_subscribes} 个订阅，"
@@ -683,6 +777,17 @@ class SyncExecutionService(OwnerDelegator):
             },
         )
         logger.info(f"网盘订阅同步完成，共转存 {transferred_count} 个文件")
+        pending_finalize_count = 0
+        if self._sync_handler:
+            pending_finalize_count = len(
+                self._sync_handler.get_pending_finalize_tasks()
+            )
+            self._sync_context["pending_finalize"] = pending_finalize_count
+            if pending_finalize_count:
+                logger.info(
+                    f"本次仍有 {pending_finalize_count} 个离线文件等待真实下载完成，"
+                    "暂不发送完成确认"
+                )
         if self._sync_handler:
             sync_metrics = self._sync_handler.get_sync_metrics()
             if sync_metrics:
@@ -903,6 +1008,12 @@ class SyncExecutionService(OwnerDelegator):
                     )
                 elif not success:
                     message = "订阅搜索执行失败"
+                elif transferred and run_context.get("pending_finalize"):
+                    message = (
+                        f"订阅搜索已提交 {transferred} 个文件，"
+                        f"其中 {run_context['pending_finalize']} 个仍在下载，"
+                        "完成后将再通知"
+                    )
                 elif transferred:
                     message = f"订阅搜索完成，共转存 {transferred} 个文件"
                 else:

@@ -19,6 +19,35 @@ from ...utils import MediaFileParser
 class OfflineTaskService(OwnerDelegator):
     """监控待处理文件并完成重命名、STRM和历史状态更新。"""
 
+    def _activate_persisted_pending_tasks(
+            self, pending: Dict[str, Dict[str, Any]], now: float
+    ) -> int:
+        """恢复历史已落盘但未激活的后处理任务。"""
+        inactive_keys = {
+            key for key, item in pending.items()
+            if not bool(item.get("history_ready", True))
+        }
+        if not inactive_keys:
+            return 0
+        history = self._get_data("history") or []
+        persisted_keys = {
+            str(record.get("finalize_key") or "")
+            for record in history
+            if isinstance(record, dict) and record.get("finalize_key")
+        }
+        activated_keys = inactive_keys & persisted_keys
+        for key in activated_keys:
+            pending[key]["history_ready"] = True
+            pending[key]["next_check_at"] = min(
+                float(pending[key].get("next_check_at") or now), now
+            )
+        if activated_keys:
+            self._save_offline_pending(pending)
+            logger.info(
+                f"已恢复 {len(activated_keys)} 个未激活的115文件后处理任务"
+            )
+        return len(activated_keys)
+
     @staticmethod
     def _due_pending_keys(
             pending: Dict[str, Dict[str, Any]],
@@ -98,6 +127,7 @@ class OfflineTaskService(OwnerDelegator):
             return []
         with self._offline_pending_lock:
             pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
+            self._activate_persisted_pending_tasks(pending, time.time())
         due_keys = self._due_pending_keys(
             pending, time.time(), force=force, pending_keys=pending_keys
         )
@@ -352,14 +382,8 @@ class OfflineTaskService(OwnerDelegator):
             )
             tasks = offline_tasks
             if needs_offline and tasks is None and self._offline_tasks:
-                target_ids = {
-                    str((pending.get(key) or {}).get("task_id") or "").strip().upper()
-                    for key in due_keys
-                    if str((pending.get(key) or {}).get("task_id") or "").strip()
-                }
                 snapshot = self._offline_tasks.get_offline_task_list_snapshot(
                     force=True,
-                    task_ids=target_ids,
                 )
                 tasks = snapshot.get("tasks") or []
                 offline_tasks_valid = bool(snapshot.get("refresh_ok"))
@@ -525,7 +549,7 @@ class OfflineTaskService(OwnerDelegator):
                         continue
                     if task is not None and not task_done:
                         if now - created_at >= self._OFFLINE_TIMEOUT:
-                            reason = "离线下载超过30分钟未完成"
+                            reason = "115 离线下载超过24小时未完成"
                             logger.error(f"{reason}：{file_name}")
                             self._mark_offline_history_status(pending_key, "失败", reason)
                             pending.pop(pending_key, None)
@@ -547,7 +571,7 @@ class OfflineTaskService(OwnerDelegator):
                             continue
                     if not task_done:
                         if now - created_at >= self._OFFLINE_TIMEOUT:
-                            reason = "离线下载超过30分钟未完成"
+                            reason = "115 离线下载超过24小时未完成"
                             logger.error(f"{reason}：{file_name}")
                             self._mark_offline_history_status(pending_key, "失败", reason)
                             pending.pop(pending_key, None)

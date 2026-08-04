@@ -58,6 +58,20 @@ class MoviePilotRegistration(OwnerDelegator):
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
+                "path": "/media-library/webhook/{key}",
+                "endpoint": self.api_media_library_webhook,
+                "methods": ["POST"],
+                "allow_anonymous": True,
+                "summary": "接收 Emby 媒体库 JSON Webhook",
+            },
+            {
+                "path": "/media-library/webhook/key/refresh",
+                "endpoint": self.api_vue_refresh_media_library_webhook_key,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "刷新媒体库 Webhook 固定 Key",
+            },
+            {
                 "path": "/overview",
                 "endpoint": self.api_platform_overview,
                 "methods": ["GET"],

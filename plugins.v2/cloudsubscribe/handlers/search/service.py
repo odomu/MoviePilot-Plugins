@@ -95,10 +95,11 @@ class SearchHandler:
             search_cache_ttl_minutes: int = 30,
             search_concurrency: int = 2,
             hdhive_candidate_limit: int = 4,
-            hdhive_request_interval: float = 2.0,
-            hdhive_unlocks_per_minute: int = 5,
+            hdhive_request_interval: float = 5.0,
+            hdhive_unlocks_per_minute: int = 2,
             dian115_candidate_limit: int = 4,
             dian115_request_interval: float = 1.0,
+            dian115_unlocks_per_minute: int = 6,
             hdhive_torrentclaw_enabled: bool = False,
             hdhive_torrentclaw_subtitle_languages: Any = None,
             enable_cloud_upgrade: bool = False,
@@ -214,16 +215,19 @@ class SearchHandler:
         self._search_concurrency = max(1, min(int(search_concurrency or 1), 5))
         self._hdhive_candidate_limit = max(1, min(int(hdhive_candidate_limit or 4), 20))
         self._hdhive_request_interval = max(
-            0.5, min(float(hdhive_request_interval or 2.0), 10.0)
+            2.0, min(float(hdhive_request_interval or 5.0), 10.0)
         )
         self._hdhive_unlocks_per_minute = max(
-            1, min(int(hdhive_unlocks_per_minute or 5), 5)
+            1, min(int(hdhive_unlocks_per_minute or 2), 3)
         )
         self._dian115_candidate_limit = max(
             1, min(int(dian115_candidate_limit or 4), 20)
         )
         self._dian115_request_interval = max(
             0.2, min(float(dian115_request_interval or 1.0), 10.0)
+        )
+        self._dian115_unlocks_per_minute = max(
+            1, min(int(dian115_unlocks_per_minute or 6), 10)
         )
         self._hdhive_torrentclaw_enabled = bool(
             hdhive_torrentclaw_enabled
@@ -564,14 +568,18 @@ class SearchHandler:
             HDHiveSearchService,
             "_search_components",
         ).close(release_cache=release_cache)
-        if self._hdhive_client and hasattr(self._hdhive_client, "close"):
+        if (
+                release_cache
+                and self._hdhive_client
+                and hasattr(self._hdhive_client, "close")
+        ):
             self._hdhive_client.close()
         get_component(
             self,
             Dian115SearchService,
             "_search_components",
         ).close()
-        if self._juying_client:
+        if release_cache and self._juying_client:
             self._juying_client.close()
 
     def set_data_funcs(self, get_func, save_func) -> None:

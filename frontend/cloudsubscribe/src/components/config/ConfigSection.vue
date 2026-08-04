@@ -68,6 +68,52 @@
                   • {{ line }}
                 </div>
               </v-alert>
+              <div
+                  v-else-if="field.type === 'media-library-webhook'"
+                  class="media-library-webhook"
+              >
+                <v-alert
+                    v-if="!(field.items || []).length"
+                    type="warning"
+                    variant="tonal"
+                    density="compact"
+                    text="MoviePilot 尚未配置 Emby 媒体服务器，暂时无法生成通知地址。"
+                />
+                <v-text-field
+                    v-for="item in field.items || []"
+                    v-else
+                    :key="item.value"
+                    :model-value="mediaLibraryWebhookUrl(item.value)"
+                    :label="`${item.title || item.value} Webhook URL`"
+                    readonly
+                    density="compact"
+                    variant="outlined"
+                    hide-details="auto"
+                >
+                  <template #append-inner>
+                    <div class="media-library-webhook__actions">
+                      <v-btn
+                          icon="mdi-content-copy"
+                          variant="text"
+                          color="primary"
+                          size="small"
+                          title="复制 Webhook URL"
+                          @click="emit('copy-text', mediaLibraryWebhookUrl(item.value))"
+                      />
+                      <v-btn
+                          icon="mdi-refresh"
+                          variant="text"
+                          color="primary"
+                          size="small"
+                          title="刷新固定 Key，旧 URL 将立即失效"
+                          :loading="refreshingWebhookKey"
+                          :disabled="refreshingWebhookKey"
+                          @click="emit('refresh-webhook-key')"
+                      />
+                    </div>
+                  </template>
+                </v-text-field>
+              </div>
               <v-btn
                   v-else-if="field.type === 'test-source'"
                   color="primary"
@@ -284,6 +330,7 @@ const props = defineProps({
   refreshingAccount: {type: String, default: ""},
   testingSource: {type: String, default: ""},
   hdhiveOauthAction: {type: String, default: ""},
+  refreshingWebhookKey: {type: Boolean, default: false},
 });
 const emit = defineEmits([
   "scan",
@@ -292,6 +339,8 @@ const emit = defineEmits([
   "refresh-account",
   "hdhive-oauth-start",
   "hdhive-oauth-exchange",
+  "copy-text",
+  "refresh-webhook-key",
 ]);
 const activeSubtab = ref(props.section.subtabs?.[0]?.value || "");
 const availableGroups = computed(() =>
@@ -315,6 +364,14 @@ const visibleGroups = computed(() => {
   );
   return [...leadingGroups, ...tabGroups];
 });
+
+function mediaLibraryWebhookUrl(serverName) {
+  const key = encodeURIComponent(
+      String(props.config.media_library_webhook_key || "").trim(),
+  );
+  const source = encodeURIComponent(String(serverName || "").trim());
+  return `${window.location.origin}/api/v1/plugin/CloudSubscribe/media-library/webhook/${key}?source=${source}`;
+}
 </script>
 
 <style scoped>
@@ -393,5 +450,17 @@ const visibleGroups = computed(() => {
   border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
   border-radius: 8px;
   background: rgba(var(--v-theme-primary), 0.035);
+}
+
+.media-library-webhook {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.media-library-webhook__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 </style>

@@ -178,9 +178,14 @@ class UpgradeService(OwnerDelegator):
             # TMDB 播出日期过滤，并保留目标集播出日期供 HDHive 淘汰旧资源。
             target_episode_air_dates: Dict[int, str] = {}
             if mediainfo.tmdb_id:
-                calendar_entry = self.get_tv_subscribe_calendar(
-                    subscribe, tmdb_id=mediainfo.tmdb_id
-                )
+                preparation = getattr(
+                    subscribe, "_cloudsubscribe_preparation", {}
+                ) or {}
+                calendar_entry = preparation.get("calendar")
+                if not calendar_entry:
+                    calendar_entry = self.get_tv_subscribe_calendar(
+                        subscribe, tmdb_id=mediainfo.tmdb_id
+                    )
                 if calendar_entry:
                     target_episode_air_dates = {
                         int(episode): str(air_date)
