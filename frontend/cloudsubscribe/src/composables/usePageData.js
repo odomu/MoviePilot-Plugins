@@ -288,8 +288,10 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
         return result.message || "洗版任务已提交";
     }
 
-    async function clearCache() {
-        const result = await api.post(`plugin/${pluginId}/cache/clear`);
+    async function clearCache(categories) {
+        const result = await api.post(`plugin/${pluginId}/cache/clear`, {
+            categories,
+        });
         if (!result?.success) throw new Error(result?.message || "清理缓存失败");
         return result.message || "缓存已清理";
     }

@@ -34,6 +34,16 @@
           <span class="action-label">离线任务</span>
         </v-btn>
         <v-btn
+            class="cache-action"
+            variant="tonal"
+            color="warning"
+            prepend-icon="mdi-cached"
+            title="选择并清理缓存"
+            @click="cacheVisible = true"
+        >
+          <span class="action-label">清理缓存</span>
+        </v-btn>
+        <v-btn
             :class="['sync-action', {'sync-action-active': active}]"
             :color="active ? 'warning' : 'primary'"
             variant="flat"
@@ -126,7 +136,6 @@
               :upgrading-key="upgradingHistoryKey"
               @refresh="loadPage"
               @clear="openClearHistory"
-              @clear-cache="cacheVisible = true"
               @retry="retryHistory"
               @delete="confirmDeleteHistory"
               @delete-groups="confirmDeleteGroups"
@@ -253,22 +262,11 @@
       </v-card>
     </v-dialog>
 
-    <v-dialog v-model="cacheVisible" max-width="420">
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">清理搜索缓存</v-card-title>
-        <v-card-text>
-          将清理搜索结果、HDHive
-          文件预览及网盘文件列表缓存，后续搜索会重新读取资源。
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer/>
-          <v-btn variant="text" @click="cacheVisible = false">取消</v-btn>
-          <v-btn color="warning" :loading="clearingCache" @click="clearCache">
-            确认清理
-          </v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
+    <CacheClearDialog
+        v-model="cacheVisible"
+        :loading="clearingCache"
+        @confirm="clearCache"
+    />
 
     <v-dialog v-model="deleteVisible" max-width="420">
       <v-card rounded="lg">
@@ -357,6 +355,7 @@ import {computed, inject, ref} from "vue";
 import {useDisplay} from "vuetify";
 import Config from "./Config.vue";
 import HistoryTable from "./dashboard/HistoryTable.vue";
+import CacheClearDialog from "./dialogs/CacheClearDialog.vue";
 import RuntimeCard from "./dashboard/RuntimeCard.vue";
 import ManualResourceDialog from "./dialogs/ManualResourceDialog.vue";
 import OfflineTasksDialog from "./dialogs/OfflineTasksDialog.vue";
@@ -605,10 +604,10 @@ async function clearHistory() {
   }
 }
 
-async function clearCache() {
+async function clearCache(categories) {
   clearingCache.value = true;
   try {
-    const message = await clearCacheRequest();
+    const message = await clearCacheRequest(categories);
     cacheVisible.value = false;
     notify(message);
   } catch (e) {
@@ -950,7 +949,7 @@ async function notifyHistory() {
 
   .app-actions {
     display: grid;
-    grid-template-columns: repeat(3, 40px) auto;
+    grid-template-columns: repeat(4, 40px) auto;
     gap: 4px;
   }
 
@@ -1027,7 +1026,7 @@ async function notifyHistory() {
   }
 
   .app-actions {
-    grid-template-columns: repeat(4, 34px);
+    grid-template-columns: repeat(5, 34px);
   }
 
   .app-actions :deep(.v-btn) {

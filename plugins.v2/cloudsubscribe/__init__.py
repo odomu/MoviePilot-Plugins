@@ -49,7 +49,7 @@ from .drive.guangya import GuangyaClient, GuangyaDrive, create_guangya_provider
 from .drive.p115 import P115ClientManager, create_p115_provider
 from .drive.p123 import P123ClientManager, P123Drive, create_p123_provider
 from .drive.quark import QuarkClient, QuarkDrive, create_quark_provider
-from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, WebhookHandler
+from .handlers import SearchHandler, SyncHandler, SubscribeHandler, WebhookHandler
 from .search.butailing import ButailingClient
 from .search.hdhive import (
     HDHiveOpenAPIClient, HDHiveOpenAPIError,
@@ -333,7 +333,6 @@ class CloudSubscribe(_PluginBase):
     _search_handler: Optional[SearchHandler] = None
     _subscribe_handler: Optional[SubscribeHandler] = None
     _sync_handler: Optional[SyncHandler] = None
-    _api_handler: Optional[ApiHandler] = None
     _webhook_handler: Optional[WebhookHandler] = None
     _subscribe_search_originals: Dict[str, Callable[..., Any]] = {}
     _platform_search_originals: Dict[str, Callable[..., Any]] = {}
@@ -1325,14 +1324,6 @@ class CloudSubscribe(_PluginBase):
         )
         self._sync_handler.reconcile_orphaned_history()
 
-        self._api_handler = ApiHandler(
-            pansou_client=self._pansou_client,
-            cloud_drive=self._cloud_drive,
-            save_path=self._cloud_transfer_path,
-            get_data_func=self.get_data,
-            save_data_func=self.save_data
-        )
-
         self._webhook_handler = WebhookHandler(
             enabled=self._webhook_enabled,
             url=self._webhook_url,
@@ -1573,12 +1564,3 @@ class CloudSubscribe(_PluginBase):
         event_data = event.event_data if event else None
         if isinstance(event_data, dict) and event_data.get("plugin_id") == self.__class__.__name__:
             register_plugin_api(plugin_id=self.__class__.__name__)
-
-    def api_search(self, keyword: str, apikey: str) -> dict:
-        return self._api_handler.search(keyword, apikey)
-
-    def api_transfer(self, share_url: str, save_path: str, apikey: str) -> dict:
-        return self._api_handler.transfer(share_url, save_path, apikey)
-
-    def api_list_directories(self, path: str = "/", apikey: str = "") -> dict:
-        return self._api_handler.list_directories(path, apikey)

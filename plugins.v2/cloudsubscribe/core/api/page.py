@@ -188,5 +188,7 @@ class PageApi(OwnerDelegator):
             return {"success": False, "message": f"读取网盘目录失败：{error}"}
 
 
-def clear_ui_options_cache() -> None:
+def clear_ui_options_cache() -> int:
+    count = len(_UI_OPTIONS_CACHE)
     _UI_OPTIONS_CACHE.clear()
+    return count

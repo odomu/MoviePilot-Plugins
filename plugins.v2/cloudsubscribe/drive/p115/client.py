@@ -495,9 +495,21 @@ class P115ClientManager:
         self.clear_path_cache()
         target_count = len(list(self._target_file_cache.items()))
         self._target_file_cache.clear()
+        with self._offline_task_lock:
+            offline_task_count = len(self._offline_task_cache)
+            offline_quota_count = bool(self._offline_quota_cache)
+            self._offline_task_cache = []
+            self._offline_task_cache_time = 0.0
+            self._offline_task_status = {}
+            self._offline_task_refresh_ok = False
+            self._offline_task_cache_revision += 1
+            self._offline_quota_cache = {}
+            self._offline_quota_cache_time = 0.0
         counts.update({
             "path": path_count,
             "target_files": target_count,
+            "offline_tasks": offline_task_count,
+            "offline_quota": int(offline_quota_count),
         })
         return counts
 

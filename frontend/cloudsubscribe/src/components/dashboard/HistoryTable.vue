@@ -169,15 +169,6 @@
             <span class="history-action-label">刷新</span>
           </v-btn>
           <v-btn
-              variant="text"
-              size="small"
-              title="清理搜索缓存"
-              @click.stop="emit('clear-cache')"
-          >
-            <v-icon icon="mdi-cached" class="history-action-icon"/>
-            <span class="history-action-label">清理缓存</span>
-          </v-btn>
-          <v-btn
               color="error"
               variant="text"
               size="small"
@@ -719,7 +710,6 @@ const props = defineProps({
 const emit = defineEmits([
   "refresh",
   "clear",
-  "clear-cache",
   "retry",
   "delete",
   "delete-groups",

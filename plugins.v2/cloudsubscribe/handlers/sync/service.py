@@ -357,19 +357,44 @@ class SyncHandler:
             return None
         return self._cloud_drive.require(capability)
 
-    def reset_sync_metrics(self) -> None:
-        with self._sync_metrics_lock:
-            self._sync_metrics = {}
+    def clear_runtime_cache(self) -> Dict[str, int]:
+        """清空同步过程中可重建的计算缓存。"""
         with self._media_recognition_lock:
+            media_recognition = len(self._media_recognition_cache)
             self._media_recognition_cache.clear()
         with self._resource_season_dir_lock:
+            resource_season_dirs = len(self._resource_season_dir_cache)
             self._resource_season_dir_cache.clear()
         with self._platform_root_lock:
+            platform_roots = len(self._platform_root_cache)
             self._platform_root_cache.clear()
+        with self._subscribe_defer_lock:
+            subscribe_defer = len(self._subscribe_defer_cache)
+            subscribe_calendar = len(self._subscribe_calendar_cache)
+            self._subscribe_defer_cache.clear()
+            self._subscribe_calendar_cache.clear()
         with self._baseline_cache_lock:
+            baseline_transfer = len(self._baseline_transfer_cache)
+            baseline_plugin = len(self._baseline_plugin_cache)
+            baseline_emby = len(self._baseline_emby_cache)
             self._baseline_transfer_cache.clear()
             self._baseline_plugin_cache.clear()
             self._baseline_emby_cache.clear()
+        return {
+            "media_recognition": media_recognition,
+            "resource_season_dirs": resource_season_dirs,
+            "platform_roots": platform_roots,
+            "subscribe_defer": subscribe_defer,
+            "subscribe_calendar": subscribe_calendar,
+            "baseline_transfer": baseline_transfer,
+            "baseline_plugin": baseline_plugin,
+            "baseline_emby": baseline_emby,
+        }
+
+    def reset_sync_metrics(self) -> None:
+        with self._sync_metrics_lock:
+            self._sync_metrics = {}
+        self.clear_runtime_cache()
 
     @staticmethod
     def _calendar_date(value: Any) -> Optional[datetime.date]:

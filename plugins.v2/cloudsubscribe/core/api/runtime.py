@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 from app.core.config import settings
 from app.log import logger
 
+from .page import clear_ui_options_cache
 from .. import CloudDriveCapability, OwnerDelegator
 from ...utils import clear_magnet_metadata_cache
 
@@ -101,35 +102,57 @@ class RuntimeApi(OwnerDelegator):
             logger.error(f"重新处理历史记录异常：{error}")
             return {"success": False, "message": str(error)}
 
-    def api_vue_clear_cache(self) -> dict:
-        counts = {
-            "search_results": 0,
-            "hdhive_web": 0,
-            "hdhive_openapi": 0,
-            "dian115_details": 0,
-            "share_info": 0,
-            "share_status": 0,
-            "share_files": 0,
-            "magnet_metadata": 0,
-        }
+    _CACHE_CATEGORIES = frozenset({
+        "search", "cloud", "sync", "interface", "platform",
+    })
+
+    def api_vue_clear_cache(
+            self, payload: Optional[Dict[str, Any]] = None
+    ) -> dict:
+        requested = (payload or {}).get("categories")
+        categories = (
+            self._CACHE_CATEGORIES
+            if requested is None
+            else {
+                str(value).strip().lower()
+                for value in requested
+                if str(value).strip().lower() in self._CACHE_CATEGORIES
+            }
+        )
+        if not categories:
+            return {"success": False, "message": "请至少选择一项缓存内容"}
+        counts: Dict[str, int] = {}
         try:
-            if self._search_handler:
-                counts.update(self._search_handler.clear_search_cache())
-            counts["magnet_metadata"] = clear_magnet_metadata_cache()
-            counts.update(self.clear_platform_cache())
-            if self._cloud_drive and self._cloud_drive.supports(
+            if "search" in categories:
+                if self._search_handler:
+                    counts.update(self._search_handler.clear_search_cache())
+                counts["magnet_metadata"] = clear_magnet_metadata_cache()
+            if "cloud" in categories and (
+                    self._cloud_drive and self._cloud_drive.supports(
                     CloudDriveCapability.CACHE_MAINTENANCE
+            )
             ):
                 cache_service = self._cloud_drive.require(
                     CloudDriveCapability.CACHE_MAINTENANCE
                 )
                 counts.update(cache_service.clear_cache())
+            if "sync" in categories and self._sync_handler:
+                counts.update(self._sync_handler.clear_runtime_cache())
+            if "interface" in categories:
+                counts["ui_options"] = clear_ui_options_cache()
+            if "platform" in categories:
+                counts.update(self.clear_platform_cache())
             total = sum(int(value or 0) for value in counts.values())
-            logger.info(f"插件缓存已清理：{total} 项")
+            logger.info(
+                f"插件缓存已清理：{total} 项，分类={','.join(sorted(categories))}"
+            )
             return {
                 "success": True,
                 "message": f"缓存已清理，共移除 {total} 项",
-                "data": counts,
+                "data": {
+                    "categories": sorted(categories),
+                    "counts": counts,
+                },
             }
         except Exception as error:
             logger.error(f"清理插件缓存失败：{error}")
