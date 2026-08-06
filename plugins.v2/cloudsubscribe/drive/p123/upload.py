@@ -29,6 +29,28 @@ class P123UploadService:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def try_rapid_upload(
+            self, local_path: str, save_path: str, target_name: str,
+            algorithm: str, checksum: str, size: int,
+    ) -> bool:
+        if algorithm != "md5" or not P123_AVAILABLE:
+            return False
+        lookup = self.files.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            raise RuntimeError(f"123 本地上传目录不可用：{save_path}")
+        response = self.client.upload_request({
+            "etag": checksum.lower(),
+            "fileName": target_name,
+            "size": int(size),
+            "parentFileId": int(lookup.directory_id or 0),
+            "type": 0,
+            "duplicate": 2,
+        })
+        check_response(response)
+        if not (response.get("data") or {}).get("Reuse"):
+            return False
+        return self._confirm_upload(save_path, target_name, Path(local_path))
+
     def upload_file(
             self,
             local_path: str,
@@ -52,16 +74,10 @@ class P123UploadService:
         upload_name = str(target_name or source.name).strip()
         file_size = source.stat().st_size
         try:
-            response = self.client.upload_request({
-                "etag": self._file_md5(source),
-                "fileName": upload_name,
-                "size": file_size,
-                "parentFileId": int(lookup.directory_id or 0),
-                "type": 0,
-                "duplicate": 2,
-            })
-            check_response(response)
-            upload_data = response.get("data") or {}
+            upload_data = self._initialize_upload(
+                lookup.directory_id, upload_name, file_size,
+                self._file_md5(source),
+            )
             if upload_data.get("Reuse"):
                 if progress_callback:
                     progress_callback(file_size, file_size)
@@ -117,6 +133,114 @@ class P123UploadService:
         except Exception as error:
             logger.error(f"123 本地文件上传失败：{source.name}，{error}")
             return False
+
+    def upload_progressive(
+            self,
+            local_path: str,
+            save_path: str,
+            target_name: str,
+            file_size: int,
+            algorithm: str,
+            checksum: str,
+            wait_for_range: Callable[[int, int], None],
+            progress_callback: Optional[Callable[[int, int], None]] = None,
+            stop_requested: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """源文件已有可信 MD5 时，消费下载线程刚落盘的连续分片。"""
+        if (
+                not P123_AVAILABLE
+                or algorithm.lower() != "md5"
+                or not checksum
+                or int(file_size or 0) <= 0
+        ):
+            return False
+        source = Path(str(local_path or ""))
+        lookup = self.files.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            raise RuntimeError(f"123 流水线上传目录不可用：{save_path}")
+        upload_name = str(target_name or source.name).strip()
+        try:
+            upload_data = self._initialize_upload(
+                lookup.directory_id, upload_name, file_size, checksum.lower()
+            )
+            if upload_data.get("Reuse"):
+                if progress_callback:
+                    progress_callback(file_size, file_size)
+                return self._confirm_upload(save_path, upload_name, source)
+
+            slice_size = int(upload_data.get("SliceSize") or 0)
+            if slice_size <= 0:
+                raise RuntimeError("上传初始化未返回有效分片大小")
+            request_kwargs = {
+                "method": "PUT",
+                "headers": {"authorization": ""},
+                "parse": ...,
+            }
+            part_number = 1
+            transferred = 0
+            while transferred < file_size:
+                if stop_requested and stop_requested():
+                    raise InterruptedError
+                end = min(file_size, transferred + slice_size) - 1
+                wait_for_range(transferred, end)
+                with source.open("rb") as file:
+                    file.seek(transferred)
+                    chunk = file.read(end - transferred + 1)
+                if len(chunk) != end - transferred + 1:
+                    raise IOError(
+                        f"流水线上传分片尚未完整落盘：{transferred}-{end}"
+                    )
+                if file_size > slice_size:
+                    upload_data["partNumberStart"] = part_number
+                    upload_data["partNumberEnd"] = part_number + 1
+                    prepared = self.client.upload_prepare(upload_data)
+                    check_response(prepared)
+                    upload_url = str(
+                        (prepared.get("data") or {}).get("presignedUrls", {}).get(
+                            str(part_number)
+                        )
+                        or ""
+                    )
+                else:
+                    authorized = self.client.upload_auth(upload_data)
+                    check_response(authorized)
+                    upload_url = str(
+                        (authorized.get("data") or {}).get(
+                            "presignedUrls", {}
+                        ).get("1") or ""
+                    )
+                if not upload_url:
+                    raise RuntimeError(f"第 {part_number} 个分片未返回上传地址")
+                self.client.request(upload_url, data=chunk, **request_kwargs)
+                transferred += len(chunk)
+                if progress_callback:
+                    progress_callback(transferred, file_size)
+                part_number += 1
+
+            upload_data["isMultipart"] = file_size > slice_size
+            completed = self.client.upload_complete(upload_data)
+            check_response(completed)
+            return self._confirm_upload(save_path, upload_name, source)
+        except InterruptedError:
+            raise
+        except Exception as error:
+            logger.error(f"123 流水线上传失败：{upload_name}，{error}")
+            return False
+
+    def _initialize_upload(
+            self, directory_id: str, upload_name: str,
+            file_size: int, file_md5: str,
+    ) -> dict:
+        response = self.client.upload_request({
+            "etag": file_md5,
+            "fileName": upload_name,
+            "size": int(file_size),
+            "parentFileId": int(directory_id or 0),
+            "type": 0,
+            "duplicate": 2,
+        })
+        check_response(response)
+        return response.get("data") or {}
 
     def _confirm_upload(self, save_path: str, upload_name: str, source: Path) -> bool:
         for index in range(10):

@@ -26,6 +26,7 @@ class QuarkUploadService:
     client: Any
     files: QuarkFileService
     default_part_size: int = 10 * 1024 * 1024
+    rapid_requires_local_file = True
 
     @staticmethod
     def _calculate_hashes(path: Path, file_sha1: str = "") -> tuple[str, str]:
@@ -38,6 +39,54 @@ class QuarkUploadService:
                     sha1_digest.update(chunk)
         sha1_value = str(file_sha1 or "").strip().lower()
         return md5_digest.hexdigest(), sha1_value or sha1_digest.hexdigest()
+
+    def try_rapid_upload(
+            self, local_path: str, save_path: str, target_name: str,
+            algorithm: str, checksum: str, size: int,
+    ) -> bool:
+        if algorithm != "md5":
+            return False
+        source = Path(local_path)
+        lookup = self.files.resolve_directory(save_path, create=True)
+        if not source.is_file() or not lookup.checked or lookup.directory_id is None:
+            return False
+        now_ms = int(time.time() * 1000)
+        format_type = mimetypes.guess_type(target_name)[0] or ""
+        pre_response = self.client.request(
+            "POST", "file/upload/pre",
+            json_data={
+                "ccp_hash_update": True,
+                "dir_name": "",
+                "file_name": target_name,
+                "format_type": format_type,
+                "l_created_at": now_ms,
+                "l_updated_at": now_ms,
+                "pdir_fid": lookup.directory_id,
+                "size": int(size),
+            },
+        )
+        if not self.client.is_success(pre_response):
+            raise RuntimeError(pre_response.get("message") or "上传预检失败")
+        pre_data = self.client.data(pre_response)
+        if not isinstance(pre_data, dict) or not pre_data:
+            raise RuntimeError("上传预检未返回有效数据")
+        if pre_data.get("finish"):
+            return self._confirm_upload(save_path, target_name, source)
+        _, sha1_value = self._calculate_hashes(source)
+        hash_response = self.client.request(
+            "POST", "file/update/hash",
+            json_data={
+                "md5": checksum.lower(),
+                "sha1": sha1_value,
+                "task_id": pre_data.get("task_id"),
+            },
+        )
+        if not self.client.is_success(hash_response):
+            raise RuntimeError(hash_response.get("message") or "上传哈希校验失败")
+        hash_data = self.client.data(hash_response)
+        if not (isinstance(hash_data, dict) and hash_data.get("finish")):
+            return False
+        return self._confirm_upload(save_path, target_name, source)
 
     def upload_file(
             self,

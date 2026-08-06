@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from ..common import CloudDriveFileServiceBase, extract_list, safe_int
 from ...core.cloud import CloudFile
+from ...core.transfer import HttpFileDownloadService
 
 
 def list_data(client: Any, response: Any) -> list:
@@ -36,6 +37,7 @@ def cloud_file(item: Any) -> Optional[CloudFile]:
         is_directory=is_directory,
         size=0 if is_directory else safe_int(item.get("fileSize") or item.get("size")),
         sha1=str(item.get("sha1") or ""),
+        md5=str(item.get("md5") or item.get("gcid") or item.get("gcId") or ""),
         playback_values=(
             {
                 "file_id": str(file_id),
@@ -54,6 +56,27 @@ class GuangyaFileService(CloudDriveFileServiceBase):
     root_directory_id = ""
     provider_name = "光鸭"
     _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": ""})
+
+    def download_file(self, file_item: CloudFile, local_path: str,
+                      progress_callback=None, stop_requested=None,
+                      preserve_partial: bool = False,
+                      download_threads: int = 5) -> str:
+        url, headers = self.resolve_download_link(file_item)
+        return HttpFileDownloadService(
+            lambda _: (url, headers), concurrency=download_threads,
+        ).download_file(
+            file_item, local_path, progress_callback, stop_requested,
+            preserve_partial=preserve_partial,
+        )
+
+    def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
+        response = self.client.request(
+            "POST", f"{self.client.API_BASE_URL}/userres/v1/get_res_download_url",
+            json_data={"fileId": file_item.id},
+        )
+        data = self.client.data(response) or {}
+        url = str(data.get("signedUrl") or data.get("downloadUrl") or "")
+        return url, {}
 
     def _get_file_list(
             self, parent_id: str = "", page: int = 0, page_size: int = 100

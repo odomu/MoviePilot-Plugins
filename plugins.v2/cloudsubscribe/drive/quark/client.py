@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from datetime import datetime, timezone
@@ -65,25 +66,14 @@ class QuarkClient:
     DEFAULT_PARAMS = {"pr": "ucpro", "fr": "pc", "uc_param_str": ""}
     DEFAULT_HEADERS = {
         "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/94.0.4606.71 Safari/537.36 "
+            "Core/1.94.225.400 QQBrowser/12.2.5544.400"
         ),
         "referer": "https://pan.quark.cn/",
         "origin": "https://pan.quark.cn",
         "accept": "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9",
-        "content-type": "application/json",
-        "x-requested-with": "XMLHttpRequest",
-        "x-client-version": "3.1.0",
-        "x-platform-version": "web",
-        "x-platform-type": "web",
-        "x-sdk-version": "3.1.0",
-        "x-device-model": "web",
-        "x-device-name": "Chrome",
-        "x-device-platform": "web",
-        "x-app-id": "30",
-        "x-app-version": "3.1.0",
-        "x-app-package": "com.quark.pan",
     }
 
     def __init__(
@@ -95,10 +85,8 @@ class QuarkClient:
         self._cookie = str(cookie or "").strip()
         self._on_cookie_refresh = on_cookie_refresh
         self._timeout = max(5, int(timeout or 30))
-        self._device_id = str(int(time.time() * 1000))
         self._session = requests.Session()
         self._session.headers.update(self.DEFAULT_HEADERS)
-        self._api_call_count = 0
 
     @property
     def cookie(self) -> str:
@@ -106,12 +94,6 @@ class QuarkClient:
 
     def close(self) -> None:
         self._session.close()
-
-    def reset_api_call_count(self) -> None:
-        self._api_call_count = 0
-
-    def get_api_call_count(self) -> int:
-        return self._api_call_count
 
     @staticmethod
     def is_success(response: Any) -> bool:
@@ -128,18 +110,28 @@ class QuarkClient:
         return response.get("data") or {} if isinstance(response, dict) else {}
 
     def _params(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        params = {**self.DEFAULT_PARAMS, "__t": int(time.time() * 1000), "__dt": 1000}
+        params = {
+            **self.DEFAULT_PARAMS,
+            "__t": int(time.time() * 1000),
+            "__dt": random.randint(100, 9999),
+        }
         if extra:
             params.update(extra)
         return params
 
     def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        headers = {**self.DEFAULT_HEADERS, "x-device-id": self._device_id}
+        headers = dict(self.DEFAULT_HEADERS)
         if self._cookie:
             headers["cookie"] = self._cookie
         if extra:
             headers.update(extra)
         return headers
+
+    def download_headers(
+            self, extra: Optional[Dict[str, str]] = None
+    ) -> Dict[str, str]:
+        """返回文件下载所需的认证请求头，供文件服务使用。"""
+        return self._headers(extra)
 
     def _refresh_cookie(self, response: requests.Response) -> None:
         current = {}
@@ -170,11 +162,11 @@ class QuarkClient:
             params: Optional[Dict[str, Any]] = None,
             json_data: Optional[Dict[str, Any]] = None,
             base_url: Optional[str] = None,
+            request_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         url = f"{(base_url or self.BASE_URL).rstrip('/')}/{endpoint.lstrip('/')}"
-        self._api_call_count += 1
         try:
-            headers = self._headers()
+            headers = self._headers(request_headers)
             if method.upper() == "GET":
                 headers.pop("content-type", None)
             response = self._session.request(
@@ -186,17 +178,23 @@ class QuarkClient:
                 timeout=self._timeout,
             )
             self._refresh_cookie(response)
-            if response.status_code in (401, 403):
-                return {"status": response.status_code, "message": "Cookie 已失效", "data": {}}
             if response.status_code >= 400:
                 try:
                     error = response.json()
                 except ValueError:
                     error = {}
                 return {
-                    "status": response.status_code,
-                    "code": response.status_code,
-                    "message": error.get("message") or response.text[:300],
+                    "status": error.get("status", response.status_code),
+                    "code": error.get("code", response.status_code),
+                    "http_status": response.status_code,
+                    "message": (
+                            error.get("message") or error.get("msg")
+                            or response.text[:300]
+                            or (
+                                "Cookie 已失效" if response.status_code == 401
+                                else f"HTTP {response.status_code}"
+                            )
+                    ),
                     "data": error,
                 }
             return response.json() if response.text else {"status": 200, "code": 0, "data": {}}
@@ -273,7 +271,6 @@ class QuarkClient:
     def get_user_info(self) -> Dict[str, Any]:
         if not self._cookie:
             return {"status": 401, "message": "未配置 Cookie", "data": {}}
-        self._api_call_count += 1
         try:
             headers = self._headers()
             headers.pop("content-type", None)
@@ -313,11 +310,6 @@ class QuarkClient:
         ):
             return member
         return self.request("GET", "capacity")
-
-    @property
-    def is_vip(self) -> bool:
-        member = self.data(self.get_member_info())
-        return bool(_member_profile(member).get("is_vip"))
 
     def check_login(self) -> bool:
         return self.is_success(self.get_member_info())

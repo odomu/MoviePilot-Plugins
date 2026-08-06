@@ -83,7 +83,6 @@ class OfflineDownloadService(OwnerDelegator):
 
         try:
             self.rate_limiter.wait()
-            self._api_call_count += 1
             tasks = [
                 self._format_offline_task(task)
                 for task in clouddownload_iter(
@@ -183,7 +182,6 @@ class OfflineDownloadService(OwnerDelegator):
             self._offline_quota_refreshing = True
         try:
             self.rate_limiter.wait()
-            self._api_call_count += 1
             response = self.client.clouddownload_quota_info_open(
                 **self._ios_request_kwargs(app=False)
             )
@@ -213,7 +211,6 @@ class OfflineDownloadService(OwnerDelegator):
         if not normalized_hash:
             raise ValueError("离线任务 info_hash 不能为空")
         self.rate_limiter.wait()
-        self._api_call_count += 1
         response = self.client.clouddownload_task_del(
             {
                 "hash[0]": normalized_hash,
@@ -246,7 +243,6 @@ class OfflineDownloadService(OwnerDelegator):
         payload = {f"hash[{index}]": value for index, value in enumerate(hashes)}
         payload["flag"] = 1 if delete_source_file else 0
         self.rate_limiter.wait()
-        self._api_call_count += 1
         response = self.client.clouddownload_task_del(
             payload, **self._ios_request_kwargs(app=False)
         )
@@ -270,7 +266,6 @@ class OfflineDownloadService(OwnerDelegator):
         if not normalized_hash:
             raise ValueError("离线任务 info_hash 不能为空")
         self.rate_limiter.wait()
-        self._api_call_count += 1
         response = self.client.clouddownload_task_restart(
             normalized_hash,
             **self._ios_request_kwargs(app=False),
@@ -393,7 +388,6 @@ class OfflineDownloadService(OwnerDelegator):
             payload["wp_path_id"] = parent_id
             try:
                 self.rate_limiter.wait()
-                self._api_call_count += 1
                 resp = self.client.clouddownload_task_add_urls(
                     payload,
                     **self._ios_request_kwargs(app=False),

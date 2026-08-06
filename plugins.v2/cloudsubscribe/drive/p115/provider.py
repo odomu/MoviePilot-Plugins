@@ -19,6 +19,7 @@ from ...core.cloud import (
     CloudDriveProvider,
     CloudFile,
 )
+from ...core.transfer import LocalRapidUploadAdapter
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ def create_p115_provider(manager: Any) -> CloudDriveProvider:
     file_mutation = P115FileMutation(files)
     batch_mutation = P115BatchFileMutation(files)
     cache_maintenance = P115CacheMaintenance(manager)
+
     return CloudDriveProvider(
         key="115",
         name="115网盘",
@@ -72,6 +74,8 @@ def create_p115_provider(manager: Any) -> CloudDriveProvider:
             CloudDriveCapability.PLAYBACK_REFERENCE: P115PlaybackReference(),
             CloudDriveCapability.OFFLINE_TASKS: offline,
             CloudDriveCapability.LOCAL_UPLOAD: upload,
+            CloudDriveCapability.RAPID_UPLOAD: LocalRapidUploadAdapter(upload, file_query, frozenset({"sha1"})),
+            CloudDriveCapability.FILE_DOWNLOAD: file_query,
             CloudDriveCapability.QRCODE_AUTH: manager.__class__,
             CloudDriveCapability.CACHE_MAINTENANCE: cache_maintenance,
         },

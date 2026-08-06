@@ -42,7 +42,6 @@ class P123ClientManager:
         self.timeout = max(5, min(int(timeout or 30), 300))
         self._client: Optional[Any] = None
         self._lock = RLock()
-        self._api_call_count = 0
 
     def _create_client(self):
         return P123Client.init(
@@ -67,9 +66,14 @@ class P123ClientManager:
 
         def wrapped(*args, **kwargs):
             kwargs.setdefault("timeout", self.timeout)
-            with self._lock:
-                self._api_call_count += 1
-            response = getattr(self._get_client(), name)(*args, **kwargs)
+            method = getattr(self._get_client(), name)
+            try:
+                response = method(*args, **kwargs)
+            except TypeError as error:
+                if "timeout" not in str(error) or "timeout" not in kwargs:
+                    raise
+                kwargs.pop("timeout", None)
+                response = method(*args, **kwargs)
             return response
 
         return wrapped
@@ -78,8 +82,6 @@ class P123ClientManager:
         """使用 p123client 创建 123 App 扫码登录会话。"""
         if not P123_AVAILABLE:
             raise RuntimeError("p123client 未安装")
-        with self._lock:
-            self._api_call_count += 1
         response = P123Client.login_qrcode_generate(timeout=self.timeout)
         check_response(response)
         data = response.get("data") or {}
@@ -105,8 +107,6 @@ class P123ClientManager:
         uni_id = str(kwargs.get("uni_id") or kwargs.get("uniID") or "").strip()
         if not uni_id:
             raise ValueError("缺少 123 网盘扫码会话参数")
-        with self._lock:
-            self._api_call_count += 1
         response = P123Client.login_qrcode_result(uni_id, timeout=self.timeout)
         if not isinstance(response, dict):
             raise RuntimeError("123网盘扫码状态响应格式无效")
@@ -144,10 +144,6 @@ class P123ClientManager:
         except Exception:
             return False
 
-    @property
-    def is_vip(self) -> bool:
-        return False
-
     def get_account_info(self) -> Dict[str, Any]:
         if not self.token:
             return {"connected": False, "error": "请扫码登录 123 网盘"}
@@ -181,14 +177,6 @@ class P123ClientManager:
             }
         except Exception as error:
             return {"connected": False, "error": str(error)}
-
-    def reset_api_call_count(self) -> None:
-        with self._lock:
-            self._api_call_count = 0
-
-    def get_api_call_count(self) -> int:
-        with self._lock:
-            return self._api_call_count
 
     def close(self) -> None:
         with self._lock:

@@ -239,8 +239,6 @@ class P115ClientManager:
         :param min_interval: API 请求最小间隔（秒），默认 1.5
         :param path_cache_ttl: 路径缓存过期时间（秒），默认 3600
         """
-        # API 调用计数器
-        self._api_call_count = 0
         self._magnet_metadata_url_template = str(
             magnet_metadata_url_template or DEFAULT_METADATA_URL_TEMPLATE
         )
@@ -372,7 +370,6 @@ class P115ClientManager:
 
         try:
             self.rate_limiter.wait()
-            self._api_call_count += 1
             user_info = self.client.user_my_info(**self._ios_request_kwargs(app=False))
             if user_info.get("state"):
                 data = user_info.get("data") or {}
@@ -410,7 +407,6 @@ class P115ClientManager:
 
             try:
                 self.rate_limiter.wait()
-                self._api_call_count += 1
                 user_response = self.client.user_my_info(
                     **self._ios_request_kwargs(app=False)
                 )
@@ -420,7 +416,6 @@ class P115ClientManager:
                 face_data = user_data.get("face") or {}
 
                 self.rate_limiter.wait()
-                self._api_call_count += 1
                 space_response = self.client.fs_index_info(
                     payload=0,
                     **self._ios_request_kwargs(app=False),
@@ -512,11 +507,3 @@ class P115ClientManager:
             "offline_quota": int(offline_quota_count),
         })
         return counts
-
-    def get_api_call_count(self) -> int:
-        """获取 API 调用次数"""
-        return self._api_call_count
-
-    def reset_api_call_count(self):
-        """重置 API 调用计数器"""
-        self._api_call_count = 0

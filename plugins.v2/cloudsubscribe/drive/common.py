@@ -65,12 +65,6 @@ class CloudDriveFileServiceBase:
     def close(self) -> None:
         self.client.close()
 
-    def reset_api_call_count(self) -> None:
-        self.client.reset_api_call_count()
-
-    def get_api_call_count(self) -> int:
-        return self.client.get_api_call_count()
-
     def resolve_directory(self, path: str, create: bool = False) -> DirectoryLookup:
         current_id = self.root_directory_id
         current_path = ""

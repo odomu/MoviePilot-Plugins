@@ -1,10 +1,13 @@
 """夸克目录与文件操作能力。"""
 
+import time
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Dict, List, Optional
 
 from ..common import CloudDriveFileServiceBase, extract_list, safe_int
 from ...core.cloud import CloudFile
+from ...core.transfer import HttpFileDownloadService
 
 
 def list_data(client: Any, response: Any) -> list:
@@ -28,6 +31,7 @@ def cloud_file(item: Any) -> Optional[CloudFile]:
         is_directory=is_directory,
         size=0 if is_directory else safe_int(item.get("size") or item.get("file_size")),
         sha1=str(item.get("sha1") or ""),
+        md5=str(item.get("md5") or ""),
         playback_values={"file_id": str(file_id)} if not is_directory else {},
         native=item,
     )
@@ -35,11 +39,76 @@ def cloud_file(item: Any) -> Optional[CloudFile]:
 
 @dataclass
 class QuarkFileService(CloudDriveFileServiceBase):
+    DOWNLOAD_PARAMS = {
+        "sys": "win32", "ve": "2.5.20", "ut": "", "guid": "",
+    }
+    DOWNLOAD_WEB_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+    )
+    DOWNLOAD_DESKTOP_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 "
+        "Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
+    )
+
     client: Any
     page_size: int = 100
     root_directory_id = "0"
     provider_name = "夸克"
     _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": "0"})
+    _directory_lock: RLock = field(default_factory=RLock, repr=False)
+
+    def resolve_directory(self, path: str, create: bool = False):
+        # 夸克会把并发创建同一目录判定为正在下载/同名冲突。
+        with self._directory_lock:
+            return super().resolve_directory(path, create=create)
+
+    def download_file(self, file_item: CloudFile, local_path: str,
+                      progress_callback=None, stop_requested=None,
+                      preserve_partial: bool = False,
+                      download_threads: int = 5) -> str:
+        url, headers = self.resolve_download_link(file_item)
+        service = HttpFileDownloadService(
+            lambda _: (url, headers),
+            concurrency=download_threads,
+            part_size=10 * 1024 * 1024,
+        )
+        return service.download_file(
+            file_item, local_path, progress_callback, stop_requested,
+            preserve_partial=preserve_partial,
+        )
+
+    def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
+        entry = {}
+        response = {}
+        download_user_agent = self.DOWNLOAD_WEB_USER_AGENT
+        for user_agent in (
+                self.DOWNLOAD_WEB_USER_AGENT,
+                self.DOWNLOAD_DESKTOP_USER_AGENT,
+        ):
+            response = self.client.request(
+                "POST", "file/download",
+                params=self.DOWNLOAD_PARAMS,
+                json_data={"fids": [file_item.id]},
+                base_url=self.client.SHARE_BASE_URL,
+                request_headers={"user-agent": user_agent},
+            )
+            data = self.client.data(response) or []
+            entry = data[0] if isinstance(data, list) and data else {}
+            download_user_agent = user_agent
+            if entry.get("download_url"):
+                break
+            if int(response.get("code") or 0) != 23018:
+                break
+        if not entry.get("download_url"):
+            raise RuntimeError(
+                response.get("message") or "夸克未返回文件下载地址"
+            )
+        return (
+            str(entry["download_url"]),
+            self.client.download_headers({"user-agent": download_user_agent}),
+        )
 
     def _get_file_list(
             self, parent_id: str = "0", page: int = 1, size: int = 100
@@ -87,8 +156,30 @@ class QuarkFileService(CloudDriveFileServiceBase):
     def _create_folder(self, name: str, parent_id: str) -> Optional[CloudFile]:
         response = self._create_folder_request(name, parent_id)
         if not self._is_success(response):
-            raise RuntimeError(response.get("message") or "创建夸克目录失败")
-        return cloud_file(self.client.data(response))
+            message = str(response.get("message") or "创建夸克目录失败")
+            if "doloading" not in message.lower() and "同名冲突" not in message:
+                raise RuntimeError(message)
+        else:
+            created = cloud_file(self.client.data(response))
+            if created:
+                return created
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                existing = next(
+                    (
+                        item for item in self._list(parent_id)
+                        if item.is_directory and item.name == name
+                    ),
+                    None,
+                )
+            except RuntimeError:
+                continue
+            if existing:
+                return existing
+        raise RuntimeError(f"夸克目录创建后长时间不可见：{name}")
 
     def _is_success(self, response: Any) -> bool:
         return self.client.is_success(response)

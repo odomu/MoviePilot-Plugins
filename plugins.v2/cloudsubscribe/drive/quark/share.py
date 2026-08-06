@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from threading import RLock
 from typing import Any, Dict, Iterable
 
 from app.log import logger
@@ -19,6 +20,9 @@ class QuarkShareService:
         self._files = files
         self.client = client
         self.page_size = files.page_size
+        self._share_items: Dict[str, Dict[str, Dict[str, str]]] = {}
+        self._share_tokens: Dict[str, str] = {}
+        self._share_items_lock = RLock()
 
     def _get_share_token(self, share_id: str, password: str = "") -> Dict[str, Any]:
         return self.client.request(
@@ -29,7 +33,7 @@ class QuarkShareService:
                 "passcode": password,
                 "support_visit_limit_private_share": True,
             },
-            base_url=self.client.SHARE_BASE_URL,
+            base_url=self.client.BASE_URL,
         )
 
     def _get_share_files(
@@ -51,26 +55,28 @@ class QuarkShareService:
                 "_fetch_total": "1",
                 "_sort": "file_type:asc,file_name:asc",
             },
-            base_url=self.client.SHARE_BASE_URL,
+            base_url=self.client.BASE_URL,
         )
 
     def _save_shared_files(
-            self, share_id: str, token: str, file_ids: list, target_id: str
+            self, share_id: str, token: str, file_ids: list, target_id: str,
+            file_tokens: list,
     ) -> Dict[str, Any]:
+        payload = {
+            "fid_list": file_ids,
+            "fid_token_list": file_tokens,
+            "to_pdir_fid": target_id,
+            "pwd_id": share_id,
+            "stoken": token,
+            "pdir_fid": "0",
+            "scene": "link",
+        }
+        if not file_ids:
+            payload.update({"pdir_save_all": True, "exclude_fids": []})
         result = self.client.request(
             "POST",
             "share/sharepage/save",
-            json_data={
-                "fid_list": file_ids,
-                "fid_token_list": [],
-                "to_pdir_fid": target_id,
-                "pwd_id": share_id,
-                "stoken": token,
-                "pdir_fid": "0",
-                "pdir_save_all": not file_ids,
-                "exclude_fids": [],
-                "scene": "link",
-            },
+            json_data=payload,
             base_url=self.client.SHARE_BASE_URL,
         )
         task_id = (self.client.data(result) or {}).get("task_id")
@@ -133,6 +139,7 @@ class QuarkShareService:
         try:
             info, token = self._share_access(share_url)
             result = []
+            share_items: Dict[str, Dict[str, str]] = {}
             stack = ["0"]
             while stack:
                 parent_id = stack.pop()
@@ -151,10 +158,17 @@ class QuarkShareService:
                         if item.is_directory:
                             stack.append(item.id)
                         else:
+                            share_items[item.id] = {
+                                "token": str(raw.get("share_fid_token") or ""),
+                                "parent_id": str(raw.get("pdir_fid") or parent_id),
+                            }
                             result.append(dict(item))
                     if len(items) < self.page_size:
                         break
                     page += 1
+            with self._share_items_lock:
+                self._share_items[info["share_id"]] = share_items
+                self._share_tokens[info["share_id"]] = token
             return result
         except Exception as error:
             logger.warning(f"读取夸克分享文件失败：{error}")
@@ -163,18 +177,49 @@ class QuarkShareService:
     def _save_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str
     ) -> bool:
-        info, token = self._share_access(share_url)
+        info = self.extract_share_info(share_url)
+        if not info:
+            raise ValueError("无效的夸克分享链接")
+        normalized = list(dict.fromkeys(str(value) for value in file_ids))
+        file_tokens = []
+        if normalized:
+            with self._share_items_lock:
+                cached = dict(self._share_items.get(info["share_id"], {}))
+                token = str(self._share_tokens.get(info["share_id"]) or "")
+            if not token or not all(file_id in cached for file_id in normalized):
+                self.list_share_files(share_url)
+                with self._share_items_lock:
+                    cached = dict(self._share_items.get(info["share_id"], {}))
+                    token = str(self._share_tokens.get(info["share_id"]) or "")
+            file_tokens = [
+                str((cached.get(file_id) or {}).get("token") or "")
+                for file_id in normalized
+            ]
+            if not token or not all(file_tokens):
+                logger.error(
+                    f"夸克分享文件缺少 stoken 或 share_fid_token，无法转存："
+                    f"{len([value for value in file_tokens if value])}/{len(normalized)}"
+                )
+                return False
+        else:
+            _, token = self._share_access(share_url)
         lookup = self._files.resolve_directory(save_path, create=True)
         if not lookup.checked or lookup.directory_id is None:
+            logger.error(f"夸克转存目录不可用：{save_path}")
             return False
         result = self._save_shared_files(
-            info["share_id"], token, [str(value) for value in file_ids],
-            lookup.directory_id,
+            info["share_id"], token, normalized, lookup.directory_id, file_tokens,
         )
-        return (
+        success = (
                 self.client.is_success(result)
                 and result.get("task_success", True) is not False
         )
+        if not success:
+            logger.error(
+                f"夸克分享转存失败：{result.get('message') or '异步任务未完成'}，"
+                f"文件数={len(normalized) or '全部'}，目录={save_path}"
+            )
+        return success
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
         return self._save_share(share_url, [], save_path)

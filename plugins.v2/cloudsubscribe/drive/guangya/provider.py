@@ -16,6 +16,7 @@ from ...core.cloud import (
     CloudDriveProvider,
     CloudFile,
 )
+from ...core.transfer import LocalRapidUploadAdapter
 
 
 @dataclass
@@ -23,12 +24,6 @@ class GuangyaDrive:
     client: GuangyaClient
     metadata_url_template: str
     page_size: int = 100
-
-    def reset_api_call_count(self) -> None:
-        self.client.reset_api_call_count()
-
-    def get_api_call_count(self) -> int:
-        return self.client.get_api_call_count()
 
     def close(self) -> None:
         """关闭底层 HTTP 会话。"""
@@ -52,6 +47,7 @@ def create_guangya_provider(drive: GuangyaDrive) -> CloudDriveProvider:
     share = GuangyaShareService(drive.client, files, offline)
     upload = GuangyaUploadService(drive.client, files)
     playback_reference = GuangyaPlaybackReference()
+
     return CloudDriveProvider(
         key="guangya",
         name="光鸭网盘",
@@ -67,6 +63,8 @@ def create_guangya_provider(drive: GuangyaDrive) -> CloudDriveProvider:
             CloudDriveCapability.FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
             CloudDriveCapability.LOCAL_UPLOAD: upload,
+            CloudDriveCapability.RAPID_UPLOAD: LocalRapidUploadAdapter(upload, files, frozenset({"md5"})),
+            CloudDriveCapability.FILE_DOWNLOAD: files,
             CloudDriveCapability.QRCODE_AUTH: drive.client,
         },
         policy=CloudDrivePolicy(

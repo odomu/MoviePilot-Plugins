@@ -15,18 +15,13 @@ from ...core.cloud import (
     CloudDriveProvider,
     CloudFile,
 )
+from ...core.transfer import LocalRapidUploadAdapter
 
 
 @dataclass
 class QuarkDrive:
     client: QuarkClient
     page_size: int = 100
-
-    def reset_api_call_count(self) -> None:
-        self.client.reset_api_call_count()
-
-    def get_api_call_count(self) -> int:
-        return self.client.get_api_call_count()
 
     def close(self) -> None:
         """关闭底层 HTTP 会话。"""
@@ -47,6 +42,7 @@ def create_quark_provider(drive: QuarkDrive) -> CloudDriveProvider:
     share = QuarkShareService(drive.client, files)
     upload = QuarkUploadService(drive.client, files)
     playback_reference = QuarkPlaybackReference()
+
     return CloudDriveProvider(
         key="quark",
         name="夸克网盘",
@@ -61,6 +57,8 @@ def create_quark_provider(drive: QuarkDrive) -> CloudDriveProvider:
             CloudDriveCapability.FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
             CloudDriveCapability.LOCAL_UPLOAD: upload,
+            CloudDriveCapability.RAPID_UPLOAD: LocalRapidUploadAdapter(upload, files, frozenset({"md5"})),
+            CloudDriveCapability.FILE_DOWNLOAD: files,
             CloudDriveCapability.QRCODE_AUTH: QuarkClient,
         },
         policy=CloudDrivePolicy(

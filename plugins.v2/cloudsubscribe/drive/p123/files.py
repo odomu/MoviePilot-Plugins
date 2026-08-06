@@ -3,9 +3,10 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
-from .client import P123_AVAILABLE, is_success
+from .client import P123_AVAILABLE, check_response, is_success
 from ..common import CloudDriveFileServiceBase, safe_int
 from ...core.cloud import CloudFile
+from ...core.transfer import HttpFileDownloadService
 
 try:
     from p123client.tool import iterdir
@@ -56,6 +57,7 @@ def cloud_file(item: Any) -> Optional[CloudFile]:
         size=size,
         # 现有同步后处理使用 sha1 字段承载提供方校验和；123 返回的是 MD5。
         sha1=checksum,
+        md5=checksum,
         playback_values=playback_values,
         native=raw,
     )
@@ -68,6 +70,48 @@ class P123FileService(CloudDriveFileServiceBase):
     root_directory_id = "0"
     provider_name = "123"
     _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": "0"})
+
+    def download_file(self, file_item: CloudFile, local_path: str,
+                      progress_callback=None, stop_requested=None,
+                      preserve_partial: bool = False,
+                      download_threads: int = 5) -> str:
+        download_url, headers = self.resolve_download_link(file_item)
+        return HttpFileDownloadService(
+            lambda _: (download_url, headers), concurrency=download_threads,
+        ).download_file(
+            file_item, local_path, progress_callback, stop_requested,
+            preserve_partial=preserve_partial,
+        )
+
+    def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
+        if not P123_AVAILABLE:
+            raise RuntimeError("p123client 未安装")
+        raw = file_item.native if isinstance(file_item.native, Mapping) else {}
+        values = file_item.playback_values or {}
+        payload = {
+            "Etag": str(
+                raw.get("Etag") or raw.get("etag")
+                or values.get("md5") or file_item.md5 or ""
+            ).strip(),
+            "FileID": int(file_item.id),
+            "FileName": file_item.name,
+            "S3KeyFlag": str(
+                raw.get("S3KeyFlag") or raw.get("s3KeyFlag")
+                or values.get("s3_key_flag") or ""
+            ).strip(),
+            "Size": int(file_item.size or raw.get("Size") or raw.get("size") or 0),
+        }
+        if not payload["Etag"] or not payload["S3KeyFlag"]:
+            raise RuntimeError(f"123 文件元数据不完整，无法获取下载地址：{file_item.name}")
+        response = self.client.download_info(payload)
+        check_response(response)
+        data = response.get("data") or {}
+        download_url = str(
+            data.get("DownloadUrl") or data.get("downloadUrl") or ""
+        ).strip()
+        if not download_url:
+            raise RuntimeError(f"123 未返回下载地址：{file_item.name}")
+        return download_url, {}
 
     def _list(self, directory_id: str) -> List[CloudFile]:
         if not P123_AVAILABLE or iterdir is None:

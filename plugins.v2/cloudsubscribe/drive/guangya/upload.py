@@ -37,6 +37,31 @@ class GuangyaUploadService:
                 digest.update(chunk)
         return digest.hexdigest().upper()
 
+    def try_rapid_upload(
+            self, local_path: str, save_path: str, target_name: str,
+            algorithm: str, checksum: str, size: int,
+    ) -> bool:
+        if algorithm != "md5":
+            return False
+        lookup = self.files.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            raise RuntimeError(f"光鸭本地上传目录不可用：{save_path}")
+        response = self._request(
+            "/nd.bizuserres.s/v1/check_can_flash_upload",
+            {
+                "taskId": "",
+                "gcid": checksum.upper(),
+                "fileSize": int(size),
+                "name": target_name,
+                "parentId": lookup.directory_id or "",
+            },
+        )
+        if not (self.client.is_success(response) and response.get("data")):
+            return False
+        return self._confirm_upload(
+            save_path, target_name, Path(local_path), retry=10
+        )
+
     def upload_file(
             self,
             local_path: str,

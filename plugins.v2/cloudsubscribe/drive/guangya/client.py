@@ -51,16 +51,9 @@ class GuangyaClient:
         self._on_token_refresh = on_token_refresh
         self._timeout = max(5, int(timeout or 30))
         self._session = requests.Session()
-        self._api_call_count = 0
 
     def close(self) -> None:
         self._session.close()
-
-    def reset_api_call_count(self) -> None:
-        self._api_call_count = 0
-
-    def get_api_call_count(self) -> int:
-        return self._api_call_count
 
     @staticmethod
     def is_success(response: Any) -> bool:
@@ -126,7 +119,6 @@ class GuangyaClient:
         if authenticated and self.access_token:
             headers["authorization"] = f"Bearer {self.access_token}"
             headers["accessToken"] = self.access_token
-        self._api_call_count += 1
         try:
             response = self._session.request(
                 method.upper(), url, headers=headers, json=json_data, timeout=self._timeout
@@ -290,10 +282,6 @@ class GuangyaClient:
         return self.request(
             "POST", f"{self.API_BASE_URL}/nd.bizassets.s/v1/get_assets", json_data={}
         )
-
-    @property
-    def is_vip(self) -> bool:
-        return False
 
     def check_login(self) -> bool:
         return self.is_success(self.get_user_info())

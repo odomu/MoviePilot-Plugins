@@ -32,7 +32,12 @@ class P123ShareService:
         value = str(share_url or "").strip()
         if not value:
             return {}
-        match = re.search(r"(?:https?://[^/]*123[^/]*/s/|123://share/)([\w-]+)", value, re.I)
+        match = re.search(
+            r"(?:https?://(?:[^/]*\.)?(?:123pan\.com|123684\.com|123865\.com)/s/"
+            r"|123://share/)([\w-]+)",
+            value,
+            re.I,
+        )
         if not match:
             return {}
         password = ""

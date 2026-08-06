@@ -108,7 +108,6 @@ class ShareService(OwnerDelegator):
         try:
             # 使用 share_snap 接口检查分享状态
             self.rate_limiter.wait()
-            self._api_call_count += 1
             payload = {
                 "share_code": share_code,
                 "receive_code": receive_code or "",
@@ -265,7 +264,6 @@ class ShareService(OwnerDelegator):
         try:
             # 速率限制
             self.rate_limiter.wait()
-            self._api_call_count += 1
 
             iterator = share_iterdir(
                 self.client,
@@ -285,8 +283,10 @@ class ShareService(OwnerDelegator):
                     "pick_code": item.get("pick_code", ""),
                 }
 
-                # 递归获取子目录内容；请求间隔统一由 RateLimiter 控制。
-                if file_info["is_dir"] and depth < max_depth:
+                # 目录仅用于递归定位文件，不进入分享文件结果。
+                if file_info["is_dir"]:
+                    if depth >= max_depth:
+                        continue
                     dir_name = file_info["name"]
 
                     # 优化：如果指定了目标季数，跳过明显不匹配的季目录
@@ -294,7 +294,6 @@ class ShareService(OwnerDelegator):
                         skip_dir = self._should_skip_season_dir(dir_name, target_season)
                         if skip_dir:
                             logger.info(f"跳过非目标季目录: {dir_name} (目标: S{target_season})")
-                            files.append(file_info)  # 仍然记录目录信息，但不递归
                             continue
 
                     sub_cid = int(item.get("id", 0))
@@ -306,7 +305,8 @@ class ShareService(OwnerDelegator):
                         max_depth=max_depth,
                         target_season=target_season
                     )
-                    file_info["children"] = children
+                    files.extend(children)
+                    continue
 
                 files.append(file_info)
 
@@ -782,7 +782,6 @@ class ShareService(OwnerDelegator):
         for attempt in range(max_retries + 1):
             try:
                 self.rate_limiter.wait()
-                self._api_call_count += 1
                 resp = self.client.share_receive(
                     payload,
                     **self._ios_request_kwargs(app=False),

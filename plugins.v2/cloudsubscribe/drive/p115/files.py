@@ -12,6 +12,7 @@ from app.log import logger
 from ..common import safe_int
 from ...core import OwnerDelegator
 from ...core.cloud import CloudFile, DirectoryListing, DirectoryLookup
+from ...core.transfer import HttpFileDownloadService
 
 try:
     from p115client.tool.edit import batch_delete, batch_move, makedir, update_name
@@ -37,6 +38,7 @@ def cloud_file(item: Any) -> CloudFile | None:
         is_directory=is_directory,
         size=safe_int(raw.get("size") or raw.get("s")),
         sha1=str(raw.get("sha1") or raw.get("sha") or ""),
+        md5=str(raw.get("md5") or ""),
         playback_values={"pickcode": str(pickcode)} if pickcode else {},
         native=raw,
     )
@@ -93,6 +95,27 @@ class P115FileQuery:
 
     def get_cached_file(self, path: str, file_name: str) -> CloudFile | None:
         return cloud_file(self.manager.get_cached_target_file(path, file_name))
+
+    def download_file(self, file_item: CloudFile, local_path: str,
+                      progress_callback=None, stop_requested=None,
+                      preserve_partial: bool = False,
+                      download_threads: int = 5) -> str:
+        url, headers = self.resolve_download_link(file_item)
+        service = HttpFileDownloadService(
+            lambda _: (url, headers), concurrency=download_threads,
+        )
+        return service.download_file(
+            file_item, local_path, progress_callback, stop_requested,
+            preserve_partial=preserve_partial,
+        )
+
+    def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
+        pickcode = str(file_item.playback_values.get("pickcode") or "")
+        client = getattr(self.manager, "client", None)
+        if not client or not pickcode:
+            raise RuntimeError("115 文件缺少 pickcode 或客户端未登录")
+        value = client.download_url(pickcode)
+        return str(value or ""), dict(getattr(value, "headers", None) or {})
 
 
 @dataclass(frozen=True)
@@ -156,7 +179,6 @@ class P115FileService(OwnerDelegator):
     def _iter_directory(self, cid: Any):
         """按页读取一个115目录，并让工具层处理字段标准化和响应校验。"""
         self.rate_limiter.wait()
-        self._api_call_count += 1
         return iterdir(
             self.client,
             cid=cid,
@@ -182,9 +204,6 @@ class P115FileService(OwnerDelegator):
         if not pairs:
             return set()
         self.rate_limiter.wait()
-        self._api_call_count += (
-                                        len(pairs) + self.MUTATION_BATCH_SIZE - 1
-                                ) // self.MUTATION_BATCH_SIZE
         renamed = update_name(
             self.client,
             pairs,
@@ -199,9 +218,6 @@ class P115FileService(OwnerDelegator):
         if not normalized:
             return
         self.rate_limiter.wait()
-        self._api_call_count += (
-                                        len(normalized) + self.MUTATION_BATCH_SIZE - 1
-                                ) // self.MUTATION_BATCH_SIZE
         batch_move(
             self.client,
             normalized,
@@ -218,9 +234,6 @@ class P115FileService(OwnerDelegator):
         if not normalized:
             return set()
         self.rate_limiter.wait()
-        self._api_call_count += (
-                                        len(normalized) + self.MUTATION_BATCH_SIZE - 1
-                                ) // self.MUTATION_BATCH_SIZE
         batch_delete(
             self.client,
             normalized,
@@ -281,7 +294,6 @@ class P115FileService(OwnerDelegator):
 
             try:
                 self.rate_limiter.wait()
-                self._api_call_count += 1
                 parent_id = makedir(
                     self.client,
                     part,
