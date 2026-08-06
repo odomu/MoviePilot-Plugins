@@ -47,7 +47,7 @@ export function createBasicSection(cloudDriveItems) {
             {
                 title: "订阅接管时段",
                 icon: "mdi-clock-outline",
-                hint: "接管时段内符合过滤规则的订阅由本插件搜索，时段外仍由 MoviePilot 原生搜索。平台下载策略独立决定接管时段内 PT/RSS 资源的处理方式。",
+                hint: "接管时段内符合过滤规则的订阅由本插件搜索，时段外仍由原生搜索。平台下载策略独立决定接管时段内 PT/RSS 资源的处理方式。",
                 fields: [
                     {
                         key: "block_system_subscribe",
@@ -61,11 +61,11 @@ export function createBasicSection(cloudDriveItems) {
                         label: "平台下载策略",
                         type: "select",
                         items: [
-                            {title: "允许 MoviePilot 下载并整理", value: "allow"},
-                            {title: "阻止 MoviePilot 搜索及下载", value: "block"},
+                            {title: "允许下载并整理", value: "allow"},
+                            {title: "阻止搜索及下载", value: "block"},
                             {title: "转为网盘离线下载", value: "cloud"},
                         ],
-                        hint: "仅在接管态生效。阻止模式会在站点请求前终止 MoviePilot 平台搜索，并阻止插件管理订阅的下载；允许模式保留 PT/RSS 自动匹配、下载和整理，但同一季集已有网盘任务时仍会阻止重复下载；网盘模式接管失败时也不会放行平台下载。",
+                        hint: "仅在接管态生效。阻止模式会在站点请求前终止平台搜索，并阻止插件管理订阅的下载；允许模式保留 PT/RSS 自动匹配、下载和整理，但同一季集已有网盘任务时仍会阻止重复下载；网盘模式接管失败时也不会放行平台下载。",
                         cols: 8,
                     },
                     {

@@ -395,19 +395,10 @@ class SyncExecutionService(OwnerDelegator):
         )
         self._set_sync_status("running", "正在读取订阅列表", 5)
 
-        # reset api counters
-        try:
-            cloud_auth.reset_api_call_count()
-        except Exception:
-            pass
-        try:
-            if self._pansou_client:
-                self._pansou_client.reset_api_call_count()
-        except Exception:
-            pass
         try:
             if self._search_handler:
-                self._search_handler.reset_task_spent_points()
+                if not manual_resources:
+                    self._search_handler.reset_task_spent_points()
                 self._search_handler.reset_search_metrics()
         except Exception:
             pass
@@ -635,7 +626,7 @@ class SyncExecutionService(OwnerDelegator):
             )
             executor = ThreadPoolExecutor(
                 max_workers=worker_count,
-                thread_name_prefix="p115-subscribe",
+                thread_name_prefix="cloudsubscribe-subscribe",
             )
             stop_waiting = False
             try:
@@ -885,6 +876,7 @@ class SyncExecutionService(OwnerDelegator):
             wait_for_slot: bool = False,
             queue_revision: Optional[int] = None,
             result: Optional[Dict[str, Any]] = None,
+            lock_acquired: bool = False,
     ) -> bool:
         is_full_sync = (
                 subscribe_id is None
@@ -894,7 +886,9 @@ class SyncExecutionService(OwnerDelegator):
                 and not manual_target
                 and not upgrade_request
         )
-        if wait_for_slot:
+        if lock_acquired:
+            pass
+        elif wait_for_slot:
             while not sync_lock.acquire(timeout=0.5):
                 if (
                         self._subscribe_search_queue_shutdown.is_set()

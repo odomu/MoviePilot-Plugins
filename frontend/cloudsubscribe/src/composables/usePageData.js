@@ -167,6 +167,7 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
         }
     }
 
+
     async function stopSync() {
         try {
             runtime.status = "stopping";

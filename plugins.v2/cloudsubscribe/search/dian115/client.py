@@ -61,7 +61,7 @@ class Dian115Client:
     ):
         if not CURL_CFFI_AVAILABLE:
             raise Dian115Error(
-                "Dian115 需要 curl_cffi 请安装依赖后重启 MoviePilot",
+                "Dian115 需要 curl_cffi 请安装依赖后重启",
                 code="curl_cffi_missing",
             )
         self._email = str(email or "").strip()
@@ -413,7 +413,7 @@ class Dian115Client:
             from cloakbrowser import launch_context_async
         except ImportError as error:
             raise Dian115Error(
-                "Dian115 登录需要 MoviePilot CloakBrowser，请先准备浏览器仿真环境",
+                "Dian115 登录需要CloakBrowser，请先准备浏览器仿真环境",
                 code="browser_unavailable",
             ) from error
 

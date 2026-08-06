@@ -1,4 +1,4 @@
-"""MoviePilot页面与API适配。"""
+"""页面与API适配。"""
 
 from .account import AccountApi
 from .config import ConfigApi

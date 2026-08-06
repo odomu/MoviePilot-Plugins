@@ -7,7 +7,7 @@ from typing import Callable, Iterable, List, Optional
 import unicodedata
 
 _TITLE_SEPARATOR_RE = re.compile(
-    r"[\s\u3000\-_:：·•.,，。!！?？'\"“”‘’()（）\[\]【】/\\]+"
+    r"[\s\u3000\-_:：·•丨｜|¦.,，。!！?？'\"“”‘’()（）\[\]【】/\\]+"
 )
 _SEASON_PATTERNS = (
     re.compile(r"(?i)\bS(?:eason)?[ ._-]*0*(\d{1,3})\b"),

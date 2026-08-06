@@ -63,7 +63,6 @@
                   :refreshing-account="refreshingAccount"
                   :testing-source="testingSource"
                   :hdhive-oauth-action="hdhiveOauthAction"
-                  :refreshing-webhook-key="refreshingWebhookKey"
                   @scan="openQrCode"
                   @browse-directory="openDirectoryPicker"
                   @test-source="openSourceTest"
@@ -71,7 +70,6 @@
                   @hdhive-oauth-start="startHdhiveOAuth"
                   @hdhive-oauth-exchange="exchangeHdhiveOAuth"
                   @copy-text="copyText"
-                  @refresh-webhook-key="refreshMediaLibraryWebhookKey"
               />
             </section>
           </div>
@@ -110,16 +108,18 @@
       </v-card-actions>
     </v-card>
     <QrCodeDialog
+        v-if="qrVisible"
         v-model="qrVisible"
         :api="api"
         :provider="qrProvider"
         @success="handleQrSuccess"
     />
     <CloudDirectoryDialog
+        v-if="directoryVisible"
         v-model="directoryVisible"
         :api="api"
         :provider="directoryProvider"
-        :initial-path="directoryField ? config[directoryField] : '/'"
+        :initial-path="directoryInitialPath"
         @select="selectDirectory"
     />
     <v-dialog
@@ -393,11 +393,17 @@
 </template>
 
 <script setup>
-import {computed, onBeforeUnmount, onMounted, reactive, ref, watch,} from "vue";
-import QrCodeDialog from "./dialogs/QrCodeDialog.vue";
-import CloudDirectoryDialog from "./dialogs/CloudDirectoryDialog.vue";
+import {computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, watch,} from "vue";
 import ConfigSection from "./config/ConfigSection.vue";
 import {createConfigSections} from "../config/fields.js";
+import {createResourceTypeItems} from "../config/fields/helpers.js";
+
+const QrCodeDialog = defineAsyncComponent(
+    () => import("./dialogs/QrCodeDialog.vue"),
+);
+const CloudDirectoryDialog = defineAsyncComponent(
+    () => import("./dialogs/CloudDirectoryDialog.vue"),
+);
 
 const props = defineProps({
   api: {type: [Object, Function], required: true},
@@ -412,11 +418,11 @@ const qrVisible = ref(false),
     qrProvider = ref("115"),
     directoryVisible = ref(false),
     directoryField = ref(""),
+    directoryInitialPath = ref("/"),
     directoryProvider = ref("115"),
     saving = ref(false),
     refreshingAccount = ref(""),
     hdhiveOauthAction = ref(""),
-    refreshingWebhookKey = ref(false),
     testingSource = ref(""),
     searchingTmdb = ref(false),
     tmdbSearched = ref(false),
@@ -434,6 +440,7 @@ let hdhiveOauthWindow = null;
 const options = reactive({
   subscribes: [],
   mediaservers: [],
+  mediaLibraryWebhookUrls: {},
   notificationTypes: [],
   cloudDrives: [],
   account: {},
@@ -480,6 +487,7 @@ const sourceNames = {
   juying: "聚影",
   seedhub: "SeedHub",
   butailing: "不太灵",
+  pinglian: "盘链",
 };
 const sourceTestConfigKeys = {
   pansou: [
@@ -489,7 +497,6 @@ const sourceTestConfigKeys = {
     "pansou_auth_enabled",
     "pansou_channels",
     "pansou_plugins",
-    "pansou_cloud_types",
     "pansou_filter_include",
     "pansou_filter_exclude",
     "pansou_concurrency",
@@ -527,6 +534,13 @@ const sourceTestConfigKeys = {
   ],
   seedhub: ["seedhub_result_limit"],
   butailing: ["butailing_result_limit"],
+  pinglian: [
+    "pinglian_username",
+    "pinglian_password",
+    "pinglian_result_limit",
+    "pinglian_request_interval",
+    "pinglian_timeout",
+  ],
 };
 const sourceTest = reactive({
   source: "",
@@ -549,6 +563,11 @@ function applyOptions(data) {
   options.mediaservers = Array.isArray(data.mediaservers)
       ? data.mediaservers
       : [];
+  options.mediaLibraryWebhookUrls =
+      data.media_library_webhook_urls &&
+      typeof data.media_library_webhook_urls === "object"
+          ? data.media_library_webhook_urls
+          : {};
   options.notificationTypes = Array.isArray(data.notification_types)
       ? data.notification_types
       : [];
@@ -565,10 +584,16 @@ function applyOptions(data) {
       : {};
   options.pansou =
       data.pansou && typeof data.pansou === "object" ? data.pansou : {};
+  const configuredSources = Array.isArray(config.search_source_order)
+      ? config.search_source_order.filter(Boolean)
+      : String(config.search_source_order || "")
+          .split(/[,，\n]+/)
+          .map((value) => value.trim())
+          .filter(Boolean);
+  config.search_source_order = configuredSources;
   [
     "pansou_channels",
     "pansou_plugins",
-    "pansou_cloud_types",
     "pansou_filter_include",
     "pansou_filter_exclude",
   ].forEach((key) => {
@@ -617,28 +642,6 @@ async function copyText(value) {
   }
 }
 
-async function refreshMediaLibraryWebhookKey() {
-  if (refreshingWebhookKey.value) return;
-  refreshingWebhookKey.value = true;
-  try {
-    const response = unwrapResponse(
-        await api.post("plugin/CloudSubscribe/media-library/webhook/key/refresh", {}),
-    );
-    if (response.success === false) {
-      throw new Error(response.message || "刷新 Webhook Key 失败");
-    }
-    const data = response.data?.data || response.data || {};
-    const newKey = String(data.media_library_webhook_key || "").trim();
-    if (!newKey) throw new Error("服务端未返回新的 Webhook Key");
-    config.media_library_webhook_key = newKey;
-    notify(response.message || "Webhook Key 已刷新");
-  } catch (error) {
-    notify(`刷新 Webhook Key 失败：${error.message || error}`, "error");
-  } finally {
-    refreshingWebhookKey.value = false;
-  }
-}
-
 function testItemStatus(item) {
   if (item?.is_unlocked) return {label: "已解锁", color: "success"};
   if (item?.need_unlock) {
@@ -678,11 +681,17 @@ function openQrCode(provider) {
 }
 
 async function handleQrSuccess(payload) {
+  const provider = String(payload?.provider || qrProvider.value || "")
+      .trim()
+      .toLowerCase();
   const credentials = payload?.credentials;
   if (credentials && typeof credentials === "object") {
     Object.assign(config, credentials);
   }
   try {
+    if (provider) {
+      await refreshAccount(`drive:${provider}`, {silent: true});
+    }
     await loadOptions();
   } catch (error) {
     notify(`账号信息刷新失败：${error.message || error}`, "warning");
@@ -692,6 +701,7 @@ async function handleQrSuccess(payload) {
 function openDirectoryPicker(fieldKey, provider) {
   directoryField.value = fieldKey;
   directoryProvider.value = String(provider || config.cloud_drive || "115");
+  directoryInitialPath.value = String(config[fieldKey] || "/").trim() || "/";
   directoryVisible.value = true;
 }
 
@@ -980,12 +990,24 @@ watch(
 );
 
 watch(
-    () => config.cloud_drive,
-    (provider, previous) => {
-      if (!previous || provider === previous) return;
-      const drive = options.cloudDrives.find((item) => item.value === provider);
-      if (!drive?.resource_types) return;
-      const supported = new Set(drive.resource_types);
+    [
+      () => config.cloud_drive,
+      () => config.cross_transfer_enabled,
+      () => options.cloudDrives,
+    ],
+    (
+        [provider, crossTransfer, drives],
+        [previousProvider, previousCrossTransfer, previousDrives],
+    ) => {
+      if (
+          provider === previousProvider &&
+          crossTransfer === previousCrossTransfer &&
+          drives === previousDrives
+      ) return;
+      const supported = new Set(
+          createResourceTypeItems(options.cloudDrives, config)
+              .map((item) => item.value),
+      );
       config.resource_type_order = (config.resource_type_order || []).filter(
           (value) => supported.has(value),
       );

@@ -40,6 +40,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
         :param exclude_ids: 排除的订阅ID集合
         :return: 更新后的转存数量
         """
+        track_points = not manual_resources
         try:
             if self._stop_requested():
                 return transferred_count
@@ -67,7 +68,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
 
             # 加载该订阅的历史积分花费（用 tmdb_id + 季数作为唯一标识）
             sub_key = self.subscription_budget_key(subscribe, MediaType.TV)
-            if hasattr(self._search_handler, 'reset_sub_spent_points'):
+            if track_points and hasattr(self._search_handler, 'reset_sub_spent_points'):
                 self._search_handler.reset_sub_spent_points(sub_key)
 
             # 生成元数据
@@ -239,7 +240,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                         mediainfo=mediainfo,
                         success_episodes=sorted(existing_episodes_in_resources),
                     )
-                if hasattr(self._search_handler, 'clear_sub_points'):
+                if track_points and hasattr(self._search_handler, 'clear_sub_points'):
                     self._search_handler.clear_sub_points(sub_key)
                 return transferred_count
 
@@ -484,7 +485,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 mediainfo,
                                 season=season,
                                 target_episodes=target_episodes,
-                                sub_key=sub_key,
+                                sub_key=sub_key if track_points else "",
                                 transient_target=transient_target,
                             )
                             if not pending_key:
@@ -524,7 +525,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             continue
 
                         video_count, share_episodes = self._summarize_share_episodes(
-                            share_files, season
+                            share_files, season, mediainfo
                         )
                         matched_episode_numbers = set(missing_episodes) & share_episodes
                         absent_episode_numbers = set(missing_episodes) - share_episodes
@@ -533,6 +534,12 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             f"{self._format_episode_ranges(share_episodes)}；"
                             f"当前缺失中可用：{self._format_episode_ranges(matched_episode_numbers)}"
                         )
+                        if video_count and not share_episodes:
+                            logger.debug(
+                                f"分享内容未被平台识别为目标媒体："
+                                f"{mediainfo.title_year} S{season:02d}，已跳过该资源"
+                            )
+                            continue
                         if absent_episode_numbers:
                             logger.debug(
                                 f"分享未包含当前缺失集数："
@@ -595,7 +602,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             mediainfo,
                             subscribe,
                             season,
-                            sub_key,
+                            sub_key if track_points else "",
                             track_subscription=not transient_target,
                         )
                         if not transfer_results:
@@ -607,7 +614,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             break
                         self._set_task_phase(subscribe, "登记文件后处理", 95)
                         batch_success_episodes = []
-                        batch_detail_episodes = []
+                        batch_detail_episodes = {}
 
                         # 处理结果
                         for transfer_result in transfer_results:
@@ -634,7 +641,9 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 episode=episode,
                                 file_size=int(item["file"].get("size") or 0),
                                 source_sha1=item["file"].get("sha1") or "",
+                                source_md5=item["file"].get("md5") or "",
                                 rule_score=current_score,
+                                upgrade=is_upgrade,
                             )
                             history.append(history_item)
 
@@ -658,15 +667,26 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                     f"成功转存：{mediainfo.title} S{season:02d}E{episode:02d} {score_info}{upgrade_info}")
 
                                 if not pending_key:
-                                    batch_detail_episodes.append(episode)
+                                    notification_kind = (
+                                        "upgrade"
+                                        if is_upgrade
+                                        else "cross_transfer"
+                                        if history_item.get("transfer_mode") == "cross"
+                                        else "transfer"
+                                    )
+                                    batch_detail_episodes.setdefault(
+                                        notification_kind, []
+                                    ).append(episode)
 
                                 batch_success_episodes.append(episode)
                             else:
                                 logger.error(f"转存失败：{mediainfo.title} S{season:02d}E{episode:02d}")
 
-                        self._append_tv_transfer_detail(
-                            transfer_details, mediainfo, season, batch_detail_episodes
-                        )
+                        for notification_kind, episodes in batch_detail_episodes.items():
+                            self._append_tv_transfer_detail(
+                                transfer_details, mediainfo, season, episodes,
+                                notification_kind=notification_kind,
+                            )
 
                         # 记录下载历史
                         if batch_success_episodes:
@@ -711,7 +731,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                     mediainfo=mediainfo,
                     success_episodes=all_success_episodes
                 )
-                if remaining_lack == 0 and hasattr(
+                if track_points and remaining_lack == 0 and hasattr(
                         self._search_handler, "clear_sub_points"
                 ):
                     self._search_handler.clear_sub_points(sub_key)

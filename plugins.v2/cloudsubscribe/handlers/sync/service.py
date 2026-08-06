@@ -8,11 +8,13 @@ import hashlib
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
-from concurrent.futures import Future
-from pathlib import Path
-from typing import List, Dict, Any, Set, Optional, Callable, Tuple
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
+from pathlib import Path, PurePosixPath
+from typing import List, Dict, Any, Set, Optional, Callable, Tuple, Mapping
 
+from app.core.config import global_vars
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
 from app.db import SessionFactory
@@ -89,7 +91,12 @@ class SyncHandler:
             subscribe_handler: SubscribeHandler,
             chain,
             cloud_transfer_path: str,
+            cloud_media_root: str = "/",
+            cloud_transfer_paths: Optional[Mapping[str, str]] = None,
             max_transfer_per_sync: int = 50,
+            cross_transfer_enabled: bool = False,
+            cloud_drive_registry=None,
+            cross_transfer_manager=None,
             batch_size: int = 20,
             skip_other_season_dirs: bool = True,
             notify: bool = False,
@@ -118,6 +125,7 @@ class SyncHandler:
             offline_pending_changed: Callable[[int], None] = None,
             file_finalized: Callable[[List[Dict[str, Any]], int], None] = None,
             task_update: Callable[..., None] = None,
+            task_context: Callable[[], Tuple[str, Any]] = None,
     ):
         """
         初始化同步处理器
@@ -126,30 +134,36 @@ class SyncHandler:
         :param search_handler: 搜索处理器
         :param subscribe_handler: 订阅处理器
         :param chain: MediaChain 实例
-        :param cloud_transfer_path: 网盘转存暂存路径；最终媒体分类固定在网盘根路径
+        :param cloud_transfer_path: 当前网盘转存暂存路径
+        :param cloud_media_root: 当前网盘媒体库分类根目录
+        :param cloud_transfer_paths: 各网盘提供方的转存暂存路径
         :param max_transfer_per_sync: 单次同步最大转存数量
         :param batch_size: 批量转存每批文件数
         :param skip_other_season_dirs: 跳过其他季目录
         :param notify: 是否发送通知
-        :param notification_type: MoviePilot 消息通知类型
+        :param notification_type: 消息通知类型
         :param post_message_func: 发送消息的函数
         :param get_data_func: 获取数据的函数
         :param save_data_func: 保存数据的函数
         :param self_heal_interval: 自愈检查间隔（分钟）
         :param enable_cloud_upgrade: 启用网盘洗版
-        :param enable_pt_upgrade: 启用 MoviePilot PT 整理后上传洗版
+        :param enable_pt_upgrade: 启用PT 整理后上传洗版
         :param upgrade_mode: 洗版文件处理模式
         :param local_resource_path: 容器内可访问的本地或挂载媒体根路径
         :param strm_generate_enabled: 转存成功后是否直接生成 STRM
         :param strm_base_url: STRM 模板中的 base_url
         :param strm_url_template: STRM 内容模板
-        :param platform_transfer_history_enabled: 是否写入 MoviePilot 整理历史
+        :param platform_transfer_history_enabled: 是否写入整理历史
         :param should_stop: 当前同步任务是否已请求停止
         :param offline_pending_changed: 待后处理任务数量变化回调
         :param file_finalized: 文件真正完成后的通知回调
         :param task_update: 订阅任务阶段更新回调
+        :param task_context: 当前订阅任务标识与停止事件回调
         """
         self._cloud_drive = cloud_drive
+        self._cross_transfer_enabled = bool(cross_transfer_enabled)
+        self._cloud_drive_registry = cloud_drive_registry
+        self._cross_transfer_manager = cross_transfer_manager
         self._cloud_auth = self._optional_cloud_service(
             CloudDriveCapability.AUTHENTICATION
         )
@@ -218,6 +232,16 @@ class SyncHandler:
         self._cloud_transfer_path = (
                 str(cloud_transfer_path or "/").strip().rstrip("/") or "/"
         )
+        self._CLOUD_MEDIA_ROOT = self._normalize_cloud_path(cloud_media_root)
+        self._cloud_transfer_paths = {
+            str(key).strip().lower(): self._normalize_cloud_path(value)
+            for key, value in dict(cloud_transfer_paths or {}).items()
+            if str(key).strip()
+        }
+        if self._cloud_drive:
+            self._cloud_transfer_paths.setdefault(
+                self._cloud_drive.key, self._cloud_transfer_path
+            )
         self._strm_generate_enabled = bool(strm_generate_enabled)
         self._nfo_scrape_enabled = bool(nfo_scrape_enabled)
         self._image_scrape_enabled = bool(image_scrape_enabled)
@@ -280,6 +304,7 @@ class SyncHandler:
         self._offline_pending_changed = offline_pending_changed
         self._file_finalized = file_finalized
         self._task_update = task_update
+        self._task_context = task_context
         self._offline_pending_lock = threading.RLock()
         self._pt_upgrade_lock = threading.RLock()
         self._pt_upgrade_active = set()
@@ -289,6 +314,7 @@ class SyncHandler:
         self._sync_metrics_lock = threading.RLock()
         self._sync_metrics: Dict[str, Dict[str, int]] = {}
         self._media_recognition_lock = threading.RLock()
+        self._platform_media_recognition_lock = threading.Lock()
         self._media_recognition_cache: OrderedDict[Tuple[Any, ...], Any] = OrderedDict()
         self._media_recognition_inflight: Dict[Tuple[Any, ...], Future] = {}
         self._resource_season_dir_lock = threading.RLock()
@@ -816,9 +842,11 @@ class SyncHandler:
             return future.result()
 
         try:
-            mediainfo = self._timed_sync_call(
-                "media_recognition", self._chain.recognize_media, **kwargs
-            )
+            # 的媒体识别链包含非线程安全的远端客户端游标，不并发调用。
+            with self._platform_media_recognition_lock:
+                mediainfo = self._timed_sync_call(
+                    "media_recognition", self._chain.recognize_media, **kwargs
+                )
         except BaseException as error:
             future.set_exception(error)
             with self._media_recognition_lock:
@@ -899,6 +927,16 @@ class SyncHandler:
             logger.warning(f"读取停止状态失败：{err}")
             return False
 
+    def _current_task_context(self) -> Tuple[str, Any]:
+        if not self._task_context:
+            return "", None
+        try:
+            task_id, stop_event = self._task_context()
+            return str(task_id or ""), stop_event
+        except Exception as error:
+            logger.debug(f"读取当前订阅任务上下文失败：{error}")
+            return "", None
+
     def reset_transfer_budget(self) -> None:
         """重置本轮同步共享的转存文件数配额。"""
         with self._transfer_budget_lock:
@@ -959,15 +997,94 @@ class SyncHandler:
                 "url": item_url,
             }
         try:
-            success_ids, _ = self._timed_sync_call(
-                "share_transfer",
-                self._share_transfer.transfer_files_batch,
-                share_url=share_url,
-                file_ids=file_ids,
-                save_path=self._cloud_transfer_path,
-                batch_size=self._batch_size,
-                rename_items=rename_items,
+            source_provider = self._resource_provider_for_url(share_url)
+            cross_batch = bool(
+                self._cross_transfer_enabled and source_provider
+                and self._cloud_drive and source_provider.key != self._cloud_drive.key
             )
+            if cross_batch:
+                parent_task_id, task_stop_event = self._current_task_context()
+
+                def batch_stop_requested() -> bool:
+                    return bool(
+                        global_vars.is_system_stopped
+                        or self._stop_requested()
+                        or (task_stop_event and task_stop_event.is_set())
+                    )
+
+                def transfer_one(item: Dict[str, Any]) -> Tuple[str, Optional[bool]]:
+                    file_id = str(item["file"]["id"])
+                    if batch_stop_requested():
+                        return file_id, None
+                    try:
+                        success = self._transfer_file(
+                            str(item["file"].get("url") or share_url),
+                            item["file"],
+                            self._cloud_transfer_path,
+                            item["target_name"],
+                            str(item["file"].get("sha1") or ""),
+                            parent_task_id=parent_task_id,
+                            stop_requested=batch_stop_requested,
+                        )
+                    except Exception as error:
+                        if batch_stop_requested():
+                            return file_id, None
+                        logger.error(
+                            f"跨盘转存文件失败：{item['target_name']}，{error}"
+                        )
+                        return file_id, False
+                    if not success and batch_stop_requested():
+                        return file_id, None
+                    return file_id, success
+
+                provider_limits = [3]
+                for provider in (source_provider, self._cloud_drive):
+                    limit = int(
+                        getattr(getattr(provider, "policy", None), "max_concurrency", 1)
+                        or 1
+                    )
+                    provider_limits.append(limit)
+                worker_count = min(len(selected_items), *provider_limits)
+                outcomes: Dict[str, bool] = {}
+                executor = ThreadPoolExecutor(
+                    max_workers=max(1, worker_count),
+                    thread_name_prefix="cloudsubscribe-file-download",
+                )
+                futures = {
+                    executor.submit(transfer_one, item): str(item["file"]["id"])
+                    for item in selected_items
+                }
+                try:
+                    for future in as_completed(futures):
+                        try:
+                            file_id, success = future.result()
+                        except CancelledError:
+                            continue
+                        if success is not None:
+                            outcomes[file_id] = success
+                        if batch_stop_requested():
+                            for pending in futures:
+                                pending.cancel()
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                processed_items = [
+                    item for item in selected_items
+                    if str(item["file"]["id"]) in outcomes
+                ]
+                success_ids = [
+                    file_id for file_id, success in outcomes.items() if success
+                ]
+            else:
+                processed_items = selected_items
+                success_ids, _ = self._timed_sync_call(
+                    "share_transfer",
+                    self._share_transfer.transfer_files_batch,
+                    share_url=share_url,
+                    file_ids=file_ids,
+                    save_path=self._cloud_transfer_path,
+                    batch_size=self._batch_size,
+                    rename_items=rename_items,
+                )
         except Exception:
             self._release_transfer_slots(reserved)
             raise
@@ -982,7 +1099,10 @@ class SyncHandler:
                     "cloud_dir": item["target_dir"],
                     "file_name": item["target_name"],
                     "staging_dir": self._cloud_transfer_path,
-                    "staging_name": item["file"]["name"],
+                    "staging_name": (
+                            item["file"].get("staging_name")
+                            or item["file"]["name"]
+                    ),
                     "source_sha1": item["file"].get("sha1"),
                     "file_size": item["file"].get("size") or 0,
                     "success_episodes": item.get(
@@ -1000,7 +1120,7 @@ class SyncHandler:
                     "upgrade_old_file_id": item.get("upgrade_old_file_id"),
                     "upgrade_old_size": item.get("upgrade_old_size") or 0,
                 }
-                for item in selected_items
+                for item in processed_items
                 if str(item["file"]["id"]) in success_id_set
             ],
             mediainfo,
@@ -1011,10 +1131,16 @@ class SyncHandler:
             sub_key=sub_key,
         )
         results = []
-        for item in selected_items:
+        for item in processed_items:
             file_id = str(item["file"]["id"])
             success = file_id in success_id_set
             strm_path, pending_key = batch_strm_results.get(file_id, (None, ""))
+            if success and not strm_path and not pending_key:
+                logger.error(
+                    f"文件已转存但后处理任务登记失败：{item['target_name']}"
+                )
+                self._release_transfer_slots(1)
+                success = False
             if success and strm_path:
                 self._media_server_notifier.notify(
                     path=strm_path,
@@ -1037,9 +1163,11 @@ class SyncHandler:
             season: int,
             episodes: List[int],
     ) -> Dict[int, tuple]:
-        """按结构收集剧集候选，再使用 MoviePilot 规则组选择文件。"""
+        """按结构收集剧集候选，再使用规则组选择文件。"""
         episode_list = list(dict.fromkeys(int(value) for value in episodes))
-        candidates = FileMatcher.episode_candidates(files, season, episode_list)
+        candidates = FileMatcher.episode_candidates(
+            files, season, episode_list, mediainfo=mediainfo
+        )
         return {
             episode: self._search_handler.select_file_candidate(
                 candidates.get(episode) or [], mediainfo, subscribe
@@ -1048,12 +1176,35 @@ class SyncHandler:
         }
 
     def _match_movie_file(
-            self, files: list, mediainfo: MediaInfo, subscribe
+            self, files: list, mediainfo: MediaInfo, subscribe,
+            resource_title: str = "",
     ) -> tuple:
-        """按媒体文件结构收集电影候选，再使用 MoviePilot 规则组选择。"""
-        return self._search_handler.select_file_candidate(
-            FileMatcher.movie_candidates(files), mediainfo, subscribe
+        """按媒体文件结构收集电影候选，再使用规则组选择。"""
+        matched = self._search_handler.select_file_candidate(
+            FileMatcher.movie_candidates(files, mediainfo=mediainfo),
+            mediainfo,
+            subscribe,
         )
+        if matched[0]:
+            return matched
+
+        # 文件名被网盘混淆时，仅允许“资源标题匹配 + 唯一大视频”进入兜底，
+        # 避免短剧合集、音乐包或多文件资源被误当成目标电影。
+        fallback = FileMatcher.movie_candidates(files)
+        if (
+                len(fallback) != 1
+                or not FileMatcher.media_name_matches(resource_title, mediainfo)
+        ):
+            return None, 0
+        actual = fallback[0]
+        scoring_item = dict(actual)
+        scoring_item["name"] = (
+            f"{str(resource_title).strip()}{Path(str(actual.get('name') or '')).suffix}"
+        )
+        selected, score = self._search_handler.select_file_candidate(
+            [scoring_item], mediainfo, subscribe
+        )
+        return (actual, score) if selected else (None, 0)
 
     def _generate_strm(
             self,
@@ -1331,6 +1482,25 @@ class SyncHandler:
         except Exception as error:
             logger.warning(f"更新网盘文件后处理监控状态失败：{error}")
 
+    @staticmethod
+    def _finalize_source_identity(
+            source_sha1: str, staging_dir: str, staging_name: str,
+            file_size: int,
+    ) -> Tuple[str, str]:
+        source_hash = re.sub(
+            r"[^0-9A-Fa-f]", "", str(source_sha1 or "")
+        ).upper()
+        if len(source_hash) != 40:
+            source_hash = ""
+        identity = source_hash or hashlib.sha1(
+            "\0".join((
+                str(staging_dir or "/").rstrip("/") or "/",
+                str(staging_name or ""),
+                str(max(0, int(file_size or 0))),
+            )).encode("utf-8")
+        ).hexdigest().upper()
+        return source_hash, identity
+
     def _queue_file_finalize(
             self,
             share_url: str,
@@ -1354,8 +1524,12 @@ class SyncHandler:
             upgrade_old_size: int = 0,
     ) -> str:
         info_hash = self._offline_hash(share_url)
-        source_hash = re.sub(r"[^0-9A-Fa-f]", "", str(source_sha1 or "")).upper()
-        if not self._get_data or (not info_hash and len(source_hash) != 40):
+        effective_staging_dir = str(staging_dir or cloud_dir).rstrip("/") or "/"
+        effective_staging_name = str(staging_name or file_name)
+        source_hash, source_identity = self._finalize_source_identity(
+            source_sha1, effective_staging_dir, effective_staging_name, file_size
+        )
+        if not self._get_data:
             logger.error(f"无法登记文件后处理任务：{file_name}")
             return ""
         now = time.time()
@@ -1367,7 +1541,7 @@ class SyncHandler:
                 f"{cloud_dir.rstrip('/')}/{file_name}".encode("utf-8")
             ).hexdigest()[:12]
             provider_key = str(getattr(self._cloud_drive, "key", "cloud") or "cloud")
-            pending_key = f"{provider_key}:{source_hash}:{path_digest}"
+            pending_key = f"{provider_key}:{source_identity}:{path_digest}"
             task_type = "share"
         with self._offline_pending_lock:
             pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
@@ -1381,8 +1555,8 @@ class SyncHandler:
                 "share_url": share_url,
                 "cloud_dir": cloud_dir,
                 "file_name": file_name,
-                "staging_dir": str(staging_dir or cloud_dir).rstrip("/") or "/",
-                "staging_name": str(staging_name or file_name),
+                "staging_dir": effective_staging_dir,
+                "staging_name": effective_staging_name,
                 "file_size": int(file_size or current.get("file_size") or 0),
                 "upgrade": bool(upgrade or current.get("upgrade")),
                 "upgrade_mode": str(upgrade_mode or current.get("upgrade_mode") or self._upgrade_mode),
@@ -1524,12 +1698,16 @@ class SyncHandler:
                 cloud_dir = item["cloud_dir"]
                 file_name = item["file_name"]
                 info_hash = self._offline_hash(share_url)
-                source_hash = re.sub(
-                    r"[^0-9A-Fa-f]", "", str(item.get("source_sha1") or "")
-                ).upper()
-                if not info_hash and not source_hash:
-                    logger.error(f"无法登记文件后处理任务：{file_name}")
-                    continue
+                staging_dir = str(
+                    item.get("staging_dir") or cloud_dir
+                ).rstrip("/") or "/"
+                staging_name = str(item.get("staging_name") or file_name)
+                source_hash, source_identity = self._finalize_source_identity(
+                    item.get("source_sha1") or "",
+                    staging_dir,
+                    staging_name,
+                    item.get("file_size") or 0,
+                )
                 if info_hash:
                     pending_key = info_hash
                     task_type = "magnet" if self._is_magnet_url(share_url) else "ed2k"
@@ -1540,7 +1718,7 @@ class SyncHandler:
                     provider_key = str(
                         getattr(self._cloud_drive, "key", "cloud") or "cloud"
                     )
-                    pending_key = f"{provider_key}:{source_hash}:{path_digest}"
+                    pending_key = f"{provider_key}:{source_identity}:{path_digest}"
                     task_type = "share"
                 current = pending.get(pending_key) or {}
                 pending[pending_key] = {
@@ -1552,10 +1730,8 @@ class SyncHandler:
                     "share_url": share_url,
                     "cloud_dir": cloud_dir,
                     "file_name": file_name,
-                    "staging_dir": str(
-                        item.get("staging_dir") or cloud_dir
-                    ).rstrip("/") or "/",
-                    "staging_name": str(item.get("staging_name") or file_name),
+                    "staging_dir": staging_dir,
+                    "staging_name": staging_name,
                     "file_size": int(
                         item.get("file_size") or current.get("file_size") or 0
                     ),
@@ -1816,7 +1992,7 @@ class SyncHandler:
             subscribe,
             mediainfo: MediaInfo,
     ) -> Optional[Path]:
-        """缓存 MoviePilot 分类根目录，避免逐集重复执行相同目录规则。"""
+        """缓存分类根目录，避免逐集重复执行相同目录规则。"""
         key = (
             str(root_path),
             getattr(mediainfo, "source", None),
@@ -1865,7 +2041,7 @@ class SyncHandler:
             season: int = None,
             episode: int = None,
     ) -> Optional[Path]:
-        """使用 MoviePilot 当前分类目录和重命名模板生成完整目标路径。"""
+        """使用当前分类目录和重命名模板生成完整目标路径。"""
         effective_media = self._effective_mediainfo(subscribe, mediainfo)
         classified_root = self._platform_classified_root(
             root_path, subscribe, effective_media
@@ -1923,7 +2099,7 @@ class SyncHandler:
             mediainfo: MediaInfo,
             season: int
     ) -> Optional[Path]:
-        """使用 MoviePilot 的目录分类和命名规则生成媒体季目录。"""
+        """使用的目录分类和命名规则生成媒体季目录。"""
         if not resource_root or not mediainfo:
             return None
 
@@ -2003,7 +2179,7 @@ class SyncHandler:
             start_episode: Optional[int] = None,
             total_episode: Optional[int] = None
     ) -> Set[int]:
-        """按 MoviePilot 元数据解析器识别已落盘或已挂载的剧集。"""
+        """按元数据解析器识别已落盘或已挂载的剧集。"""
         resource_files = self._get_local_resource_files(subscribe, mediainfo, season)
         found_episodes = self._parse_resource_episode_names(
             (resource_file.name for resource_file in resource_files),
@@ -2026,7 +2202,7 @@ class SyncHandler:
             start_episode: Optional[int] = None,
             total_episode: Optional[int] = None,
     ) -> Set[int]:
-        """使用 MoviePilot 元数据解析器从文件名提取目标季集数。"""
+        """使用元数据解析器从文件名提取目标季集数。"""
         found_episodes = set()
         for file_name in file_names:
             file_meta = MetaInfo(Path(str(file_name)).stem)
@@ -2148,7 +2324,9 @@ class SyncHandler:
         return None
 
     @staticmethod
-    def _summarize_share_episodes(files: List[dict], season: int) -> Tuple[int, Set[int]]:
+    def _summarize_share_episodes(
+            files: List[dict], season: int, mediainfo: Optional[MediaInfo] = None
+    ) -> Tuple[int, Set[int]]:
         """递归统计分享中的实际视频数量和目标季集数。"""
         video_count = 0
         episodes = set()
@@ -2163,9 +2341,9 @@ class SyncHandler:
                 if not MediaFileParser.is_video(name):
                     continue
                 video_count += 1
-                season_episode = MediaFileParser.extract_season_episode(name)
-                if season_episode and season_episode[0] == season:
-                    episodes.add(int(season_episode[1]))
+                episode = FileMatcher.episode_from_file(item, season, mediainfo)
+                if episode is not None:
+                    episodes.add(episode)
 
         walk(files)
         return video_count, episodes
@@ -2355,15 +2533,20 @@ class SyncHandler:
             log_prefix: str = "",
     ) -> bool:
         """使用当前网盘 Provider 的统一能力校验资源链接。"""
+        share_service = self._resource_provider_for_url(share_url).require(
+            CloudDriveCapability.SHARE_TRANSFER
+        ) if self._resource_provider_for_url(share_url) else self._share_transfer
+        if not share_service:
+            return False
         status = self._timed_sync_call(
             "share_validation",
-            self._share_transfer.check_share_status,
+            share_service.check_share_status,
             share_url,
         )
         if status.is_valid:
             return True
         prefix = f"{log_prefix} " if log_prefix else ""
-        logger.warning(
+        logger.debug(
             f"{prefix}{resource_label}无效："
             f"{self._resource_log_reference(share_url)}，原因：{status.status_text}"
         )
@@ -2382,12 +2565,17 @@ class SyncHandler:
         ):
             return []
         kwargs = {"target_season": target_season} if target_season is not None else {}
+        provider = self._resource_provider_for_url(share_url)
+        share_service = provider.require(CloudDriveCapability.SHARE_TRANSFER) if provider else self._share_transfer
+        if not share_service:
+            return []
         files = self._timed_sync_call(
             "share_listing",
-            self._share_transfer.list_share_files,
+            share_service.list_share_files,
             share_url,
             **kwargs,
         ) or []
+        files = list(MediaFileParser.iter_files(files))
         if not files:
             label = resource_title or self._resource_log_reference(share_url)
             logger.debug(f"{log_prefix + ' ' if log_prefix else ''}分享链接无内容：{label}")
@@ -2410,17 +2598,219 @@ class SyncHandler:
             return "ed2k"
         if normalized_url.startswith("magnet:?"):
             return "magnet"
+        for marker, value in (
+                ("quark", "quark"), ("189.cn", "tianyi"),
+                ("cloud.189", "tianyi"), ("guangya", "guangya"),
+                ("123pan", "123"), ("123.cn", "123"),
+                ("123684.com", "123"), ("123865.com", "123"),
+                ("alipan.com", "alipan"), ("aliyundrive.com", "alipan"),
+        ):
+            if marker in normalized_url:
+                return value
         return "115"
+
+    def _resource_provider_for_url(self, share_url: str) -> Optional[CloudDriveProvider]:
+        if not self._cloud_drive_registry:
+            return self._cloud_drive
+        key = self._supported_resource_type({}, share_url)
+        aliases = {
+            "189": "tianyi", "aliyun": "alipan"
+        }
+        try:
+            return self._cloud_drive_registry.get(aliases.get(key, key))
+        except KeyError:
+            return self._cloud_drive if key == "115" else None
+
+    @staticmethod
+    def _cloud_file_from_dict(item: Dict[str, Any]) -> CloudFile:
+        return CloudFile(
+            id=str(item.get("id") or ""), name=str(item.get("name") or ""),
+            is_directory=False, size=int(item.get("size") or 0),
+            sha1=str(item.get("sha1") or ""), md5=str(item.get("md5") or ""),
+            native=item,
+        )
+
+    @staticmethod
+    def _normalize_cloud_path(path: str) -> str:
+        return str(PurePosixPath("/" + str(path or "/").strip().lstrip("/")))
+
+    def _cross_transfer_staging_path(self, provider_key: str) -> str:
+        base_path = self._cloud_transfer_paths.get(
+            str(provider_key or "").strip().lower(), "/"
+        )
+        return str(
+            PurePosixPath(base_path)
+            / uuid.uuid4().hex
+        )
+
+    @staticmethod
+    def _cleanup_cross_transfer_staging(
+            source: CloudDriveProvider, staged_path: str,
+            item: Optional[CloudFile] = None,
+    ) -> None:
+        if not source.supports(CloudDriveCapability.FILE_MUTATION):
+            return
+        mutation = source.require(CloudDriveCapability.FILE_MUTATION)
+        if source.supports(CloudDriveCapability.DIRECTORY_READ):
+            try:
+                lookup = source.require(
+                    CloudDriveCapability.DIRECTORY_READ
+                ).resolve_directory(staged_path)
+                if lookup.checked and lookup.directory_id is not None:
+                    if mutation.delete_file(lookup.directory_id):
+                        return
+            except Exception as error:
+                logger.warning(f"清理源盘跨盘临时目录失败：{error}")
+        if item:
+            try:
+                mutation.delete_file(item.id)
+            except Exception as error:
+                logger.warning(f"清理源盘跨盘临时文件失败：{error}")
+
+    def _transfer_file(
+            self, share_url: str, file_item: Dict[str, Any], save_path: str,
+            target_name: str, source_sha1: str = "",
+            parent_task_id: str = "",
+            stop_requested: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        should_stop = stop_requested or self._stop_requested
+        source = self._resource_provider_for_url(share_url)
+        cross_provider = bool(
+            source and self._cloud_drive and source.key != self._cloud_drive.key
+        )
+        if cross_provider:
+            required = (
+                    self._cross_transfer_enabled
+                    and self._cross_transfer_manager
+                    and source.supports(CloudDriveCapability.SHARE_TRANSFER)
+                    and source.supports(CloudDriveCapability.FILE_QUERY)
+                    and source.supports(CloudDriveCapability.FILE_DOWNLOAD)
+                    and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
+            )
+            if not required:
+                logger.warning(
+                    f"无法跨盘转存单个文件：{source.name} -> "
+                    f"{self._cloud_drive.name}，请检查跨盘开关和网盘能力"
+                )
+                return False
+            source_file_id = str(file_item.get("id") or "").strip()
+            if not source_file_id:
+                logger.warning(f"无法跨盘转存单个文件：{source.name} 文件 ID 为空")
+                return False
+            staged_path = self._cross_transfer_staging_path(source.key)
+            source_share = source.require(CloudDriveCapability.SHARE_TRANSFER)
+            try:
+                staged = source_share.transfer_file(
+                    share_url=share_url, file_id=source_file_id,
+                    save_path=staged_path,
+                    target_name=file_item.get("name") or target_name,
+                )
+            except Exception:
+                self._cleanup_cross_transfer_staging(source, staged_path)
+                raise
+            if not staged:
+                self._cleanup_cross_transfer_staging(source, staged_path)
+                return False
+            source_files = source.require(CloudDriveCapability.FILE_QUERY)
+            staged_name = file_item.get("name") or target_name
+            item = None
+            for attempt in range(10):
+                item = source_files.find_file(staged_path, staged_name)
+                if item or should_stop():
+                    break
+                time.sleep(min(0.5 + attempt * 0.25, 2.0))
+            if not item:
+                logger.warning(
+                    f"跨盘临时文件尚未可见：{source.name} "
+                    f"{staged_path}/{staged_name}"
+                )
+                self._cleanup_cross_transfer_staging(source, staged_path)
+                return False
+            if source_sha1 and not item.sha1:
+                item = CloudFile(item.id, item.name, False, item.size, source_sha1, item.md5, native=item.native)
+            try:
+                if not parent_task_id:
+                    parent_task_id, _ = self._current_task_context()
+                task = self._cross_transfer_manager.create_from_cloud_file(
+                    source.key, item, self._cloud_drive.key, save_path, target_name,
+                    fallback=True,
+                    parent_task_id=parent_task_id,
+                )
+                success = self._cross_transfer_manager.wait(
+                    task["id"], cancel_check=should_stop
+                )
+                completed_task = next(
+                    (
+                        value for value in self._cross_transfer_manager.list()
+                        if value.get("id") == task["id"]
+                    ),
+                    {},
+                )
+                if success:
+                    result_name = str(
+                        completed_task.get("result_file_name")
+                        or target_name or item.name
+                    ).strip()
+                    if result_name:
+                        file_item["staging_name"] = result_name
+                    result_sha1 = str(
+                        completed_task.get("result_sha1") or ""
+                    ).strip()
+                    result_md5 = str(
+                        completed_task.get("result_md5") or ""
+                    ).strip()
+                    if result_sha1:
+                        file_item["sha1"] = result_sha1
+                    if result_md5:
+                        file_item["md5"] = result_md5
+                    result_size = int(
+                        completed_task.get("result_file_size") or 0
+                    )
+                    if result_size > 0:
+                        file_item["size"] = result_size
+                if not success:
+                    if (
+                            should_stop()
+                            or completed_task.get("status") in {"canceled", "stopping"}
+                    ):
+                        logger.info(
+                            f"跨盘转存已由用户停止：{source.name} -> "
+                            f"{self._cloud_drive.name}"
+                        )
+                    else:
+                        logger.error(
+                            f"跨盘转存失败：{source.name} -> {self._cloud_drive.name}，"
+                            f"阶段={completed_task.get('phase') or 'unknown'}，"
+                            f"原因={completed_task.get('error') or completed_task.get('message') or '未知错误'}"
+                        )
+                return success
+            finally:
+                self._cleanup_cross_transfer_staging(source, staged_path, item)
+        service = source.require(CloudDriveCapability.SHARE_TRANSFER) if source else self._share_transfer
+        return bool(service.transfer_file(
+            share_url=share_url, file_id=file_item.get("id"),
+            save_path=save_path, target_name=target_name,
+            source_sha1=source_sha1,
+        ))
 
     def _is_supported_resource(self, resource: Dict[str, Any], share_url: str) -> bool:
         if not self._cloud_drive:
             return False
         resource_type = self._supported_resource_type(resource, share_url)
         if not self._cloud_drive.supports_resource_type(resource_type):
-            return False
+            if not self._cross_transfer_enabled:
+                return False
+            source = self._resource_provider_for_url(share_url)
+            if not source or not source.supports(CloudDriveCapability.SHARE_TRANSFER):
+                return False
+            if not source.supports(CloudDriveCapability.FILE_DOWNLOAD):
+                return False
+            if not self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD):
+                return False
         if resource_type in {"ed2k", "magnet"}:
             return self._offline_download is not None
-        return self._share_transfer is not None
+        source = self._resource_provider_for_url(share_url)
+        return bool(source and source.supports(CloudDriveCapability.SHARE_TRANSFER))
 
     @classmethod
     def _format_resource_summary(cls, resources: List[Dict[str, Any]]) -> str:
@@ -2495,51 +2885,58 @@ class SyncHandler:
         }
 
     def send_transfer_notification(self, transfer_details: List[Dict[str, Any]], total_count: int):
-        """
-        发送转存完成通知
-
-        :param transfer_details: 转存详情列表
-        :param total_count: 转存总数
-        """
+        """按普通转存、跨盘转存和洗版分别发送完成通知。"""
         if not transfer_details or not self._post_message:
             return
-
-        text_lines = []
-        first_image = None
-
+        kind_config = {
+            "transfer": ("【网盘订阅助手】转存完成", "转存"),
+            "cross_transfer": ("【网盘订阅助手】跨盘转存完成", "跨盘转存"),
+            "upgrade": ("【网盘洗版】洗版完成", "洗版"),
+        }
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
         for detail in transfer_details:
-            if detail.get("type") == "电影":
-                title = detail.get("title", "未知")
-                year = detail.get("year", "")
-                text_lines.append(f"{title} ({year})")
-                if not first_image and detail.get("image"):
-                    first_image = detail.get("image")
-            else:
-                title = detail.get("title", "未知")
-                season = max(1, int(detail.get("season") or 1))
-                episodes = sorted(detail.get("episodes") or [])
-                if len(episodes) <= 5:
-                    ep_str = ", ".join([f"E{e:02d}" for e in episodes])
+            kind = str(detail.get("notification_kind") or "transfer")
+            grouped.setdefault(kind if kind in kind_config else "transfer", []).append(detail)
+
+        for kind, details in grouped.items():
+            text_lines = []
+            first_image = None
+            file_count = 0
+            for detail in details:
+                if detail.get("type") == "电影":
+                    title = detail.get("title", "未知")
+                    year = detail.get("year", "")
+                    text_lines.append(f"{title} ({year})")
+                    file_count += 1
                 else:
-                    ep_str = f"E{episodes[0]:02d}-E{episodes[-1]:02d} 共{len(episodes)}集"
-                text_lines.append(f"{title} S{season:02d} {ep_str}")
+                    title = detail.get("title", "未知")
+                    season = max(1, int(detail.get("season") or 1))
+                    episodes = sorted(detail.get("episodes") or [])
+                    file_count += len(episodes)
+                    if len(episodes) <= 5:
+                        ep_str = ", ".join(f"E{episode:02d}" for episode in episodes)
+                    else:
+                        ep_str = (
+                            f"E{episodes[0]:02d}-E{episodes[-1]:02d} "
+                            f"共{len(episodes)}集"
+                        )
+                    text_lines.append(f"{title} S{season:02d} {ep_str}")
                 if not first_image and detail.get("image"):
                     first_image = detail.get("image")
-
-        if len(text_lines) > 10:
-            text_lines = text_lines[:10]
-            text_lines.append(f"... 等共 {len(transfer_details)} 项")
-
-        self._post_message(
-            mtype=self._notification_type,
-            title=f"【网盘订阅助手】转存完成",
-            text=f"本次共转存 {total_count} 个文件\n\n" + "\n".join(text_lines),
-            image=first_image,
-        )
-        logger.info(
-            f"转存完成通知已发送：{total_count} 个文件，"
-            f"{len(transfer_details)} 个媒体项"
-        )
+            if len(text_lines) > 10:
+                text_lines = text_lines[:10]
+                text_lines.append(f"... 等共 {len(details)} 项")
+            notification_title, action = kind_config[kind]
+            self._post_message(
+                mtype=self._notification_type,
+                title=notification_title,
+                text=f"本次共{action} {file_count} 个文件\n\n" + "\n".join(text_lines),
+                image=first_image,
+            )
+            logger.info(
+                f"{action}完成通知已发送：{file_count} 个文件，"
+                f"{len(details)} 个媒体项"
+            )
 
     def guardian_check(self, all_subs) -> int:
         """

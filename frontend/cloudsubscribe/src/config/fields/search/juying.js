@@ -1,5 +1,3 @@
-import {enabled} from "../helpers.js";
-
 export function createJuyingGroups(options = {}) {
     return [
         {
@@ -15,26 +13,17 @@ export function createJuyingGroups(options = {}) {
                     data: options.searchAccounts?.juying || {},
                     compact: true,
                     cols: 12,
-                    show: enabled("juying_enabled"),
-                },
-                {
-                    key: "juying_enabled",
-                    label: "启用聚影",
-                    type: "switch",
-                    cols: 12,
                 },
                 {
                     key: "juying_username",
                     label: "网页登录账号",
                     cols: 6,
-                    show: enabled("juying_enabled"),
                 },
                 {
                     key: "juying_password",
                     label: "网页登录密码",
                     type: "password",
                     cols: 6,
-                    show: enabled("juying_enabled"),
                 },
                 {
                     key: "test_juying",
@@ -42,7 +31,6 @@ export function createJuyingGroups(options = {}) {
                     type: "test-source",
                     source: "juying",
                     cols: 12,
-                    show: enabled("juying_enabled"),
                 },
             ],
         },
@@ -51,7 +39,6 @@ export function createJuyingGroups(options = {}) {
             title: "聚影搜索与风控",
             icon: "mdi-shield-search",
             hint: "影片、资源和票据接口共用限速；缓存搜索结果和短时访问票据，减少重复请求。",
-            show: enabled("juying_enabled"),
             fields: [
                 {
                     key: "juying_result_limit",
@@ -60,7 +47,6 @@ export function createJuyingGroups(options = {}) {
                     min: 1,
                     max: 20,
                     cols: 6,
-                    show: enabled("juying_enabled"),
                 },
                 {
                     key: "juying_unlocks_per_minute",
@@ -71,7 +57,6 @@ export function createJuyingGroups(options = {}) {
                     max: 12,
                     suffix: "次",
                     cols: 6,
-                    show: enabled("juying_enabled"),
                 },
                 {
                     key: "juying_request_interval",
@@ -83,7 +68,6 @@ export function createJuyingGroups(options = {}) {
                     step: 0.5,
                     suffix: "秒",
                     cols: 6,
-                    show: enabled("juying_enabled"),
                 },
             ],
         },

@@ -1,4 +1,4 @@
-"""基于 MoviePilot TMDB 刮削器批量生成本地媒体元数据。"""
+"""基于TMDB 刮削器批量生成本地媒体元数据。"""
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, Iterable, Optional
@@ -12,7 +12,7 @@ from app.utils.http import RequestUtils
 
 
 class MediaScraper:
-    """在平台分类目录批量生成与 MoviePilot 一致的 NFO 和图片。"""
+    """在平台分类目录批量生成一致的 NFO 和图片。"""
 
     def __init__(self, nfo_enabled: bool, image_enabled: bool):
         self._nfo_enabled = bool(nfo_enabled)

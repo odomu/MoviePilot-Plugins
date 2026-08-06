@@ -10,6 +10,7 @@ from ...core import OwnerDelegator
 from ...search.butailing import ButailingError
 from ...search.juying import JuyingError
 from ...search.matching import unique_texts
+from ...search.pinglian import PinglianError
 from ...search.seedhub import SeedHubError
 from ...utils import parse_magnet_metadata
 
@@ -188,3 +189,33 @@ class ExternalResourceSearchService(OwnerDelegator):
         results = self._normalize_magnets(resources, "juying")
         logger.debug(f"{prefix} 查询完成：可用候选={len(results)}")
         return results
+
+    def _search_pinglian(
+            self,
+            mediainfo: MediaInfo,
+            media_type: MediaType,
+            season: Optional[int],
+            raise_errors: bool = False,
+            test_mode: bool = False,
+    ) -> List[Dict[str, Any]]:
+        label = self._search_label(mediainfo, media_type, season)
+        prefix = f"[{label}][PINGLIAN]"
+        if not self._pinglian_client:
+            return []
+        titles = self._media_titles(mediainfo)
+        try:
+            resources = self._pinglian_client.search(
+                title=titles[0] if titles else "",
+                alternative_titles=titles[1:],
+                year=getattr(mediainfo, "year", None),
+                resource_type_order=self._resource_type_order_config,
+                limit=self._pinglian_result_limit,
+                test_mode=test_mode,
+            )
+        except PinglianError as error:
+            logger.warning(f"{prefix} 搜索失败：{error}")
+            if raise_errors:
+                raise
+            return []
+        logger.debug(f"{prefix} 查询完成：可用候选={len(resources)}")
+        return resources

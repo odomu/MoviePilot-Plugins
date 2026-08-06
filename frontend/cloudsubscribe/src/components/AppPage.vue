@@ -125,7 +125,7 @@
               @stop-task="confirmStopTask"
           />
         </div>
-        <div v-if="mainTab === 'history'" class="workspace-pane history-pane">
+        <div v-show="mainTab === 'history'" class="workspace-pane history-pane">
           <HistoryTable
               :items="sortedHistory"
               :emby-play-items="embyPlayItems"
@@ -373,12 +373,10 @@
 import {computed, defineAsyncComponent, inject, ref} from "vue";
 import {useDisplay} from "vuetify";
 import RuntimeCard from "./dashboard/RuntimeCard.vue";
+import HistoryTable from "./dashboard/HistoryTable.vue";
 import {usePageData} from "../composables/usePageData.js";
 
 const Config = defineAsyncComponent(() => import("./Config.vue"));
-const HistoryTable = defineAsyncComponent(
-    () => import("./dashboard/HistoryTable.vue"),
-);
 const CacheClearDialog = defineAsyncComponent(
     () => import("./dialogs/CacheClearDialog.vue"),
 );

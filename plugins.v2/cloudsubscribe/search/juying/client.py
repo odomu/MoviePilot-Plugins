@@ -35,7 +35,7 @@ class JuyingClient:
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "MoviePilot-CloudSubscribe-Juying/1.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
 
     def __init__(

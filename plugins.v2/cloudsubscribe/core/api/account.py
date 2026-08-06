@@ -50,6 +50,7 @@ class AccountApi(OwnerDelegator):
                 "hdhive": "HDHive 用户",
                 "dian115": "Dian115 用户",
                 "juying": "聚影用户",
+                "pinglian": "盘链用户",
             }.get(source, "渠道用户")
         if source == "hdhive":
             add_detail("会员状态", "VIP" if info.get("is_vip") else "普通用户")
@@ -67,6 +68,10 @@ class AccountApi(OwnerDelegator):
                 "连续签到", f"{int(info.get('consecutive_signin') or 0)} 天"
             )
             add_detail("已解锁", f"{int(info.get('unlock_count') or 0)} 次")
+        elif source == "pinglian":
+            add_detail("会员到期", info.get("expires_at"))
+            add_detail("注册日期", info.get("registered_at"))
+            add_detail("邀请用户", info.get("invite_count"))
         else:
             add_detail("累计签到", f"{int(info.get('checkin_days') or 0)} 天")
             add_detail("上传资源", f"{int(info.get('upload_count') or 0)} 个")
@@ -80,7 +85,7 @@ class AccountApi(OwnerDelegator):
                 "badge": badge,
             },
             "points": {
-                "label": "可用积分",
+                "label": "金币余额" if source == "pinglian" else "可用积分",
                 "available": max(0, int(info.get("points") or 0)),
             },
             "details": details,
@@ -91,16 +96,12 @@ class AccountApi(OwnerDelegator):
         from ...search.dian115 import Dian115Client
         from ...search.hdhive import HDHiveClient
         from ...search.juying import JuyingClient
+        from ...search.pinglian import PinglianClient
 
         client = None
         close_client = False
         try:
             if source == "hdhive":
-                if not self._hdhive_enabled:
-                    return {
-                        "connected": False,
-                        "error": "启用并保存 HDHive 配置后读取账户信息",
-                    }
                 if self._hdhive_query_mode == "api":
                     if not self._hdhive_client or not self._hdhive_client.is_ready:
                         return {
@@ -134,11 +135,6 @@ class AccountApi(OwnerDelegator):
                 )
                 close_client = True
             elif source == "dian115":
-                if not self._dian115_enabled:
-                    return {
-                        "connected": False,
-                        "error": "启用并保存 Dian115 配置后读取账户信息",
-                    }
                 if not self._dian115_email or not self._dian115_password:
                     return {
                         "connected": False,
@@ -156,11 +152,6 @@ class AccountApi(OwnerDelegator):
                 )
                 close_client = True
             elif source == "juying":
-                if not self._juying_enabled:
-                    return {
-                        "connected": False,
-                        "error": "启用并保存聚影配置后读取账户信息",
-                    }
                 if not self._juying_username or not self._juying_password:
                     return {
                         "connected": False,
@@ -173,6 +164,22 @@ class AccountApi(OwnerDelegator):
                     request_timeout=10,
                     request_interval=self._juying_request_interval,
                     unlocks_per_minute=self._juying_unlocks_per_minute,
+                    get_data_func=self.get_data,
+                    save_data_func=self.save_data,
+                )
+                close_client = True
+            elif source == "pinglian":
+                if not self._pinglian_username or not self._pinglian_password:
+                    return {
+                        "connected": False,
+                        "error": "请填写盘链账号和密码并保存配置",
+                    }
+                client = PinglianClient(
+                    username=self._pinglian_username,
+                    password=self._pinglian_password,
+                    proxy=settings.PROXY,
+                    request_timeout=min(self._pinglian_timeout, 30),
+                    request_interval=self._pinglian_request_interval,
                     get_data_func=self.get_data,
                     save_data_func=self.save_data,
                 )
@@ -443,7 +450,12 @@ class AccountApi(OwnerDelegator):
                 client.close()
 
 
-def clear_account_cache() -> None:
+def clear_account_cache(account_key: str = "") -> None:
+    normalized_key = str(account_key or "").strip().lower()
     with _ACCOUNT_INFO_LOCK:
-        _ACCOUNT_INFO_CACHE.clear()
-        _ACCOUNT_REFRESH_GUARD.clear()
+        if normalized_key:
+            _ACCOUNT_INFO_CACHE.pop(normalized_key, None)
+            _ACCOUNT_REFRESH_GUARD.pop(normalized_key, None)
+        else:
+            _ACCOUNT_INFO_CACHE.clear()
+            _ACCOUNT_REFRESH_GUARD.clear()

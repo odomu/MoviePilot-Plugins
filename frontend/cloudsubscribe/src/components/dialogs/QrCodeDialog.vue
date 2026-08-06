@@ -118,6 +118,8 @@ const providerMeta = {
   123: {name: "123网盘", hint: "请使用 123 云盘 App 扫描二维码"},
   quark: {name: "夸克网盘", hint: "请使用夸克 App 扫描二维码"},
   guangya: {name: "光鸭网盘", hint: "请使用光鸭网盘完成扫码授权"},
+  alipan: {name: "阿里云盘", hint: "请使用阿里云盘 App 扫描二维码"},
+  tianyi: {name: "天翼云盘", hint: "请使用小翼管家、支付宝或天翼云盘 App 扫描二维码"},
 };
 const channels = [
   {title: "支付宝", value: "alipaymini"},
@@ -177,6 +179,15 @@ function buildStatusQuery() {
     query.set("device_code", session.value.device_code || "");
     query.set("device_id", session.value.device_id || "");
     query.set("client_id", session.value.client_id || "");
+  } else if (props.provider === "alipan") {
+    query.set("t", session.value.t || "");
+    query.set("ck", session.value.ck || "");
+  } else if (props.provider === "tianyi") {
+    query.set("uuid", session.value.uuid || "");
+    query.set("encryuuid", session.value.encryuuid || "");
+    query.set("req_id", session.value.req_id || "");
+    query.set("lt", session.value.lt || "");
+    query.set("param_id", session.value.param_id || "");
   }
   return query;
 }

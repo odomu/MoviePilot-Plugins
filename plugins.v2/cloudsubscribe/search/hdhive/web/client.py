@@ -80,7 +80,7 @@ class HDHiveClient:
     ):
         if not CURL_CFFI_AVAILABLE:
             raise HDHiveWebError(
-                "HDHive WebAPI 模式依赖未安装，请安装插件依赖后重启 MoviePilot",
+                "HDHive WebAPI 模式依赖未安装，请安装插件依赖后重启",
                 code="curl_cffi_missing",
             )
         self._username = str(username or "").strip()

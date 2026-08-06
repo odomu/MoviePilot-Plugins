@@ -22,6 +22,8 @@ class CloudDriveCapability(str, Enum):
     PLAYBACK_REFERENCE = "playback_reference"
     OFFLINE_TASKS = "offline_tasks"
     LOCAL_UPLOAD = "local_upload"
+    RAPID_UPLOAD = "rapid_upload"
+    FILE_DOWNLOAD = "file_download"
     QRCODE_AUTH = "qrcode_auth"
     CACHE_MAINTENANCE = "cache_maintenance"
 
@@ -69,6 +71,7 @@ class CloudFile(Mapping[str, Any]):
     is_directory: bool
     size: int = 0
     sha1: str = ""
+    md5: str = ""
     playback_values: Mapping[str, str] = field(default_factory=dict)
     native: Any = field(default=None, repr=False, compare=False)
 
@@ -79,14 +82,15 @@ class CloudFile(Mapping[str, Any]):
             "is_dir": self.is_directory,
             "size": self.size,
             "sha1": self.sha1,
+            "md5": self.md5,
         }
         return values[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(("id", "name", "is_dir", "size", "sha1"))
+        return iter(("id", "name", "is_dir", "size", "sha1", "md5"))
 
     def __len__(self) -> int:
-        return 5
+        return 6
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,15 @@ class DirectoryListing:
 
     checked: bool
     files: tuple[CloudFile, ...] = ()
+
+
+@dataclass(frozen=True)
+class RapidUploadResult:
+    """秒传探测结果；reused=False 表示可安全回退普通上传。"""
+
+    reused: bool
+    file: CloudFile | None = None
+    message: str = ""
 
 
 @dataclass
@@ -135,16 +148,9 @@ class ShareLinkStatus:
 class AuthenticationOperations(Protocol):
     def check_login(self) -> bool: ...
 
-    def reset_api_call_count(self) -> None: ...
-
-    def get_api_call_count(self) -> int: ...
-
 
 @runtime_checkable
 class AccountOperations(Protocol):
-    @property
-    def is_vip(self) -> bool: ...
-
     def get_account_info(self) -> Dict[str, Any]: ...
 
 
@@ -278,6 +284,34 @@ class LocalUploadOperations(Protocol):
 
 
 @runtime_checkable
+class RapidUploadOperations(Protocol):
+    """目标网盘按校验和尝试秒传，失败时由编排器决定是否回退。"""
+
+    @property
+    def algorithms(self) -> FrozenSet[str]: ...
+
+    def upload_by_hash(
+            self, local_path: str, save_path: str, target_name: str,
+            algorithm: str, checksum: str, size: int = 0,
+            progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> RapidUploadResult: ...
+
+
+@runtime_checkable
+class FileDownloadOperations(Protocol):
+    def resolve_download_link(
+            self, file_item: CloudFile,
+    ) -> tuple[str, Mapping[str, str]]: ...
+
+    def download_file(
+            self, file_item: CloudFile, local_path: str,
+            progress_callback: Optional[Callable[[int, int], None]] = None,
+            stop_requested: Optional[Callable[[], bool]] = None,
+            preserve_partial: bool = False,
+            download_threads: int = 5,
+    ) -> str: ...
+
+@runtime_checkable
 class QrCodeAuthOperations(Protocol):
     def create_qrcode_login(self, client_type: str) -> Dict[str, Any]: ...
 
@@ -304,6 +338,8 @@ CAPABILITY_CONTRACTS = {
     CloudDriveCapability.PLAYBACK_REFERENCE: PlaybackReferenceOperations,
     CloudDriveCapability.OFFLINE_TASKS: OfflineTaskOperations,
     CloudDriveCapability.LOCAL_UPLOAD: LocalUploadOperations,
+    CloudDriveCapability.RAPID_UPLOAD: RapidUploadOperations,
+    CloudDriveCapability.FILE_DOWNLOAD: FileDownloadOperations,
     CloudDriveCapability.QRCODE_AUTH: QrCodeAuthOperations,
     CloudDriveCapability.CACHE_MAINTENANCE: CacheMaintenanceOperations,
 }
@@ -406,6 +442,8 @@ class CloudDriveProvider:
             CloudDriveCapability.BATCH_FILE_MUTATION,
             CloudDriveCapability.OFFLINE_TASKS,
             CloudDriveCapability.LOCAL_UPLOAD,
+            CloudDriveCapability.RAPID_UPLOAD,
+            CloudDriveCapability.FILE_DOWNLOAD,
         }
         object.__setattr__(self, "_io_gate", io_gate)
         object.__setattr__(

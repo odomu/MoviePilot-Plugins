@@ -19,11 +19,12 @@ _SEARCH_TEST_TIMEOUT_SECONDS = 30
 
 
 class SearchApi(OwnerDelegator):
+    _SEARCH_TEST_RESULT_LIMIT = 20
     _SEARCH_TEST_CONFIG_FIELDS = {
         "pansou": frozenset({
             "pansou_url", "pansou_username", "pansou_password",
             "pansou_auth_enabled", "pansou_channels", "pansou_plugins",
-            "pansou_cloud_types", "pansou_filter_include",
+            "pansou_filter_include",
             "pansou_filter_exclude", "pansou_concurrency",
             "pansou_result_limit", "pansou_timeout",
         }),
@@ -45,6 +46,10 @@ class SearchApi(OwnerDelegator):
         }),
         "seedhub": frozenset({"seedhub_result_limit"}),
         "butailing": frozenset({"butailing_result_limit"}),
+        "pinglian": frozenset({
+            "pinglian_username", "pinglian_password", "pinglian_result_limit",
+            "pinglian_request_interval", "pinglian_timeout",
+        }),
     }
 
     def _test_search_config(
@@ -71,8 +76,9 @@ class SearchApi(OwnerDelegator):
         from ...handlers.search import SearchHandler
         from ...search.butailing import ButailingClient
         from ...search.hdhive import HDHiveOpenAPIClient
-        from ...search.juying import JuyingClient, JuyingResourceService
+        from ...search.juying import JuyingClient
         from ...search.pansou import PanSouClient
+        from ...search.pinglian import PinglianClient
         from ...search.seedhub import SeedHubClient
 
         def as_list(value: Any) -> list:
@@ -105,18 +111,33 @@ class SearchApi(OwnerDelegator):
             str(value).strip().lower()
             for value in as_list(config.get("resource_type_order"))
             if str(value).strip().lower()
-            in {"115", "123", "quark", "guangya", "ed2k", "magnet"}
+            in {
+                "115", "123", "quark", "guangya", "tianyi", "alipan",
+                "ed2k", "magnet",
+            }
         ))
         if not resource_type_order:
-            resource_type_order = ["115", "ed2k"]
-        if source in {"seedhub", "butailing"} and "magnet" not in resource_type_order:
-            resource_type_order.append("magnet")
-        if source == "juying":
-            resource_type_order.extend(
-                resource_type
-                for resource_type in JuyingResourceService.SUPPORTED_RESOURCE_TYPE_ORDER
-                if resource_type not in resource_type_order
-            )
+            raise ValueError("请至少选择一种资源类型")
+
+        def require(*keys: str) -> None:
+            if any(not str(config.get(key) or "").strip() for key in keys):
+                raise ValueError("搜索渠道账号配置不完整")
+
+        if source == "pansou":
+            require("pansou_url")
+            if bool(config.get("pansou_auth_enabled", False)):
+                require("pansou_username", "pansou_password")
+        elif source == "hdhive":
+            if hdhive_query_mode == "api":
+                require("hdhive_api_key", "hdhive_access_token")
+            else:
+                require("hdhive_username", "hdhive_password")
+        elif source == "dian115":
+            require("dian115_email", "dian115_password")
+        elif source == "juying":
+            require("juying_username", "juying_password")
+        elif source == "pinglian":
+            require("pinglian_username", "pinglian_password")
 
         pansou_client = None
         pansou_timeout = 20
@@ -157,18 +178,33 @@ class SearchApi(OwnerDelegator):
                 get_data_func=self.get_data,
                 save_data_func=self.save_data,
             )
+        pinglian_client = None
+        if source == "pinglian":
+            pinglian_client = PinglianClient(
+                username=str(config.get("pinglian_username") or ""),
+                password=str(config.get("pinglian_password") or ""),
+                proxy=proxy,
+                request_timeout=int(config.get("pinglian_timeout", 30) or 30),
+                request_interval=float(
+                    config.get("pinglian_request_interval", 1) or 1
+                ),
+                get_data_func=self.get_data,
+                save_data_func=self.save_data,
+            )
         handler = SearchHandler(
             pansou_client=pansou_client,
             hdhive_client=hdhive_client,
             seedhub_client=seedhub_client,
             butailing_client=butailing_client,
             juying_client=juying_client,
+            pinglian_client=pinglian_client,
             pansou_enabled=source == "pansou",
             hdhive_enabled=source == "hdhive",
             dian115_enabled=source == "dian115",
             seedhub_enabled=source == "seedhub",
             butailing_enabled=source == "butailing",
             juying_enabled=source == "juying",
+            pinglian_enabled=source == "pinglian",
             hdhive_username=str(config.get("hdhive_username") or ""),
             hdhive_password=str(config.get("hdhive_password") or ""),
             hdhive_query_mode=hdhive_query_mode,
@@ -186,7 +222,7 @@ class SearchApi(OwnerDelegator):
             dian115_max_points_per_sub=0,
             pansou_channels=config.get("pansou_channels") or [],
             pansou_plugins=config.get("pansou_plugins") or [],
-            pansou_cloud_types=config.get("pansou_cloud_types") or [],
+            pansou_cloud_types=resource_type_order,
             pansou_filter_include=config.get("pansou_filter_include") or [],
             pansou_filter_exclude=config.get("pansou_filter_exclude") or [],
             resource_type_order=resource_type_order,
@@ -204,6 +240,9 @@ class SearchApi(OwnerDelegator):
             ),
             juying_result_limit=min(
                 5, int(config.get("juying_result_limit", 5) or 5)
+            ),
+            pinglian_result_limit=min(
+                20, int(config.get("pinglian_result_limit", 20) or 20)
             ),
             search_source_order=[source],
             search_cache_enabled=False,
@@ -302,6 +341,7 @@ class SearchApi(OwnerDelegator):
             "juying": "聚影",
             "seedhub": "SeedHub",
             "butailing": "不太灵",
+            "pinglian": "盘链",
         }
         if source not in source_names:
             return {"success": False, "message": "不支持的搜索渠道"}
@@ -399,6 +439,9 @@ class SearchApi(OwnerDelegator):
                 "success": False,
                 "message": f"{source_names[source]} 测试失败：{error}",
             }
+        results = self._balanced_test_results(
+            results, self._SEARCH_TEST_RESULT_LIMIT
+        )
         logger.debug(
             f"[{title}{f' S{season:02d}' if season else ''}]"
             f"[{source.upper()}] 只读渠道测试完成："
@@ -415,8 +458,6 @@ class SearchApi(OwnerDelegator):
             "aliyun": "阿里云盘",
             "alipan": "阿里云盘",
             "ali": "阿里云盘",
-            "baidu": "百度网盘",
-            "baidupan": "百度网盘",
             "xunlei": "迅雷云盘",
             "189": "天翼云盘",
             "123pan": "123云盘",
@@ -553,3 +594,27 @@ class SearchApi(OwnerDelegator):
                 ],
             },
         }
+
+    @staticmethod
+    def _balanced_test_results(
+            results: Any, limit: int
+    ) -> List[Dict[str, Any]]:
+        """按资源类型轮询选取测试候选，避免单一类型占满展示额度。"""
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            resource_type = str(
+                item.get("resource_type") or item.get("pan_type") or "unknown"
+            ).strip().lower() or "unknown"
+            groups.setdefault(resource_type, []).append(item)
+        balanced = []
+        while groups and len(balanced) < max(1, int(limit or 20)):
+            for resource_type in list(groups):
+                rows = groups[resource_type]
+                balanced.append(rows.pop(0))
+                if not rows:
+                    groups.pop(resource_type)
+                if len(balanced) >= max(1, int(limit or 20)):
+                    break
+        return balanced

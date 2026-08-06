@@ -6,7 +6,7 @@
         <span>选择网盘转存路径</span>
       </v-card-title>
       <v-card-text class="px-3 py-2">
-        <div v-if="loading" class="d-flex justify-center my-3">
+        <div v-if="loading" class="directory-loading">
           <v-progress-circular indeterminate color="primary"/>
         </div>
         <div v-else>
@@ -19,6 +19,15 @@
               hide-details
               @keyup.enter="loadDirectories(currentPath)"
           />
+          <v-btn
+              prepend-icon="mdi-folder-plus"
+              variant="tonal"
+              size="small"
+              class="mb-2"
+              :disabled="loading"
+              @click="createDirectory"
+          >新建文件夹
+          </v-btn>
           <v-list class="directory-list border rounded">
             <v-list-item
                 v-if="currentPath !== '/'"
@@ -104,6 +113,7 @@ const currentPath = ref("/");
 const directories = ref([]);
 const loading = ref(false);
 const errorMessage = ref("");
+const lastRequestedPath = ref("");
 
 const visible = computed({
   get: () => props.modelValue,
@@ -127,6 +137,8 @@ async function loadDirectories(path) {
   errorMessage.value = "";
   try {
     const normalized = String(path || "/").trim() || "/";
+    if (lastRequestedPath.value === normalized) return;
+    lastRequestedPath.value = normalized;
     const query = new URLSearchParams({
       path: normalized,
       provider: props.provider || "",
@@ -151,7 +163,35 @@ async function loadDirectories(path) {
   } catch (error) {
     directories.value = [];
     errorMessage.value = error.message || String(error);
+    lastRequestedPath.value = "";
   } finally {
+    loading.value = false;
+  }
+}
+
+async function createDirectory() {
+  const name = window.prompt("请输入文件夹名称", "");
+  if (name === null) return;
+  const folderName = name.trim();
+  if (!folderName) {
+    errorMessage.value = "文件夹名称不能为空";
+    return;
+  }
+  loading.value = true;
+  errorMessage.value = "";
+  try {
+    const response = unwrap(await props.api.post(
+        `plugin/${props.pluginId}/cloud/directories/create`,
+        {path: currentPath.value || "/", name: folderName, provider: props.provider || ""},
+    ));
+    if (response.success === false)
+      throw new Error(response.message || "创建文件夹失败");
+    loading.value = false;
+    await loadDirectories(
+        response.data?.path || `${currentPath.value.replace(/\/$/, "")}/${folderName}`,
+    );
+  } catch (error) {
+    errorMessage.value = error.message || String(error);
     loading.value = false;
   }
 }
@@ -163,8 +203,12 @@ function selectDirectory() {
 watch(
     () => props.modelValue,
     (value) => {
-      if (value) loadDirectories(props.initialPath || "/");
+      if (value) {
+        currentPath.value = String(props.initialPath || "/").trim() || "/";
+        loadDirectories(currentPath.value);
+      }
     },
+    {immediate: true},
 );
 </script>
 
@@ -175,11 +219,18 @@ watch(
 }
 
 .directory-card {
-  min-height: min(720px, 88vh);
+  min-height: min(560px, 72vh);
 }
 
 .directory-list {
-  height: min(540px, calc(88vh - 168px));
+  height: min(390px, calc(72vh - 168px));
   overflow-y: auto;
+}
+
+.directory-loading {
+  display: flex;
+  min-height: min(390px, calc(72vh - 168px));
+  align-items: center;
+  justify-content: center;
 }
 </style>

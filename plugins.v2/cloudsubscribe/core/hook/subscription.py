@@ -1,4 +1,4 @@
-"""MoviePilot 订阅与平台搜索钩子。"""
+"""订阅与平台搜索钩子。"""
 
 from functools import wraps
 from typing import Callable, List, Optional, Tuple
@@ -11,7 +11,7 @@ from .. import OwnerDelegator
 
 
 class SubscriptionSearchHook(OwnerDelegator):
-    """按接管时段分流 MoviePilot 订阅搜索，并精确恢复原函数。"""
+    """按接管时段分流订阅搜索，并精确恢复原函数。"""
 
     _JOB_IDS = ("subscribe_search", "new_subscribe_search", "subscribe_refresh")
     _PLATFORM_SEARCH_METHODS = {
@@ -32,7 +32,7 @@ class SubscriptionSearchHook(OwnerDelegator):
 
             scheduler = Scheduler.get_existing_instance()
             if scheduler is None:
-                logger.debug("MoviePilot 调度器尚未就绪，等待平台注册后安装订阅接管")
+                logger.debug("调度器尚未就绪，等待平台注册后安装订阅接管")
                 return
             jobs = getattr(scheduler, "_jobs", None) or {}
             newly_installed = []
@@ -51,11 +51,11 @@ class SubscriptionSearchHook(OwnerDelegator):
                 )
                 newly_installed.append(job_id)
             if newly_installed:
-                logger.info(f"MoviePilot 订阅搜索路由已接管：{', '.join(newly_installed)}")
+                logger.info(f"订阅搜索路由已接管：{', '.join(newly_installed)}")
             else:
-                logger.debug("MoviePilot 订阅搜索路由已保持接管")
+                logger.debug("订阅搜索路由已保持接管")
         except Exception as error:
-            logger.warning(f"安装 MoviePilot 订阅搜索路由失败：{error}")
+            logger.warning(f"安装订阅搜索路由失败：{error}")
 
     def _restore_subscribe_search_takeover(self) -> None:
         self._restore_platform_search_block()
@@ -74,7 +74,7 @@ class SubscriptionSearchHook(OwnerDelegator):
                 if job and getattr(current, "__self__", None) is self:
                     job["func"] = original
         except Exception as error:
-            logger.warning(f"恢复 MoviePilot 订阅搜索路由失败：{error}")
+            logger.warning(f"恢复订阅搜索路由失败：{error}")
         finally:
             self._subscribe_search_originals = {}
 
@@ -87,7 +87,7 @@ class SubscriptionSearchHook(OwnerDelegator):
             for method_name, method_type in self._PLATFORM_SEARCH_METHODS.items():
                 current = getattr(SearchChain, method_name, None)
                 if not callable(current):
-                    logger.warning(f"MoviePilot 搜索入口不存在：SearchChain.{method_name}")
+                    logger.warning(f"搜索入口不存在：SearchChain.{method_name}")
                     continue
                 if getattr(current, "__cloudsubscribe_owner__", None) is self:
                     continue
@@ -105,10 +105,10 @@ class SubscriptionSearchHook(OwnerDelegator):
                 installed.append(method_name)
             if installed:
                 logger.info(
-                    "MoviePilot 平台搜索阻止器已安装：" + ", ".join(installed)
+                    "平台搜索阻止器已安装：" + ", ".join(installed)
                 )
         except Exception as error:
-            logger.warning(f"安装 MoviePilot 平台搜索阻止器失败：{error}")
+            logger.warning(f"安装平台搜索阻止器失败：{error}")
 
     def _restore_platform_search_block(self) -> None:
         """仅恢复当前插件实例安装的平台搜索方法。"""
@@ -123,7 +123,7 @@ class SubscriptionSearchHook(OwnerDelegator):
                 if getattr(current, "__cloudsubscribe_owner__", None) is self:
                     setattr(SearchChain, method_name, original)
         except Exception as error:
-            logger.warning(f"恢复 MoviePilot 平台搜索入口失败：{error}")
+            logger.warning(f"恢复平台搜索入口失败：{error}")
         finally:
             self._platform_search_originals = {}
 
@@ -143,7 +143,7 @@ class SubscriptionSearchHook(OwnerDelegator):
                         "type": "done",
                         "stage": "done",
                         "value": 100,
-                        "text": "网盘订阅接管中，已阻止 MoviePilot 平台搜索",
+                        "text": "网盘订阅接管中，已阻止平台搜索",
                         "items": [],
                         "total_items": 0,
                     }
@@ -199,7 +199,7 @@ class SubscriptionSearchHook(OwnerDelegator):
                 progress_callback=progress_callback,
             )
 
-        # MoviePilot 自身会每 5 分钟触发新增订阅搜索；接管状态下仅消费
+        # 自身会每 5 分钟触发新增订阅搜索；接管状态下仅消费
         # 平台自动任务，统一由插件配置的 Cron 执行自动同步。
         if not bool(manual):
             return True
@@ -222,16 +222,16 @@ class SubscriptionSearchHook(OwnerDelegator):
         )
 
     def _dispatch_subscribe_refresh(self, progress_callback: Optional[Callable[..., None]] = None, ):
-        """按平台下载策略决定接管态是否继续 MoviePilot RSS/PT 刷新。"""
+        """按平台下载策略决定接管态是否继续RSS/PT 刷新。"""
         if not self._is_takeover_active():
             return SubscribeChain().refresh(progress_callback=progress_callback)
 
         if progress_callback:
             progress_callback(
                 value=100,
-                text="订阅已由网盘订阅助手接管，跳过 MoviePilot 原生资源刷新",
+                text="订阅已由网盘订阅助手接管，跳过原生资源刷新",
             )
-        logger.debug("接管态已跳过 MoviePilot 原生订阅资源刷新")
+        logger.debug("接管态已跳过原生订阅资源刷新")
         return True
 
     def _dispatch_all_subscribe_search(
@@ -244,7 +244,7 @@ class SubscriptionSearchHook(OwnerDelegator):
         try:
             subscribes = SubscribeOper().list(state or "N,R") or []
         except Exception as error:
-            logger.warning(f"读取订阅接管范围失败，已回退 MoviePilot 原生搜索：{error}")
+            logger.warning(f"读取订阅接管范围失败，已回退原生搜索：{error}")
             return SubscribeChain().search(
                 state=state,
                 manual=manual,
@@ -276,7 +276,7 @@ class SubscriptionSearchHook(OwnerDelegator):
         return True
 
     def _partition_subscribe_ids(self, subscribes) -> Tuple[List[int], List[int]]:
-        """按过滤规则划分插件与 MoviePilot 原生搜索的订阅。"""
+        """按过滤规则划分插件与原生搜索的订阅。"""
         managed_ids = []
         native_ids = []
         for subscribe in subscribes:

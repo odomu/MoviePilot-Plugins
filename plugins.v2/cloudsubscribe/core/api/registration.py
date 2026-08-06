@@ -1,4 +1,4 @@
-"""MoviePilot 页面模式、API 路由、命令与定时服务注册。"""
+""" 页面模式、API 路由、命令与定时服务注册。"""
 
 import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
@@ -25,7 +25,7 @@ from ..config import UIConfig
 
 
 class _WorkflowActionHandler(dict):
-    """兼顾 MoviePilot 动作执行与 FastAPI 动作列表序列化。"""
+    """兼顾动作执行与 FastAPI 动作列表序列化。"""
 
     def __init__(self, func: Callable[..., Tuple[bool, Any]]):
         super().__init__()
@@ -39,14 +39,14 @@ class _WorkflowActionHandler(dict):
 
 
 class MoviePilotRegistration(OwnerDelegator):
-    """声明插件对 MoviePilot 暴露的注册信息。"""
+    """声明插件对暴露的注册信息。"""
 
     def get_state(self) -> bool:
         return self._enabled
 
     @staticmethod
     def get_render_mode() -> Tuple[str, str]:
-        """使用 MoviePilot Vue 模块联邦渲染配置页与详情页。"""
+        """使用 Vue 模块联邦渲染配置页与详情页。"""
         return "vue", "dist/assets"
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -57,20 +57,6 @@ class MoviePilotRegistration(OwnerDelegator):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
-            {
-                "path": "/media-library/webhook/{key}",
-                "endpoint": self.api_media_library_webhook,
-                "methods": ["POST"],
-                "allow_anonymous": True,
-                "summary": "接收 Emby 媒体库 JSON Webhook",
-            },
-            {
-                "path": "/media-library/webhook/key/refresh",
-                "endpoint": self.api_vue_refresh_media_library_webhook_key,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "刷新媒体库 Webhook 固定 Key",
-            },
             {
                 "path": "/overview",
                 "endpoint": self.api_platform_overview,
@@ -119,6 +105,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "浏览当前网盘目录",
+            },
+            {
+                "path": "/cloud/directories/create",
+                "endpoint": self.api_vue_create_cloud_directory,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "创建网盘目录",
             },
             {
                 "path": "/search/tmdb",
@@ -445,7 +438,7 @@ class MoviePilotRegistration(OwnerDelegator):
         return services
 
     def _refresh_platform_services(self) -> None:
-        """配置保存后刷新当前插件在 MoviePilot 中注册的定时服务。"""
+        """配置保存后刷新当前插件在中注册的定时服务。"""
         try:
             from app.scheduler import Scheduler
 
@@ -454,4 +447,4 @@ class MoviePilotRegistration(OwnerDelegator):
                 return
             scheduler.update_plugin_job(self._owner.__class__.__name__)
         except Exception as error:
-            logger.warning(f"刷新 MoviePilot 插件服务失败：{error}")
+            logger.warning(f"刷新插件服务失败：{error}")

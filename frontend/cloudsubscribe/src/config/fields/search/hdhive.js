@@ -15,13 +15,6 @@ export function createHdhiveGroups(options = {}) {
                     data: options.searchAccounts?.hdhive || {},
                     compact: true,
                     cols: 12,
-                    show: enabled("hdhive_enabled"),
-                },
-                {
-                    key: "hdhive_enabled",
-                    label: "启用 HDHive",
-                    type: "switch",
-                    cols: 6,
                 },
                 {
                     key: "hdhive_query_mode",
@@ -32,7 +25,6 @@ export function createHdhiveGroups(options = {}) {
                         {title: "OpenAPI", value: "api"},
                     ],
                     cols: 6,
-                    show: enabled("hdhive_enabled"),
                 },
                 {
                     key: "hdhive_api_key",
@@ -40,14 +32,14 @@ export function createHdhiveGroups(options = {}) {
                     type: "password",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_client_id",
                     label: "Client ID",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_redirect_uri",
@@ -55,7 +47,7 @@ export function createHdhiveGroups(options = {}) {
                     hint: "必须与 HDHive OpenAPI 应用配置完全一致，且不能包含 fragment。",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_response_mode",
@@ -67,14 +59,14 @@ export function createHdhiveGroups(options = {}) {
                     ],
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_oauth",
                     type: "hdhive-oauth",
                     cols: 12,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_access_token",
@@ -82,7 +74,7 @@ export function createHdhiveGroups(options = {}) {
                     type: "password",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_refresh_token",
@@ -90,21 +82,21 @@ export function createHdhiveGroups(options = {}) {
                     type: "password",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_token_file",
                     label: "Token 挂载文件",
                     cols: 12,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "api",
+                        config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_username",
                     label: "HDHive 用户名",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "web",
+                        config.hdhive_query_mode === "web",
                 },
                 {
                     key: "hdhive_password",
@@ -112,7 +104,7 @@ export function createHdhiveGroups(options = {}) {
                     type: "password",
                     cols: 6,
                     show: (config) =>
-                        config.hdhive_enabled && config.hdhive_query_mode === "web",
+                        config.hdhive_query_mode === "web",
                 },
                 {
                     key: "test_hdhive",
@@ -120,7 +112,6 @@ export function createHdhiveGroups(options = {}) {
                     type: "test-source",
                     source: "hdhive",
                     cols: 12,
-                    show: enabled("hdhive_enabled"),
                 },
             ],
         },
@@ -129,14 +120,12 @@ export function createHdhiveGroups(options = {}) {
             title: "HDHive 积分解锁",
             icon: "mdi-ticket-confirmation-outline",
             hint: "默认不解锁收费资源；开启后仅在候选被实际采用且双重预算充足时扣费。",
-            show: enabled("hdhive_enabled"),
             fields: [
                 {
                     key: "hdhive_auto_unlock",
                     label: "允许积分解锁",
                     type: "switch",
                     cols: 4,
-                    show: enabled("hdhive_enabled"),
                 },
                 {
                     key: "hdhive_max_unlock_points",
@@ -145,7 +134,7 @@ export function createHdhiveGroups(options = {}) {
                     type: "number",
                     min: 0,
                     cols: 4,
-                    show: (config) => config.hdhive_enabled && config.hdhive_auto_unlock,
+                    show: (config) => config.hdhive_auto_unlock,
                 },
                 {
                     key: "hdhive_max_points_per_sub",
@@ -154,7 +143,7 @@ export function createHdhiveGroups(options = {}) {
                     type: "number",
                     min: 0,
                     cols: 4,
-                    show: (config) => config.hdhive_enabled && config.hdhive_auto_unlock,
+                    show: (config) => config.hdhive_auto_unlock,
                 },
             ],
         },
@@ -163,7 +152,6 @@ export function createHdhiveGroups(options = {}) {
             title: "HDHive 搜索与风控",
             icon: "mdi-shield-search",
             hint: "资源缓存减少重复访问；WebAPI 每分钟最多请求 10 次，异常页面会触发 10 分钟保护冷却。",
-            show: enabled("hdhive_enabled"),
             fields: [
                 {
                     key: "hdhive_candidate_limit",
@@ -173,7 +161,6 @@ export function createHdhiveGroups(options = {}) {
                     min: 1,
                     max: 20,
                     cols: 6,
-                    show: enabled("hdhive_enabled"),
                 },
                 {
                     key: "hdhive_request_interval",
@@ -185,7 +172,6 @@ export function createHdhiveGroups(options = {}) {
                     step: 0.5,
                     suffix: "秒",
                     cols: 6,
-                    show: enabled("hdhive_enabled"),
                 },
                 {
                     key: "hdhive_unlocks_per_minute",
@@ -198,7 +184,6 @@ export function createHdhiveGroups(options = {}) {
                     suffix: "次/分钟",
                     cols: 6,
                     show: (config) =>
-                        enabled("hdhive_enabled")(config) &&
                         config.hdhive_query_mode === "web",
                 },
                 {
@@ -208,7 +193,6 @@ export function createHdhiveGroups(options = {}) {
                     type: "switch",
                     cols: 12,
                     show: (config) =>
-                        enabled("hdhive_enabled")(config) &&
                         config.hdhive_query_mode === "web",
                 },
                 {
@@ -238,7 +222,6 @@ export function createHdhiveGroups(options = {}) {
                     multiple: true,
                     cols: 12,
                     show: (config) =>
-                        enabled("hdhive_enabled")(config) &&
                         config.hdhive_query_mode === "web" &&
                         enabled("hdhive_torrentclaw_enabled")(config),
                 },

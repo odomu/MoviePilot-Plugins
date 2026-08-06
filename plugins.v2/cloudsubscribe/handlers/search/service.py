@@ -40,6 +40,7 @@ class SearchHandler:
     _DIAN115_SEARCH_CACHE_VERSION = 1
     _SUPPORTED_SOURCES = frozenset({
         "hdhive", "dian115", "pansou", "seedhub", "butailing", "juying",
+        "pinglian",
     })
 
     @staticmethod
@@ -60,12 +61,14 @@ class SearchHandler:
             seedhub_client=None,
             butailing_client=None,
             juying_client=None,
+            pinglian_client=None,
             pansou_enabled: bool = False,
             hdhive_enabled: bool = False,
             dian115_enabled: bool = False,
             seedhub_enabled: bool = False,
             butailing_enabled: bool = False,
             juying_enabled: bool = False,
+            pinglian_enabled: bool = False,
             hdhive_username: str = "",
             hdhive_password: str = "",
             hdhive_query_mode: str = "web",
@@ -90,6 +93,7 @@ class SearchHandler:
             seedhub_result_limit: int = 20,
             butailing_result_limit: int = 20,
             juying_result_limit: int = 5,
+            pinglian_result_limit: int = 20,
             search_source_order: Optional[List[str]] = None,
             search_cache_enabled: bool = True,
             search_cache_ttl_minutes: int = 30,
@@ -125,6 +129,7 @@ class SearchHandler:
         self._seedhub_client = seedhub_client
         self._butailing_client = butailing_client
         self._juying_client = juying_client
+        self._pinglian_client = pinglian_client
         self._juying_resources = (
             JuyingResourceService(juying_client) if juying_client else None
         )
@@ -134,6 +139,7 @@ class SearchHandler:
         self._seedhub_enabled = bool(seedhub_enabled)
         self._butailing_enabled = bool(butailing_enabled)
         self._juying_enabled = bool(juying_enabled)
+        self._pinglian_enabled = bool(pinglian_enabled)
         self._hdhive_username = hdhive_username
         self._hdhive_password = hdhive_password
         self._hdhive_query_mode = str(hdhive_query_mode or "web")
@@ -202,6 +208,9 @@ class SearchHandler:
         )
         self._juying_result_limit = max(
             1, min(int(juying_result_limit or 5), 20)
+        )
+        self._pinglian_result_limit = max(
+            1, min(int(pinglian_result_limit or 20), 80)
         )
         self._juying_resource_types = [
             value for value in unique_texts(
@@ -312,12 +321,9 @@ class SearchHandler:
 
     def get_enabled_sources(self) -> List[str]:
         """
-        获取已启用且可用的搜索源列表，按优先级排序
+        获取用户选择且当前可用的搜索源列表，按选择顺序排序
 
-        优先级规则：
-        1. 用户配置了自定义优先级（search_source_order）时按其顺序排列；
-           未出现在自定义列表中的已启用源按默认顺序追加在末尾
-        2. 未配置时使用代码声明的默认顺序
+        未出现在 ``search_source_order`` 中的搜索源不会发起请求。
 
         :return: 搜索源名称列表
         """
@@ -371,13 +377,16 @@ class SearchHandler:
         ):
             available.append("butailing")
 
-        # 应用用户自定义优先级
-        if self._search_source_order:
-            sources = [s for s in self._search_source_order if s in available]
-            sources += [s for s in available if s not in sources]
-            return sources
+        # 盘链
+        if (
+                self._pinglian_enabled
+                and self._pinglian_client
+                and self._pinglian_client.is_configured
+                and self._resource_type_order_config
+        ):
+            available.append("pinglian")
 
-        return available
+        return [source for source in self._search_source_order if source in available]
 
     @property
     def source_concurrency_enabled(self) -> bool:
@@ -443,6 +452,9 @@ class SearchHandler:
             ),
             "juying_result_limit": (
                 self._juying_result_limit if source == "juying" else 0
+            ),
+            "pinglian_result_limit": (
+                self._pinglian_result_limit if source == "pinglian" else 0
             ),
             "juying_resource_types": (
                 self._juying_resource_types if source == "juying" else []
@@ -543,6 +555,7 @@ class SearchHandler:
             "seedhub": self._clear_client_cache(self._seedhub_client),
             "butailing": self._clear_client_cache(self._butailing_client),
             "juying": self._clear_client_cache(self._juying_resources),
+            "pinglian": self._clear_client_cache(self._pinglian_client),
             "dian115_details": self._clear_client_cache(
                 get_component(self, Dian115SearchService, "_search_components")
             ),
@@ -581,6 +594,8 @@ class SearchHandler:
         ).close()
         if release_cache and self._juying_client:
             self._juying_client.close()
+        if release_cache and self._pinglian_client:
+            self._pinglian_client.close()
 
     def set_data_funcs(self, get_func, save_func) -> None:
         """为各积分搜索源注入持久化函数。"""
@@ -631,7 +646,10 @@ class SearchHandler:
 
         results: Dict[str, List[Dict]] = {source: [] for source in ordered_sources}
         workers = min(self._search_concurrency, len(ordered_sources))
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="p115-search")
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="cloudsubscribe-search",
+        )
         stopped = False
         try:
             futures = {
@@ -725,9 +743,10 @@ class SearchHandler:
     @staticmethod
     def _resource_type(resource: Dict[str, Any]) -> str:
         """读取内部规范化类型；pan_type 仅用于尚未规范化的外部来源。"""
-        return str(
+        value = str(
             resource.get("resource_type") or resource.get("pan_type") or ""
         ).strip().lower()
+        return "alipan" if value == "aliyun" else value
 
     @classmethod
     def _resource_availability_order(cls, resource: Dict[str, Any]) -> int:
@@ -828,7 +847,7 @@ class SearchHandler:
 
     @staticmethod
     def _resource_filter_title(resource: Dict[str, Any]) -> str:
-        """将搜索源的结构化发布信息还原为 MoviePilot 可识别的规则标题。"""
+        """将搜索源的结构化发布信息还原为可识别的规则标题。"""
         video_info = resource.get("video_info") or {}
         language_values = []
         for value in (
@@ -865,7 +884,7 @@ class SearchHandler:
             season: Optional[int] = None,
             target_episodes: Optional[List[int]] = None,
     ) -> List[Dict]:
-        """使用 MoviePilot 平台规则组筛选并按平台优先级排序。"""
+        """使用平台规则组筛选并按平台优先级排序。"""
         if not resources:
             return []
         resources = self._prefilter_resource_order(
@@ -928,7 +947,7 @@ class SearchHandler:
             return []
 
     def _platform_rule_groups(self, subscribe: Any = None) -> List[str]:
-        """读取订阅指定规则组，否则使用 MoviePilot 对应的全局规则组。"""
+        """读取订阅指定规则组，否则使用对应的全局规则组。"""
         from app.db.systemconfig_oper import SystemConfigOper
         from app.schemas.types import SystemConfigKey
 
@@ -948,7 +967,7 @@ class SearchHandler:
             mediainfo: MediaInfo,
             subscribe: Any = None,
     ) -> List[tuple]:
-        """使用 MoviePilot 规则组筛选实际文件并返回 ``(文件, pri_order)``。"""
+        """使用规则组筛选实际文件并返回 ``(文件, pri_order)``。"""
         candidates = [item for item in files or [] if item]
         if not candidates:
             return []
@@ -1170,6 +1189,14 @@ class SearchHandler:
                 raise_errors=test_mode,
                 test_mode=test_mode,
             )
+        if source == "pinglian":
+            return self._search_pinglian(
+                mediainfo,
+                media_type,
+                season,
+                raise_errors=test_mode,
+                test_mode=test_mode,
+            )
         raise ValueError("不支持的搜索渠道")
 
     def _prepare_source_results(
@@ -1221,6 +1248,7 @@ class SearchHandler:
             "seedhub": self._seedhub_client,
             "butailing": self._butailing_client,
             "juying": self._juying_resources,
+            "pinglian": self._pinglian_client,
         }.get(source)
         if client:
             client.clear_cache()

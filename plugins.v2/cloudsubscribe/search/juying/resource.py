@@ -17,7 +17,7 @@ class JuyingResourceService:
 
     _MAX_RESOURCE_PAGES = 10
     SUPPORTED_RESOURCE_TYPE_ORDER = (
-        "115", "123", "quark", "guangya", "ed2k", "magnet"
+        "115", "123", "quark", "guangya", "alipan", "ed2k", "magnet"
     )
     SUPPORTED_RESOURCE_TYPES = frozenset(SUPPORTED_RESOURCE_TYPE_ORDER)
     _TYPE_ALIASES = {
@@ -27,6 +27,8 @@ class JuyingResourceService:
         "123pan": "123",
         "quark": "quark",
         "guangya": "guangya",
+        "alipan": "alipan",
+        "aliyun": "alipan",
         "magnet": "magnet",
         "magnetlink": "magnet",
         "ed2k": "ed2k",
@@ -253,6 +255,8 @@ class JuyingResourceService:
             return "quark"
         if cls._host_matches(host, {"guangyapan.com"}):
             return "guangya"
+        if cls._host_matches(host, {"alipan.com", "aliyundrive.com"}):
+            return "alipan"
         return ""
 
     @classmethod

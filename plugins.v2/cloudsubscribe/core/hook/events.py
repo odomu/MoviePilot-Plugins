@@ -15,7 +15,7 @@ from ...core import OwnerDelegator
 
 
 class PluginEventHandler(OwnerDelegator):
-    """处理 MoviePilot 事件总线回调。"""
+    """处理事件总线回调。"""
 
     @staticmethod
     def _torrent_payload_to_magnet(payload: bytes) -> Tuple[str, Dict[str, Any]]:
@@ -144,7 +144,7 @@ class PluginEventHandler(OwnerDelegator):
             return None
 
     def on_subscribe_added(self, event: Event):
-        """新增订阅由 MoviePilot 搜索调度钩子自动分流。"""
+        """新增订阅由搜索调度钩子自动分流。"""
         sid = self._get_subscribe_id_from_event(event)
         if not sid:
             return
@@ -162,7 +162,7 @@ class PluginEventHandler(OwnerDelegator):
         return
 
     def on_transfer_complete(self, event: Event):
-        """MoviePilot PT 整理完成后异步进入网盘洗版上传。"""
+        """PT 整理完成后异步进入网盘洗版上传。"""
         if (
                 not event
                 or not self._enabled
@@ -268,7 +268,7 @@ class PluginEventHandler(OwnerDelegator):
             )
 
     def on_resource_download(self, event: Event):
-        """接管或拦截 MoviePilot 即将创建的平台资源下载。"""
+        """接管或拦截即将创建的平台资源下载。"""
         if not event or not self._enabled:
             return
         if not self._sync_handler:

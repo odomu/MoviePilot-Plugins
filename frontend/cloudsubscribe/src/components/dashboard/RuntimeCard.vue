@@ -1,22 +1,14 @@
 <template>
   <div class="runtime-panel">
-    <div v-if="tasks.length" class="runtime-header">
-      <div class="d-flex align-center ga-2 min-width-0">
-        <v-icon icon="mdi-format-list-checks" color="primary" size="small"/>
-        <v-chip size="x-small" variant="tonal">
-          共 {{ tasks.length }} · 运行 {{ runningCount }} · 等待
-          {{ queuedCount }} · 后处理 {{ postprocessingCount }}
-        </v-chip>
-      </div>
-    </div>
-
     <div v-if="tasks.length" class="task-list">
       <div v-for="task in tasks" :key="task.id" class="task-row">
         <v-icon
             :icon="
-            task.media_type === '电影'
-              ? 'mdi-movie-outline'
-              : 'mdi-television-classic'
+            task.task_kind === 'cross_transfer'
+              ? 'mdi-swap-horizontal-bold'
+              : task.media_type === '电影'
+                ? 'mdi-movie-outline'
+                : 'mdi-television-classic'
           "
             :color="taskColor(task.status)"
             size="small"
@@ -50,26 +42,32 @@
           </div>
           <div class="task-meta">
             <span class="task-phase text-caption text-medium-emphasis">{{
-                task.status === "failed"
+                task.task_kind === "cross_transfer"
+                    ? task.error || task.message || task.phase
+                    : task.status === "failed"
                     ? task.message || task.phase || "处理失败"
                     : task.phase || "等待调度"
               }}</span>
             <span
                 v-if="
-                task.task_kind === 'pt_upgrade' && Number(task.total || 0) > 0
+                (task.transfer_active ||
+                  ['pt_upgrade', 'cross_transfer'].includes(task.task_kind)) &&
+                displayTotal(task) > 0
               "
                 class="task-transfer text-caption text-medium-emphasis"
             >
-              {{ formatSize(task.transferred) }} /
-              {{ formatSize(task.total) }} ·
-              {{ formatSpeed(task.upload_speed) }}
+              {{ formatSize(displayTransferred(task)) }} /
+              {{ formatSize(displayTotal(task)) }} ·
+              {{ formatSpeed(task.speed_bytes_per_second || task.upload_speed) }}
             </span>
           </div>
           <v-progress-linear
               class="task-progress"
               :model-value="Number(task.progress || 0)"
+              :style="progressStyle(task)"
               :indeterminate="
-              task.task_kind !== 'pt_upgrade' &&
+              !task.transfer_active &&
+              !['pt_upgrade', 'cross_transfer'].includes(task.task_kind) &&
               ['running', 'stopping', 'postprocessing'].includes(task.status)
             "
               :color="taskColor(task.status)"
@@ -131,21 +129,10 @@ const emit = defineEmits(["stop-task"]);
 const active = computed(() => props.active);
 const tasks = computed(() =>
     (props.runtime.tasks || []).filter((task) =>
+        task.task_kind === "cross_transfer" ||
         ["queued", "running", "stopping", "postprocessing"].includes(task.status),
     ),
 );
-const runningCount = computed(
-    () =>
-        tasks.value.filter((task) => ["running", "stopping"].includes(task.status))
-            .length,
-);
-const queuedCount = computed(
-    () => tasks.value.filter((task) => task.status === "queued").length,
-);
-const postprocessingCount = computed(
-    () => tasks.value.filter((task) => task.status === "postprocessing").length,
-);
-
 function canStop(task) {
   return ["queued", "running", "stopping", "postprocessing"].includes(
       task?.status,
@@ -160,8 +147,10 @@ function taskStatus(status) {
         stopping: "停止中",
         postprocessing: "后处理中",
         completed: "完成",
+        success: "完成",
         failed: "失败",
         stopped: "已停止",
+        canceled: "已取消",
       }[status] || "未知"
   );
 }
@@ -174,19 +163,58 @@ function taskColor(status) {
         stopping: "warning",
         postprocessing: "primary",
         completed: "success",
+        success: "success",
         failed: "error",
         stopped: "warning",
+        canceled: "warning",
       }[status] || "secondary"
   );
 }
 
+const progressColors = [
+  {progress: 0, color: [66, 165, 245]},
+  {progress: 35, color: [38, 198, 218]},
+  {progress: 65, color: [255, 179, 0]},
+  {progress: 85, color: [102, 187, 106]},
+  {progress: 100, color: [46, 125, 50]},
+];
+
+function progressColor(progress) {
+  const value = Math.max(0, Math.min(100, Number(progress || 0)));
+  const upperIndex = progressColors.findIndex((item) => value <= item.progress);
+  if (upperIndex <= 0) return `rgb(${progressColors[0].color.join(", ")})`;
+  const lower = progressColors[upperIndex - 1];
+  const upper = progressColors[upperIndex];
+  const ratio = (value - lower.progress) / (upper.progress - lower.progress);
+  const color = lower.color.map((channel, index) =>
+      Math.round(channel + (upper.color[index] - channel) * ratio),
+  );
+  return `rgb(${color.join(", ")})`;
+}
+
+function progressStyle(task) {
+  if (["failed"].includes(task?.status)) {
+    return {"--task-progress-gradient": "linear-gradient(90deg, #ff8a80, #d32f2f)"};
+  }
+  if (["stopping", "stopped", "canceled"].includes(task?.status)) {
+    return {"--task-progress-gradient": "linear-gradient(90deg, #ffd54f, #fb8c00)"};
+  }
+  const progress = Math.max(0, Math.min(100, Number(task?.progress || 0)));
+  return {
+    "--task-progress-gradient": `linear-gradient(90deg, ${progressColor(progress)}, ${progressColor(Math.min(100, progress + 18))})`,
+  };
+}
+
 function resultIcon(status, taskKind) {
+  if (taskKind === "cross_transfer" && status === "running") {
+    return "mdi-cloud-upload-outline";
+  }
   if (taskKind === "pt_upgrade" && status === "running") {
     return "mdi-cloud-upload-outline";
   }
   return status === "postprocessing"
       ? "mdi-cog-sync-outline"
-      : status === "completed"
+      : ["completed", "success"].includes(status)
       ? "mdi-check-circle"
       : status === "failed"
               ? "mdi-alert-circle"
@@ -206,6 +234,18 @@ function formatSize(value) {
 
 function formatSpeed(value) {
   return `${formatSize(value)}/s`;
+}
+
+function displayTransferred(task) {
+  return Number(task?.stage_total || 0) > 0
+      ? Number(task?.stage_transferred || 0)
+      : Number(task?.transferred || 0);
+}
+
+function displayTotal(task) {
+  return Number(task?.stage_total || 0) > 0
+      ? Number(task?.stage_total || 0)
+      : Number(task?.total || 0);
 }
 </script>
 
@@ -286,6 +326,11 @@ function formatSpeed(value) {
 
 .task-progress {
   margin-top: 5px;
+}
+
+.task-progress :deep(.v-progress-linear__determinate) {
+  background: var(--task-progress-gradient) !important;
+  transition: width 0.35s ease, background 0.35s ease;
 }
 
 .idle-state {

@@ -33,7 +33,7 @@ class UpgradeService(OwnerDelegator):
         洗版模式专用转存逻辑（独立于普通转存）
 
         流程：
-        1. 合并 MoviePilot 整理历史、插件转存历史和 Emby 路径建立基线
+        1. 合并整理历史、插件转存历史和 Emby 路径建立基线
         2. 搜索全部集数（含已存在的）
         3. 仅转存画质提升达到层级的集数
         4. 不调用 check_and_finish_subscribe，保持订阅活跃
@@ -256,7 +256,6 @@ class UpgradeService(OwnerDelegator):
             new_priority = dict(existing_ep_pri)
             upgrade_downloaded = 0
             upgrade_episodes = set()  # 记录已升级的集号，用于更新 note
-            upgrade_notices = []  # 用于通知
 
             for source_index, source in enumerate(enabled_sources):
                 if self._stop_requested():
@@ -594,6 +593,7 @@ class UpgradeService(OwnerDelegator):
                             episode=episode,
                             file_size=int(item.get("candidate_size") or 0),
                             source_sha1=item["file"].get("sha1") or "",
+                            source_md5=item["file"].get("md5") or "",
                             rule_score=new_score,
                             upgrade=item.get("is_upgrade", False),
                         )
@@ -607,14 +607,6 @@ class UpgradeService(OwnerDelegator):
 
                             if episode in episodes_to_search:
                                 episodes_to_search.remove(episode)
-
-                            # 收集升级通知
-                            upgrade_notices.append({
-                                "episode": episode,
-                                "old_score": old_score,
-                                "new_score": new_score,
-                                "file_name": file_name,
-                            })
 
                             if pending_key:
                                 history_item["finalize_key"] = pending_key
@@ -632,7 +624,8 @@ class UpgradeService(OwnerDelegator):
                             )
 
                     self._append_tv_transfer_detail(
-                        transfer_details, mediainfo, season, batch_detail_episodes
+                        transfer_details, mediainfo, season, batch_detail_episodes,
+                        notification_kind="upgrade",
                     )
                     if batch_success_episodes:
                         self._record_download_history(
@@ -665,26 +658,6 @@ class UpgradeService(OwnerDelegator):
                     logger.debug(f"{upgrade_log_prefix} 已更新 {len(new_priority)} 集评分")
                 except Exception as e:
                     logger.warning(f"{upgrade_log_prefix} 更新 episode_priority 失败：{e}")
-
-            # 仅通知本轮实际升级的集数。
-            if upgrade_notices and self._notify and self._post_message:
-                real_upgrades = [n for n in upgrade_notices if n['old_score'] > 0]
-                if real_upgrades:
-                    lines = []
-                    for n in real_upgrades:
-                        lines.append(
-                            f"S{season:02d} E{n['episode']:02d} "
-                            f"评分 {n['old_score']}→{n['new_score']}分"
-                        )
-                        if n.get('file_name'):
-                            lines.append(f"  资源：{n['file_name']}")
-                    title = f"【网盘洗版】转存升级"
-                    text = f"{mediainfo.title} 共升级 {len(real_upgrades)} 集\n\n" + "\n".join(lines[:15])
-                    self._post_message(
-                        mtype=self._notification_type,
-                        title=title,
-                        text=text
-                    )
 
             # 不调用 check_and_finish_subscribe——保持订阅活跃以持续搜索更优资源
             if upgrade_downloaded:

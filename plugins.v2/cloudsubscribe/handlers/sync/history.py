@@ -21,7 +21,7 @@ from app.log import logger
 from app.schemas.types import MediaType
 from sqlalchemy import func, or_
 
-from ...core import OwnerDelegator
+from ...core import CloudDriveCapability, CloudFile, OwnerDelegator
 
 
 class HistoryService(OwnerDelegator):
@@ -74,6 +74,33 @@ class HistoryService(OwnerDelegator):
             **fields,
         }
         item.update(self._resource_history_meta(resource or {}, share_url))
+        source_provider = self._resource_provider_for_url(share_url)
+        if (
+                source_provider and self._cloud_drive
+                and source_provider.key != self._cloud_drive.key
+        ):
+            source_file = CloudFile(
+                id="",
+                name=str(source_file_name or file_name or ""),
+                is_directory=False,
+                size=int(fields.get("file_size") or 0),
+                sha1=str(fields.get("source_sha1") or ""),
+                md5=str(fields.get("source_md5") or ""),
+            )
+            item.update({
+                "transfer_mode": "cross",
+                "source_drive_key": source_provider.key,
+                "source_drive_name": source_provider.name,
+                "target_drive_key": self._cloud_drive.key,
+                "target_drive_name": self._cloud_drive.name,
+            })
+            if self._cross_transfer_manager:
+                item.update(self._cross_transfer_manager.cache_info(
+                    source_provider.key,
+                    source_file,
+                    verify_checksum=False,
+                ))
+        item["task_types"] = self._history_task_types(item)
         return item
 
     def _record_download_history(
@@ -88,7 +115,7 @@ class HistoryService(OwnerDelegator):
             seasons: str = "",
             episodes: str = "",
     ) -> bool:
-        """通过 MoviePilot 下载历史能力登记一次网盘转存。"""
+        """通过下载历史能力登记一次网盘转存。"""
         effective_media = self._effective_mediainfo(subscribe, mediainfo)
         provider_name = str(
             getattr(self._cloud_drive, "name", "网盘") or "网盘"
@@ -134,6 +161,7 @@ class HistoryService(OwnerDelegator):
             mediainfo: MediaInfo,
             season: int,
             episodes: List[int],
+            notification_kind: str = "transfer",
     ) -> None:
         """按媒体季批量合并通知详情，避免逐集重复扫描列表。"""
         normalized = sorted({
@@ -146,6 +174,7 @@ class HistoryService(OwnerDelegator):
                 item for item in transfer_details
                 if item.get("title") == mediainfo.title
                    and int(item.get("season") or 0) == int(season)
+                   and item.get("notification_kind", "transfer") == notification_kind
             ),
             None,
         )
@@ -161,6 +190,7 @@ class HistoryService(OwnerDelegator):
             "season": season,
             "episodes": normalized,
             "image": mediainfo.get_poster_image(),
+            "notification_kind": notification_kind,
         })
 
     @staticmethod
@@ -171,7 +201,6 @@ class HistoryService(OwnerDelegator):
         identity = tuple(
             str(record.get(key) or "")
             for key in (
-                "time",
                 "share_url",
                 "file_name",
                 "tmdb_id",
@@ -179,7 +208,31 @@ class HistoryService(OwnerDelegator):
                 "episode",
             )
         )
-        return identity if identity[0] and identity[2] else None
+        return identity if identity[0] and identity[1] else None
+
+    @classmethod
+    def _upgrade_scope_identity(
+            cls, record: Dict[str, Any]
+    ) -> Optional[Tuple[str, ...]]:
+        """标识同一媒体季集，洗版写入时据此替换旧版本记录。"""
+        media_type = str(record.get("type") or "").strip()
+        tmdb_id = str(record.get("tmdb_id") or "").strip()
+        media_key = (
+            f"tmdb:{tmdb_id}"
+            if tmdb_id
+            else "legacy:"
+                 f"{str(record.get('title') or '').strip()}:"
+                 f"{str(record.get('year') or '').strip()}"
+        )
+        if not media_type or media_key == "legacy::":
+            return None
+        if media_type == MediaType.MOVIE.value:
+            return media_type, media_key
+        season = cls._positive_int(record.get("season"))
+        episode = cls._positive_int(record.get("episode"))
+        if not season or not episode:
+            return None
+        return media_type, media_key, str(season), str(episode)
 
     @classmethod
     def _ensure_history_record_id(cls, record: Dict[str, Any]) -> str:
@@ -207,6 +260,26 @@ class HistoryService(OwnerDelegator):
         if isinstance(value, bool):
             return value
         return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _history_task_types(cls, record: Dict[str, Any]) -> List[str]:
+        raw_types = record.get("task_types") or []
+        if isinstance(raw_types, str):
+            raw_types = [raw_types]
+        task_types = {
+            str(value or "").strip()
+            for value in raw_types
+            if str(value or "").strip()
+        }
+        if str(record.get("transfer_mode") or "") == "cross":
+            task_types.add("cross_transfer")
+        if cls._is_upgrade_history(record):
+            task_types.add("upgrade")
+        return sorted(task_types)
+
+    @classmethod
+    def _is_workflow_history(cls, record: Dict[str, Any]) -> bool:
+        return bool(cls._history_task_types(record))
 
     @staticmethod
     def _platform_episode_numbers(record: Dict[str, Any]) -> List[int]:
@@ -440,12 +513,12 @@ class HistoryService(OwnerDelegator):
                 )
             return added + updated + removed
         except Exception as error:
-            logger.error(f"登记 MoviePilot 成功整理历史失败：{error}")
+            logger.error(f"登记成功整理历史失败：{error}")
             return 0
 
     @staticmethod
     def _history_image_from_download(record: Dict[str, Any]) -> Optional[str]:
-        """从 MoviePilot 下载历史恢复旧版插件记录缺失的海报。"""
+        """从下载历史恢复旧版插件记录缺失的海报。"""
         media_type = str(record.get("type") or "").strip()
         tmdb_id = HistoryService._positive_int(record.get("tmdb_id"))
         title = str(record.get("title") or "").strip()
@@ -510,11 +583,11 @@ class HistoryService(OwnerDelegator):
             finally:
                 self._platform_history_lock.release()
         except Exception as error:
-            logger.error(f"清理 MoviePilot 整理历史失败：{error}")
+            logger.error(f"清理整理历史失败：{error}")
             return 0
 
     def sync_platform_transfer_history(self) -> int:
-        """让 MoviePilot 整理历史完整镜像插件历史；关闭开关时清理镜像。"""
+        """让整理历史完整镜像插件历史；关闭开关时清理镜像。"""
         if not self._get_data:
             return 0
         with self._offline_pending_lock:
@@ -569,22 +642,68 @@ class HistoryService(OwnerDelegator):
                 for index, record in enumerate(history)
                 if (identity := self._history_record_identity(record))
             }
+            upgrade_scope_index = {
+                scope: index
+                for index, record in enumerate(history)
+                if (scope := self._upgrade_scope_identity(record))
+            }
+            workflow_scope_index = {
+                scope: index
+                for index, record in enumerate(history)
+                if self._is_workflow_history(record)
+                if (scope := self._upgrade_scope_identity(record))
+            }
+            failed_scope_index = {
+                scope: index
+                for index, record in enumerate(history)
+                if str(record.get("status") or "") == "失败"
+                if (scope := self._upgrade_scope_identity(record))
+            }
             for record in records:
                 incoming = copy.deepcopy(record)
                 self._ensure_history_record_id(incoming)
                 identity = self._history_record_identity(incoming)
                 index = record_index.get(identity) if identity else None
+                scope = self._upgrade_scope_identity(incoming)
+                if index is None and self._is_upgrade_history(incoming) and scope:
+                    index = upgrade_scope_index.get(scope)
+                if index is None and scope and self._is_workflow_history(incoming):
+                    index = workflow_scope_index.get(scope)
+                # 换源重试可能改变分享链接和源文件名；只复用同媒体季集的失败记录，
+                # 成功记录与普通多版本记录仍按精确身份隔离。
+                if index is None and scope and not self._is_upgrade_history(incoming):
+                    index = failed_scope_index.get(scope)
                 if index is None:
                     history.append(incoming)
                     platform_records.append(copy.deepcopy(incoming))
                     if identity:
                         record_index[identity] = len(history) - 1
+                    if scope:
+                        upgrade_scope_index[scope] = len(history) - 1
+                        if self._is_workflow_history(incoming):
+                            workflow_scope_index[scope] = len(history) - 1
+                    if str(incoming.get("status") or "") == "失败" and scope:
+                        failed_scope_index[scope] = len(history) - 1
                     continue
 
                 current = history[index]
                 current_status = str(current.get("status") or "")
                 incoming_status = str(incoming.get("status") or "")
                 merged = {**current, **incoming}
+                merged["task_types"] = sorted(
+                    set(self._history_task_types(current))
+                    | set(self._history_task_types(incoming))
+                )
+                if self._is_upgrade_history(incoming):
+                    merged["upgrade"] = True
+                    merged["upgrade_count"] = max(
+                        1, int(current.get("upgrade_count") or 0) + 1
+                    )
+                    merged["previous_file_name"] = str(
+                        current.get("file_name") or ""
+                    )
+                    merged["previous_file_size"] = current.get("file_size")
+                    merged["previous_rule_score"] = current.get("rule_score")
                 if (
                         current_status in {"成功", "失败"}
                         and incoming_status not in {"成功", "失败"}
@@ -596,8 +715,18 @@ class HistoryService(OwnerDelegator):
                             merged[state_key] = current[state_key]
                         else:
                             merged.pop(state_key, None)
+                if incoming_status != "失败":
+                    merged.pop("failure_reason", None)
                 history[index] = merged
                 platform_records.append(copy.deepcopy(merged))
+                if scope:
+                    upgrade_scope_index[scope] = index
+                    if self._is_workflow_history(merged):
+                        workflow_scope_index[scope] = index
+                    if incoming_status == "失败":
+                        failed_scope_index[scope] = index
+                    elif failed_scope_index.get(scope) == index:
+                        failed_scope_index.pop(scope, None)
             self._save_data("history", history)
             finalize_keys = {
                 str(record.get("finalize_key") or "")
@@ -624,6 +753,182 @@ class HistoryService(OwnerDelegator):
             self._notify_offline_pending_changed(activated_pending_count)
         self._record_platform_transfer_histories(platform_records)
         return len(records)
+
+    def compact_workflow_history(self) -> List[Dict[str, Any]]:
+        """合并同一媒体季集的跨盘、洗版工作流记录并持久化。"""
+        if not self._get_data or not self._save_data:
+            return []
+        with self._offline_pending_lock:
+            history = [
+                copy.deepcopy(record)
+                for record in (self._get_data("history") or [])
+                if isinstance(record, dict)
+            ]
+            compacted: List[Dict[str, Any]] = []
+            scope_indexes: Dict[Tuple[str, ...], int] = {}
+            upgrade_scopes = {
+                scope
+                for record in history
+                if self._is_upgrade_history(record)
+                if (scope := self._upgrade_scope_identity(record))
+            }
+            for record in history:
+                self._ensure_history_record_id(record)
+                scope = self._upgrade_scope_identity(record)
+                index = scope_indexes.get(scope) if scope else None
+                should_merge = bool(
+                    index is not None
+                    and (
+                            scope in upgrade_scopes
+                            or (
+                                    self._is_workflow_history(record)
+                                    and self._is_workflow_history(compacted[index])
+                            )
+                    )
+                )
+                if not should_merge:
+                    compacted.append(record)
+                    if scope:
+                        scope_indexes[scope] = len(compacted) - 1
+                    continue
+                current = compacted[index]
+                latest, previous = (
+                    (record, current)
+                    if str(record.get("time") or "") >= str(current.get("time") or "")
+                    else (current, record)
+                )
+                is_upgrade = (
+                        self._is_upgrade_history(previous)
+                        or self._is_upgrade_history(latest)
+                )
+                merged = {**previous, **latest, "upgrade": is_upgrade}
+                merged["task_types"] = sorted(
+                    set(self._history_task_types(previous))
+                    | set(self._history_task_types(latest))
+                    | ({"upgrade"} if is_upgrade else set())
+                )
+                if is_upgrade:
+                    merged["upgrade_count"] = max(
+                        1,
+                        int(current.get("upgrade_count") or int(
+                            self._is_upgrade_history(current)
+                        )) + int(self._is_upgrade_history(record)),
+                    )
+                    merged["previous_file_name"] = str(
+                        previous.get("file_name") or ""
+                    )
+                    merged["previous_file_size"] = previous.get("file_size")
+                    merged["previous_rule_score"] = previous.get("rule_score")
+                compacted[index] = merged
+            if compacted != history:
+                self._save_data("history", compacted)
+                logger.info(
+                    f"跨盘/洗版历史已合并：{len(history)} 条 -> {len(compacted)} 条"
+                )
+            return compacted
+
+    @staticmethod
+    def _format_history_size(value: Any) -> str:
+        try:
+            size = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return "-"
+        if not size:
+            return "-"
+        amount = float(size)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if amount < 1024 or unit == "TB":
+                digits = 0 if amount >= 100 else 1
+                return f"{amount:.{digits}f} {unit}"
+            amount /= 1024
+        return "-"
+
+    @classmethod
+    def _history_retry_state(cls, record: Dict[str, Any]) -> Tuple[bool, str]:
+        status = str(record.get("status") or "")
+        is_cross = str(record.get("transfer_mode") or "") == "cross"
+        if status == "成功" and is_cross:
+            return False, "跨盘任务已成功完成，无需重试"
+        if not str(record.get("share_url") or "").strip():
+            return False, "历史记录缺少资源链接，无法重试"
+        if status == "失败":
+            if is_cross:
+                cache_status = str(record.get("cache_status") or "")
+                title = (
+                    "恢复跨盘转存"
+                    if cache_status in {"complete", "partial"}
+                    else "重新执行跨盘转存"
+                )
+                return True, title
+            return True, "重试此记录"
+        if (
+                status == "成功"
+                and str(record.get("source_file_name") or "")
+                == str(record.get("file_name") or "")
+        ):
+            return True, "修复此记录"
+        return False, "当前记录无需重试"
+
+    @classmethod
+    def prepare_history_records(
+            cls, records: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """为历史页面生成业务展示字段，前端不再重复推导状态。"""
+        prepared = []
+        for source in records or []:
+            record = copy.deepcopy(source)
+            is_cross = str(record.get("transfer_mode") or "") == "cross"
+            record["is_cross_transfer"] = is_cross
+            record["task_types"] = cls._history_task_types(record)
+            if is_cross:
+                source_name = str(
+                    record.get("source_drive_name")
+                    or record.get("source_drive_key")
+                    or "源网盘"
+                )
+                target_name = str(
+                    record.get("target_drive_name")
+                    or record.get("target_drive_key")
+                    or "目标网盘"
+                )
+                cache_labels = {
+                    "complete": "缓存完整",
+                    "partial": "可断点续传",
+                    "missing": "缓存已清理" if record.get("status") == "成功" else "无可用缓存",
+                }
+                cache_label = cache_labels.get(
+                    str(record.get("cache_status") or ""), cache_labels["missing"]
+                )
+                record["cross_transfer_title"] = (
+                    f"{source_name} → {target_name} · {cache_label}"
+                )
+            can_retry, retry_title = cls._history_retry_state(record)
+            record["can_retry"] = can_retry
+            record["retry_title"] = retry_title
+            if cls._is_upgrade_history(record):
+                parts = []
+                previous_name = str(record.get("previous_file_name") or "").strip()
+                if previous_name:
+                    parts.append(previous_name)
+                previous_size = cls._format_history_size(record.get("previous_file_size"))
+                current_size = cls._format_history_size(record.get("file_size"))
+                if previous_size != "-":
+                    parts.append(
+                        f"{previous_size} → {current_size}"
+                        if current_size != "-" else previous_size
+                    )
+                if record.get("previous_rule_score") is not None:
+                    parts.append(
+                        f"评分 {int(record.get('previous_rule_score') or 0)}"
+                        f" → {int(record.get('rule_score') or 0)}"
+                    )
+                count = max(1, int(record.get("upgrade_count") or 1))
+                count_label = f"（已洗版 {count} 次）" if count > 1 else ""
+                record["upgrade_version_info"] = (
+                    f"原版{count_label}：{' · '.join(parts) or '版本信息缺失'}"
+                )
+            prepared.append(record)
+        return prepared
 
     def reconcile_orphaned_history(self) -> int:
         """将 pending 已消失但 STRM 已存在的假下载中记录纠正为成功。"""
@@ -794,6 +1099,13 @@ class HistoryService(OwnerDelegator):
             "year": mediainfo.year,
             "image": getattr(mediainfo, "get_poster_image", lambda: None)(),
             "file_name": item.get("file_name"),
+            "notification_kind": (
+                "upgrade"
+                if self._is_upgrade_history(history_record)
+                else "cross_transfer"
+                if history_record.get("transfer_mode") == "cross"
+                else "transfer"
+            ),
         }
         episodes = []
         episode_values = (
@@ -831,7 +1143,7 @@ class HistoryService(OwnerDelegator):
     ) -> List[Dict[str, Any]]:
         """按电视剧标题、年份和季聚合延迟完成的文件。"""
         aggregated: List[Dict[str, Any]] = []
-        tv_index: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        tv_index: Dict[Tuple[str, str, int, str], Dict[str, Any]] = {}
         for raw_detail in transfer_details:
             detail = copy.deepcopy(raw_detail)
             if detail.get("type") != "电视剧":
@@ -850,6 +1162,7 @@ class HistoryService(OwnerDelegator):
                 str(detail.get("title") or ""),
                 str(detail.get("year") or ""),
                 season,
+                str(detail.get("notification_kind") or "transfer"),
             )
             current = tv_index.get(key)
             if current is None:
@@ -1145,7 +1458,7 @@ class HistoryService(OwnerDelegator):
 
     @staticmethod
     def _media_server_storage_name(name: str, service: Any) -> str:
-        """返回 MoviePilot 媒体库同步表使用的服务器类型标识。"""
+        """返回媒体库同步表使用的服务器类型标识。"""
         return str(getattr(service, "type", "") or name or "").strip().casefold()
 
     def _configured_media_path(self, value: Any) -> Tuple[Path, str]:
@@ -1439,6 +1752,7 @@ class HistoryService(OwnerDelegator):
                 linked_result = None
                 if delete_linked_files:
                     linked_result = self._delete_history_linked_files(deleted)
+                deleted["cache_deleted"] = self._delete_history_cache(deleted)
                 history.pop(index)
                 self._save_data("history", history)
                 if linked_result:
@@ -1513,6 +1827,11 @@ class HistoryService(OwnerDelegator):
                 self._delete_history_linked_files_batch(deletable_records)
                 linked_deleted = len(deletable_records)
 
+            cache_deleted = sum(
+                self._delete_history_cache(record)
+                for record in deletable_records
+            )
+
             if deleted_indexes:
                 history = [
                     record
@@ -1529,8 +1848,17 @@ class HistoryService(OwnerDelegator):
         return {
             "deleted": len(deleted_indexes),
             "linked_deleted": linked_deleted,
+            "cache_deleted": cache_deleted,
             "skipped": skipped,
         }
+
+    def _delete_history_cache(self, record: Dict[str, Any]) -> int:
+        if not self._cross_transfer_manager:
+            return 0
+        cache_key = str(record.get("cache_key") or "").strip()
+        if not cache_key:
+            return 0
+        return self._cross_transfer_manager.delete_cache(cache_key)
 
     def _delete_history_linked_files_batch(
             self, records: List[Dict[str, Any]]
@@ -1750,8 +2078,7 @@ class HistoryService(OwnerDelegator):
         return len(relative.parts) >= 2
 
     def _delete_cloud_directory_direct(self, cloud_dir: str) -> bool:
-        parts = [part for part in PurePosixPath(cloud_dir).parts if part != "/"]
-        if len(parts) < 2:
+        if len(self._cloud_media_relative_parts(cloud_dir)) < 2:
             return False
         try:
             lookup = self._cloud_directories.resolve_directory(cloud_dir)
@@ -1846,7 +2173,7 @@ class HistoryService(OwnerDelegator):
     def _cleanup_cloud_media_parent(self, cloud_dir: str) -> int:
         child_path = PurePosixPath(cloud_dir)
         parent_path = str(child_path.parent) or "/"
-        if len([part for part in PurePosixPath(parent_path).parts if part != "/"]) < 2:
+        if len(self._cloud_media_relative_parts(parent_path)) < 2:
             return 0
         lookup = self._cloud_directories.resolve_directory(parent_path)
         if not lookup.checked or not lookup.directory_id:
@@ -1861,6 +2188,15 @@ class HistoryService(OwnerDelegator):
         if not self._cloud_items_are_generated_metadata(remaining):
             return 0
         return int(bool(self._cloud_mutations.delete_file(lookup.directory_id)))
+
+    def _cloud_media_relative_parts(self, path: str) -> Tuple[str, ...]:
+        root = PurePosixPath(self._CLOUD_MEDIA_ROOT)
+        candidate = PurePosixPath(str(path or "/"))
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            return ()
+        return tuple(part for part in relative.parts if part not in {"", ".", "/"})
 
     def _delete_history_linked_files(
             self, record: Dict[str, Any]
@@ -1974,6 +2310,8 @@ class HistoryService(OwnerDelegator):
             if deleted_count:
                 self._save_data("history", retained)
         if deleted_count:
+            for record in deleted_records:
+                self._delete_history_cache(record)
             self._delete_platform_transfer_histories(deleted_records)
         return {"deleted": deleted_count, "retained": len(retained)}
 
@@ -2024,6 +2362,9 @@ class HistoryService(OwnerDelegator):
         )
         if not record:
             raise ValueError("未找到对应的转存历史记录")
+        can_retry, retry_title = self._history_retry_state(record)
+        if not can_retry:
+            raise ValueError(retry_title)
 
         source_sha1 = str(record.get("source_sha1") or "").strip()
         source_name = str(
@@ -2045,14 +2386,95 @@ class HistoryService(OwnerDelegator):
             self._cloud_query.find_file(cloud_dir, target_name, attempts=1)
         )
         success = final_file_exists
+        retry_staging_name = source_name
+        if not success:
+            expected_size = int(record.get("file_size") or 0)
+            expected_sha1 = source_sha1.upper()
+            for candidate_name in dict.fromkeys((source_name, target_name)):
+                staging_file = self._cloud_query.find_file(
+                    self._cloud_transfer_path, candidate_name, attempts=1
+                )
+                if not staging_file:
+                    continue
+                actual_size = int(getattr(staging_file, "size", 0) or 0)
+                actual_sha1 = str(
+                    getattr(staging_file, "sha1", "") or ""
+                ).upper()
+                if expected_sha1 and actual_sha1 != expected_sha1:
+                    continue
+                if expected_size > 0 and actual_size != expected_size:
+                    continue
+                retry_staging_name = str(
+                    getattr(staging_file, "name", "") or candidate_name
+                )
+                if not source_sha1 and actual_sha1:
+                    source_sha1 = actual_sha1
+                    record["source_sha1"] = actual_sha1
+                success = True
+                logger.info(
+                    f"历史恢复复用目标盘暂存文件："
+                    f"{self._cloud_transfer_path.rstrip('/')}/{retry_staging_name}"
+                )
+                break
+        cross_source = None
+        cached_source = None
+        if record.get("transfer_mode") == "cross":
+            source_key = str(record.get("source_drive_key") or "").strip()
+            target_key = str(record.get("target_drive_key") or "").strip()
+            if not source_key or not target_key:
+                raise ValueError("跨盘历史缺少源网盘或目标网盘信息")
+            if not self._cloud_drive or target_key != self._cloud_drive.key:
+                raise ValueError("跨盘历史的目标网盘与当前转存网盘不一致")
+            cached_source = CloudFile(
+                id="",
+                name=source_name,
+                is_directory=False,
+                size=int(record.get("file_size") or 0),
+                sha1=source_sha1,
+                md5=str(record.get("source_md5") or ""),
+            )
+            cache_info = self._cross_transfer_manager.cache_info(
+                source_key, cached_source, verify_checksum=True
+            ) if self._cross_transfer_manager else {}
+            record.update(cache_info)
+            if self._save_data:
+                self._save_data("history", history)
+            if not success and cache_info.get("cache_status") == "complete":
+                task = self._cross_transfer_manager.create_from_cloud_file(
+                    source_key,
+                    cached_source,
+                    target_key,
+                    self._cloud_transfer_path,
+                    source_name,
+                )
+                success = self._cross_transfer_manager.wait(task["id"])
+                if not success:
+                    record.update(self._cross_transfer_manager.cache_info(
+                        source_key, cached_source, verify_checksum=False,
+                    ))
+                    record["failure_reason"] = "缓存恢复上传失败"
+                    self._save_data("history", history)
+                    raise RuntimeError("缓存完整，但恢复上传到目标网盘失败")
+            if not success:
+                try:
+                    cross_source = self._cloud_drive_registry.get(source_key)
+                except KeyError as error:
+                    raise ValueError(
+                        f"跨盘历史源网盘未就绪：{source_key}"
+                    ) from error
 
         if not success:
             file_id = ""
             if not self._is_ed2k_url(canonical_url):
-                status = self._share_transfer.check_share_status(canonical_url)
+                share_transfer = (
+                    cross_source.require(CloudDriveCapability.SHARE_TRANSFER)
+                    if cross_source else self._share_transfer
+                )
+                status = share_transfer.check_share_status(canonical_url)
                 if not status.is_valid:
-                    raise ValueError(f"115分享链接无效：{status.status_text}")
-                share_files = self._share_transfer.list_share_files(canonical_url)
+                    provider_name = cross_source.name if cross_source else "网盘"
+                    raise ValueError(f"{provider_name}分享链接无效：{status.status_text}")
+                share_files = share_transfer.list_share_files(canonical_url)
                 source_file = self._find_share_file_for_history(
                     share_files, source_sha1, source_name
                 )
@@ -2063,19 +2485,39 @@ class HistoryService(OwnerDelegator):
                     raise ValueError("原分享文件缺少文件ID")
                 if not source_sha1:
                     source_sha1 = str(source_file.get("sha1") or "")
+                source_md5 = str(
+                    source_file.get("md5") or record.get("source_md5") or ""
+                )
                 source_name = str(source_file.get("name") or source_name)
                 record["source_file_name"] = source_name
                 record["source_sha1"] = source_sha1
+                record["source_md5"] = source_md5
                 record["file_size"] = int(source_file.get("size") or 0)
-            success = self._share_transfer.transfer_file(
-                share_url=canonical_url,
-                file_id=file_id,
-                save_path=self._cloud_transfer_path,
-                target_name=None,
-                source_sha1=source_sha1,
+                if cached_source:
+                    cached_source = CloudFile(
+                        id=file_id,
+                        name=source_name,
+                        is_directory=False,
+                        size=int(record.get("file_size") or 0),
+                        sha1=source_sha1,
+                        md5=source_md5,
+                    )
+            success = self._transfer_file(
+                canonical_url,
+                {"id": file_id, "name": source_name,
+                 "size": record.get("file_size") or 0,
+                 "sha1": source_sha1,
+                 "md5": record.get("source_md5") or ""},
+                self._cloud_transfer_path, None, source_sha1,
             )
 
         if not success:
+            if cached_source and self._cross_transfer_manager:
+                record.update(self._cross_transfer_manager.cache_info(
+                    str(record.get("source_drive_key") or ""),
+                    cached_source,
+                    verify_checksum=False,
+                ))
             record["failure_reason"] = "重试转存失败"
             self._save_data("history", history)
             raise RuntimeError("重试转存失败")
@@ -2096,14 +2538,25 @@ class HistoryService(OwnerDelegator):
                 [episode] if mediainfo.type == MediaType.TV and episode else None
             ),
             staging_dir="" if final_file_exists else self._cloud_transfer_path,
-            staging_name=source_name,
+            staging_name=retry_staging_name,
         )
+        if not strm_path and not pending_key:
+            record["status"] = "失败"
+            record["failure_reason"] = "文件已转存但后处理任务登记失败"
+            self._save_data("history", history)
+            raise RuntimeError("文件已转存，但无法登记后处理任务")
         record["file_name"] = target_name
         record["cloud_dir"] = cloud_dir
         record["source_file_name"] = source_name
         record["source_sha1"] = source_sha1
         record["tmdb_id"] = mediainfo.tmdb_id
         record.pop("failure_reason", None)
+        if cached_source and self._cross_transfer_manager:
+            record.update(self._cross_transfer_manager.cache_info(
+                str(record.get("source_drive_key") or ""),
+                cached_source,
+                verify_checksum=False,
+            ))
         if pending_key:
             record["finalize_key"] = pending_key
             record["status"] = (
@@ -2149,7 +2602,7 @@ class HistoryService(OwnerDelegator):
     def _resolve_history_retry_context(
             self, record: Dict[str, Any], source_name: str
     ) -> Dict[str, Any]:
-        """按当前订阅和 MoviePilot 规则还原历史记录的最终处理上下文。"""
+        """按当前订阅和规则还原历史记录的最终处理上下文。"""
         title = str(record.get("title") or "").strip()
         if not title or not source_name:
             raise ValueError("历史记录缺少媒体名称或源文件名")

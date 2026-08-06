@@ -12,6 +12,7 @@ from .cloud import (
 )
 from .delegation import OwnerDelegator, get_component, resolve_component
 from .scraper import MediaScraper
+from .transfer import CrossDriveTransfer, CrossTransferTaskManager, LocalRapidUploadAdapter
 
 __all__ = [
     "OwnerDelegator",
@@ -26,4 +27,7 @@ __all__ = [
     "MediaScraper",
     "get_component",
     "resolve_component",
+    "CrossDriveTransfer",
+    "LocalRapidUploadAdapter",
+    "CrossTransferTaskManager",
 ]

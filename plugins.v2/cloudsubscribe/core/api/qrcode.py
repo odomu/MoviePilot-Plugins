@@ -69,6 +69,13 @@ class QRCodeService(OwnerDelegator):
             device_code: str = "",
             device_id: str = "",
             client_id: str = "",
+            t: str = "",
+            ck: str = "",
+            uuid: str = "",
+            encryuuid: str = "",
+            req_id: str = "",
+            lt: str = "",
+            param_id: str = "",
     ) -> dict:
         try:
             key, service = self._qrcode_service(provider)
@@ -90,6 +97,16 @@ class QRCodeService(OwnerDelegator):
                     "device_id": device_id,
                     "client_id": client_id,
                 }
+            elif key == "alipan":
+                params = {"t": t, "ck": ck}
+            elif key == "tianyi":
+                params = {
+                    "uuid": uuid,
+                    "encryuuid": encryuuid,
+                    "req_id": req_id,
+                    "lt": lt,
+                    "param_id": param_id,
+                }
             else:
                 raise ValueError(f"不支持扫码登录的网盘提供方：{key}")
 
@@ -100,7 +117,9 @@ class QRCodeService(OwnerDelegator):
             credentials = self._apply_qrcode_credentials(key, result)
             self._update_plugin_config()
             self._init_handlers()
+            from .account import clear_account_cache
             from .page import clear_ui_options_cache
+            clear_account_cache(f"drive:{key}")
             clear_ui_options_cache()
             logger.info(f"{key} 扫码登录成功")
             return {
@@ -167,6 +186,34 @@ class QRCodeService(OwnerDelegator):
                 "guangya_refresh_token": refresh_token,
                 "guangya_client_id": self._guangya_client_id,
                 "guangya_device_id": self._guangya_device_id,
+            }
+
+        if provider == "alipan":
+            access_token = str(result.get("access_token") or "").strip()
+            refresh_token = str(result.get("refresh_token") or "").strip()
+            if not access_token and not refresh_token:
+                raise RuntimeError("扫码成功但未获得阿里云盘 Token")
+            self._alipan_access_token = access_token
+            self._alipan_refresh_token = refresh_token
+            self._register_alipan_provider()
+            return {
+                "alipan_access_token": access_token,
+                "alipan_refresh_token": refresh_token,
+            }
+
+        if provider == "tianyi":
+            access_token = str(result.get("access_token") or "").strip()
+            refresh_token = str(result.get("refresh_token") or "").strip()
+            session_key = str(result.get("session_key") or "").strip()
+            if not session_key:
+                raise RuntimeError("扫码成功但未获得天翼云盘 SessionKey")
+            self._tianyi_access_token = access_token
+            self._tianyi_refresh_token = refresh_token
+            self._tianyi_session_key = session_key
+            self._register_tianyi_provider()
+            return {
+                "tianyi_access_token": access_token,
+                "tianyi_refresh_token": refresh_token,
             }
 
         raise ValueError(f"不支持扫码登录的网盘提供方：{provider}")

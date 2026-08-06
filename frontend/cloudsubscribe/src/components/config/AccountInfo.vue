@@ -44,8 +44,20 @@
           >
             {{ vipText }}
           </v-chip>
+          <v-chip
+              v-if="account.connected && compact && hasPoints"
+              class="account-points-chip"
+              color="info"
+              size="x-small"
+              variant="tonal"
+          >
+            {{ points.label || "可用积分" }} {{ formattedPoints }}
+          </v-chip>
         </div>
-        <div v-if="account.connected && hasPoints" class="account-points">
+        <div
+            v-if="account.connected && !compact && hasPoints"
+            class="account-points"
+        >
           <span class="text-caption text-medium-emphasis">
             {{ points.label || "可用积分" }}
           </span>
@@ -241,6 +253,18 @@ const vipText = computed(() => {
   gap: 4px 14px;
   margin-top: 6px;
   padding-top: 6px;
+}
+
+.account-info--compact .account-heading {
+  flex-wrap: nowrap;
+}
+
+.account-info--compact .account-name {
+  flex: 0 1 auto;
+}
+
+.account-points-chip {
+  flex: 0 0 auto;
 }
 
 .account-detail {

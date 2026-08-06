@@ -10,7 +10,7 @@ from ...core import OwnerDelegator
 
 
 class SubscriptionScoringService(OwnerDelegator):
-    """统一复用同步处理器的整季基线和 MoviePilot 规则评分。"""
+    """统一复用同步处理器的整季基线和规则评分。"""
 
     def _selected_tv_subscribes(self):
         selected_ids = set(self._upgrade_subscribe_ids or [])

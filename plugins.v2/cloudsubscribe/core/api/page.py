@@ -1,5 +1,8 @@
 """配置页选项与详情页数据 API。"""
 
+import copy
+from urllib.parse import urlencode
+
 from app.core.config import settings
 from app.log import logger
 from app.schemas.types import NotificationType
@@ -13,7 +16,14 @@ _UI_OPTIONS_CACHE = TTLCache(maxsize=1, ttl=2 * 60)
 
 class PageApi(OwnerDelegator):
     def api_vue_page_data(self) -> dict:
-        history = self.get_data("history") or []
+        # 页面读取不得触发历史合并和持久化，避免展示请求改写运行中的历史数据。
+        history = [
+            copy.deepcopy(record)
+            for record in (self.get_data("history") or [])
+            if isinstance(record, dict)
+        ]
+        if self._sync_handler:
+            history = self._sync_handler.prepare_history_records(history)
         return {
             "success": True,
             "data": {
@@ -28,7 +38,7 @@ class PageApi(OwnerDelegator):
                     "task": self._sync_task_text,
                     "progress": self._sync_progress,
                     "context": dict(self._sync_context),
-                    "tasks": self._serialize_sync_tasks(),
+                    "tasks": self._serialize_runtime_tasks(),
                 },
             },
         }
@@ -60,15 +70,19 @@ class PageApi(OwnerDelegator):
         search_accounts = {
             "hdhive": {
                 "connected": False,
-                "error": "启用并保存 HDHive 配置后读取账户信息",
+                "error": "配置并保存 HDHive 账户后读取账户信息",
             },
             "dian115": {
                 "connected": False,
-                "error": "启用并保存 Dian115 配置后读取账户信息",
+                "error": "配置并保存 Dian115 账户后读取账户信息",
             },
             "juying": {
                 "connected": False,
-                "error": "启用并保存聚影配置后读取账户信息",
+                "error": "配置并保存聚影账户后读取账户信息",
+            },
+            "pinglian": {
+                "connected": False,
+                "error": "配置并保存盘链账户后读取账户信息",
             },
         }
 
@@ -129,13 +143,27 @@ class PageApi(OwnerDelegator):
                     for value in health.get("channels", [])
                 ],
             })
+        mediaservers = UIConfig.get_media_server_options()
+        media_library_webhook_urls = {
+            str(item.get("value") or ""): (
+                    "/api/v1/webhook/?"
+                    + urlencode({
+                "token": settings.API_TOKEN,
+                "source": str(item.get("value") or ""),
+            })
+            )
+            for item in mediaservers
+            if str(item.get("type") or "").strip().lower() == "emby"
+               and str(item.get("value") or "").strip()
+        }
         return {
             "success": True,
             "data": {
                 "defaults": UIConfig.get_default_config(),
                 "subscribes": UIConfig.get_subscribe_options_grouped(),
                 "sites": UIConfig.get_site_name_options(),
-                "mediaservers": UIConfig.get_media_server_options(),
+                "mediaservers": mediaservers,
+                "media_library_webhook_urls": media_library_webhook_urls,
                 "notification_types": [
                     {"title": item.value, "value": item.name}
                     for item in NotificationType
@@ -186,6 +214,34 @@ class PageApi(OwnerDelegator):
         except Exception as error:
             logger.error(f"读取网盘目录失败：{normalized_path}，{error}")
             return {"success": False, "message": f"读取网盘目录失败：{error}"}
+
+    def api_vue_create_cloud_directory(
+            self, path: str = "/", name: str = "", provider: str = ""
+    ) -> dict:
+        """在目录选择器当前目录创建子文件夹。"""
+        normalized_path = str(path or "/").strip() or "/"
+        folder_name = str(name or "").strip()
+        if not folder_name or folder_name in {".", ".."} or "/" in folder_name or "\\" in folder_name:
+            return {"success": False, "message": "文件夹名称无效"}
+        drive = self._cloud_drive
+        provider_key = str(provider or "").strip().lower()
+        if provider_key and self._cloud_drive_registry:
+            try:
+                drive = self._cloud_drive_registry.get(provider_key)
+            except KeyError:
+                return {"success": False, "message": "网盘提供方不存在"}
+        if not drive or not drive.supports(CloudDriveCapability.DIRECTORY_READ):
+            return {"success": False, "message": "当前网盘不支持目录操作"}
+        try:
+            service = drive.require(CloudDriveCapability.DIRECTORY_READ)
+            target_path = f"{normalized_path.rstrip('/')}/{folder_name}" if normalized_path != "/" else f"/{folder_name}"
+            lookup = service.resolve_directory(target_path, create=True)
+            if not lookup.checked or lookup.directory_id is None:
+                return {"success": False, "message": "创建文件夹失败"}
+            return {"success": True, "data": {"path": target_path}}
+        except Exception as error:
+            logger.error(f"创建网盘目录失败：{target_path if 'target_path' in locals() else folder_name}，{error}")
+            return {"success": False, "message": f"创建文件夹失败：{error}"}
 
 
 def clear_ui_options_cache() -> int:

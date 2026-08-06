@@ -58,7 +58,7 @@ except ImportError:
 
 
 def normalize_proxies(proxy: Any) -> Optional[Dict[str, str]]:
-    """统一 MoviePilot 字符串、requests 字典和 server 代理配置。"""
+    """统一字符串、requests 字典和 server 代理配置。"""
     if not proxy:
         return None
     if isinstance(proxy, str):
@@ -105,7 +105,7 @@ def gated_idempotent_request(
         except requests.exceptions.RequestException:
             if attempt + 1 >= attempts:
                 raise
-            logger.warning(
+            logger.debug(
                 f"{gate.name} 连接异常，{retry_delay:.2f} 秒后重试一次"
             )
             time.sleep(max(0.0, float(retry_delay)))

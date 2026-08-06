@@ -56,7 +56,7 @@ export function createNotifySection(options) {
             {
                 title: "媒体库通知",
                 icon: "mdi-server-network-outline",
-                hint: "接收 Emby 媒体库变更事件后，同步 MoviePilot 内部媒体索引。",
+                hint: "通过平台 Webhook 接收 Emby 变更事件并同步内部媒体索引。",
                 fields: [
                     {
                         key: "platform_media_sync_enabled",
@@ -71,6 +71,7 @@ export function createNotifySection(options) {
                         items: options.mediaservers.filter(
                             (item) => String(item.type || "").toLowerCase() === "emby",
                         ),
+                        urls: options.mediaLibraryWebhookUrls || {},
                         cols: 12,
                         show: enabled("platform_media_sync_enabled"),
                     },
@@ -79,10 +80,10 @@ export function createNotifySection(options) {
                         type: "info",
                         label: "Emby Webhook 配置",
                         lines: [
-                            "请求方法：POST；内容类型：application/json",
-                            "将上方对应媒体服务器的完整地址复制到 Emby Webhook；固定 Key 不能手工修改",
-                            "Emby 测试通知仅验证连接；正式事件只勾选媒体库新增、删除和更新",
-                            "无效 Key、来源或事件会返回明确错误，不会返回假成功",
+                            "使用平台统一 Webhook；上方地址已自动包含系统 API Token，可直接复制",
+                            "Emby 请求方法选择 POST，并按平台要求使用表单字段 data 发送事件内容",
+                            "正式事件只勾选媒体库新增和删除；更新事件不会触发全量媒体库同步",
+                            "source 必须与中配置的 Emby 媒体服务器名称一致",
                         ],
                         cols: 12,
                         show: enabled("platform_media_sync_enabled"),
@@ -99,7 +100,7 @@ export function createNotifySection(options) {
                         label: "消息通知类型",
                         type: "select",
                         items: options.notificationTypes,
-                        hint: "按 MoviePilot 消息类型分发到已启用的通知渠道。",
+                        hint: "按消息类型分发到已启用的通知渠道。",
                         cols: 8,
                         show: enabled("notify"),
                     },

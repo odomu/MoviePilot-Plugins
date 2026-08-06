@@ -7,7 +7,7 @@
 
 ```text
 cloudsubscribe/
-├── __init__.py          # 插件入口、元数据及 MoviePilot 生命周期代理
+├── __init__.py          # 插件入口、元数据及生命周期代理
 ├── requirements.txt     # Python 运行依赖
 ├── core/                # 领域模型、配置、平台适配和通用服务
 ├── drive/               # 网盘能力接口及提供方实现
@@ -22,7 +22,7 @@ cloudsubscribe/
 - `core/` 定义插件自身业务模型与服务，不放具体网盘或搜索源实现。
 - `drive/` 通过稳定能力协议接入网盘；调用方先检查能力，再获取对应服务。
 - `search/` 只负责获取和标准化资源候选，不执行转存或文件处理。
-- `handlers/` 组合领域服务并对接 MoviePilot 事件、API、通知和任务入口。
+- `handlers/` 组合领域服务并对接事件、API、通知和任务入口。
 - `utils/` 仅保留无状态或低状态的通用辅助逻辑。
 
 ## 前端与发布

@@ -1,4 +1,4 @@
-"""MoviePilot 规则评分。"""
+"""规则评分。"""
 
 import hashlib
 import json
@@ -90,7 +90,7 @@ class UpgradeRuleScoringService(OwnerDelegator):
             season: int,
             mediainfo: Optional[MediaInfo] = None,
     ) -> int:
-        """返回 MoviePilot 规则组的 ``pri_order``，未匹配时为 0。"""
+        """返回规则组的 ``pri_order``，未匹配时为 0。"""
         try:
             rule_mediainfo = mediainfo or MediaInfo(
                 type=MediaType.TV,

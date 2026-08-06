@@ -22,13 +22,12 @@ class PanSouClient:
     _SESSION_DATA_KEY = "pansou_auth_session"
     _LOGIN_LOCK = threading.RLock()
     SUPPORTED_CLOUD_TYPES = (
-        "baidu", "aliyun", "quark", "guangya", "tianyi", "uc", "mobile",
+        "aliyun", "quark", "guangya", "tianyi", "uc", "mobile",
         "115", "pikpak", "xunlei", "123", "magnet", "ed2k",
     )
 
     # 网盘类型中文名映射
     TYPE_NAMES = {
-        "baidu": "百度网盘",
         "aliyun": "阿里云盘",
         "quark": "夸克网盘",
         "guangya": "光鸭网盘",
@@ -105,8 +104,6 @@ class PanSouClient:
         self._token_expires: Optional[datetime] = None
         self._get_data_func = get_data_func
         self._save_data_func = save_data_func
-        # API 调用计数器
-        self._api_call_count = 0
         # 代理设置（兼容字符串和字典格式）
         self._proxies = normalize_proxies(proxy)
         self._auth_lock = threading.RLock()
@@ -291,7 +288,6 @@ class PanSouClient:
                     return self._token
             try:
                 login_url = f"{self.base_url}/api/auth/login"
-                self._api_call_count += 1
                 response = gated_request(
                     self._request_gate,
                     requests.post,
@@ -459,7 +455,6 @@ class PanSouClient:
                 payload["filter"] = normalized_filter
 
             logger.debug(f"PanSou 搜索: {payload}")
-            self._api_call_count += 1
             started_at = time.monotonic()
             response = gated_request(
                 self._request_gate,
@@ -479,7 +474,6 @@ class PanSouClient:
                 token = self._get_token()
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-                    self._api_call_count += 1
                     response = gated_request(
                         self._request_gate,
                         requests.post,
@@ -651,11 +645,3 @@ class PanSouClient:
             return []
 
         return result.get("results", {}).get("115网盘", [])
-
-    def get_api_call_count(self) -> int:
-        """获取 API 调用次数"""
-        return self._api_call_count
-
-    def reset_api_call_count(self):
-        """重置 API 调用计数器"""
-        self._api_call_count = 0

@@ -58,7 +58,7 @@ class UpgradeBaselineService(OwnerDelegator):
 
     @staticmethod
     def _episode_numbers(value: Any) -> List[int]:
-        """解析 MoviePilot 的 E01、E01-E03、列表等剧集表达。"""
+        """解析的 E01、E01-E03、列表等剧集表达。"""
         if isinstance(value, (list, tuple, set)):
             return sorted({int(item) for item in value if str(item).isdigit()})
         text = str(value or "").strip()

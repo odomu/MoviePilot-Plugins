@@ -1,4 +1,4 @@
-"""供 MoviePilot 智能体调用的精简业务工具。"""
+"""供智能体调用的精简业务工具。"""
 
 import json
 from typing import Optional, Type
@@ -78,7 +78,7 @@ class CloudSubscribeLinksTool(MoviePilotTool):
         ToolTag.Transfer,
     ]
     description: str = (
-        "校验并向指定 MoviePilot 订阅提交用户直接提供的115分享、ED2K或Magnet链接，"
+        "校验并向指定订阅提交用户直接提供的115分享、ED2K或Magnet链接，"
         "链接仍通过网盘订阅助手现有转存流程处理。仅处理用户明确提供的链接；"
         "搜索工具返回的候选必须改用 cloudsubscribe_select_resources，禁止复制或改写候选链接。"
     )
@@ -117,7 +117,7 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
         ToolTag.Recommendation,
     ]
     description: str = (
-        "按媒体名称或 MoviePilot 订阅 ID 直接搜索网盘候选资源，支持指定电视剧季号或最新季，"
+        "按媒体名称或订阅 ID 直接搜索网盘候选资源，支持指定电视剧季号或最新季，"
         "返回候选列表、来源与类型汇总、"
         "MoviePilot规则优先级、清晰度、大小、更新时间、解锁成本和推荐候选ID。"
         "用户只提供媒体名称时直接调用本工具，不要先查询全部订阅。必须先调用本工具"
@@ -195,7 +195,7 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
         if media.get("subscribe_id"):
             lines.append("回复要处理的候选 ID；也可以要求我比较后再选择。")
         else:
-            lines.append("当前媒体未绑定 MoviePilot 订阅，只能查看候选，不能直接转存。")
+            lines.append("当前媒体未绑定订阅，只能查看候选，不能直接转存。")
         return "\n\n".join(lines)
 
     async def run(
@@ -214,7 +214,7 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
         title = str(title or "").strip()
         media_type = str(media_type or "").strip().lower()
         if not subscribe_id and not title:
-            return "请提供媒体名称或 MoviePilot 订阅 ID"
+            return "请提供媒体名称或订阅 ID"
         if media_type and media_type not in {"movie", "tv"}:
             return "媒体类型仅支持 movie（电影）或 tv（电视剧）"
         if season and latest_season:

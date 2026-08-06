@@ -22,6 +22,15 @@ sync_lock = Lock()
 class SyncRuntimeService(OwnerDelegator):
     """管理同步任务运行态及离线任务生命周期。"""
 
+    def _current_task_context(self) -> Tuple[str, Optional[ThreadEvent]]:
+        """返回当前订阅线程的任务标识与停止事件。"""
+        if self._task_local is None:
+            return "", None
+        return (
+            str(getattr(self._task_local, "task_id", "") or ""),
+            getattr(self._task_local, "stop_event", None),
+        )
+
     def _stop_requested(self) -> bool:
         if self._stop_event and self._stop_event.is_set():
             return True
@@ -271,6 +280,7 @@ class SyncRuntimeService(OwnerDelegator):
                 continue
 
             self._task_local.stop_event = task_event
+            self._task_local.task_id = task_id
             manual_upgrade = bool(getattr(subscribe, "_manual_upgrade", False))
             transient_target = bool(getattr(subscribe, "_transient_target", False))
             target_episodes = getattr(subscribe, "_target_episodes", None)
@@ -345,6 +355,10 @@ class SyncRuntimeService(OwnerDelegator):
                     del self._task_local.stop_event
                 except AttributeError:
                     pass
+                try:
+                    del self._task_local.task_id
+                except AttributeError:
+                    pass
 
         return {
             "history": local_history[initial_history_count:],
@@ -366,6 +380,94 @@ class SyncRuntimeService(OwnerDelegator):
         if context is not None:
             self._sync_context = dict(context)
 
+    def _serialize_runtime_tasks(self) -> List[Dict[str, Any]]:
+        """合并订阅任务与其跨盘子任务，避免同一操作重复展示。"""
+        tasks = self._serialize_sync_tasks()
+        transfer_manager = getattr(self, "_cross_transfer_manager", None)
+        if not transfer_manager:
+            return tasks
+        tasks_by_id = {
+            str(task.get("id") or ""): task for task in tasks
+            if task.get("id")
+        }
+        grouped_transfers: Dict[str, List[Dict[str, Any]]] = {}
+        active_statuses = set(getattr(transfer_manager, "ACTIVE", ()))
+        for transfer in transfer_manager.list():
+            parent_id = str(transfer.get("parent_task_id") or "")
+            if parent_id not in tasks_by_id:
+                if transfer.get("status") in active_statuses:
+                    tasks.append(transfer)
+                continue
+            grouped_transfers.setdefault(parent_id, []).append(transfer)
+
+        for parent_id, transfers in grouped_transfers.items():
+            if not any(item.get("status") in active_statuses for item in transfers):
+                continue
+            parent = tasks_by_id[parent_id]
+            total = sum(int(item.get("total") or 0) for item in transfers)
+            transferred = sum(
+                int(item.get("transferred") or 0) for item in transfers
+            )
+            speed = sum(
+                float(item.get("speed_bytes_per_second") or 0)
+                for item in transfers
+            )
+            stage_transfers = [
+                item for item in transfers
+                if item.get("status") in active_statuses
+                   and int(item.get("stage_total") or 0) > 0
+            ]
+            stage_transferred = sum(
+                int(item.get("stage_transferred") or 0)
+                for item in stage_transfers
+            )
+            stage_total = sum(
+                int(item.get("stage_total") or 0)
+                for item in stage_transfers
+            )
+            if total > 0:
+                progress = int(sum(
+                    int(item.get("progress") or 0)
+                    * int(item.get("total") or 0)
+                    for item in transfers
+                ) / total)
+            else:
+                progress = int(sum(
+                    int(item.get("progress") or 0) for item in transfers
+                ) / len(transfers))
+            messages: Dict[str, int] = {}
+            for item in transfers:
+                message = str(
+                    item.get("error") or item.get("message")
+                    or item.get("phase") or "正在跨盘转存"
+                )
+                messages[message] = messages.get(message, 0) + 1
+            if len(transfers) == 1:
+                phase = next(iter(messages))
+            else:
+                detail = " · ".join(
+                    f"{message} × {count}" if count > 1 else message
+                    for message, count in messages.items()
+                )
+                phase = f"跨盘转存 {len(transfers)} 个文件 · {detail}"
+            parent.update({
+                "phase": phase,
+                "progress": progress,
+                "transferred": transferred,
+                "total": total,
+                "stage_transferred": stage_transferred,
+                "stage_total": stage_total,
+                "speed_bytes_per_second": speed,
+                "transfer_active": True,
+                "transfer_file_count": len(transfers),
+                "transfer_task_ids": [
+                    str(item.get("id") or "") for item in transfers
+                ],
+            })
+            if any(item.get("status") == "stopping" for item in transfers):
+                parent["status"] = "stopping"
+        return tasks
+
     def api_runtime_status(self, apikey: str) -> dict:
         if apikey != settings.API_TOKEN:
             return {"success": False, "message": "API密钥错误"}
@@ -376,7 +478,7 @@ class SyncRuntimeService(OwnerDelegator):
                 "task": self._sync_task_text,
                 "progress": self._sync_progress,
                 "context": dict(self._sync_context),
-                "tasks": self._serialize_sync_tasks(),
+                "tasks": self._serialize_runtime_tasks(),
             },
         }
 
@@ -384,9 +486,17 @@ class SyncRuntimeService(OwnerDelegator):
         if apikey != settings.API_TOKEN:
             return {"success": False, "message": "API密钥错误"}
         if not self._sync_running:
+            transfer_manager = getattr(self, "_cross_transfer_manager", None)
+            if transfer_manager:
+                for task in transfer_manager.list(active_only=True):
+                    transfer_manager.cancel(str(task.get("id") or ""))
             self.cancel_pending_subscribe_searches()
             return {"success": True, "message": "当前没有正在处理的任务"}
         self.cancel_pending_subscribe_searches()
+        transfer_manager = getattr(self, "_cross_transfer_manager", None)
+        if transfer_manager:
+            for task in transfer_manager.list(active_only=True):
+                transfer_manager.cancel(str(task.get("id") or ""))
         self._stop_event.set()
         with self._sync_tasks_lock:
             for task in self._sync_tasks.values():
@@ -407,6 +517,9 @@ class SyncRuntimeService(OwnerDelegator):
         with self._sync_tasks_lock:
             task = self._sync_tasks.get(task_id)
             if not task:
+                transfer_manager = getattr(self, "_cross_transfer_manager", None)
+                if transfer_manager and transfer_manager.cancel(task_id):
+                    return {"success": True, "message": "已发送跨盘任务取消请求"}
                 return {"success": False, "message": "订阅任务不存在"}
             if task.get("status") == "postprocessing":
                 task_snapshot = dict(task)
@@ -425,6 +538,10 @@ class SyncRuntimeService(OwnerDelegator):
                 task["status"] = "stopping"
                 task["phase"] = "等待安全停止"
                 stop_event.set()
+
+        transfer_manager = getattr(self, "_cross_transfer_manager", None)
+        if transfer_manager:
+            transfer_manager.cancel_parent(task_id)
 
         if task_snapshot:
             subscribe_id = int(task_snapshot.get("subscribe_id") or 0)

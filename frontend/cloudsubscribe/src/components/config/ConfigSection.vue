@@ -77,13 +77,13 @@
                     type="warning"
                     variant="tonal"
                     density="compact"
-                    text="MoviePilot 尚未配置 Emby 媒体服务器，暂时无法生成通知地址。"
+                    text="尚未配置 Emby 媒体服务器，暂时无法生成通知地址。"
                 />
                 <v-text-field
                     v-for="item in field.items || []"
                     v-else
                     :key="item.value"
-                    :model-value="mediaLibraryWebhookUrl(item.value)"
+                    :model-value="mediaLibraryWebhookUrl(field, item.value)"
                     :label="`${item.title || item.value} Webhook URL`"
                     readonly
                     density="compact"
@@ -98,17 +98,7 @@
                           color="primary"
                           size="small"
                           title="复制 Webhook URL"
-                          @click="emit('copy-text', mediaLibraryWebhookUrl(item.value))"
-                      />
-                      <v-btn
-                          icon="mdi-refresh"
-                          variant="text"
-                          color="primary"
-                          size="small"
-                          title="刷新固定 Key，旧 URL 将立即失效"
-                          :loading="refreshingWebhookKey"
-                          :disabled="refreshingWebhookKey"
-                          @click="emit('refresh-webhook-key')"
+                          @click="emit('copy-text', mediaLibraryWebhookUrl(field, item.value))"
                       />
                     </div>
                   </template>
@@ -121,8 +111,10 @@
                   prepend-icon="mdi-flask-outline"
                   :loading="testingSource === field.source"
                   :disabled="
-                  Boolean(testingSource) && testingSource !== field.source
+                  !isTestSourceConfigured(field.source) ||
+                  (Boolean(testingSource) && testingSource !== field.source)
                 "
+                  :title="testSourceTitle(field.source)"
                   @click="emit('test-source', field.source)"
               >
                 {{ field.label }}
@@ -330,7 +322,6 @@ const props = defineProps({
   refreshingAccount: {type: String, default: ""},
   testingSource: {type: String, default: ""},
   hdhiveOauthAction: {type: String, default: ""},
-  refreshingWebhookKey: {type: Boolean, default: false},
 });
 const emit = defineEmits([
   "scan",
@@ -340,8 +331,36 @@ const emit = defineEmits([
   "hdhive-oauth-start",
   "hdhive-oauth-exchange",
   "copy-text",
-  "refresh-webhook-key",
 ]);
+
+const hasText = (value) => Boolean(String(value || "").trim());
+
+function isTestSourceConfigured(source) {
+  if (!Array.isArray(props.config.resource_type_order) || !props.config.resource_type_order.length)
+    return false;
+  if (source === "pansou") {
+    return hasText(props.config.pansou_url) &&
+        (!props.config.pansou_auth_enabled ||
+            (hasText(props.config.pansou_username) && hasText(props.config.pansou_password)));
+  }
+  if (source === "hdhive") {
+    return props.config.hdhive_query_mode === "api"
+        ? hasText(props.config.hdhive_api_key) && hasText(props.config.hdhive_access_token)
+        : hasText(props.config.hdhive_username) && hasText(props.config.hdhive_password);
+  }
+  const credentials = {
+    dian115: ["dian115_email", "dian115_password"],
+    juying: ["juying_username", "juying_password"],
+    pinglian: ["pinglian_username", "pinglian_password"],
+  }[source];
+  return !credentials || credentials.every((key) => hasText(props.config[key]));
+}
+
+function testSourceTitle(source) {
+  return isTestSourceConfigured(source)
+      ? "测试当前搜索渠道"
+      : "请先完成渠道账号配置并选择资源类型";
+}
 const activeSubtab = ref(props.section.subtabs?.[0]?.value || "");
 const availableGroups = computed(() =>
     props.section.groups.filter(
@@ -365,12 +384,9 @@ const visibleGroups = computed(() => {
   return [...leadingGroups, ...tabGroups];
 });
 
-function mediaLibraryWebhookUrl(serverName) {
-  const key = encodeURIComponent(
-      String(props.config.media_library_webhook_key || "").trim(),
-  );
-  const source = encodeURIComponent(String(serverName || "").trim());
-  return `${window.location.origin}/api/v1/plugin/CloudSubscribe/media-library/webhook/${key}?source=${source}`;
+function mediaLibraryWebhookUrl(field, serverName) {
+  const relativeUrl = String(field?.urls?.[serverName] || "").trim();
+  return relativeUrl ? new URL(relativeUrl, window.location.origin).toString() : "";
 }
 </script>
 

@@ -1,4 +1,4 @@
-"""MoviePilot 平台入口共享的聚合与业务调用。"""
+"""平台入口共享的聚合与业务调用。"""
 
 import copy
 import datetime
@@ -90,7 +90,7 @@ class PlatformIntegrationService(OwnerDelegator):
         transferred_today = sum(
             str(record.get("time") or "").startswith(today) for record in history
         )
-        tasks = self._serialize_sync_tasks()
+        tasks = self._serialize_runtime_tasks()
         provider = self._cloud_drive
         overview = {
             "runtime": {
@@ -346,7 +346,7 @@ class PlatformIntegrationService(OwnerDelegator):
             reasons.append("官方或官组资源")
         priority = int(resource.get("platform_priority") or 0)
         if priority:
-            reasons.append(f"MoviePilot规则优先级 {priority}")
+            reasons.append(f"规则优先级 {priority}")
         if not resource.get("need_unlock"):
             reasons.append("无需积分解锁")
         elif int(resource.get("unlock_points") or 0) > 0:
@@ -571,7 +571,7 @@ class PlatformIntegrationService(OwnerDelegator):
             ],
             "candidates": candidates,
             "next_step": (
-                    "请使用中文汇总候选，并结合 MoviePilot 规则优先级、官组、清晰度、"
+                    "请使用中文汇总候选，并结合规则优先级、官组、清晰度、"
                     "资源大小、更新时间和解锁成本说明推荐理由。"
                     + (
                         "用户需要手动选择时，优先调用 ask_user_choice 展示候选 ID；"
@@ -633,7 +633,7 @@ class PlatformIntegrationService(OwnerDelegator):
     def get_runtime_performance(self, include_tasks: bool = True) -> Dict[str, Any]:
         """汇总当前任务、搜索缓存和同步阶段性能指标。"""
         now = time.time()
-        tasks = self._serialize_sync_tasks() if include_tasks else []
+        tasks = self._serialize_runtime_tasks() if include_tasks else []
         search_metrics = (
             self._search_handler.get_search_metrics()
             if self._search_handler else {}

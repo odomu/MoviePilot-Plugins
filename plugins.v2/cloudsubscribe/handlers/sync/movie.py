@@ -35,6 +35,7 @@ class MovieSyncProcessor(OwnerDelegator):
         :param transferred_count: 当前已转存数量
         :return: 更新后的转存数量
         """
+        track_points = not manual_resources
         try:
             if self._stop_requested():
                 return transferred_count
@@ -42,7 +43,7 @@ class MovieSyncProcessor(OwnerDelegator):
 
             # 加载该订阅的历史积分花费（用 tmdb_id 作为唯一标识）
             sub_key = self.subscription_budget_key(subscribe, MediaType.MOVIE)
-            if hasattr(self._search_handler, 'reset_sub_spent_points'):
+            if track_points and hasattr(self._search_handler, 'reset_sub_spent_points'):
                 self._search_handler.reset_sub_spent_points(sub_key)
 
             # 检查历史记录是否已成功转存
@@ -194,7 +195,7 @@ class MovieSyncProcessor(OwnerDelegator):
                     mediainfo=mediainfo,
                     success_episodes=[1],
                 )
-                if hasattr(self._search_handler, "clear_sub_points"):
+                if track_points and hasattr(self._search_handler, "clear_sub_points"):
                     self._search_handler.clear_sub_points(sub_key)
                 logger.debug(
                     f"电影 {subscribe.name} 已有成功转存历史，"
@@ -236,7 +237,7 @@ class MovieSyncProcessor(OwnerDelegator):
                             mediainfo=mediainfo,
                             success_episodes=[1],
                         )
-                    if hasattr(self._search_handler, "clear_sub_points"):
+                    if track_points and hasattr(self._search_handler, "clear_sub_points"):
                         self._search_handler.clear_sub_points(sub_key)
                     return transferred_count
 
@@ -382,7 +383,8 @@ class MovieSyncProcessor(OwnerDelegator):
                         if not self._reserve_transfer_slots(1):
                             break
                         pending_key = self._queue_magnet_package(
-                            resource, share_url, subscribe, mediainfo, sub_key=sub_key,
+                            resource, share_url, subscribe, mediainfo,
+                            sub_key=sub_key if track_points else "",
                             upgrade=magnet_upgrade,
                             upgrade_mode=self._upgrade_mode,
                             upgrade_baseline={
@@ -421,8 +423,15 @@ class MovieSyncProcessor(OwnerDelegator):
                         continue
 
                     matched_file, current_score = self._match_movie_file(
-                        share_files, mediainfo, subscribe
+                        share_files, mediainfo, subscribe, resource_title
                     )
+
+                    if not matched_file:
+                        logger.debug(
+                            f"分享内容未被平台识别为目标电影："
+                            f"{mediainfo.title_year}，已跳过该资源"
+                        )
+                        continue
 
                     if matched_file:
                         file_name = matched_file.get('name', '')
@@ -478,21 +487,23 @@ class MovieSyncProcessor(OwnerDelegator):
                         try:
                             success = self._timed_sync_call(
                                 "share_transfer",
-                                self._share_transfer.transfer_file,
-                                share_url=share_url,
-                                file_id=matched_file.get("id"),
-                                save_path=self._cloud_transfer_path,
-                                target_name=(
-                                    None if self._is_offline_url(share_url)
-                                    else target_name
-                                ),
-                                source_sha1=matched_file.get("sha1"),
+                                self._transfer_file,
+                                share_url,
+                                matched_file,
+                                self._cloud_transfer_path,
+                                None if self._is_offline_url(share_url) else target_name,
+                                matched_file.get("sha1"),
                             )
                         except Exception:
                             self._release_transfer_slots(1)
                             raise
                         if not success:
                             self._release_transfer_slots(1)
+                            if self._stop_requested():
+                                logger.info(
+                                    f"用户已停止转存：{mediainfo.title}"
+                                )
+                                break
 
                         # 记录历史
                         history_item = self._build_transfer_history_item(
@@ -506,6 +517,7 @@ class MovieSyncProcessor(OwnerDelegator):
                             resource=resource,
                             file_size=self._resource_size_bytes(matched_file.get("size")),
                             source_sha1=matched_file.get("sha1") or "",
+                            source_md5=matched_file.get("md5") or "",
                             rule_score=current_score,
                             upgrade=is_upgrade,
                         )
@@ -527,9 +539,11 @@ class MovieSyncProcessor(OwnerDelegator):
                                     None if transient_target else getattr(subscribe, "id", None)
                                 ),
                                 success_episodes=[] if transient_target else [1],
-                                sub_key=sub_key,
+                                sub_key=sub_key if track_points else "",
                                 staging_dir=self._cloud_transfer_path,
-                                staging_name=file_name,
+                                staging_name=(
+                                        matched_file.get("staging_name") or file_name
+                                ),
                                 upgrade=is_upgrade,
                                 upgrade_mode=self._upgrade_mode,
                                 upgrade_old_cloud_dir=(
@@ -544,6 +558,19 @@ class MovieSyncProcessor(OwnerDelegator):
                                 ),
                                 upgrade_old_size=upgrade_old_size,
                             )
+                            if not strm_path and not pending_key:
+                                history_item["status"] = "失败"
+                                history_item["failure_reason"] = (
+                                    "文件已转存但后处理任务登记失败"
+                                )
+                                transferred_count = max(0, transferred_count - 1)
+                                movie_transferred = False
+                                movie_history_score = 0
+                                self._release_transfer_slots(1)
+                                logger.error(
+                                    f"文件已转存但后处理任务登记失败：{target_name}"
+                                )
+                                continue
                             if pending_key:
                                 history_item["finalize_key"] = pending_key
                                 history_item["status"] = (
@@ -569,6 +596,13 @@ class MovieSyncProcessor(OwnerDelegator):
                                     "year": mediainfo.year,
                                     "image": mediainfo.get_poster_image(),
                                     "file_name": target_name,
+                                    "notification_kind": (
+                                        "upgrade"
+                                        if is_upgrade
+                                        else "cross_transfer"
+                                        if history_item.get("transfer_mode") == "cross"
+                                        else "transfer"
+                                    ),
                                 })
 
                             self._record_download_history(
@@ -587,7 +621,7 @@ class MovieSyncProcessor(OwnerDelegator):
                                     mediainfo=mediainfo,
                                     success_episodes=[1],
                                 )
-                                if hasattr(self._search_handler, "clear_sub_points"):
+                                if track_points and hasattr(self._search_handler, "clear_sub_points"):
                                     self._search_handler.clear_sub_points(sub_key)
                         else:
                             logger.error(f"转存失败：{mediainfo.title}")

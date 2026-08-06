@@ -7,6 +7,7 @@ const SOURCE_ITEMS = [
     {title: "聚影", value: "juying"},
     {title: "SeedHub", value: "seedhub"},
     {title: "不太灵", value: "butailing"},
+    {title: "盘链", value: "pinglian"},
 ];
 
 export function createCommonSearchGroups(resourceTypeItems) {
@@ -15,11 +16,12 @@ export function createCommonSearchGroups(resourceTypeItems) {
             tab: "common",
             title: "搜索顺序",
             icon: "mdi-sort",
-            hint: "按选择顺序依次查询；未选择但已启用的来源会排在末尾。",
+            hint: "按勾选顺序设置搜索源优先级；未选择的搜索源不会发起请求。",
             fields: [
                 {
                     key: "search_source_order",
-                    label: "搜索源优先级",
+                    label: "搜索资源优先级",
+                    hint: "已选搜索源按当前顺序查询；留空时不搜索任何渠道。",
                     type: "select",
                     items: SOURCE_ITEMS,
                     multiple: true,
@@ -28,7 +30,7 @@ export function createCommonSearchGroups(resourceTypeItems) {
                 {
                     key: "resource_type_order",
                     label: "资源类型优先级",
-                    hint: "仅显示当前转存网盘支持的类型；未选择的类型不会获取或处理。",
+                    hint: "开启跨盘转存后可选择其他已接入网盘；仅搜索和处理已选类型，并按当前顺序优先匹配。",
                     type: "select",
                     items: resourceTypeItems,
                     multiple: true,

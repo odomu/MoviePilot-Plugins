@@ -1,12 +1,10 @@
-import {enabled} from "../helpers.js";
-
 export function createDian115Groups(options = {}) {
     return [
         {
             tab: "dian115",
             title: "Dian115 账号",
             icon: "mdi-account-key-outline",
-            hint: "使用 MoviePilot 浏览器仿真完成 Turnstile 登录并维护访问状态。",
+            hint: "使用浏览器仿真完成 Turnstile 登录并维护访问状态。",
             fields: [
                 {
                     key: "dian115_account_info",
@@ -15,26 +13,17 @@ export function createDian115Groups(options = {}) {
                     data: options.searchAccounts?.dian115 || {},
                     compact: true,
                     cols: 12,
-                    show: enabled("dian115_enabled"),
-                },
-                {
-                    key: "dian115_enabled",
-                    label: "启用 Dian115",
-                    type: "switch",
-                    cols: 4,
                 },
                 {
                     key: "dian115_email",
                     label: "登录邮箱",
-                    cols: 4,
-                    show: enabled("dian115_enabled"),
+                    cols: 6,
                 },
                 {
                     key: "dian115_password",
                     label: "登录密码",
                     type: "password",
-                    cols: 4,
-                    show: enabled("dian115_enabled"),
+                    cols: 6,
                 },
                 {
                     key: "test_dian115",
@@ -42,7 +31,6 @@ export function createDian115Groups(options = {}) {
                     type: "test-source",
                     source: "dian115",
                     cols: 12,
-                    show: enabled("dian115_enabled"),
                 },
             ],
         },
@@ -51,14 +39,12 @@ export function createDian115Groups(options = {}) {
             title: "Dian115 积分解锁",
             icon: "mdi-ticket-confirmation-outline",
             hint: "默认不解锁收费资源；开启后仅在候选被实际采用且双重预算充足时扣费。",
-            show: enabled("dian115_enabled"),
             fields: [
                 {
                     key: "dian115_auto_unlock",
                     label: "允许积分解锁",
                     type: "switch",
                     cols: 4,
-                    show: enabled("dian115_enabled"),
                 },
                 {
                     key: "dian115_max_unlock_points",
@@ -68,7 +54,7 @@ export function createDian115Groups(options = {}) {
                     min: 0,
                     cols: 4,
                     show: (config) =>
-                        config.dian115_enabled && config.dian115_auto_unlock,
+                        config.dian115_auto_unlock,
                 },
                 {
                     key: "dian115_max_points_per_sub",
@@ -78,7 +64,7 @@ export function createDian115Groups(options = {}) {
                     min: 0,
                     cols: 4,
                     show: (config) =>
-                        config.dian115_enabled && config.dian115_auto_unlock,
+                        config.dian115_auto_unlock,
                 },
             ],
         },
@@ -87,7 +73,6 @@ export function createDian115Groups(options = {}) {
             title: "Dian115 搜索与风控",
             icon: "mdi-shield-search",
             hint: "登录和资源接口共用请求限速；详情结果另有短期内存缓存。",
-            show: enabled("dian115_enabled"),
             fields: [
                 {
                     key: "dian115_candidate_limit",
@@ -96,7 +81,6 @@ export function createDian115Groups(options = {}) {
                     min: 1,
                     max: 20,
                     cols: 6,
-                    show: enabled("dian115_enabled"),
                 },
                 {
                     key: "dian115_unlocks_per_minute",
@@ -107,7 +91,6 @@ export function createDian115Groups(options = {}) {
                     max: 10,
                     suffix: "次",
                     cols: 6,
-                    show: enabled("dian115_enabled"),
                 },
                 {
                     key: "dian115_request_interval",
@@ -119,7 +102,6 @@ export function createDian115Groups(options = {}) {
                     step: 0.2,
                     suffix: "秒",
                     cols: 6,
-                    show: enabled("dian115_enabled"),
                 },
             ],
         },

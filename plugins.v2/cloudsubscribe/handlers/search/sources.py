@@ -13,6 +13,13 @@ from ...utils import parse_magnet_metadata
 class PanSouSearchService(OwnerDelegator):
     """提供 PanSou 搜索实现。"""
 
+    @staticmethod
+    def _pansou_resource_type(resource: Dict[str, Any]) -> str:
+        value = str(
+            resource.get("resource_type") or resource.get("pan_type") or ""
+        ).strip().lower()
+        return "alipan" if value == "aliyun" else value
+
     def _pansou_search(
             self,
             keyword: str,
@@ -37,7 +44,10 @@ class PanSouSearchService(OwnerDelegator):
             titles.append(title_en)
         search_results = self._pansou_client.search(
             keyword=keyword,
-            cloud_types=self._pansou_cloud_types,
+            cloud_types=[
+                "aliyun" if value == "alipan" else value
+                for value in self._resource_type_order_config
+            ],
             channels=self._pansou_channels,
             plugins=self._pansou_plugins,
             limit=self._pansou_result_limit,
@@ -66,15 +76,16 @@ class PanSouSearchService(OwnerDelegator):
             return []
 
         results = search_results.get("results", {})
-        share_results = results.get("115网盘", [])
-        magnet_results = results.get("磁力链接", [])
-        ed2k_results = results.get("电驴链接", [])
-        supported_groups = {"115网盘", "磁力链接", "电驴链接"}
-        other_count = sum(
-            len(items)
-            for group_name, items in results.items()
-            if group_name not in supported_groups and isinstance(items, list)
-        )
+        candidates = [
+            item
+            for group in results.values()
+            if isinstance(group, list)
+            for item in group
+            if self._pansou_resource_type(item) in self._resource_type_order_config
+        ]
+        magnet_results = [
+            item for item in candidates if self._pansou_resource_type(item) == "magnet"
+        ]
         for resource in magnet_results:
             provider_text = " ".join(
                 str(resource.get(key) or "").strip()
@@ -92,14 +103,6 @@ class PanSouSearchService(OwnerDelegator):
                 resource["size"] = metadata["size"]
             if metadata["preview_episodes"]:
                 resource["preview_episodes"] = metadata["preview_episodes"]
-        if other_count:
-            other_action = "保留展示" if test_mode else "不支持，已跳过"
-        else:
-            other_action = "无"
-        candidates = (
-            [item for group in results.values() if isinstance(group, list) for item in group]
-            if test_mode else [*share_results, *ed2k_results, *magnet_results]
-        )
         usable = [
             resource
             for resource in candidates
@@ -109,7 +112,7 @@ class PanSouSearchService(OwnerDelegator):
         logger.debug(
             f"{search_prefix} 查询完成：原始条目={int(search_results.get('raw_count') or 0)}，"
             f"匹配链接={int(search_results.get('count') or 0)}，"
-            f"可用候选={len(usable)}，其他网盘={other_count}（{other_action}），"
+            f"可用候选={len(usable)}，已选类型={'/'.join(self._resource_type_order_config) or '无'}，"
             f"耗时={int(search_results.get('elapsed_ms') or 0)}ms"
         )
         return usable

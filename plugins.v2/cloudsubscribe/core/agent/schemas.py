@@ -20,7 +20,7 @@ class CloudSubscribeSyncInput(BaseModel):
 
 
 class CloudSubscribeLinksInput(BaseModel):
-    subscribe_id: int = Field(..., gt=0, description="要关联的 MoviePilot 订阅 ID")
+    subscribe_id: int = Field(..., gt=0, description="要关联的订阅 ID")
     resource_links: List[str] = Field(
         ...,
         min_length=1,
@@ -33,7 +33,7 @@ class CloudSubscribeResourceSearchInput(BaseModel):
     subscribe_id: Optional[int] = Field(
         default=None,
         gt=0,
-        description="已有 MoviePilot 订阅 ID；已知媒体名称时可不传",
+        description="已有订阅 ID；已知媒体名称时可不传",
     )
     title: Optional[str] = Field(
         default=None,
@@ -95,7 +95,7 @@ class CloudSubscribePerformanceInput(BaseModel):
 class CloudSubscribeConfigUpdateInput(BaseModel):
     show_sidebar_nav: Optional[bool] = Field(
         default=None,
-        description="是否在 MoviePilot 左侧导航显示网盘订阅入口",
+        description="是否在左侧导航显示网盘订阅入口",
     )
     agent_enabled: Optional[bool] = Field(
         default=None,

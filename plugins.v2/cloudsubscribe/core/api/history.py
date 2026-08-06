@@ -83,6 +83,8 @@ class HistoryApi(OwnerDelegator):
             message = f"历史记录已删除；{cloud_status}，{strm_status}"
         else:
             message = "历史记录已删除，网盘文件和STRM均已保留"
+        if int(deleted.get("cache_deleted") or 0) > 0:
+            message += "；跨盘缓存已清理"
         return {
             "success": True,
             "message": message,
@@ -129,6 +131,8 @@ class HistoryApi(OwnerDelegator):
             message += f"，保留 {result['skipped']} 条状态变化或处理失败记录"
         if delete_linked_files and result["linked_deleted"]:
             message += f"；同步处理 {result['linked_deleted']} 条关联文件"
+        if result.get("cache_deleted"):
+            message += f"；清理 {result['cache_deleted']} 个跨盘缓存文件"
         return {"success": True, "message": message, "data": result}
 
     def api_notify_history(self, apikey: str, identity: Dict[str, Any]) -> dict:

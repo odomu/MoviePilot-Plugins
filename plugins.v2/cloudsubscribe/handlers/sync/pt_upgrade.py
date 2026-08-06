@@ -1,4 +1,4 @@
-"""MoviePilot PT 整理完成后的网盘洗版上传。"""
+"""PT 整理完成后的网盘洗版上传。"""
 
 import hashlib
 import time
@@ -19,7 +19,7 @@ class _PtUploadCancelled(RuntimeError):
 
 
 class PtUpgradeService(OwnerDelegator):
-    """将符合洗版条件的 MoviePilot 本地整理文件上传并交给现有后处理链。"""
+    """将符合洗版条件的本地整理文件上传并交给现有后处理链。"""
 
     @staticmethod
     def _file_sha1(path: Path, stop_event: Optional[ThreadEvent] = None) -> str:
@@ -174,7 +174,7 @@ class PtUpgradeService(OwnerDelegator):
         )
 
     def process_pt_upgrade(self, event_data: Dict[str, Any]) -> bool:
-        """处理单个 MoviePilot 整理完成事件。"""
+        """处理单个整理完成事件。"""
         if not self._enable_pt_upgrade or not self._cloud_upload:
             return False
         if not event_data.get("downloader") or not event_data.get("download_hash"):

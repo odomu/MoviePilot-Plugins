@@ -7,11 +7,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 import httpx
-from torf import Magnet, Torrent, TorfError
-
 from app.core.cache import TTLCache
 from app.core.config import settings
 from app.core.metainfo import MetaInfo
+from torf import Magnet, Torrent, TorfError
 
 _TORRENT_CACHE_TTL = 30 * 60
 DEFAULT_METADATA_URL_TEMPLATE = "https://itorrents.org/torrent/{info_hash}.torrent"
@@ -34,7 +33,7 @@ def _extract_preview_episodes(
         provider_text: str,
         torrent_files: list,
 ) -> Dict[str, list]:
-    """使用 MoviePilot 元数据识别汇总资源包含的季集。"""
+    """使用元数据识别汇总资源包含的季集。"""
     episodes: Dict[str, set] = {}
     resource_seasons = [1]
     resource_title = display_name or provider_text

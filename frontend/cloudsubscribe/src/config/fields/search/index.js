@@ -5,6 +5,7 @@ import {createHdhiveGroups} from "./hdhive.js";
 import {createJuyingGroups} from "./juying.js";
 import {createPansouGroups} from "./pansou.js";
 import {createSeedhubGroups} from "./seedhub.js";
+import {createPinglianGroups} from "./pinglian.js";
 
 export function createSearchSection(resourceTypeItems, options = {}) {
     return {
@@ -17,6 +18,7 @@ export function createSearchSection(resourceTypeItems, options = {}) {
             {value: "hdhive", title: "HDHive", icon: "mdi-hexagon-multiple-outline"},
             {value: "dian115", title: "Dian115", icon: "mdi-cloud-search"},
             {value: "juying", title: "聚影", icon: "mdi-movie-search-outline"},
+            {value: "pinglian", title: "盘链", icon: "mdi-link-variant"},
             {value: "seedhub", title: "SeedHub", icon: "mdi-seed-outline"},
             {value: "butailing", title: "不太灵", icon: "mdi-magnet"},
         ],
@@ -28,6 +30,7 @@ export function createSearchSection(resourceTypeItems, options = {}) {
             ...createButailingGroups(),
             ...createHdhiveGroups(options),
             ...createDian115Groups(options),
+            ...createPinglianGroups(options),
         ],
     };
 }

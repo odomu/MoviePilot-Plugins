@@ -1,11 +1,10 @@
 """
 网盘订阅助手插件
-结合 MoviePilot 订阅功能，自动搜索网盘资源并同步缺失内容
+结合订阅功能，自动搜索网盘资源并同步缺失内容
 """
 import copy
 import datetime
 import re
-import secrets
 from threading import Event as ThreadEvent, Lock, RLock, local
 from typing import Optional, Any, List, Dict, Tuple, Callable
 
@@ -22,6 +21,8 @@ from apscheduler.triggers.cron import CronTrigger
 from .core import (
     CloudDriveProvider,
     CloudDriveRegistry,
+    CloudDriveCapability,
+    CrossTransferTaskManager,
     get_component,
     resolve_component,
 )
@@ -45,10 +46,12 @@ from .core.services import (
     SyncExecutionService,
     SyncRuntimeService,
 )
+from .drive.alipan import AliPanClient, AliPanDrive, create_alipan_provider
 from .drive.guangya import GuangyaClient, GuangyaDrive, create_guangya_provider
 from .drive.p115 import P115ClientManager, create_p115_provider
 from .drive.p123 import P123ClientManager, P123Drive, create_p123_provider
 from .drive.quark import QuarkClient, QuarkDrive, create_quark_provider
+from .drive.tianyi import TianyiClient, TianyiDrive, create_tianyi_provider
 from .handlers import SearchHandler, SyncHandler, SubscribeHandler, WebhookHandler
 from .search.butailing import ButailingClient
 from .search.hdhive import (
@@ -57,6 +60,7 @@ from .search.hdhive import (
 )
 from .search.juying import JuyingClient
 from .search.pansou import PanSouClient
+from .search.pinglian import PinglianClient
 from .search.seedhub import SeedHubClient
 
 _COMPONENT_TYPES = (
@@ -86,11 +90,11 @@ class CloudSubscribe(_PluginBase):
     # 插件名称
     plugin_name = "网盘订阅助手"
     # 插件描述
-    plugin_desc = "结合 MoviePilot 订阅功能，自动搜索网盘资源并同步缺失的电影和剧集。"
+    plugin_desc = "结合订阅功能，自动搜索网盘资源并同步缺失的电影和剧集。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.6"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -163,6 +167,13 @@ class CloudSubscribe(_PluginBase):
     def on_plugin_action(self, event: Event):
         return self._get_component(PluginEventHandler).on_plugin_action(event)
 
+    @eventmanager.register(EventType.WebhookMessage)
+    def on_media_server_webhook(self, event: Event):
+        event_info = getattr(event, "event_data", None) if event else None
+        return self._get_component(MediaLibraryApi).handle_platform_media_webhook(
+            event_info
+        )
+
     # 私有变量
     _scheduler: Optional[BackgroundScheduler] = None
     _offline_scheduler: Optional[BackgroundScheduler] = None
@@ -192,6 +203,18 @@ class CloudSubscribe(_PluginBase):
     _guangya_client_id: str = ""
     _guangya_device_id: str = ""
     _guangya_request_timeout: int = 30
+    _tianyi_cookie: str = ""
+    _tianyi_access_token: str = ""
+    _tianyi_refresh_token: str = ""
+    _tianyi_session_key: str = ""
+    _tianyi_request_timeout: int = 60
+    _tianyi_transfer_path: str = "/"
+    _tianyi_media_path: str = "/"
+    _alipan_access_token: str = ""
+    _alipan_refresh_token: str = ""
+    _alipan_request_timeout: int = 60
+    _alipan_transfer_path: str = "/"
+    _alipan_media_path: str = "/"
     _cloud_drive_key: str = "115"
     _pansou_enabled: bool = True
     _pansou_url: str = "https://so.252035.xyz"
@@ -219,6 +242,12 @@ class CloudSubscribe(_PluginBase):
     _juying_result_limit: int = 5
     _juying_request_interval: float = 1.0
     _juying_unlocks_per_minute: int = 8
+    _pinglian_enabled: bool = False
+    _pinglian_username: str = ""
+    _pinglian_password: str = ""
+    _pinglian_result_limit: int = 20
+    _pinglian_request_interval: float = 1.0
+    _pinglian_timeout: int = 30
 
     # 订阅过滤模式："exclude" 排除模式（处理除勾选外的全部订阅）/ "include" 指定模式（仅处理勾选的订阅）
     _subscribe_filter_mode: str = "exclude"
@@ -270,6 +299,9 @@ class CloudSubscribe(_PluginBase):
     _platform_download_policy: str = "block"
 
     _max_transfer_per_sync: int = 50
+    _cross_transfer_enabled: bool = False
+    _cross_transfer_download_path: str = ""
+    _cross_transfer_download_threads: int = 5
     _subscription_concurrency: int = 2
     _batch_size: int = 20
     _skip_other_season_dirs: bool = True
@@ -287,6 +319,11 @@ class CloudSubscribe(_PluginBase):
     _quark_transfer_path: str = "/"
     _guangya_transfer_path: str = "/"
     _cloud_transfer_path: str = "/"
+    _p115_media_path: str = "/"
+    _p123_media_path: str = "/"
+    _quark_media_path: str = "/"
+    _guangya_media_path: str = "/"
+    _cloud_media_path: str = "/"
     _strm_generate_enabled: bool = True
     _nfo_scrape_enabled: bool = False
     _image_scrape_enabled: bool = False
@@ -298,7 +335,6 @@ class CloudSubscribe(_PluginBase):
     _media_server_refresh_delay: int = 0
     _emby_mediainfo_enabled: bool = False
     _platform_media_sync_enabled: bool = False
-    _media_library_webhook_key: str = ""
     _platform_transfer_history_enabled: bool = False
     _timeout_enabled: bool = True
     _timeout_default_connect: float = 30
@@ -320,10 +356,13 @@ class CloudSubscribe(_PluginBase):
     _seedhub_client: Optional[SeedHubClient] = None
     _butailing_client: Optional[ButailingClient] = None
     _juying_client: Optional[JuyingClient] = None
+    _pinglian_client: Optional[PinglianClient] = None
     _p115_manager: Optional[P115ClientManager] = None
     _p123_drive: Optional[P123Drive] = None
     _quark_drive: Optional[QuarkDrive] = None
     _guangya_drive: Optional[GuangyaDrive] = None
+    _tianyi_drive: Optional[TianyiDrive] = None
+    _alipan_drive: Optional[AliPanDrive] = None
     _cloud_drive_registry: Optional[CloudDriveRegistry] = None
     _cloud_drive: Optional[CloudDriveProvider] = None
     _hdhive_client: Optional[Any] = None
@@ -375,7 +414,7 @@ class CloudSubscribe(_PluginBase):
 
     @staticmethod
     def _resolve_notification_type(value: Any) -> NotificationType:
-        """将配置值解析为 MoviePilot 消息类型，无效值回退为插件消息。"""
+        """将配置值解析为消息类型，无效值回退为插件消息。"""
         if isinstance(value, NotificationType):
             return value
         configured = str(value or NotificationType.Plugin.name).strip()
@@ -386,6 +425,11 @@ class CloudSubscribe(_PluginBase):
                 return item
         logger.warning(f"未知消息通知类型：{configured}，已回退为插件")
         return NotificationType.Plugin
+
+    @staticmethod
+    def _config_cloud_path(value: Any) -> str:
+        path = str(value or "/").strip()
+        return f"/{path.strip('/')}" if path.strip("/") else "/"
 
     def init_plugin(self, config: dict = None):
         """宿主加载或重载插件时初始化完整运行环境。"""
@@ -426,14 +470,6 @@ class CloudSubscribe(_PluginBase):
                 logger.info("订阅接管配置已迁移为新平台下载策略")
             else:
                 logger.warning("订阅接管配置迁移持久化失败，本次运行仍使用迁移后配置")
-        webhook_key = str(config.get("media_library_webhook_key", "") or "").strip()
-        if len(webhook_key) < 16:
-            webhook_key = secrets.token_hex(8)
-            config["media_library_webhook_key"] = webhook_key
-            if self.update_config(config):
-                logger.info("已生成媒体库 Webhook 固定 Key")
-            else:
-                logger.warning("媒体库 Webhook 固定 Key 持久化失败，本次运行临时使用")
         hot_keys = {
             "show_sidebar_nav",
             "agent_enabled",
@@ -449,7 +485,6 @@ class CloudSubscribe(_PluginBase):
             "media_server_refresh_delay",
             "emby_mediainfo_enabled",
             "platform_media_sync_enabled",
-            "media_library_webhook_key",
         }
         if not reset_runtime and self._applied_config:
             changed_keys = {
@@ -547,18 +582,59 @@ class CloudSubscribe(_PluginBase):
             self._guangya_request_timeout = max(
                 5, min(int(config.get("guangya_request_timeout", 30) or 30), 300)
             )
+            self._tianyi_cookie = str(config.get("tianyi_cookie", "") or "").strip()
+            self._tianyi_access_token = str(
+                config.get("tianyi_access_token", "") or ""
+            ).strip()
+            self._tianyi_refresh_token = str(
+                config.get("tianyi_refresh_token", "") or ""
+            ).strip()
+            self._tianyi_request_timeout = max(10, min(int(config.get("tianyi_request_timeout", 60) or 60), 300))
+            self._tianyi_transfer_path = self._config_cloud_path(
+                config.get("tianyi_transfer_path", "/")
+            )
+            self._tianyi_media_path = self._config_cloud_path(
+                config.get("tianyi_media_path", "/")
+            )
+            self._alipan_access_token = str(
+                config.get("alipan_access_token", "") or ""
+            ).strip()
+            self._alipan_refresh_token = str(
+                config.get("alipan_refresh_token", "") or ""
+            ).strip()
+            self._alipan_request_timeout = max(
+                10, min(int(config.get("alipan_request_timeout", 60) or 60), 300)
+            )
+            self._alipan_transfer_path = self._config_cloud_path(
+                config.get("alipan_transfer_path", "/")
+            )
+            self._alipan_media_path = self._config_cloud_path(
+                config.get("alipan_media_path", "/")
+            )
             self._cloud_drive_key = str(
                 config.get("cloud_drive", "115") or "115"
             ).strip().lower()
 
-            self._pansou_enabled = config.get("pansou_enabled", True)
+            source_names = (
+                "hdhive", "dian115", "pansou", "juying", "seedhub", "butailing",
+                "pinglian",
+            )
+            raw_order = config.get("search_source_order", []) or []
+            if isinstance(raw_order, str):
+                raw_order = raw_order.split(",")
+            self._search_source_order = list(dict.fromkeys(
+                str(value).strip().lower()
+                for value in raw_order
+                if str(value).strip().lower() in source_names
+            ))
+            selected_sources = set(self._search_source_order)
+            self._pansou_enabled = "pansou" in selected_sources
             self._pansou_url = config.get("pansou_url", "https://so.252035.xyz/")
             self._pansou_username = config.get("pansou_username", "")
             self._pansou_password = config.get("pansou_password", "")
             self._pansou_auth_enabled = config.get("pansou_auth_enabled", False)
             self._pansou_channels = config.get("pansou_channels") or []
             self._pansou_plugins = config.get("pansou_plugins") or []
-            self._pansou_cloud_types = config.get("pansou_cloud_types") or []
             self._pansou_filter_include = config.get("pansou_filter_include") or []
             self._pansou_filter_exclude = config.get("pansou_filter_exclude") or []
             configured_resource_order = config.get(
@@ -571,9 +647,13 @@ class CloudSubscribe(_PluginBase):
                 str(item).strip().lower()
                 for item in configured_resource_order
                 if str(item).strip().lower()
-                in {"115", "123", "quark", "guangya", "ed2k", "magnet"}
+                in {
+                    "115", "123", "quark", "guangya", "tianyi", "alipan",
+                    "ed2k", "magnet",
+                }
             ))
             self._resource_type_order = resource_order
+            self._pansou_cloud_types = list(resource_order)
             metadata_url_template = str(config.get(
                 "magnet_metadata_url_template",
                 "https://itorrents.org/torrent/{info_hash}.torrent",
@@ -604,15 +684,15 @@ class CloudSubscribe(_PluginBase):
             self._pansou_timeout = max(
                 5, min(int(config.get("pansou_timeout", 30) or 30), 120)
             )
-            self._seedhub_enabled = bool(config.get("seedhub_enabled", False))
+            self._seedhub_enabled = "seedhub" in selected_sources
             self._seedhub_result_limit = max(
                 1, min(int(config.get("seedhub_result_limit", 20) or 20), 80)
             )
-            self._butailing_enabled = bool(config.get("butailing_enabled", False))
+            self._butailing_enabled = "butailing" in selected_sources
             self._butailing_result_limit = max(
                 1, min(int(config.get("butailing_result_limit", 20) or 20), 80)
             )
-            self._juying_enabled = bool(config.get("juying_enabled", False))
+            self._juying_enabled = "juying" in selected_sources
             self._juying_username = str(
                 config.get("juying_username", "") or ""
             ).strip()
@@ -626,6 +706,21 @@ class CloudSubscribe(_PluginBase):
             self._juying_unlocks_per_minute = max(
                 1, min(int(config.get("juying_unlocks_per_minute", 8) or 8), 12)
             )
+            self._pinglian_enabled = "pinglian" in selected_sources
+            self._pinglian_username = str(
+                config.get("pinglian_username", "") or ""
+            ).strip()
+            self._pinglian_password = str(config.get("pinglian_password", "") or "")
+            self._pinglian_result_limit = max(
+                1, min(int(config.get("pinglian_result_limit", 20) or 20), 80)
+            )
+            self._pinglian_request_interval = max(
+                0.5,
+                min(float(config.get("pinglian_request_interval", 1) or 1), 10.0),
+            )
+            self._pinglian_timeout = max(
+                5, min(int(config.get("pinglian_timeout", 30) or 30), 120)
+            )
 
             self._subscribe_filter_mode = config.get("subscribe_filter_mode", "exclude") or "exclude"
             self._exclude_subscribes = config.get("exclude_subscribes", []) or []
@@ -633,7 +728,7 @@ class CloudSubscribe(_PluginBase):
             if self._subscribe_filter_mode == "include":
                 logger.info(f"订阅过滤模式：指定模式，仅处理 {len(self._include_subscribes)} 个勾选订阅")
 
-            self._hdhive_enabled = config.get("hdhive_enabled", False)
+            self._hdhive_enabled = "hdhive" in selected_sources
             self._hdhive_query_mode = str(
                 config.get("hdhive_query_mode", "web") or "web"
             )
@@ -657,7 +752,7 @@ class CloudSubscribe(_PluginBase):
             self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
             self._hdhive_username = config.get("hdhive_username", "")
             self._hdhive_password = config.get("hdhive_password", "")
-            self._dian115_enabled = bool(config.get("dian115_enabled", False))
+            self._dian115_enabled = "dian115" in selected_sources
             self._dian115_email = str(config.get("dian115_email", "") or "").strip()
             self._dian115_password = str(config.get("dian115_password", "") or "")
             self._dian115_auto_unlock = bool(
@@ -671,20 +766,25 @@ class CloudSubscribe(_PluginBase):
             )
 
             self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
+            self._cross_transfer_enabled = bool(config.get("cross_transfer_enabled", False))
+            self._cross_transfer_download_path = str(
+                config.get("cross_transfer_download_path", "") or ""
+            ).strip()
+            self._cross_transfer_download_threads = max(
+                1,
+                min(
+                    int(config.get("cross_transfer_download_threads", 5) or 5),
+                    10,
+                ),
+            )
             self._subscription_concurrency = max(
                 1, min(int(config.get("subscription_concurrency", 2) or 2), 5)
             )
             self._batch_size = int(config.get("batch_size", 20) or 20)
             self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
 
-            # 搜索源优先级（兼容逗号分隔字符串）
-            raw_order = config.get("search_source_order", []) or []
-            if isinstance(raw_order, str):
-                self._search_source_order = [x.strip() for x in raw_order.split(",") if x.strip()]
-            else:
-                self._search_source_order = list(raw_order)
             if self._search_source_order:
-                logger.info(f"搜索源自定义优先级：{' > '.join(self._search_source_order)}")
+                logger.info(f"搜索资源优先级：{' > '.join(self._search_source_order)}")
             self._search_cache_enabled = bool(config.get("search_cache_enabled", True))
             self._search_cache_ttl_minutes = max(
                 1, min(int(config.get("search_cache_ttl_minutes", 30) or 30), 1440)
@@ -735,23 +835,45 @@ class CloudSubscribe(_PluginBase):
             if self._upgrade_mode not in {"coexist", "replace", "largest", "smallest"}:
                 self._upgrade_mode = "largest"
             self._local_resource_path = str(config.get("local_resource_path", "") or "").strip()
-            self._p115_transfer_path = str(
-                config.get("cloud_transfer_path", "/") or "/"
-            ).strip().rstrip("/") or "/"
-            self._p123_transfer_path = str(
-                config.get("p123_transfer_path", "/") or "/"
-            ).strip().rstrip("/") or "/"
-            self._quark_transfer_path = str(
-                config.get("quark_transfer_path", "/") or "/"
-            ).strip().rstrip("/") or "/"
-            self._guangya_transfer_path = str(
-                config.get("guangya_transfer_path", "/") or "/"
-            ).strip().rstrip("/") or "/"
+            self._p115_transfer_path = self._config_cloud_path(
+                config.get("cloud_transfer_path", "/")
+            )
+            self._p123_transfer_path = self._config_cloud_path(
+                config.get("p123_transfer_path", "/")
+            )
+            self._quark_transfer_path = self._config_cloud_path(
+                config.get("quark_transfer_path", "/")
+            )
+            self._guangya_transfer_path = self._config_cloud_path(
+                config.get("guangya_transfer_path", "/")
+            )
+            self._p115_media_path = self._config_cloud_path(
+                config.get("cloud_media_path", "/")
+            )
+            self._p123_media_path = self._config_cloud_path(
+                config.get("p123_media_path", "/")
+            )
+            self._quark_media_path = self._config_cloud_path(
+                config.get("quark_media_path", "/")
+            )
+            self._guangya_media_path = self._config_cloud_path(
+                config.get("guangya_media_path", "/")
+            )
             self._cloud_transfer_path = {
                 "115": self._p115_transfer_path,
                 "123": self._p123_transfer_path,
                 "quark": self._quark_transfer_path,
                 "guangya": self._guangya_transfer_path,
+                "tianyi": self._tianyi_transfer_path,
+                "alipan": self._alipan_transfer_path,
+            }.get(self._cloud_drive_key, "/")
+            self._cloud_media_path = {
+                "115": self._p115_media_path,
+                "123": self._p123_media_path,
+                "quark": self._quark_media_path,
+                "guangya": self._guangya_media_path,
+                "tianyi": self._tianyi_media_path,
+                "alipan": self._alipan_media_path,
             }.get(self._cloud_drive_key, "/")
             self._strm_generate_enabled = bool(config.get("strm_generate_enabled", True))
             self._nfo_scrape_enabled = bool(config.get("nfo_scrape_enabled", False))
@@ -778,9 +900,6 @@ class CloudSubscribe(_PluginBase):
             self._platform_media_sync_enabled = bool(
                 config.get("platform_media_sync_enabled", False)
             )
-            self._media_library_webhook_key = str(
-                config.get("media_library_webhook_key", "") or ""
-            ).strip()
             self._platform_transfer_history_enabled = bool(
                 config.get("platform_transfer_history_enabled", False)
             )
@@ -884,9 +1003,6 @@ class CloudSubscribe(_PluginBase):
         self._platform_media_sync_enabled = bool(
             config.get("platform_media_sync_enabled", False)
         )
-        self._media_library_webhook_key = str(
-            config.get("media_library_webhook_key", "") or ""
-        ).strip()
         if self._subscribe_handler:
             self._subscribe_handler._notify = self._notify
             self._subscribe_handler._notification_type = self._notification_type
@@ -930,15 +1046,18 @@ class CloudSubscribe(_PluginBase):
         self._p123_drive = None
         self._quark_drive = None
         self._guangya_drive = None
+        self._tianyi_drive = None
+        self._alipan_drive = None
         self._cloud_drive = None
         self._cloud_drive_registry = CloudDriveRegistry()
         self._pansou_client = None
         self._seedhub_client = None
         self._butailing_client = None
         self._juying_client = None
+        self._pinglian_client = None
         proxy = settings.PROXY
         if proxy:
-            logger.info(f"使用 MoviePilot PROXY: {proxy}")
+            logger.info(f"使用PROXY: {proxy}")
 
         if self._pansou_enabled and self._pansou_url:
             self._pansou_client = PanSouClient(
@@ -968,6 +1087,18 @@ class CloudSubscribe(_PluginBase):
             )
             if not self._juying_username or not self._juying_password:
                 logger.warning("聚影已启用但未配置网页登录账号和密码，将无法使用聚影搜索")
+        if self._pinglian_enabled:
+            self._pinglian_client = PinglianClient(
+                username=self._pinglian_username,
+                password=self._pinglian_password,
+                proxy=proxy,
+                request_timeout=self._pinglian_timeout,
+                request_interval=self._pinglian_request_interval,
+                get_data_func=self.get_data,
+                save_data_func=self.save_data,
+            )
+            if not self._pinglian_username or not self._pinglian_password:
+                logger.warning("盘链已启用但未配置网页登录账号和密码，将无法使用盘链搜索")
 
         # OpenAPI 模式初始化官方客户端；WebAPI 由搜索服务按需创建唯一客户端。
         if self._hdhive_query_mode == "api":
@@ -998,6 +1129,13 @@ class CloudSubscribe(_PluginBase):
         self._register_p123_provider()
         self._register_quark_provider()
         self._register_guangya_provider()
+        self._register_tianyi_provider()
+        self._register_alipan_provider()
+        self._cross_transfer_manager = CrossTransferTaskManager(
+            self._cloud_drive_registry.get,
+            download_path=self._cross_transfer_download_path,
+            download_threads=self._cross_transfer_download_threads,
+        )
 
         try:
             self._cloud_drive = self._cloud_drive_registry.get(self._cloud_drive_key)
@@ -1006,13 +1144,34 @@ class CloudSubscribe(_PluginBase):
                 f"网盘提供方 {self._cloud_drive_key or '<empty>'} 未就绪，请检查对应账号配置"
             )
         if self._cloud_drive:
+            aliases = {
+                "189": "tianyi", "aliyun": "alipan"
+            }
+
+            def resource_supported(value: str) -> bool:
+                if self._cloud_drive.supports_resource_type(value):
+                    return True
+                if not self._cross_transfer_enabled:
+                    return False
+                try:
+                    source = self._cloud_drive_registry.get(
+                        aliases.get(str(value).lower(), str(value).lower())
+                    )
+                except KeyError:
+                    return False
+                return (
+                        source.supports(CloudDriveCapability.SHARE_TRANSFER)
+                        and source.supports(CloudDriveCapability.FILE_DOWNLOAD)
+                        and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
+                )
+
             unsupported_types = [
                 value for value in self._resource_type_order
-                if not self._cloud_drive.supports_resource_type(value)
+                if not resource_supported(value)
             ]
             self._resource_type_order = [
                 value for value in self._resource_type_order
-                if self._cloud_drive.supports_resource_type(value)
+                if resource_supported(value)
             ]
             if unsupported_types:
                 logger.info(
@@ -1108,6 +1267,50 @@ class CloudSubscribe(_PluginBase):
         )
         if self._cloud_drive_key == "guangya":
             self._cloud_drive = self._cloud_drive_registry.get("guangya")
+
+    def _register_tianyi_provider(self) -> None:
+        if self._tianyi_drive:
+            self._tianyi_drive.close()
+        self._tianyi_drive = TianyiDrive(TianyiClient(
+            cookie=self._tianyi_cookie,
+            timeout=self._tianyi_request_timeout,
+            access_token=self._tianyi_access_token,
+            refresh_token=self._tianyi_refresh_token,
+            session_key=self._tianyi_session_key,
+            on_token_refresh=self._on_tianyi_token_update,
+        ))
+        self._cloud_drive_registry.register(create_tianyi_provider(self._tianyi_drive), replace=True)
+
+    def _on_tianyi_token_update(
+            self, access_token: str, refresh_token: str, session_key: str
+    ) -> None:
+        self._tianyi_access_token = str(access_token or "").strip()
+        self._tianyi_refresh_token = str(refresh_token or "").strip()
+        self._tianyi_session_key = str(session_key or "").strip()
+        self._update_plugin_config()
+
+    def _on_alipan_token_update(
+            self, access_token: str, refresh_token: str
+    ) -> None:
+        self._alipan_access_token = str(access_token or "").strip()
+        self._alipan_refresh_token = str(refresh_token or "").strip()
+        self._update_plugin_config()
+
+    def _register_alipan_provider(self) -> None:
+        """注册阿里云盘，并允许空凭证实例提供扫码入口。"""
+        if self._alipan_drive:
+            self._alipan_drive.close()
+        self._alipan_drive = AliPanDrive(AliPanClient(
+            access_token=self._alipan_access_token,
+            refresh_token=self._alipan_refresh_token,
+            timeout=self._alipan_request_timeout,
+            on_token_refresh=self._on_alipan_token_update,
+        ))
+        self._cloud_drive_registry.register(
+            create_alipan_provider(self._alipan_drive), replace=True
+        )
+        if self._cloud_drive_key == "alipan":
+            self._cloud_drive = self._cloud_drive_registry.get("alipan")
 
     def _on_hdhive_token_update(self, tokens: Dict[str, Any]):
         """Token 刷新后写回来源文件，并同步插件配置。"""
@@ -1234,12 +1437,14 @@ class CloudSubscribe(_PluginBase):
             seedhub_client=self._seedhub_client,
             butailing_client=self._butailing_client,
             juying_client=self._juying_client,
+            pinglian_client=self._pinglian_client,
             pansou_enabled=self._pansou_enabled,
             hdhive_enabled=self._hdhive_enabled,
             dian115_enabled=self._dian115_enabled,
             seedhub_enabled=self._seedhub_enabled,
             butailing_enabled=self._butailing_enabled,
             juying_enabled=self._juying_enabled,
+            pinglian_enabled=self._pinglian_enabled,
             hdhive_query_mode=self._hdhive_query_mode,
             hdhive_auto_unlock=self._hdhive_auto_unlock,
             hdhive_max_unlock_points=self._hdhive_max_unlock_points,
@@ -1264,6 +1469,7 @@ class CloudSubscribe(_PluginBase):
             seedhub_result_limit=self._seedhub_result_limit,
             butailing_result_limit=self._butailing_result_limit,
             juying_result_limit=self._juying_result_limit,
+            pinglian_result_limit=self._pinglian_result_limit,
             search_source_order=self._search_source_order,
             search_cache_enabled=self._search_cache_enabled,
             search_cache_ttl_minutes=self._search_cache_ttl_minutes,
@@ -1290,7 +1496,19 @@ class CloudSubscribe(_PluginBase):
             subscribe_handler=self._subscribe_handler,
             chain=self.chain,
             cloud_transfer_path=self._cloud_transfer_path,
+            cloud_media_root=self._cloud_media_path,
+            cloud_transfer_paths={
+                "115": self._p115_transfer_path,
+                "123": self._p123_transfer_path,
+                "quark": self._quark_transfer_path,
+                "guangya": self._guangya_transfer_path,
+                "tianyi": self._tianyi_transfer_path,
+                "alipan": self._alipan_transfer_path,
+            },
             max_transfer_per_sync=self._max_transfer_per_sync,
+            cross_transfer_enabled=self._cross_transfer_enabled,
+            cloud_drive_registry=self._cloud_drive_registry,
+            cross_transfer_manager=self._cross_transfer_manager,
             batch_size=self._batch_size,
             skip_other_season_dirs=self._skip_other_season_dirs,
             notify=self._notify,
@@ -1321,6 +1539,7 @@ class CloudSubscribe(_PluginBase):
             offline_pending_changed=self._update_offline_monitor,
             file_finalized=self._on_file_finalized,
             task_update=self._update_sync_task,
+            task_context=self._current_task_context,
         )
         self._sync_handler.reconcile_orphaned_history()
 
@@ -1369,15 +1588,20 @@ class CloudSubscribe(_PluginBase):
             "guangya_client_id": self._guangya_client_id,
             "guangya_device_id": self._guangya_device_id,
             "guangya_request_timeout": self._guangya_request_timeout,
+            "tianyi_cookie": self._tianyi_cookie,
+            "tianyi_access_token": self._tianyi_access_token,
+            "tianyi_refresh_token": self._tianyi_refresh_token,
+            "tianyi_request_timeout": self._tianyi_request_timeout,
+            "alipan_access_token": self._alipan_access_token,
+            "alipan_refresh_token": self._alipan_refresh_token,
+            "alipan_request_timeout": self._alipan_request_timeout,
             "cloud_drive": self._cloud_drive_key,
-            "pansou_enabled": self._pansou_enabled,
             "pansou_url": self._pansou_url,
             "pansou_username": self._pansou_username,
             "pansou_password": self._pansou_password,
             "pansou_auth_enabled": self._pansou_auth_enabled,
             "pansou_channels": self._pansou_channels,
             "pansou_plugins": self._pansou_plugins,
-            "pansou_cloud_types": self._pansou_cloud_types,
             "pansou_filter_include": self._pansou_filter_include,
             "pansou_filter_exclude": self._pansou_filter_exclude,
             "resource_type_order": self._resource_type_order,
@@ -1386,18 +1610,19 @@ class CloudSubscribe(_PluginBase):
             "pansou_result_limit": self._pansou_result_limit,
             "pansou_refresh": self._pansou_refresh,
             "pansou_timeout": self._pansou_timeout,
-            "seedhub_enabled": self._seedhub_enabled,
             "seedhub_result_limit": self._seedhub_result_limit,
-            "butailing_enabled": self._butailing_enabled,
             "butailing_result_limit": self._butailing_result_limit,
-            "juying_enabled": self._juying_enabled,
             "juying_username": self._juying_username,
             "juying_password": self._juying_password,
             "juying_result_limit": self._juying_result_limit,
             "juying_request_interval": self._juying_request_interval,
             "juying_unlocks_per_minute": self._juying_unlocks_per_minute,
+            "pinglian_username": self._pinglian_username,
+            "pinglian_password": self._pinglian_password,
+            "pinglian_result_limit": self._pinglian_result_limit,
+            "pinglian_request_interval": self._pinglian_request_interval,
+            "pinglian_timeout": self._pinglian_timeout,
             # HDHive 配置
-            "hdhive_enabled": self._hdhive_enabled,
             "hdhive_query_mode": self._hdhive_query_mode,
             "hdhive_api_key": self._hdhive_api_key,
             "hdhive_client_id": self._hdhive_client_id,
@@ -1414,7 +1639,6 @@ class CloudSubscribe(_PluginBase):
             "hdhive_username": self._hdhive_username,
             "hdhive_password": self._hdhive_password,
             # Dian115 配置
-            "dian115_enabled": self._dian115_enabled,
             "dian115_email": self._dian115_email,
             "dian115_password": self._dian115_password,
             "dian115_auto_unlock": self._dian115_auto_unlock,
@@ -1445,6 +1669,9 @@ class CloudSubscribe(_PluginBase):
             "block_end_time": self._block_end_time,
             "upgrade_subscribe_ids": self._upgrade_subscribe_ids,
             "max_transfer_per_sync": self._max_transfer_per_sync,
+            "cross_transfer_enabled": self._cross_transfer_enabled,
+            "cross_transfer_download_path": self._cross_transfer_download_path,
+            "cross_transfer_download_threads": self._cross_transfer_download_threads,
             "subscription_concurrency": self._subscription_concurrency,
             "batch_size": self._batch_size,
             "skip_other_season_dirs": self._skip_other_season_dirs,
@@ -1456,6 +1683,14 @@ class CloudSubscribe(_PluginBase):
             "p123_transfer_path": self._p123_transfer_path,
             "quark_transfer_path": self._quark_transfer_path,
             "guangya_transfer_path": self._guangya_transfer_path,
+            "tianyi_transfer_path": self._tianyi_transfer_path,
+            "alipan_transfer_path": self._alipan_transfer_path,
+            "cloud_media_path": self._p115_media_path,
+            "p123_media_path": self._p123_media_path,
+            "quark_media_path": self._quark_media_path,
+            "guangya_media_path": self._guangya_media_path,
+            "tianyi_media_path": self._tianyi_media_path,
+            "alipan_media_path": self._alipan_media_path,
             "strm_generate_enabled": self._strm_generate_enabled,
             "nfo_scrape_enabled": self._nfo_scrape_enabled,
             "image_scrape_enabled": self._image_scrape_enabled,
@@ -1467,7 +1702,6 @@ class CloudSubscribe(_PluginBase):
             "media_server_refresh_delay": self._media_server_refresh_delay,
             "emby_mediainfo_enabled": self._emby_mediainfo_enabled,
             "platform_media_sync_enabled": self._platform_media_sync_enabled,
-            "media_library_webhook_key": self._media_library_webhook_key,
             "platform_transfer_history_enabled": self._platform_transfer_history_enabled,
             "timeout_enabled": self._timeout_enabled,
             "timeout_default_connect": self._timeout_default_connect,
@@ -1533,6 +1767,15 @@ class CloudSubscribe(_PluginBase):
                 self._guangya_drive.close()
         except Exception as error:
             logger.debug(f"关闭光鸭客户端失败：{error}")
+        for drive, name in (
+                (self._tianyi_drive, "天翼"),
+                (self._alipan_drive, "阿里云盘"),
+        ):
+            try:
+                if drive:
+                    drive.close()
+            except Exception as error:
+                logger.debug(f"关闭{name}客户端失败：{error}")
         try:
             components = self.__dict__.get("_plugin_components", {})
             platform_service = components.pop(PlatformIntegrationService, None)

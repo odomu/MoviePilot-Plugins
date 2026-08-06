@@ -122,7 +122,7 @@
                   :upgrading-key="upgradingHistoryKey"
                   @refresh="loadPage"
                   @clear="openClearHistory"
-                  @retry="retryHistory"
+                  @retry="confirmRetryHistory"
                   @delete="confirmDeleteHistory"
                   @delete-groups="confirmDeleteGroups"
                   @selection-change="updateHistorySelection"
@@ -137,12 +137,13 @@
       </v-card-text>
     </v-card>
     <OfflineTasksDialog
-        v-if="offlineSupported"
+        v-if="offlineSupported && offlineVisible"
         v-model="offlineVisible"
         :api="api"
         @updated="loadPage(false)"
     />
     <ManualResourceDialog
+        v-if="manualVisible"
         v-model="manualVisible"
         :api="api"
         :active="active"
@@ -175,6 +176,22 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+    <v-dialog v-model="retryVisible" max-width="440" persistent>
+      <v-card rounded="lg">
+        <v-card-title class="text-subtitle-1">恢复历史任务</v-card-title>
+        <v-card-text>
+          确认恢复“{{ historyUpgradeLabel(retryingRecord ? {records: [retryingRecord]} : null) }}”的转存任务？
+          <v-alert type="info" variant="tonal" density="compact" class="mt-3">
+            将重新检查目标文件、本地缓存和原分享，必要时重新执行跨盘转存及后处理。
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer/>
+          <v-btn variant="text" :disabled="Boolean(retryingHistoryKey)" @click="retryVisible = false">取消</v-btn>
+          <v-btn color="primary" :loading="Boolean(retryingHistoryKey)" @click="retryHistory">确认恢复</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
     <v-dialog v-model="upgradeVisible" max-width="440" persistent>
       <v-card rounded="lg">
         <v-card-title class="text-subtitle-1">确认历史洗版</v-card-title>
@@ -202,6 +219,7 @@
       </v-card>
     </v-dialog>
     <StopTasksDialog
+        v-if="stopVisible"
         v-model="stopVisible"
         :task="stoppingTask"
         :task-count="stoppableTaskCount"
@@ -260,6 +278,7 @@
       </v-card>
     </v-dialog>
     <CacheClearDialog
+        v-if="cacheVisible"
         v-model="cacheVisible"
         :loading="clearingCache"
         @confirm="clearCache"
@@ -341,15 +360,24 @@
 </template>
 
 <script setup>
-import {computed, ref} from "vue";
-import OfflineTasksDialog from "./dialogs/OfflineTasksDialog.vue";
-import ManualResourceDialog from "./dialogs/ManualResourceDialog.vue";
-import StopTasksDialog from "./dialogs/StopTasksDialog.vue";
+import {computed, defineAsyncComponent, ref} from "vue";
 import RuntimeCard from "./dashboard/RuntimeCard.vue";
-import StatsGrid from "./dashboard/StatsGrid.vue";
 import HistoryTable from "./dashboard/HistoryTable.vue";
-import CacheClearDialog from "./dialogs/CacheClearDialog.vue";
+import StatsGrid from "./dashboard/StatsGrid.vue";
 import {usePageData} from "../composables/usePageData.js";
+
+const CacheClearDialog = defineAsyncComponent(
+    () => import("./dialogs/CacheClearDialog.vue"),
+);
+const ManualResourceDialog = defineAsyncComponent(
+    () => import("./dialogs/ManualResourceDialog.vue"),
+);
+const OfflineTasksDialog = defineAsyncComponent(
+    () => import("./dialogs/OfflineTasksDialog.vue"),
+);
+const StopTasksDialog = defineAsyncComponent(
+    () => import("./dialogs/StopTasksDialog.vue"),
+);
 
 const props = defineProps({
   api: {type: [Object, Function], required: true},
@@ -373,6 +401,8 @@ const message = ref(""),
     cacheVisible = ref(false),
     clearingCache = ref(false),
     retryingHistoryKey = ref(""),
+    retryVisible = ref(false),
+    retryingRecord = ref(null),
     deleteVisible = ref(false),
     deletingRecord = ref(null),
     deletingRecords = ref([]),
@@ -569,7 +599,14 @@ async function clearCache(categories) {
   }
 }
 
-async function retryHistory(record) {
+function confirmRetryHistory(record) {
+  retryingRecord.value = record;
+  retryVisible.value = true;
+}
+
+async function retryHistory() {
+  const record = retryingRecord.value;
+  if (!record || retryingHistoryKey.value) return;
   retryingHistoryKey.value = [
     record.time,
     record.share_url,
@@ -583,6 +620,8 @@ async function retryHistory(record) {
     });
     if (!result?.success) throw new Error(result?.message || "重试失败");
     await loadPage(false);
+    retryVisible.value = false;
+    retryingRecord.value = null;
   } catch (error) {
     notify(error.message || "重试失败", "error");
   } finally {

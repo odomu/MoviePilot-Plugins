@@ -1,15 +1,18 @@
 {
   "CloudSubscribe": {
     "name": "网盘订阅助手",
-    "description": "按网盘能力搜索、推荐并同步 MoviePilot 订阅缺失内容。",
+    "description": "按网盘能力搜索、推荐并同步订阅缺失内容。",
     "labels": "订阅,网盘,115,STRM,智能体",
-    "version": "1.0.3",
+    "version": "1.0.6",
     "icon": "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "odomu",
     "level": 1,
     "release": true,
     "system_version": ">=2.14.6",
     "history": {
+      "v1.0.6": "支持跨网盘转存文件，支持跨网盘秒传和进度显示，优化历史列表显示",
+      "v1.0.5": "新增阿里云盘、天翼云盘支持，完善分享解析逻辑",
+      "v1.0.4": "优化前端加载速度，优化媒体库通知",
       "v1.0.3": "支持媒体库通知，优化离线任务状态判断，优化风控逻辑，优化清理缓存",
       "v1.0.2": "支持网盘PT洗版，修复hdhive webapi",
       "v1.0.1": "优化订阅接管配置和文档说明",

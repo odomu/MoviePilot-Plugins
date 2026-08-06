@@ -79,6 +79,24 @@
                   </v-chip-group>
                 </div>
                 <div class="history-filter-group">
+                  <span class="history-filter-label">任务类型</span>
+                  <v-chip-group
+                      v-model="selectedTaskTypes"
+                      multiple
+                      selected-class="text-primary"
+                  >
+                    <v-chip
+                        v-for="option in taskTypeOptions"
+                        :key="option.value"
+                        :value="option.value"
+                        size="small"
+                        variant="tonal"
+                        filter
+                    >{{ option.title }}
+                    </v-chip>
+                  </v-chip-group>
+                </div>
+                <div class="history-filter-group">
                   <span class="history-filter-label">状态</span>
                   <v-chip-group
                       v-model="selectedStatuses"
@@ -148,7 +166,7 @@
         <v-btn
             class="delete-selected-button"
             color="error"
-            variant="tonal"
+            variant="text"
             size="small"
             :disabled="!deletableSelectedGroups.length"
             :loading="deletingKey === 'batch'"
@@ -367,6 +385,20 @@
                         variant="tonal"
                     >
                       洗版
+                      <v-tooltip activator="parent" location="top">
+                        {{ record.upgrade_version_info }}
+                      </v-tooltip>
+                    </v-chip>
+                    <v-chip
+                        v-if="record.is_cross_transfer"
+                        size="x-small"
+                        color="info"
+                        variant="tonal"
+                    >
+                      跨盘
+                      <v-tooltip activator="parent" location="top">
+                        {{ record.cross_transfer_title }}
+                      </v-tooltip>
                     </v-chip>
                   </div>
                   <div class="text-caption text-medium-emphasis file-name">
@@ -608,9 +640,23 @@
                       size="x-small"
                       color="warning"
                       variant="tonal"
-                  >洗版
-                  </v-chip
                   >
+                    洗版
+                    <v-tooltip activator="parent" location="top">
+                      {{ record.upgrade_version_info }}
+                    </v-tooltip>
+                  </v-chip>
+                  <v-chip
+                      v-if="record.is_cross_transfer"
+                      size="x-small"
+                      color="info"
+                      variant="tonal"
+                  >
+                    跨盘
+                    <v-tooltip activator="parent" location="top">
+                      {{ record.cross_transfer_title }}
+                    </v-tooltip>
+                  </v-chip>
                   <v-chip
                       :color="statusColor(record.status)"
                       size="x-small"
@@ -724,6 +770,7 @@ const isMobile = computed(() => display.xs.value);
 const keyword = ref("");
 const selectedResourceTypes = ref([]);
 const selectedSources = ref([]);
+const selectedTaskTypes = ref([]);
 const selectedStatuses = ref([]);
 const expanded = ref([]);
 const selectedGroupKeys = ref([]);
@@ -739,6 +786,10 @@ const sourceNames = {
   unknown: "未知",
 };
 const statusOptions = ["处理中", "下载中", "成功", "失败"];
+const taskTypeOptions = [
+  {title: "跨盘", value: "cross_transfer"},
+  {title: "洗版", value: "upgrade"},
+];
 const pageSizes = [
   {value: 10, title: "10"},
   {value: 20, title: "20"},
@@ -779,6 +830,13 @@ const filteredRecords = computed(() => {
     )
       return false;
     if (selectedSources.value.length && !selectedSources.value.includes(source))
+      return false;
+    if (
+        selectedTaskTypes.value.length &&
+        !selectedTaskTypes.value.some((value) =>
+            (item.task_types || []).includes(value),
+        )
+    )
       return false;
     if (
         selectedStatuses.value.length &&
@@ -875,6 +933,7 @@ const activeFilterCount = computed(
     () =>
         selectedResourceTypes.value.length +
         selectedSources.value.length +
+        selectedTaskTypes.value.length +
         selectedStatuses.value.length,
 );
 const mobileTotalPages = computed(() =>
@@ -898,7 +957,7 @@ const groupedItemKeys = computed(
 );
 
 watch(
-    [keyword, selectedResourceTypes, selectedSources, selectedStatuses],
+    [keyword, selectedResourceTypes, selectedSources, selectedTaskTypes, selectedStatuses],
     () => {
       mobilePage.value = 1;
       expanded.value = [];
@@ -993,6 +1052,9 @@ function resourceTypeLabel(value) {
     "123": "123网盘",
     quark: "夸克网盘",
     guangya: "光鸭网盘",
+    tianyi: "天翼云盘",
+    alipan: "阿里云盘",
+    aliyun: "阿里云盘",
     ed2k: "ED2K",
     magnet: "Magnet",
   }[normalized] || normalized.toUpperCase();
@@ -1167,22 +1229,16 @@ function deleteSelected() {
 function clearFilters() {
   selectedResourceTypes.value = [];
   selectedSources.value = [];
+  selectedTaskTypes.value = [];
   selectedStatuses.value = [];
 }
 
 function canRetryRecord(record) {
-  if (!record?.share_url) return false;
-  if (record.status === "失败") return true;
-  return (
-      record.status === "成功" &&
-      record.source_file_name &&
-      record.source_file_name === record.file_name
-  );
+  return Boolean(record?.can_retry);
 }
 
 function retryTitle(record) {
-  if (!canRetryRecord(record)) return "当前记录无需重试";
-  return record.status === "失败" ? "重试此记录" : "修复此记录";
+  return record?.retry_title || "当前记录无需重试";
 }
 
 function canDeleteRecord(record) {
@@ -1618,6 +1674,7 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
 .history-mobile-record-footer {
   display: flex;
   align-items: flex-end;
+  flex-wrap: wrap;
   min-width: 0;
   gap: 8px;
 }

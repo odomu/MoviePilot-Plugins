@@ -10,6 +10,7 @@ const outputDir = resolve(
 );
 
 export default defineConfig({
+    base: "./",
     plugins: [
         vue(),
         federation({

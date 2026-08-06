@@ -69,7 +69,7 @@ class SubscribeHandler:
     ):
         """
         :param exclude_subscribes: 排除的订阅ID列表（is_excluded_func 未提供时使用）
-        :param notification_type: MoviePilot 消息通知类型
+        :param notification_type:消息通知类型
         :param is_excluded_func: 订阅过滤判断函数，支持排除/指定两种模式
         """
         self._exclude_subscribes = exclude_subscribes or []
@@ -175,7 +175,7 @@ class SubscribeHandler:
             success_episodes: List[int]
     ):
         """
-        合并订阅进度；完成时调用 MoviePilot 官方订阅链迁移。
+        合并订阅进度；完成时调用官方订阅链迁移。
         """
         with self._progress_lock:
             try:

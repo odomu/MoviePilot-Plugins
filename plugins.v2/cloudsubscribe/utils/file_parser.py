@@ -9,7 +9,7 @@ class MediaFileParser:
     """文件结构和命名解析"""
 
     VIDEO_EXTENSIONS = {
-        ".mkv", ".mp4", ".avi", ".rmvb", ".wmv", ".flv", ".ts", ".m2ts"
+        ".mkv", ".mp4", ".iso"
     }
     _SXEX_PATTERN = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
     _SEASON_EPISODE_PATTERN = re.compile(r"[Ss](\d{1,2})[Ee]")

@@ -1,5 +1,3 @@
-import {enabled} from "../helpers.js";
-
 export function createPansouGroups(options = {}) {
     return [
         {
@@ -8,30 +6,22 @@ export function createPansouGroups(options = {}) {
             icon: "mdi-server-network",
             fields: [
                 {
-                    key: "pansou_enabled",
-                    label: "启用 PanSou",
-                    type: "switch",
-                    cols: 4,
-                },
-                {
                     key: "pansou_url",
                     label: "服务地址",
                     cols: 8,
-                    show: enabled("pansou_enabled"),
                 },
                 {
                     key: "pansou_auth_enabled",
                     label: "启用身份认证",
                     type: "switch",
                     cols: 4,
-                    show: enabled("pansou_enabled"),
                 },
                 {
                     key: "pansou_username",
                     label: "用户名",
                     cols: 4,
                     show: (config) =>
-                        config.pansou_enabled && config.pansou_auth_enabled,
+                        config.pansou_auth_enabled,
                 },
                 {
                     key: "pansou_password",
@@ -39,7 +29,7 @@ export function createPansouGroups(options = {}) {
                     type: "password",
                     cols: 4,
                     show: (config) =>
-                        config.pansou_enabled && config.pansou_auth_enabled,
+                        config.pansou_auth_enabled,
                 },
                 {
                     key: "test_pansou",
@@ -47,7 +37,6 @@ export function createPansouGroups(options = {}) {
                     type: "test-source",
                     source: "pansou",
                     cols: 12,
-                    show: enabled("pansou_enabled"),
                 },
             ],
         },
@@ -58,7 +47,6 @@ export function createPansouGroups(options = {}) {
             hint: options.status === "ok"
                 ? `服务可用：${options.channels?.length || 0} 个频道，${options.plugins?.length || 0} 个插件`
                 : options.error || "保存连接配置后读取可选范围",
-            show: enabled("pansou_enabled"),
             fields: [
                 {
                     key: "pansou_channels",
@@ -66,7 +54,7 @@ export function createPansouGroups(options = {}) {
                     type: "select",
                     items: options.channels || [],
                     multiple: true,
-                    cols: 12,
+                    cols: 4,
                 },
                 {
                     key: "pansou_plugins",
@@ -74,15 +62,7 @@ export function createPansouGroups(options = {}) {
                     type: "select",
                     items: options.plugins || [],
                     multiple: true,
-                    cols: 6,
-                },
-                {
-                    key: "pansou_cloud_types",
-                    label: "返回网盘类型",
-                    type: "select",
-                    items: options.cloud_types || [],
-                    multiple: true,
-                    cols: 6,
+                    cols: 4,
                 },
             ],
         },
@@ -90,7 +70,6 @@ export function createPansouGroups(options = {}) {
             tab: "pansou",
             title: "过滤与性能",
             icon: "mdi-filter-cog-outline",
-            show: enabled("pansou_enabled"),
             fields: [
                 {
                     key: "pansou_filter_include",
