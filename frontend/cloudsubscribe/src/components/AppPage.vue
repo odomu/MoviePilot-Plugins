@@ -125,7 +125,7 @@
               @stop-task="confirmStopTask"
           />
         </div>
-        <div v-show="mainTab === 'history'" class="workspace-pane history-pane">
+        <div v-if="mainTab === 'history'" class="workspace-pane history-pane">
           <HistoryTable
               :items="sortedHistory"
               :emby-play-items="embyPlayItems"
@@ -136,7 +136,7 @@
               :upgrading-key="upgradingHistoryKey"
               @refresh="loadPage"
               @clear="openClearHistory"
-              @retry="retryHistory"
+              @retry="confirmRetryHistory"
               @delete="confirmDeleteHistory"
               @delete-groups="confirmDeleteGroups"
               @selection-change="updateHistorySelection"
@@ -150,12 +150,13 @@
     </section>
 
     <OfflineTasksDialog
-        v-if="offlineSupported"
+        v-if="offlineSupported && offlineVisible"
         v-model="offlineVisible"
         :api="api"
         @updated="loadPage(false)"
     />
     <ManualResourceDialog
+        v-if="manualVisible"
         v-model="manualVisible"
         :api="api"
         :plugin-id="pluginId"
@@ -189,6 +190,22 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+    <v-dialog v-model="retryVisible" max-width="440" persistent>
+      <v-card rounded="lg">
+        <v-card-title class="text-subtitle-1">恢复历史任务</v-card-title>
+        <v-card-text>
+          确认恢复“{{ historyUpgradeLabel(retryingRecord ? {records: [retryingRecord]} : null) }}”的转存任务？
+          <v-alert type="info" variant="tonal" density="compact" class="mt-3">
+            将重新检查目标文件、本地缓存和原分享，必要时重新执行跨盘转存及后处理。
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer/>
+          <v-btn variant="text" :disabled="Boolean(retryingHistoryKey)" @click="retryVisible = false">取消</v-btn>
+          <v-btn color="primary" :loading="Boolean(retryingHistoryKey)" @click="retryHistory">确认恢复</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
     <v-dialog v-model="upgradeVisible" max-width="440" persistent>
       <v-card rounded="lg">
         <v-card-title class="text-subtitle-1">确认历史洗版</v-card-title>
@@ -216,6 +233,7 @@
       </v-card>
     </v-dialog>
     <StopTasksDialog
+        v-if="stopVisible"
         v-model="stopVisible"
         :task="stoppingTask"
         :task-count="stoppableTaskCount"
@@ -263,6 +281,7 @@
     </v-dialog>
 
     <CacheClearDialog
+        v-if="cacheVisible"
         v-model="cacheVisible"
         :loading="clearingCache"
         @confirm="clearCache"
@@ -351,16 +370,27 @@
 </template>
 
 <script setup>
-import {computed, inject, ref} from "vue";
+import {computed, defineAsyncComponent, inject, ref} from "vue";
 import {useDisplay} from "vuetify";
-import Config from "./Config.vue";
-import HistoryTable from "./dashboard/HistoryTable.vue";
-import CacheClearDialog from "./dialogs/CacheClearDialog.vue";
 import RuntimeCard from "./dashboard/RuntimeCard.vue";
-import ManualResourceDialog from "./dialogs/ManualResourceDialog.vue";
-import OfflineTasksDialog from "./dialogs/OfflineTasksDialog.vue";
-import StopTasksDialog from "./dialogs/StopTasksDialog.vue";
 import {usePageData} from "../composables/usePageData.js";
+
+const Config = defineAsyncComponent(() => import("./Config.vue"));
+const HistoryTable = defineAsyncComponent(
+    () => import("./dashboard/HistoryTable.vue"),
+);
+const CacheClearDialog = defineAsyncComponent(
+    () => import("./dialogs/CacheClearDialog.vue"),
+);
+const ManualResourceDialog = defineAsyncComponent(
+    () => import("./dialogs/ManualResourceDialog.vue"),
+);
+const OfflineTasksDialog = defineAsyncComponent(
+    () => import("./dialogs/OfflineTasksDialog.vue"),
+);
+const StopTasksDialog = defineAsyncComponent(
+    () => import("./dialogs/StopTasksDialog.vue"),
+);
 
 const props = defineProps({
   api: {type: Object, default: () => ({})},
@@ -392,6 +422,8 @@ const forceClearHistory = ref(false);
 const cacheVisible = ref(false);
 const clearingCache = ref(false);
 const retryingHistoryKey = ref("");
+const retryVisible = ref(false);
+const retryingRecord = ref(null);
 const deleteVisible = ref(false);
 const deletingRecord = ref(null);
 const deletingRecords = ref([]);
@@ -442,6 +474,7 @@ const {
   upgradeHistory: upgradeHistoryRequest,
   clearCache: clearCacheRequest,
 } = usePageData(api, notify, props.pluginId);
+
 
 const activeTaskCount = computed(
     () =>
@@ -621,7 +654,14 @@ function historyKey(record) {
   return [record.time, record.share_url, record.file_name].join("|");
 }
 
-async function retryHistory(record) {
+function confirmRetryHistory(record) {
+  retryingRecord.value = record;
+  retryVisible.value = true;
+}
+
+async function retryHistory() {
+  const record = retryingRecord.value;
+  if (!record || retryingHistoryKey.value) return;
   retryingHistoryKey.value = historyKey(record);
   try {
     const result = await api.post(`plugin/${props.pluginId}/history/retry`, {
@@ -631,6 +671,8 @@ async function retryHistory(record) {
     });
     if (!result?.success) throw new Error(result?.message || "重试失败");
     await loadPage(false);
+    retryVisible.value = false;
+    retryingRecord.value = null;
     notify(result.message || "已重新提交处理");
   } catch (e) {
     notify(e.message || "重试失败", "error");

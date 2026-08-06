@@ -52,10 +52,6 @@ class ConfigApi(OwnerDelegator):
             payload = await request.json()
             if not isinstance(payload, dict):
                 return {"success": False, "message": "配置数据格式错误"}
-            # 固定 Key 只能通过专用刷新接口轮换，忽略客户端提交值。
-            payload["media_library_webhook_key"] = str(
-                self._media_library_webhook_key or ""
-            ).strip()
             self.update_config(payload)
             clear_ui_options_cache()
             clear_account_cache()
