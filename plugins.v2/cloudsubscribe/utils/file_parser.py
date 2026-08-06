@@ -8,9 +8,7 @@ from typing import Any, Iterator, Optional, Tuple
 class MediaFileParser:
     """文件结构和命名解析"""
 
-    VIDEO_EXTENSIONS = {
-        ".mkv", ".mp4", ".iso"
-    }
+    VIDEO_EXTENSIONS = {".mkv", ".mp4", "avi", ".iso"}
     _SXEX_PATTERN = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})")
     _SEASON_EPISODE_PATTERN = re.compile(r"[Ss](\d{1,2})[Ee]")
     _CN_SEASON_PATTERN = re.compile(r"第\s*(\d{1,2})\s*季")

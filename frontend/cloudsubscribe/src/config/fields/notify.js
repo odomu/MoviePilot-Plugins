@@ -62,7 +62,14 @@ export function createNotifySection(options) {
                         key: "platform_media_sync_enabled",
                         label: "接收媒体库通知",
                         type: "switch",
-                        cols: 12,
+                        cols: 6,
+                    },
+                    {
+                        key: "platform_deep_delete_enabled",
+                        label: "神医深度删除联动",
+                        type: "switch",
+                        hint: "收到神医 deep.delete 通知后，精确匹配并删除网盘文件、STRM和插件历史；不会删除订阅。",
+                        cols: 6,
                     },
                     {
                         key: "media_library_webhook_urls",

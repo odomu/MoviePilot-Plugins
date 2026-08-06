@@ -94,7 +94,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -335,6 +335,7 @@ class CloudSubscribe(_PluginBase):
     _media_server_refresh_delay: int = 0
     _emby_mediainfo_enabled: bool = False
     _platform_media_sync_enabled: bool = False
+    _platform_deep_delete_enabled: bool = False
     _platform_transfer_history_enabled: bool = False
     _timeout_enabled: bool = True
     _timeout_default_connect: float = 30
@@ -429,6 +430,8 @@ class CloudSubscribe(_PluginBase):
     @staticmethod
     def _config_cloud_path(value: Any) -> str:
         path = str(value or "/").strip()
+        if "://" in path:
+            return "/"
         return f"/{path.strip('/')}" if path.strip("/") else "/"
 
     def init_plugin(self, config: dict = None):
@@ -485,6 +488,7 @@ class CloudSubscribe(_PluginBase):
             "media_server_refresh_delay",
             "emby_mediainfo_enabled",
             "platform_media_sync_enabled",
+            "platform_deep_delete_enabled",
         }
         if not reset_runtime and self._applied_config:
             changed_keys = {
@@ -900,6 +904,9 @@ class CloudSubscribe(_PluginBase):
             self._platform_media_sync_enabled = bool(
                 config.get("platform_media_sync_enabled", False)
             )
+            self._platform_deep_delete_enabled = bool(
+                config.get("platform_deep_delete_enabled", False)
+            )
             self._platform_transfer_history_enabled = bool(
                 config.get("platform_transfer_history_enabled", False)
             )
@@ -1002,6 +1009,9 @@ class CloudSubscribe(_PluginBase):
         )
         self._platform_media_sync_enabled = bool(
             config.get("platform_media_sync_enabled", False)
+        )
+        self._platform_deep_delete_enabled = bool(
+            config.get("platform_deep_delete_enabled", False)
         )
         if self._subscribe_handler:
             self._subscribe_handler._notify = self._notify
@@ -1702,6 +1712,7 @@ class CloudSubscribe(_PluginBase):
             "media_server_refresh_delay": self._media_server_refresh_delay,
             "emby_mediainfo_enabled": self._emby_mediainfo_enabled,
             "platform_media_sync_enabled": self._platform_media_sync_enabled,
+            "platform_deep_delete_enabled": self._platform_deep_delete_enabled,
             "platform_transfer_history_enabled": self._platform_transfer_history_enabled,
             "timeout_enabled": self._timeout_enabled,
             "timeout_default_connect": self._timeout_default_connect,

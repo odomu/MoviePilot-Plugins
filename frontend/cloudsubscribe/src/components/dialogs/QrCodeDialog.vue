@@ -122,13 +122,17 @@ const providerMeta = {
   tianyi: {name: "天翼云盘", hint: "请使用小翼管家、支付宝或天翼云盘 App 扫描二维码"},
 };
 const channels = [
-  {title: "支付宝", value: "alipaymini"},
-  {title: "微信", value: "wechatmini"},
-  {title: "安卓", value: "115android"},
-  {title: "iOS", value: "115ios"},
   {title: "网页", value: "web"},
-  {title: "PAD", value: "115ipad"},
   {title: "TV", value: "tv"},
+  {title: "苹果", value: "115ios"},
+  {title: "安卓", value: "115android"},
+  {title: "ipad", value: "115ipad"},
+  {title: "Windows", value: "os_windows"},
+  {title: "MacOS", value: "os_mac"},
+  {title: "Linux", value: "os_linux"},
+  {title: "微信", value: "wechatmini"},
+  {title: "支付宝", value: "alipaymini"},
+  {title: "鸿蒙", value: "harmony"},
 ];
 const providerName = computed(
     () => providerMeta[props.provider]?.name || "网盘",

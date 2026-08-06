@@ -6,8 +6,10 @@ import hashlib
 import threading
 from base64 import b64encode
 from inspect import signature as inspect_signature
+from io import BytesIO
 from typing import Optional, List, Dict, Any, Callable
 
+import qrcode
 from app.core.cache import TTLCache
 from app.log import logger
 
@@ -23,9 +25,10 @@ from ...utils import DEFAULT_METADATA_URL_TEMPLATE
 try:
     from p115client import P115Client, check_response
     from p115client.const import APP_TO_SSOENT
-    P115_AVAILABLE = True
+
+    PAVAILABLE = True
 except ImportError:
-    P115_AVAILABLE = False
+    PAVAILABLE = False
     logger.warning("p115client 未安装，115网盘功能不可用，请安装: pip install p115client")
 
 IOS_USER_AGENT = (
@@ -45,7 +48,7 @@ def _accepts_extra_kwargs(func: Callable) -> bool:
         return False
 
 
-class P115ClientWithTimeout(P115Client if P115_AVAILABLE else object):
+class P115ClientWithTimeout(P115Client if PAVAILABLE else object):
     """参考 p115disk，为 p115client API 统一注入连接和读取超时。"""
 
     SLOW_METHODS = {
@@ -117,13 +120,17 @@ class P115ClientManager:
     OFFLINE_TASK_CACHE_TTL = 600  # 115 离线任务接口最短刷新间隔（秒）
 
     QR_CLIENT_TYPES = {
-        "alipaymini": "支付宝",
-        "wechatmini": "微信",
-        "115android": "安卓",
-        "115ios": "iOS",
         "web": "网页",
-        "115ipad": "PAD",
         "tv": "TV",
+        "115ios": "苹果",
+        "115android": "安卓",
+        "115ipad": "平板",
+        "os_windows": "Windows",
+        "os_mac": "macOS",
+        "os_linux": "Linux",
+        "wechatmini": "微信",
+        "alipaymini": "支付宝",
+        "harmony": "鸿蒙",
     }
 
     def _get_component(self, component_type):
@@ -142,7 +149,7 @@ class P115ClientManager:
     @classmethod
     def create_qrcode_login(cls, client_type: str = "alipaymini") -> Dict[str, Any]:
         """创建指定渠道的115扫码登录会话。"""
-        if not P115_AVAILABLE:
+        if not PAVAILABLE:
             raise RuntimeError("p115client 未安装")
         final_client_type = cls.normalize_qrcode_client_type(client_type)
         response = P115Client.login_qrcode_token()
@@ -153,16 +160,23 @@ class P115ClientManager:
         sign = str(data.get("sign") or "")
         if not uid or not qrcode_time or not sign:
             raise RuntimeError("115返回的二维码登录参数不完整")
-        image = P115Client.login_qrcode(uid)
-        if not isinstance(image, (bytes, bytearray)):
-            raise RuntimeError("115返回的二维码图片格式无效")
+        # login_qrcode 图片接口因客户端渠道变化而返回 405 或非图片内容。
+        qrcode_content = str(data.get("qrcode") or "").strip()
+        if not qrcode_content:
+            qrcode_content = f"https://115.com/scan/dg-{uid}"
+        image = qrcode.make(qrcode_content)
+        output = BytesIO()
+        image.save(output, format="PNG")
         return {
             "uid": uid,
             "time": qrcode_time,
             "sign": sign,
             "client_type": final_client_type,
             "channel_name": cls.QR_CLIENT_TYPES[final_client_type],
-            "qrcode": f"data:image/png;base64,{b64encode(image).decode('ascii')}",
+            "qrcode": (
+                "data:image/png;base64,"
+                f"{b64encode(output.getvalue()).decode('ascii')}"
+            ),
         }
 
     @classmethod
@@ -174,7 +188,7 @@ class P115ClientManager:
             client_type: str = "alipaymini",
     ) -> Dict[str, Any]:
         """检查扫码状态，确认后返回对应渠道 Cookie。"""
-        if not P115_AVAILABLE:
+        if not PAVAILABLE:
             raise RuntimeError("p115client 未安装")
         if not uid or not qrcode_time or not sign:
             raise ValueError("二维码登录参数不完整")
@@ -259,7 +273,7 @@ class P115ClientManager:
         _path_cache_ttl = path_cache_ttl if path_cache_ttl is not None else self.DEFAULT_PATH_CACHE_TTL
         self.path_cache = PathCache(
             default_ttl=_path_cache_ttl,
-            region=f"cloudsubscribe:p115_paths:{cache_scope}",
+            region=f"cloudsubscribe:ppaths:{cache_scope}",
         )
         # 根目录始终缓存
         self.path_cache.set("/", 0)
@@ -309,7 +323,7 @@ class P115ClientManager:
         )
         self._account_info_lock = threading.Lock()
 
-        if P115_AVAILABLE and cookies:
+        if PAVAILABLE and cookies:
             try:
                 if timeout_enabled and default_timeout is None:
                     default_timeout = {

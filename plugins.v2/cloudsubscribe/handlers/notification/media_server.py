@@ -4,12 +4,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from threading import RLock, Timer
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
 from app.chain.mediaserver import MediaServerChain
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.schemas import MediaInfo, RefreshMediaItem
+from app.schemas.types import MediaType
 from app.utils.http import RequestUtils
 
 
@@ -283,8 +285,37 @@ class MediaServerNotifier:
         translated = f"{server_root}/{relative}" if relative else server_root
         return Path(translated)
 
-    def notify(self, path: Path, mediainfo: MediaInfo, file_name: str = "") -> bool:
-        if not self.enabled:
+    def media_server_path(self, moviepilot_path: Path) -> Path:
+        """将 MoviePilot 可访问路径转换为媒体服务器路径。"""
+        return self._media_server_path(moviepilot_path)
+
+    def notify_deleted_path(self, path: Path, record: Dict[str, Any]) -> bool:
+        """按已删除历史记录的路径刷新媒体服务器目录。"""
+        try:
+            media_type = MediaType(str(record.get("type") or ""))
+        except ValueError:
+            media_type = None
+        media_info = SimpleNamespace(
+            title=str(record.get("title") or record.get("file_name") or ""),
+            year=record.get("year"),
+            type=media_type,
+            category=record.get("category"),
+        )
+        return self.notify(
+            path,
+            media_info,
+            file_name=str(record.get("file_name") or ""),
+            force=True,
+        )
+
+    def notify(
+            self,
+            path: Path,
+            mediainfo: MediaInfo,
+            file_name: str = "",
+            force: bool = False,
+    ) -> bool:
+        if not self.enabled and not force:
             return True
         if not self.mediaservers:
             logger.warning("入库通知已启用，但尚未选择媒体服务器")

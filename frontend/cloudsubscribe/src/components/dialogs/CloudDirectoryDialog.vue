@@ -205,6 +205,9 @@ watch(
     (value) => {
       if (value) {
         currentPath.value = String(props.initialPath || "/").trim() || "/";
+        // 弹窗组件通常保持挂载，首次打开时请求缓存的初始路径也必须执行。
+        // 清掉上次请求标记，避免 loadDirectories 将首次加载误判为重复请求。
+        lastRequestedPath.value = "";
         loadDirectories(currentPath.value);
       }
     },

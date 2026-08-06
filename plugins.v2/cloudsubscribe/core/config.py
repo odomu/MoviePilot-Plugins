@@ -56,6 +56,7 @@ class UIConfig:
             "media_server_refresh_delay": 0,
             "emby_mediainfo_enabled": False,
             "platform_media_sync_enabled": False,
+            "platform_deep_delete_enabled": False,
             "platform_transfer_history_enabled": False,
             "timeout_enabled": True,
             "timeout_default_connect": 30,

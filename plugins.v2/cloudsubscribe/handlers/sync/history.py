@@ -1752,8 +1752,11 @@ class HistoryService(OwnerDelegator):
                 linked_result = None
                 if delete_linked_files:
                     linked_result = self._delete_history_linked_files(deleted)
+                    self._refresh_deleted_media([deleted])
                 deleted["cache_deleted"] = self._delete_history_cache(deleted)
                 history.pop(index)
+                if delete_linked_files:
+                    self._refresh_deleted_subscribe_notes([deleted], history)
                 self._save_data("history", history)
                 if linked_result:
                     deleted["linked_delete"] = linked_result
@@ -1825,6 +1828,7 @@ class HistoryService(OwnerDelegator):
 
             if delete_linked_files and deletable_records:
                 self._delete_history_linked_files_batch(deletable_records)
+                self._refresh_deleted_media(deletable_records)
                 linked_deleted = len(deletable_records)
 
             cache_deleted = sum(
@@ -1838,6 +1842,10 @@ class HistoryService(OwnerDelegator):
                     for index, record in enumerate(history)
                     if index not in deleted_indexes
                 ]
+                if delete_linked_files and deletable_records:
+                    self._refresh_deleted_subscribe_notes(
+                        deletable_records, history
+                    )
                 self._save_data("history", history)
 
         if pending_removed:
@@ -1851,6 +1859,130 @@ class HistoryService(OwnerDelegator):
             "cache_deleted": cache_deleted,
             "skipped": skipped,
         }
+
+    def _refresh_deleted_media(self, records: List[Dict[str, Any]]) -> None:
+        """删除关联文件后，按受影响 STRM 路径刷新媒体库。"""
+        for record in records:
+            cloud_dir = str(record.get("cloud_dir") or "").strip()
+            file_name = str(record.get("file_name") or "").strip()
+            if not cloud_dir or not file_name or not self._local_resource_path:
+                continue
+            try:
+                local_path = self._path_mapper.local_path(
+                    local_root=self._local_resource_path,
+                    cloud_root=self._CLOUD_MEDIA_ROOT,
+                    cloud_dir=cloud_dir,
+                    file_name=file_name,
+                )
+                self._media_server_notifier.notify_deleted_path(local_path, record)
+            except Exception as error:
+                logger.warning(
+                    f"删除历史后刷新媒体库失败：{file_name} - {error}"
+                )
+
+    @staticmethod
+    def _history_episodes(record: Dict[str, Any]) -> Set[int]:
+        values = record.get("episodes") or record.get("notification_episodes")
+        if values is None:
+            values = [record.get("episode")]
+        return {
+            int(value) for value in values
+            if str(value or "").isdigit() and int(value) > 0
+        }
+
+    def _refresh_deleted_subscribe_notes(
+            self,
+            deleted_records: List[Dict[str, Any]],
+            remaining_history: List[Dict[str, Any]],
+    ) -> None:
+        """按删除后的剩余历史修正电视剧订阅 note 和缺集数。"""
+        targets: Dict[Tuple[str, int], Set[int]] = {}
+        for record in deleted_records:
+            tmdb_id = str(record.get("tmdb_id") or "").strip()
+            season = int(record.get("season") or 0)
+            episodes = self._history_episodes(record)
+            if tmdb_id and season > 0 and episodes:
+                targets.setdefault((tmdb_id, season), set()).update(episodes)
+        if not targets:
+            return
+        for (tmdb_id, season), deleted_episodes in targets.items():
+            remaining_episodes = {
+                episode
+                for record in remaining_history
+                if str(record.get("tmdb_id") or "").strip() == tmdb_id
+                   and int(record.get("season") or 0) == season
+                   and str(record.get("status") or "") == "成功"
+                for episode in self._history_episodes(record)
+            }
+            for subscribe in SubscribeOper().list_by_tmdbid(int(tmdb_id), season) or []:
+                if str(getattr(subscribe, "type", "")) != MediaType.TV.value:
+                    continue
+                current_note = {
+                    int(value) for value in (getattr(subscribe, "note", None) or [])
+                    if str(value).isdigit()
+                }
+                new_note = sorted(
+                    (current_note - deleted_episodes) | remaining_episodes
+                )
+                if new_note == sorted(current_note):
+                    continue
+                start = int(getattr(subscribe, "start_episode", 1) or 1)
+                total = int(getattr(subscribe, "total_episode", 0) or 0)
+                expected = max(0, total - start + 1)
+                lack = len(set(range(start, total + 1)) - set(new_note)) if expected else 0
+                SubscribeOper().update(
+                    subscribe.id,
+                    {"note": new_note, "lack_episode": lack},
+                )
+                logger.info(
+                    f"历史删除后更新订阅 note：{subscribe.name}，"
+                    f"{sorted(current_note)} -> {new_note}"
+                )
+
+    def delete_by_media_server_paths(self, paths: List[str]) -> Dict[str, int]:
+        """按媒体服务器 STRM 路径精确匹配并联动删除终态历史。"""
+        normalized_paths = set()
+        for path in paths:
+            normalized = self._normalize_media_server_path(path)
+            if normalized:
+                normalized_paths.add(normalized)
+        if not normalized_paths or not self._get_data:
+            return {"matched": 0, "deleted": 0, "linked_deleted": 0,
+                    "cache_deleted": 0, "skipped": 0}
+        matched = []
+        for record in self._get_data("history") or []:
+            cloud_dir = str(record.get("cloud_dir") or "").strip()
+            file_name = str(record.get("file_name") or "").strip()
+            if not cloud_dir or not file_name or not self._local_resource_path:
+                continue
+            try:
+                local_path = self._path_mapper.local_path(
+                    local_root=self._local_resource_path,
+                    cloud_root=self._CLOUD_MEDIA_ROOT,
+                    cloud_dir=cloud_dir,
+                    file_name=file_name,
+                )
+                media_server_path = self._media_server_notifier.media_server_path(
+                    local_path
+                )
+            except Exception as error:
+                logger.debug(f"计算深度删除匹配路径失败：{file_name} - {error}")
+                continue
+            if self._normalize_media_server_path(media_server_path) in normalized_paths:
+                matched.append(record)
+        if not matched:
+            return {"matched": 0, "deleted": 0, "linked_deleted": 0,
+                    "cache_deleted": 0, "skipped": 0}
+        result = self.delete_history_records(matched, delete_linked_files=True)
+        return {"matched": len(matched), **result}
+
+    @staticmethod
+    def _normalize_media_server_path(path: Any) -> str:
+        """标准化用于精确比较的媒体服务器路径。"""
+        value = str(path or "").strip().replace("\\", "/")
+        while "//" in value:
+            value = value.replace("//", "/")
+        return value.rstrip("/")
 
     def _delete_history_cache(self, record: Dict[str, Any]) -> int:
         if not self._cross_transfer_manager:

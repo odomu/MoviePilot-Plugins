@@ -23,10 +23,14 @@ class MediaLibraryApi(OwnerDelegator):
 
     def handle_platform_media_webhook(self, event_info: Any) -> bool:
         """消费已鉴权并标准化的媒体服务器 Webhook 事件。"""
-        if not self._platform_media_sync_enabled or not event_info:
+        if not event_info:
             return False
         event_name = str(getattr(event_info, "event", "") or "").strip().lower()
         channel = str(getattr(event_info, "channel", "") or "").strip().lower()
+        if channel == "emby" and event_name == "deep.delete":
+            return self._handle_platform_deep_delete(event_info)
+        if not self._platform_media_sync_enabled:
+            return False
         server_name = str(
             getattr(event_info, "server_name", "") or ""
         ).strip()
@@ -50,6 +54,70 @@ class MediaLibraryApi(OwnerDelegator):
                 f"已接收平台 Emby Webhook：{server_name} - {event_name}"
             )
         return scheduled
+
+    def _handle_platform_deep_delete(self, event_info: Any) -> bool:
+        """按神医通知中的媒体服务器路径精确删除关联内容。"""
+        if not self._platform_deep_delete_enabled:
+            return False
+        if not self._sync_handler:
+            logger.warning("神医深度删除联动失败：同步处理器未初始化")
+            return False
+        paths = self._deep_delete_paths(event_info)
+        if not paths:
+            logger.warning("神医深度删除通知缺少 Item Path，已跳过")
+            return False
+        result = self._sync_handler.delete_by_media_server_paths(paths)
+        if not result["matched"]:
+            logger.warning(
+                f"神医深度删除未匹配插件历史：{', '.join(paths)}"
+            )
+            return False
+        logger.info(
+            f"神医深度删除联动完成：路径={len(paths)} 个，"
+            f"匹配={result['matched']} 条，删除={result['deleted']} 条，"
+            f"跳过={result['skipped']} 条"
+        )
+        return result["deleted"] > 0
+
+    @classmethod
+    def _deep_delete_paths(cls, event_info: Any) -> list[str]:
+        """合并标准路径与神医 Description 中的多版本路径。"""
+        paths = [str(getattr(event_info, "item_path", "") or "").strip()]
+        payload = getattr(event_info, "json_object", None) or {}
+        description = str(payload.get("Description") or "")
+        in_path_section = False
+        for raw_line in description.splitlines():
+            line = raw_line.strip()
+            if "Item Path:" in line:
+                in_path_section = True
+                _, _, inline_path = line.partition(":")
+                paths.append(inline_path.strip())
+                continue
+            if not in_path_section:
+                continue
+            if any(marker in line for marker in (
+                    "Mount Paths:", "Item Name:", "Description:", "Other Info:"
+            )):
+                in_path_section = False
+                continue
+            if line and not line.startswith(("http://", "https://")):
+                paths.append(line)
+        normalized = []
+        seen = set()
+        for path in paths:
+            value = cls._normalize_media_path(path)
+            if value and value not in seen:
+                seen.add(value)
+                normalized.append(value)
+        return normalized
+
+    @staticmethod
+    def _normalize_media_path(path: str) -> str:
+        """统一神医与媒体服务器通知中的路径分隔符。"""
+        value = str(path or "").strip().replace("\\", "/")
+        while "//" in value:
+            value = value.replace("//", "/")
+        return value.rstrip("/")
 
     def _schedule_platform_media_sync(self, server_name: str) -> bool:
         """仅由有效 Emby Webhook 触发，并按媒体服务器合并短时重复事件。"""

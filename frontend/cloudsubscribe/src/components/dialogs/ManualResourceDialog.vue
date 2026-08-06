@@ -771,6 +771,7 @@ watch(
         confirmVisible.value = false;
       }
     },
+    {immediate: true},
 );
 </script>
 

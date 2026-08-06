@@ -96,8 +96,7 @@
           />
         </v-sheet>
         <div class="text-caption text-medium-emphasis mb-3">
-          最近检查：{{ updatedText }} · 下载按 1、3、5、10 分钟递增检查，30
-          分钟未完成则失败；已下载文件最多等待系统处理24小时
+          最近检查：{{ updatedText }} · 已下载文件最多等待系统处理24小时
         </div>
 
         <v-alert
@@ -242,7 +241,7 @@
 </template>
 
 <script setup>
-import {computed, ref, watch} from "vue";
+import {computed, onBeforeUnmount, ref, watch} from "vue";
 
 const props = defineProps({
   modelValue: Boolean,
@@ -264,6 +263,7 @@ const selectedKeys = ref([]);
 const retrying = ref(false);
 const retryingKey = ref("");
 const batchDeleting = ref(false);
+let refreshTimer = null;
 
 const updatedText = computed(() =>
     updatedAt.value
@@ -393,6 +393,19 @@ async function refreshAll() {
   await load(true);
 }
 
+function startAutoRefresh() {
+  if (refreshTimer !== null) return;
+  refreshTimer = window.setInterval(() => {
+    if (props.modelValue && !loading.value) load(false);
+  }, 30000);
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer === null) return;
+  window.clearInterval(refreshTimer);
+  refreshTimer = null;
+}
+
 async function retryTasks(pendingKeys) {
   const keys = [...new Set((pendingKeys || []).filter(Boolean))];
   if (!keys.length) return;
@@ -490,8 +503,18 @@ async function deleteTask() {
 
 watch(
     () => props.modelValue,
-    (value) => value && refreshAll(),
+    (value) => {
+      if (value) {
+        refreshAll();
+        startAutoRefresh();
+      } else {
+        stopAutoRefresh();
+      }
+    },
+    {immediate: true},
 );
+
+onBeforeUnmount(stopAutoRefresh);
 </script>
 
 <style scoped>

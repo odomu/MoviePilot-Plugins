@@ -250,6 +250,9 @@ class P115FileService(OwnerDelegator):
         if not self.client:
             return False, -1
         normalized = str(path or "").replace("\\", "/")
+        if "://" in normalized:
+            logger.warning(f"115目录路径不能是URL，已跳过目录解析：{normalized}")
+            return False, -1
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
         normalized = normalized.rstrip("/")

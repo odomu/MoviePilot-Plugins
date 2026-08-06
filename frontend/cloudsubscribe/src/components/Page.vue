@@ -137,13 +137,14 @@
       </v-card-text>
     </v-card>
     <OfflineTasksDialog
-        v-if="offlineSupported && offlineVisible"
+        v-if="offlineSupported"
+        v-show="offlineVisible"
         v-model="offlineVisible"
         :api="api"
         @updated="loadPage(false)"
     />
     <ManualResourceDialog
-        v-if="manualVisible"
+        v-show="manualVisible"
         v-model="manualVisible"
         :api="api"
         :active="active"

@@ -770,13 +770,20 @@ class SyncExecutionService(OwnerDelegator):
         logger.info(f"网盘订阅同步完成，共转存 {transferred_count} 个文件")
         pending_finalize_count = 0
         if self._sync_handler:
-            pending_finalize_count = len(
-                self._sync_handler.get_pending_finalize_tasks()
+            pending_finalize_tasks = self._sync_handler.get_pending_finalize_tasks()
+            pending_finalize_count = len(pending_finalize_tasks)
+            offline_pending_count = sum(
+                str(item.get("task_type") or "share").strip().lower()
+                in {"ed2k", "magnet"}
+                for item in pending_finalize_tasks
             )
+            cloud_pending_count = pending_finalize_count - offline_pending_count
             self._sync_context["pending_finalize"] = pending_finalize_count
+            self._sync_context["offline_pending"] = offline_pending_count
+            self._sync_context["cloud_pending"] = cloud_pending_count
             if pending_finalize_count:
                 logger.info(
-                    f"本次仍有 {pending_finalize_count} 个离线文件等待真实下载完成，"
+                    f"本次仍有 {pending_finalize_count} 个文件等待网盘文件就绪，"
                     "暂不发送完成确认"
                 )
         if self._sync_handler:
@@ -1003,9 +1010,21 @@ class SyncExecutionService(OwnerDelegator):
                 elif not success:
                     message = "订阅搜索执行失败"
                 elif transferred and run_context.get("pending_finalize"):
+                    pending_count = int(run_context["pending_finalize"] or 0)
+                    offline_count = int(run_context.get("offline_pending") or 0)
+                    cloud_count = int(run_context.get("cloud_pending") or 0)
+                    if offline_count and cloud_count:
+                        pending_text = (
+                            f"其中 {offline_count} 个离线文件等待下载、"
+                            f"{cloud_count} 个网盘文件等待就绪，"
+                        )
+                    elif offline_count:
+                        pending_text = f"其中 {offline_count} 个离线文件等待下载，"
+                    else:
+                        pending_text = f"其中 {pending_count} 个网盘文件等待就绪，"
                     message = (
                         f"订阅搜索已提交 {transferred} 个文件，"
-                        f"其中 {run_context['pending_finalize']} 个仍在下载，"
+                        f"{pending_text}"
                         "完成后将再通知"
                     )
                 elif transferred:

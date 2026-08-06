@@ -108,14 +108,14 @@
       </v-card-actions>
     </v-card>
     <QrCodeDialog
-        v-if="qrVisible"
+        v-show="qrVisible"
         v-model="qrVisible"
         :api="api"
         :provider="qrProvider"
         @success="handleQrSuccess"
     />
     <CloudDirectoryDialog
-        v-if="directoryVisible"
+        v-show="directoryVisible"
         v-model="directoryVisible"
         :api="api"
         :provider="directoryProvider"
