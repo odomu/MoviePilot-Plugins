@@ -94,7 +94,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -300,10 +300,14 @@ class CloudSubscribe(_PluginBase):
 
     _max_transfer_per_sync: int = 50
     _cross_transfer_enabled: bool = False
+    _cross_transfer_media_types: list = ["movie", "tv"]
     _cross_transfer_download_path: str = ""
     _cross_transfer_download_threads: int = 5
+    _cross_transfer_max_concurrent: int = 2
     _subscription_concurrency: int = 2
     _batch_size: int = 20
+    _batch_interval: float = 3
+    _transfer_risk_cooldown: int = 1800
     _skip_other_season_dirs: bool = True
 
     # 洗版配置
@@ -771,6 +775,13 @@ class CloudSubscribe(_PluginBase):
 
             self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
             self._cross_transfer_enabled = bool(config.get("cross_transfer_enabled", False))
+            raw_cross_types = config.get("cross_transfer_media_types", ["movie", "tv"])
+            if isinstance(raw_cross_types, str):
+                raw_cross_types = [value.strip().lower() for value in raw_cross_types.split(",")]
+            self._cross_transfer_media_types = [
+                                                   value for value in (raw_cross_types or []) if
+                                                   value in {"movie", "tv"}
+                                               ] or ["movie", "tv"]
             self._cross_transfer_download_path = str(
                 config.get("cross_transfer_download_path", "") or ""
             ).strip()
@@ -781,10 +792,16 @@ class CloudSubscribe(_PluginBase):
                     10,
                 ),
             )
+            self._cross_transfer_max_concurrent = max(1,
+                                                      min(int(config.get("cross_transfer_max_concurrent", 2) or 2), 10))
             self._subscription_concurrency = max(
                 1, min(int(config.get("subscription_concurrency", 2) or 2), 5)
             )
             self._batch_size = int(config.get("batch_size", 20) or 20)
+            self._batch_interval = max(0, min(float(config.get("batch_interval", 3) or 0), 60))
+            self._transfer_risk_cooldown = max(
+                60, min(int(config.get("transfer_risk_cooldown", 1800) or 1800), 86400)
+            )
             self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
 
             if self._search_source_order:
@@ -1145,6 +1162,7 @@ class CloudSubscribe(_PluginBase):
             self._cloud_drive_registry.get,
             download_path=self._cross_transfer_download_path,
             download_threads=self._cross_transfer_download_threads,
+            max_concurrent=self._cross_transfer_max_concurrent,
         )
 
         try:
@@ -1236,6 +1254,7 @@ class CloudSubscribe(_PluginBase):
             on_cookie_refresh=self._on_quark_cookie_update,
             timeout=self._quark_request_timeout,
         )
+        client.risk_cooldown = self._transfer_risk_cooldown
         self._quark_drive = QuarkDrive(client=client)
         if self._cloud_drive_registry is None:
             self._cloud_drive_registry = CloudDriveRegistry()
@@ -1517,9 +1536,12 @@ class CloudSubscribe(_PluginBase):
             },
             max_transfer_per_sync=self._max_transfer_per_sync,
             cross_transfer_enabled=self._cross_transfer_enabled,
+            cross_transfer_media_types=self._cross_transfer_media_types,
             cloud_drive_registry=self._cloud_drive_registry,
             cross_transfer_manager=self._cross_transfer_manager,
             batch_size=self._batch_size,
+            batch_interval=self._batch_interval,
+            transfer_risk_cooldown=self._transfer_risk_cooldown,
             skip_other_season_dirs=self._skip_other_season_dirs,
             notify=self._notify,
             notification_type=self._notification_type,
@@ -1680,10 +1702,14 @@ class CloudSubscribe(_PluginBase):
             "upgrade_subscribe_ids": self._upgrade_subscribe_ids,
             "max_transfer_per_sync": self._max_transfer_per_sync,
             "cross_transfer_enabled": self._cross_transfer_enabled,
+            "cross_transfer_media_types": self._cross_transfer_media_types,
             "cross_transfer_download_path": self._cross_transfer_download_path,
             "cross_transfer_download_threads": self._cross_transfer_download_threads,
+            "cross_transfer_max_concurrent": self._cross_transfer_max_concurrent,
             "subscription_concurrency": self._subscription_concurrency,
             "batch_size": self._batch_size,
+            "batch_interval": self._batch_interval,
+            "transfer_risk_cooldown": self._transfer_risk_cooldown,
             "skip_other_season_dirs": self._skip_other_season_dirs,
             "enable_cloud_upgrade": self._enable_cloud_upgrade,
             "enable_pt_upgrade": self._enable_pt_upgrade,

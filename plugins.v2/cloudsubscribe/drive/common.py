@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import PurePosixPath
-from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence
+from typing import Any, ClassVar, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from app.log import logger
 
@@ -43,6 +44,20 @@ def extract_list(data: Any, keys: Sequence[str]) -> list:
 
 def normalize_path(path: str) -> str:
     return str(PurePosixPath("/" + str(path or "/").lstrip("/")))
+
+
+def iter_transfer_batches(
+        values: Sequence[str], batch_size: int, batch_interval: float,
+        provider_limit: int,
+) -> Iterator[List[str]]:
+    """按公共风控节奏切分转存请求，并遵守网盘自身单批上限。"""
+    size = max(1, min(int(batch_size or 1), int(provider_limit or 1)))
+    interval = max(0.0, min(float(batch_interval or 0), 60.0))
+    normalized = list(dict.fromkeys(str(value) for value in values))
+    for offset in range(0, len(normalized), size):
+        if offset and interval:
+            time.sleep(interval)
+        yield normalized[offset:offset + size]
 
 
 class CloudDriveFileServiceBase:

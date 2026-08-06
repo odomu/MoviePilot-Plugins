@@ -42,9 +42,9 @@ export function createQuarkGroups(options) {
         },
         {
             tab: "quark",
-            title: "请求超时",
+            title: "请求与风控",
             icon: "mdi-timer-cog-outline",
-            hint: "作用于夸克网盘 HTTP 请求，范围 5-300 秒。",
+            hint: "夸克接口超时设置；分享转存风控使用“转存设置”中的公共配置。",
             fields: [
                 {
                     key: "quark_request_timeout",
@@ -52,7 +52,7 @@ export function createQuarkGroups(options) {
                     type: "number",
                     min: 5,
                     max: 300,
-                    cols: 6,
+                    cols: 12,
                 },
             ],
         },

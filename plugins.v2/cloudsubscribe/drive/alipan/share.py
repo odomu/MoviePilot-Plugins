@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+from threading import RLock
 from urllib.parse import parse_qs, urlsplit
 
+from app.core.cache import TTLCache
 from app.log import logger
 
+from ..common import iter_transfer_batches
 from ...core.cloud import ShareLinkStatus
 
 
@@ -18,6 +21,12 @@ class AliPanShareService:
         self.client = client
         self.files = files
         self._shares = {}
+        self._share_listing_cache = TTLCache(
+            region="cloudsubscribe:alipan:share_listings",
+            maxsize=1024,
+            ttl=10 * 60,
+        )
+        self._share_cache_lock = RLock()
 
     @staticmethod
     def extract_share_info(share_url: str) -> dict[str, str]:
@@ -61,6 +70,11 @@ class AliPanShareService:
         return info
 
     def _list(self, info: dict, parent_id: str = "root") -> list[dict]:
+        cache_key = f"{info['share_id']}|{parent_id}"
+        with self._share_cache_lock:
+            cached = self._share_listing_cache.get(cache_key)
+        if isinstance(cached, list):
+            return [dict(item) for item in cached]
         marker = ""
         result = []
         while True:
@@ -79,6 +93,10 @@ class AliPanShareService:
             result.extend(data.get("items") or [])
             marker = str(data.get("next_marker") or "")
             if not marker:
+                with self._share_cache_lock:
+                    self._share_listing_cache.set(
+                        cache_key, [dict(item) for item in result]
+                    )
                 return result
 
     def check_share_status(self, share_url: str) -> ShareLinkStatus:
@@ -176,9 +194,13 @@ class AliPanShareService:
             self, share_url: str, file_ids: list, save_path: str, **kwargs,
     ) -> tuple:
         succeeded, failed = [], []
-        for file_id in dict.fromkeys(str(value) for value in file_ids):
-            if self.transfer_file(share_url, file_id, save_path, ""):
-                succeeded.append(file_id)
-            else:
-                failed.append(file_id)
+        for batch in iter_transfer_batches(
+                file_ids, kwargs.get("batch_size", 20),
+                kwargs.get("batch_interval", 3), 20,
+        ):
+            for file_id in batch:
+                if self.transfer_file(share_url, file_id, save_path, ""):
+                    succeeded.append(file_id)
+                else:
+                    failed.append(file_id)
         return succeeded, failed

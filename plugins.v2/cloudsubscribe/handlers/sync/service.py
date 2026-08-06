@@ -8,7 +8,6 @@ import hashlib
 import re
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -95,9 +94,12 @@ class SyncHandler:
             cloud_transfer_paths: Optional[Mapping[str, str]] = None,
             max_transfer_per_sync: int = 50,
             cross_transfer_enabled: bool = False,
+            cross_transfer_media_types: Optional[List[str]] = None,
             cloud_drive_registry=None,
             cross_transfer_manager=None,
             batch_size: int = 20,
+            batch_interval: float = 3,
+            transfer_risk_cooldown: int = 1800,
             skip_other_season_dirs: bool = True,
             notify: bool = False,
             notification_type: NotificationType = NotificationType.Plugin,
@@ -162,6 +164,7 @@ class SyncHandler:
         """
         self._cloud_drive = cloud_drive
         self._cross_transfer_enabled = bool(cross_transfer_enabled)
+        self._cross_transfer_media_types = set(cross_transfer_media_types or ("movie", "tv"))
         self._cloud_drive_registry = cloud_drive_registry
         self._cross_transfer_manager = cross_transfer_manager
         self._cloud_auth = self._optional_cloud_service(
@@ -210,6 +213,12 @@ class SyncHandler:
             configured_batch_size,
             policy.max_batch_size if policy and policy.supports_batch else configured_batch_size,
         )
+        self._batch_interval = max(0.0, min(float(batch_interval or 0), 60.0))
+        self._transfer_risk_cooldown = max(
+            60, min(int(transfer_risk_cooldown or 1800), 86400)
+        )
+        self._share_transfer_risk_lock = threading.Lock()
+        self._share_transfer_blocked_until: Dict[str, float] = {}
         self._skip_other_season_dirs = skip_other_season_dirs
         self._notify = notify
         self._notification_type = notification_type
@@ -792,6 +801,30 @@ class SyncHandler:
                     f"{getattr(subscribe, 'name', '')} - {error}"
                 )
 
+        # 同步准备阶段可能早于平台搜索缓存建立；识别链是同一套平台
+        # 能力，但会按标题/年份直接返回唯一 MediaInfo，作为最后兜底。
+        if not tmdb_id:
+            try:
+                recognized = self._recognize_media_once(
+                    (
+                        "subscribe_tmdb_repair",
+                        media_type.value,
+                        getattr(subscribe, "name", ""),
+                        getattr(subscribe, "year", None),
+                    ),
+                    meta=meta,
+                    mtype=media_type,
+                    tmdbid=None,
+                    doubanid=getattr(subscribe, "doubanid", None),
+                    cache=True,
+                )
+                tmdb_id = self._tmdb_id_from_media(recognized)
+            except Exception as error:
+                logger.warning(
+                    f"订阅 TMDB ID 自动修复的媒体识别失败："
+                    f"{getattr(subscribe, 'name', '')} - {error}"
+                )
+
         if not tmdb_id:
             logger.debug(
                 f"订阅 TMDB ID 自动修复未找到唯一匹配："
@@ -960,6 +993,24 @@ class SyncHandler:
                 0, self._transfer_budget_used - max(0, int(count or 0))
             )
 
+    def _ensure_share_transfer_available(self, provider_key: str) -> None:
+        key = str(provider_key or "default").lower()
+        with self._share_transfer_risk_lock:
+            remaining = self._share_transfer_blocked_until.get(key, 0.0) - time.monotonic()
+        if remaining > 0:
+            raise RuntimeError(f"{key} 分享转存处于风控冷却期，剩余 {int(remaining)} 秒")
+
+    def _activate_share_transfer_cooldown(self, provider_key: str) -> None:
+        key = str(provider_key or "default").lower()
+        with self._share_transfer_risk_lock:
+            self._share_transfer_blocked_until[key] = max(
+                self._share_transfer_blocked_until.get(key, 0.0),
+                time.monotonic() + self._transfer_risk_cooldown,
+            )
+        logger.warning(
+            f"{key} 分享转存连续失败，冷却 {self._transfer_risk_cooldown} 秒"
+        )
+
     def _transfer_episode_items(
             self,
             matched_items: List[Dict[str, Any]],
@@ -998,17 +1049,23 @@ class SyncHandler:
             }
         try:
             source_provider = self._resource_provider_for_url(share_url)
+            provider_key = getattr(source_provider, "key", "") or getattr(
+                self._cloud_drive, "key", "default"
+            )
+            self._ensure_share_transfer_available(provider_key)
             cross_batch = bool(
                 self._cross_transfer_enabled and source_provider
                 and self._cloud_drive and source_provider.key != self._cloud_drive.key
             )
             if cross_batch:
                 parent_task_id, task_stop_event = self._current_task_context()
+                source_abort_event = threading.Event()
 
                 def batch_stop_requested() -> bool:
                     return bool(
                         global_vars.is_system_stopped
                         or self._stop_requested()
+                        or source_abort_event.is_set()
                         or (task_stop_event and task_stop_event.is_set())
                     )
 
@@ -1025,10 +1082,21 @@ class SyncHandler:
                             str(item["file"].get("sha1") or ""),
                             parent_task_id=parent_task_id,
                             stop_requested=batch_stop_requested,
+                            media_type=getattr(getattr(mediainfo, "type", None), "value", ""),
                         )
                     except Exception as error:
                         if batch_stop_requested():
                             return file_id, None
+                        error_text = str(error)
+                        if any(marker in error_text for marker in (
+                                "封禁转存", "风控", "未返回下载地址",
+                                "No space left on device", "磁盘可用空间不足",
+                        )):
+                            source_abort_event.set()
+                            logger.error(
+                                f"跨盘转存批次已熔断：{item['target_name']}，{error_text}"
+                            )
+                            return file_id, False
                         logger.error(
                             f"跨盘转存文件失败：{item['target_name']}，{error}"
                         )
@@ -1074,18 +1142,31 @@ class SyncHandler:
                 success_ids = [
                     file_id for file_id, success in outcomes.items() if success
                 ]
+                if outcomes and not success_ids and all(
+                        success is False for success in outcomes.values()
+                ):
+                    self._activate_share_transfer_cooldown(provider_key)
             else:
                 processed_items = selected_items
-                success_ids, _ = self._timed_sync_call(
+                success_ids, failed_ids = self._timed_sync_call(
                     "share_transfer",
                     self._share_transfer.transfer_files_batch,
                     share_url=share_url,
                     file_ids=file_ids,
                     save_path=self._cloud_transfer_path,
                     batch_size=self._batch_size,
+                    batch_interval=self._batch_interval,
+                    risk_cooldown=self._transfer_risk_cooldown,
                     rename_items=rename_items,
                 )
-        except Exception:
+                if failed_ids and not success_ids:
+                    self._activate_share_transfer_cooldown(provider_key)
+        except Exception as error:
+            message = str(error)
+            if any(marker in message.lower() for marker in (
+                    "风控", "封禁", "受限", "频繁", "rate limit", "too many", "429",
+            )):
+                self._activate_share_transfer_cooldown(locals().get("provider_key", "default"))
             self._release_transfer_slots(reserved)
             raise
 
@@ -2638,10 +2719,8 @@ class SyncHandler:
         base_path = self._cloud_transfer_paths.get(
             str(provider_key or "").strip().lower(), "/"
         )
-        return str(
-            PurePosixPath(base_path)
-            / uuid.uuid4().hex
-        )
+        # 直接复用已配置的转存目录，不为跨盘任务创建额外目录。
+        return str(PurePosixPath(base_path))
 
     @staticmethod
     def _cleanup_cross_transfer_staging(
@@ -2651,7 +2730,7 @@ class SyncHandler:
         if not source.supports(CloudDriveCapability.FILE_MUTATION):
             return
         mutation = source.require(CloudDriveCapability.FILE_MUTATION)
-        if source.supports(CloudDriveCapability.DIRECTORY_READ):
+        if staged_path and source.supports(CloudDriveCapability.DIRECTORY_READ):
             try:
                 lookup = source.require(
                     CloudDriveCapability.DIRECTORY_READ
@@ -2672,6 +2751,7 @@ class SyncHandler:
             target_name: str, source_sha1: str = "",
             parent_task_id: str = "",
             stop_requested: Optional[Callable[[], bool]] = None,
+            media_type: str = "",
     ) -> bool:
         should_stop = stop_requested or self._stop_requested
         source = self._resource_provider_for_url(share_url)
@@ -2679,6 +2759,9 @@ class SyncHandler:
             source and self._cloud_drive and source.key != self._cloud_drive.key
         )
         if cross_provider:
+            item_media_type = str(file_item.get("media_type") or media_type or "").strip().lower()
+            if item_media_type and item_media_type not in self._cross_transfer_media_types:
+                return False
             required = (
                     self._cross_transfer_enabled
                     and self._cross_transfer_manager
@@ -2706,10 +2789,10 @@ class SyncHandler:
                     target_name=file_item.get("name") or target_name,
                 )
             except Exception:
-                self._cleanup_cross_transfer_staging(source, staged_path)
+                self._cleanup_cross_transfer_staging(source, "")
                 raise
             if not staged:
-                self._cleanup_cross_transfer_staging(source, staged_path)
+                self._cleanup_cross_transfer_staging(source, "")
                 return False
             source_files = source.require(CloudDriveCapability.FILE_QUERY)
             staged_name = file_item.get("name") or target_name
@@ -2724,7 +2807,7 @@ class SyncHandler:
                     f"跨盘临时文件尚未可见：{source.name} "
                     f"{staged_path}/{staged_name}"
                 )
-                self._cleanup_cross_transfer_staging(source, staged_path)
+                self._cleanup_cross_transfer_staging(source, "")
                 return False
             if source_sha1 and not item.sha1:
                 item = CloudFile(item.id, item.name, False, item.size, source_sha1, item.md5, native=item.native)
@@ -2785,7 +2868,8 @@ class SyncHandler:
                         )
                 return success
             finally:
-                self._cleanup_cross_transfer_staging(source, staged_path, item)
+                # 只清理暂存文件，保留稳定目录供后续任务复用。
+                self._cleanup_cross_transfer_staging(source, "", item)
         service = source.require(CloudDriveCapability.SHARE_TRANSFER) if source else self._share_transfer
         return bool(service.transfer_file(
             share_url=share_url, file_id=file_item.get("id"),

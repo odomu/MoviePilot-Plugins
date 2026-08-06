@@ -10,6 +10,7 @@ from app.log import logger
 
 from .client import P123_AVAILABLE, is_success
 from .files import cloud_file
+from ..common import iter_transfer_batches
 from ...core.cloud import ShareLinkStatus
 
 try:
@@ -188,10 +189,11 @@ class P123ShareService:
             self, share_url: str, file_ids: list, save_path: str, **kwargs: Any
     ) -> tuple:
         normalized = list(dict.fromkeys(str(value) for value in file_ids))
-        batch_size = max(1, min(int(kwargs.get("batch_size", 20) or 20), 100))
         succeeded = []
         failed = []
-        for offset in range(0, len(normalized), batch_size):
-            batch = normalized[offset:offset + batch_size]
+        for batch in iter_transfer_batches(
+                normalized, kwargs.get("batch_size", 20),
+                kwargs.get("batch_interval", 3), 100,
+        ):
             (succeeded if self._copy(share_url, batch, save_path) else failed).extend(batch)
         return succeeded, failed

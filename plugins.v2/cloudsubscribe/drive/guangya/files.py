@@ -70,12 +70,32 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         )
 
     def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
-        response = self.client.request(
-            "POST", f"{self.client.API_BASE_URL}/userres/v1/get_res_download_url",
-            json_data={"fileId": file_item.id},
-        )
+        access_token = str(
+            file_item.playback_values.get("share_access_token") or ""
+        ).strip()
+        if access_token:
+            response = self.client.request(
+                "POST",
+                f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/get_share_download_url",
+                json_data={"fileId": file_item.id, "accessToken": access_token},
+                authenticated=False,
+            )
+        else:
+            response = self.client.request(
+                "POST",
+                f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/get_res_download_url",
+                json_data={"fileId": file_item.id},
+            )
         data = self.client.data(response) or {}
-        url = str(data.get("signedUrl") or data.get("downloadUrl") or "")
+        if not isinstance(data, dict):
+            data = {}
+        url = str(
+            data.get("signedUrl") or data.get("downloadUrl")
+            or data.get("url") or data.get("fileDownloadUrl") or ""
+        ).strip()
+        if not url:
+            message = str(response.get("msg") or response.get("message") or "")
+            raise RuntimeError(message or "光鸭未返回有效下载地址")
         return url, {}
 
     def _get_file_list(

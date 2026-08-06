@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Semaphore, Thread
 from typing import Callable, Optional
 
 import requests
@@ -426,12 +427,15 @@ class CrossTransferTaskManager:
     """本地中继任务管理器。"""
 
     ACTIVE = frozenset({"pending", "running", "stopping"})
+    _MIN_FREE_BYTES = 512 * 1024 * 1024
 
     def __init__(self, provider_resolver: Callable[[str], CloudDriveProvider],
-                 download_path: str = "", download_threads: int = 5):
+                 download_path: str = "", download_threads: int = 5,
+                 max_concurrent: int = 2):
         self._provider_resolver = provider_resolver
         self._download_path = str(download_path or "").strip()
         self._download_threads = max(1, min(int(download_threads or 5), 10))
+        self._transfer_slots = Semaphore(max(1, min(int(max_concurrent or 2), 10)))
         self._tasks: dict[str, dict] = {}
         self._lock = Lock()
 
@@ -609,6 +613,17 @@ class CrossTransferTaskManager:
         task_id = uuid.uuid4().hex
         now = time.time()
         total = int(source.stat().st_size) if source else int(source_file.size or 0)
+        cache_root = self._cache_root()
+        required = max(self._MIN_FREE_BYTES, int(total * 1.10))
+        try:
+            free_bytes = int(shutil.disk_usage(cache_root).free)
+        except OSError as error:
+            raise RuntimeError(f"无法检查中继磁盘空间：{error}") from error
+        if free_bytes < required:
+            raise RuntimeError(
+                f"中继磁盘可用空间不足：剩余 {free_bytes} 字节，"
+                f"至少需要 {required} 字节"
+            )
         task = {
             "id": f"cross:{task_id}", "task_kind": "cross_transfer",
             "parent_task_id": str(parent_task_id or ""),
@@ -887,9 +902,11 @@ class CrossTransferTaskManager:
         return CrossDriveTransferResult(item, "progressive") if item else None
 
     def _run(self, task_id: str, checksum: str) -> None:
+        self._transfer_slots.acquire()
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
+                self._transfer_slots.release()
                 return
             source_path = task["source_path"]
             stop_event = task["stop_event"]
@@ -1234,3 +1251,5 @@ class CrossTransferTaskManager:
                 self._delete_cache_path(Path(temporary_path))
             self._update(task_id, status="failed", phase="failed", message="跨盘传输失败",
                          error=str(error), speed_bytes_per_second=0.0, finished_at=time.time())
+        finally:
+            self._transfer_slots.release()

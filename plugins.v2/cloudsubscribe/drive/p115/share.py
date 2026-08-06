@@ -575,7 +575,7 @@ class ShareService(OwnerDelegator):
             logger.error(f"无法获取或创建目标目录: {save_path}")
             return success_ids, file_ids
 
-        page_size = self.SHARE_TRANSFER_PAGE_SIZE
+        page_size = max(1, min(batch_size, self.SHARE_TRANSFER_PAGE_SIZE))
         total_pages = (len(file_ids) + page_size - 1) // page_size
         logger.debug(
             f"115 批量转存：共 {len(file_ids)} 个文件，"
@@ -627,19 +627,12 @@ class ShareService(OwnerDelegator):
                     f"{len(recovered)} 个，仍失败 {len(page_ids) - len(verified_ids)} 个"
                 )
             else:
-                logger.warning(f"第 {page_num} 页批量转存失败，尝试逐个转存...")
-                for fid in page_ids:
-                    single_success = self._do_transfer(
-                        share_code=share_code,
-                        receive_code=receive_code,
-                        file_id=fid,
-                        parent_id=parent_id,
-                        save_path=save_path
-                    )
-                    if single_success is True:
-                        success_ids.append(fid)
-                    else:
-                        failed_ids.append(fid)
+                logger.warning(
+                    f"第 {page_num} 页批量转存失败，停止逐文件重试以避免放大风控"
+                )
+                failed_ids.extend(page_ids)
+            if page_index + len(page_ids) < len(file_ids) and batch_interval:
+                time.sleep(max(0.0, min(float(batch_interval), 60.0)))
         if rename_items and any(
                 str(item.get("target_name") or "").strip()
                 for item in rename_items.values()

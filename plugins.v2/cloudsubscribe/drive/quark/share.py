@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+import time
 from threading import RLock
 from typing import Any, Dict, Iterable
 
+from app.core.cache import TTLCache
 from app.log import logger
 
 from .files import cloud_file, list_data
@@ -21,8 +23,14 @@ class QuarkShareService:
         self.client = client
         self.page_size = files.page_size
         self._share_items: Dict[str, Dict[str, Dict[str, str]]] = {}
-        self._share_tokens: Dict[str, str] = {}
+        self._share_tokens = TTLCache(
+            region="cloudsubscribe:quark:share_tokens",
+            maxsize=256,
+            ttl=10 * 60,
+        )
         self._share_items_lock = RLock()
+        self._transfer_blocked_until = 0.0
+        self._transfer_block_reason = ""
 
     def _get_share_token(self, share_id: str, password: str = "") -> Dict[str, Any]:
         return self.client.request(
@@ -110,10 +118,17 @@ class QuarkShareService:
         info = self.extract_share_info(share_url)
         if not info:
             raise ValueError("无效的夸克分享链接")
+        cache_key = f"{info['share_id']}|{info['password']}"
+        with self._share_items_lock:
+            cached = self._share_tokens.get(cache_key)
+        if cached:
+            return info, str(cached)
         response = self._get_share_token(info["share_id"], info["password"])
         token = str((self.client.data(response) or {}).get("stoken") or "")
         if not self.client.is_success(response) or not token:
             raise RuntimeError(response.get("message") or "获取夸克分享令牌失败")
+        with self._share_items_lock:
+            self._share_tokens.set(cache_key, token)
         return info, token
 
     def check_share_status(self, share_url: str) -> ShareLinkStatus:
@@ -168,7 +183,9 @@ class QuarkShareService:
                     page += 1
             with self._share_items_lock:
                 self._share_items[info["share_id"]] = share_items
-                self._share_tokens[info["share_id"]] = token
+                self._share_tokens.set(
+                    f"{info['share_id']}|{info['password']}", token
+                )
             return result
         except Exception as error:
             logger.warning(f"读取夸克分享文件失败：{error}")
@@ -177,6 +194,11 @@ class QuarkShareService:
     def _save_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str
     ) -> bool:
+        if time.monotonic() < self._transfer_blocked_until:
+            logger.warning(
+                f"夸克转存已熔断，暂不重试：{self._transfer_block_reason}"
+            )
+            return False
         info = self.extract_share_info(share_url)
         if not info:
             raise ValueError("无效的夸克分享链接")
@@ -185,12 +207,16 @@ class QuarkShareService:
         if normalized:
             with self._share_items_lock:
                 cached = dict(self._share_items.get(info["share_id"], {}))
-                token = str(self._share_tokens.get(info["share_id"]) or "")
+                token = str(self._share_tokens.get(
+                    f"{info['share_id']}|{info['receive_code']}"
+                ) or "")
             if not token or not all(file_id in cached for file_id in normalized):
                 self.list_share_files(share_url)
                 with self._share_items_lock:
                     cached = dict(self._share_items.get(info["share_id"], {}))
-                    token = str(self._share_tokens.get(info["share_id"]) or "")
+                    token = str(self._share_tokens.get(
+                        f"{info['share_id']}|{info['receive_code']}"
+                    ) or "")
             file_tokens = [
                 str((cached.get(file_id) or {}).get("token") or "")
                 for file_id in normalized
@@ -215,10 +241,20 @@ class QuarkShareService:
                 and result.get("task_success", True) is not False
         )
         if not success:
+            message = str(result.get("message") or result.get("msg") or "")
+            if any(marker in message for marker in ("封禁", "风控", "限制", "频繁")):
+                self._transfer_block_reason = message or "账号转存受限"
+                self._transfer_blocked_until = time.monotonic() + max(
+                    300, int(getattr(self.client, "risk_cooldown", 1800))
+                )
             logger.error(
-                f"夸克分享转存失败：{result.get('message') or '异步任务未完成'}，"
+                f"夸克分享转存失败：{message or '异步任务未完成'}，"
                 f"文件数={len(normalized) or '全部'}，目录={save_path}"
             )
+            with self._share_items_lock:
+                self._share_tokens.pop(
+                    f"{info['share_id']}|{info['receive_code']}", None
+                )
         return success
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
@@ -234,8 +270,22 @@ class QuarkShareService:
             self, share_url: str, file_ids: list, save_path: str, **kwargs: Any
     ) -> tuple:
         normalized = [str(value) for value in file_ids]
-        return (
-            (normalized, [])
-            if self._save_share(share_url, normalized, save_path)
-            else ([], normalized)
+        batch_size = max(1, min(int(kwargs.get("batch_size", 5) or 5), 20))
+        interval = max(0.0, min(float(kwargs.get("batch_interval", 3) or 0), 60.0))
+        self.client.risk_cooldown = max(
+            60, min(int(kwargs.get("risk_cooldown", 1800) or 1800), 86400)
         )
+        succeeded = []
+        failed = []
+        for offset in range(0, len(normalized), batch_size):
+            batch = normalized[offset:offset + batch_size]
+            if self._save_share(share_url, batch, save_path):
+                succeeded.extend(batch)
+            else:
+                failed.extend(batch)
+                if time.monotonic() < self._transfer_blocked_until:
+                    failed.extend(normalized[offset + len(batch):])
+                    break
+            if offset + len(batch) < len(normalized):
+                time.sleep(interval)
+        return succeeded, failed

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import re
+from threading import RLock
 from typing import Any, Dict, Iterable
 from urllib.parse import parse_qs, urlsplit
 
+from app.core.cache import TTLCache
 from app.log import logger
 
 from .files import cloud_file, list_data
-from ..common import safe_int
+from ..common import iter_transfer_batches, safe_int
 from ...core.cloud import ShareLinkStatus
 
 
@@ -21,6 +23,12 @@ class GuangyaShareService:
         self._offline = offline_service
         self.client = client
         self.page_size = files.page_size
+        self._share_token_cache = TTLCache(
+            region="cloudsubscribe:guangya:share_tokens",
+            maxsize=256,
+            ttl=10 * 60,
+        )
+        self._share_token_lock = RLock()
 
     def _share_summary(self, share_id: str) -> Dict[str, Any]:
         return self.client.request(
@@ -101,6 +109,11 @@ class GuangyaShareService:
         info = self.extract_share_info(share_url)
         if not info:
             raise ValueError("无效的光鸭分享链接")
+        cache_key = f"{info['share_id']}|{info['password']}"
+        with self._share_token_lock:
+            cached = self._share_token_cache.get(cache_key)
+        if cached:
+            return info, str(cached)
         response = self._share_access_token(info["share_id"], info["password"])
         data = self.client.data(response)
         token = str(
@@ -108,6 +121,8 @@ class GuangyaShareService:
         ) if isinstance(data, dict) else ""
         if not self.client.is_success(response) or not token:
             raise RuntimeError(response.get("msg") or response.get("error") or "获取光鸭分享令牌失败")
+        with self._share_token_lock:
+            self._share_token_cache.set(cache_key, token)
         return info, token
 
     def check_share_status(self, share_url: str) -> ShareLinkStatus:
@@ -169,6 +184,7 @@ class GuangyaShareService:
                         if item.is_directory:
                             stack.append(item.id)
                         else:
+                            item.playback_values["share_access_token"] = token
                             result.append(dict(item))
                     if len(items) < self.page_size:
                         break
@@ -181,7 +197,7 @@ class GuangyaShareService:
     def _restore_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str
     ) -> bool:
-        _, token = self._share_access(share_url)
+        info, token = self._share_access(share_url)
         lookup = self._files.resolve_directory(save_path, create=True)
         if not lookup.checked or lookup.directory_id is None:
             return False
@@ -194,9 +210,14 @@ class GuangyaShareService:
             ]
         if not normalized:
             return False
-        return self.client.is_success(
-            self._restore(token, normalized, lookup.directory_id)
-        )
+        response = self._restore(token, normalized, lookup.directory_id)
+        success = self.client.is_success(response)
+        if not success:
+            with self._share_token_lock:
+                self._share_token_cache.pop(
+                    f"{info['share_id']}|{info['password']}", None
+                )
+        return success
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
         return self._restore_share(share_url, [], save_path)
@@ -222,8 +243,10 @@ class GuangyaShareService:
                 else []
             )
             return succeeded, [value for value in normalized if value not in succeeded]
-        return (
-            (normalized, [])
-            if self._restore_share(share_url, normalized, save_path)
-            else ([], normalized)
-        )
+        succeeded, failed = [], []
+        for batch in iter_transfer_batches(
+                normalized, kwargs.get("batch_size", 20),
+                kwargs.get("batch_interval", 3), 50,
+        ):
+            (succeeded if self._restore_share(share_url, batch, save_path) else failed).extend(batch)
+        return succeeded, failed

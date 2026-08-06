@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import re
 import time
+from threading import RLock
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from app.core.cache import TTLCache
 from app.log import logger
 
+from ..common import iter_transfer_batches
 from ...core.cloud import ShareLinkStatus
 
 
@@ -18,6 +21,12 @@ class TianyiShareService:
         self.client = client
         self.files = files
         self._share_items: dict[str, dict[str, dict[str, Any]]] = {}
+        self._share_info_cache = TTLCache(
+            region="cloudsubscribe:tianyi:share_info",
+            maxsize=256,
+            ttl=10 * 60,
+        )
+        self._share_cache_lock = RLock()
 
     @staticmethod
     def extract_share_info(share_url: str) -> dict[str, str]:
@@ -36,12 +45,20 @@ class TianyiShareService:
         parsed = self.extract_share_info(share_url)
         if not parsed:
             raise ValueError("无效的天翼分享链接")
+        cache_key = f"{parsed['share_code']}|{parsed['access_code']}"
+        with self._share_cache_lock:
+            cached = self._share_info_cache.get(cache_key)
+        if isinstance(cached, dict):
+            return dict(cached)
         result = self.client.request(
             "GET", "https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action",
             params={"shareCode": parsed["share_code"]},
         )
         data = result.get("data") if isinstance(result.get("data"), dict) else result
-        return {**parsed, **data}
+        info = {**parsed, **data}
+        with self._share_cache_lock:
+            self._share_info_cache.set(cache_key, info)
+        return dict(info)
 
     def check_share_status(self, share_url: str) -> ShareLinkStatus:
         status = ShareLinkStatus()
@@ -166,7 +183,10 @@ class TianyiShareService:
     def transfer_files_batch(
             self, share_url: str, file_ids: list, save_path: str, **kwargs,
     ) -> tuple:
-        ids = list(dict.fromkeys(str(value) for value in file_ids))
-        if self._save(share_url, ids, save_path):
-            return ids, []
-        return [], ids
+        succeeded, failed = [], []
+        for batch in iter_transfer_batches(
+                file_ids, kwargs.get("batch_size", 20),
+                kwargs.get("batch_interval", 3), 100,
+        ):
+            (succeeded if self._save(share_url, batch, save_path) else failed).extend(batch)
+        return succeeded, failed
