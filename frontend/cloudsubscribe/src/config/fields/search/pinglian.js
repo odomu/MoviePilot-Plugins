@@ -15,6 +15,11 @@ export function createPinglianGroups(options = {}) {
                     cols: 12,
                 },
                 {
+                    key: "pinglian_base_url",
+                    label: "服务地址",
+                    cols: 12,
+                },
+                {
                     key: "pinglian_username",
                     label: "网页登录账号",
                     cols: 6,

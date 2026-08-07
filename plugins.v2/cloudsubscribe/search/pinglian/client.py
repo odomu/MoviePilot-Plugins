@@ -18,6 +18,7 @@ from ..http_client import (
     requests,
 )
 from ..matching import extract_year, title_matches, unique_texts
+from ..types import TYPE_ALIASES as COMMON_TYPE_ALIASES, TYPE_HOSTS as COMMON_TYPE_HOSTS
 
 
 class PinglianError(RuntimeError):
@@ -109,25 +110,8 @@ class PinglianClient:
     BASE_URL = "https://pinglian.lol"
     _SESSION_DATA_KEY = "pinglian_auth_session"
     _LOGIN_LOCK = threading.RLock()
-    _TYPE_ALIASES = {
-        "115": "115",
-        "123": "123",
-        "quark": "quark",
-        "aliyun": "alipan",
-        "alipan": "alipan",
-        "tianyi": "tianyi",
-        "guangya": "guangya",
-        "baidu": "baidu",
-    }
-    _TYPE_HOSTS = {
-        "115": {"115.com", "115cdn.com"},
-        "123": {"123pan.com", "123pan.cn", "123684.com", "123865.com"},
-        "quark": {"quark.cn"},
-        "alipan": {"alipan.com", "aliyundrive.com"},
-        "tianyi": {"cloud.189.cn"},
-        "guangya": {"guangyapan.com"},
-        "baidu": {"pan.baidu.com"},
-    }
+    _TYPE_ALIASES = COMMON_TYPE_ALIASES
+    _TYPE_HOSTS = COMMON_TYPE_HOSTS
     _HEADERS = {
         "Accept": "application/json, text/plain, */*",
         "X-Requested-With": "XMLHttpRequest",
@@ -141,13 +125,14 @@ class PinglianClient:
             self,
             username: str,
             password: str,
+            base_url: str = BASE_URL,
             proxy: Any = None,
             request_timeout: int = 30,
             request_interval: float = 1.0,
             get_data_func: Optional[Callable] = None,
             save_data_func: Optional[Callable] = None,
     ):
-        self.base_url = self.BASE_URL
+        self.base_url = str(base_url or self.BASE_URL).rstrip("/")
         self.username = str(username or "").strip()
         self.password = str(password or "")
         self._proxies = normalize_proxies(proxy)
@@ -364,6 +349,16 @@ class PinglianClient:
         return best[2] if best is not None else None
 
     @staticmethod
+    def _first_video(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        return next(
+            (
+                dict(row) for row in rows
+                if isinstance(row, dict) and str(row.get("vod_id") or "").strip()
+            ),
+            None,
+        )
+
+    @staticmethod
     def _host_matches(host: str, domains: Iterable[str]) -> bool:
         return any(host == domain or host.endswith(f".{domain}") for domain in domains)
 
@@ -448,13 +443,24 @@ class PinglianClient:
         titles = unique_texts((title, *alternative_titles))
         if not titles:
             return []
-        allowed = list(dict.fromkeys(
-            str(value).strip().casefold() for value in resource_type_order
-            if str(value).strip().casefold() in self._TYPE_HOSTS
-        ))
+        allowed = (
+            list(self._TYPE_HOSTS)
+            if test_mode
+            else list(dict.fromkeys(
+                str(value).strip().casefold() for value in resource_type_order
+                if str(value).strip().casefold() in self._TYPE_HOSTS
+            ))
+        )
         if not allowed:
             return []
         expected_year = extract_year(year)
+        limit_value = max(1, min(int(limit or 20), 80))
+        prefix = "[PINGLIAN]"
+        logger.debug(
+            f"{prefix} 查询开始：关键词={','.join(titles)}，"
+            f"模式={'测试' if test_mode else '正式'}，"
+            f"资源类型={'全部' if test_mode else '/'.join(allowed)}"
+        )
         with self._lock:
             video = None
             selected_keyword = ""
@@ -463,40 +469,69 @@ class PinglianClient:
                     "/api/search_suggestions.php", params={"q": keyword}
                 )
                 rows = payload.get("data") if payload.get("success") else []
-                video = self._select_video(rows, titles, expected_year)
+                rows = rows if isinstance(rows, list) else []
+                logger.debug(
+                    f"{prefix} suggestions：关键词={keyword}，条目={len(rows)}"
+                )
+                video = (
+                    self._first_video(rows) if test_mode
+                    else self._select_video(rows, titles, expected_year)
+                )
                 if not video:
                     payload = self.request_json(
                         "/api/get_videos.php", params={"wd": keyword, "pg": 1}
                     )
-                    video = self._select_video(
-                        payload.get("list") or [], titles, expected_year
+                    rows = payload.get("list") or []
+                    rows = rows if isinstance(rows, list) else []
+                    logger.debug(
+                        f"{prefix} get_videos：关键词={keyword}，条目={len(rows)}"
+                    )
+                    video = (
+                        self._first_video(rows) if test_mode
+                        else self._select_video(rows, titles, expected_year)
                     )
                 if video:
                     selected_keyword = keyword
                     break
             if not video:
+                logger.debug(f"{prefix} 未选中作品：关键词={','.join(titles)}")
                 return []
             vod_id = video.get("vod_id")
+            logger.debug(
+                f"{prefix} 选中作品：vod_id={vod_id}，标题={self._video_title(video)}"
+            )
             payload = self.request_json(
                 "/api/search_pan_links.php",
                 params={"keyword": selected_keyword, "vod_id": vod_id, "_t": int(time.time() * 1000)},
             )
             groups = payload.get("data") if payload.get("success") else None
             if not isinstance(groups, dict):
+                logger.debug(f"{prefix} search_pan_links：分组=0，原始链接=0")
                 return []
             type_order = {value: index for index, value in enumerate(allowed)}
             candidates = []
+            raw_link_count = 0
+            type_counts: Dict[str, int] = {}
             for group in groups.values():
                 for row in (group.get("links") or []) if isinstance(group, dict) else []:
+                    raw_link_count += 1
                     if not isinstance(row, dict):
                         continue
                     resource_type = self._TYPE_ALIASES.get(
                         str(row.get("type") or "").strip().casefold(), ""
                     )
                     token = str(row.get("token") or "").strip()
-                    if resource_type not in type_order or not token:
+                    if resource_type:
+                        type_counts[resource_type] = type_counts.get(resource_type, 0) + 1
+                    if resource_type not in type_order or (not token and not test_mode):
                         continue
                     candidates.append((type_order[resource_type], row, resource_type, token))
+
+            logger.debug(
+                f"{prefix} search_pan_links：分组={len(groups)}，"
+                f"原始链接={raw_link_count}，类型={'/'.join(f'{k}={v}' for k, v in type_counts.items()) or '无'}，"
+                f"可用候选={len(candidates)}"
+            )
 
             def user_tier(item) -> int:
                 try:
@@ -525,8 +560,10 @@ class PinglianClient:
                             offsets.pop(resource_type, None)
             results = []
             seen = set()
+            resolved_count = 0
+            resolve_failed_count = 0
             for _, row, resource_type, token in candidates:
-                if len(results) >= max(1, min(int(limit or 20), 80)):
+                if len(results) >= limit_value:
                     break
                 key = (resource_type, str(row.get("title") or "").strip(), token)
                 if key in seen:
@@ -537,8 +574,10 @@ class PinglianClient:
                 if not test_mode:
                     try:
                         target = self._resolve_token(token, resource_type)
+                        resolved_count += 1
                     except PinglianError as error:
-                        logger.debug(f"[PINGLIAN] 跳过不可用资源：{error.code}")
+                        resolve_failed_count += 1
+                        logger.debug(f"{prefix} 跳过不可用资源：{error.code}")
                         continue
                     target = self._append_password(
                         resource_type, target, row.get("password")
@@ -555,6 +594,10 @@ class PinglianClient:
                     "source_url": source_url,
                     "pinglian_resource_id": str(row.get("id") or ""),
                 })
+            logger.debug(
+                f"{prefix} 返回完成：测试候选={len(results)}，"
+                f"链接解析成功={resolved_count}，解析失败={resolve_failed_count}"
+            )
             return results
 
     def clear_cache(self) -> Dict[str, int]:

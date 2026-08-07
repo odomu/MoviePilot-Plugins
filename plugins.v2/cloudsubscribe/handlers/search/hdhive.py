@@ -358,7 +358,7 @@ class HDHiveSearchService(OwnerDelegator):
                         ),
                         need_unlock=not is_free,
                     ))
-                    if len(raw_candidates) >= 20:
+                    if len(raw_candidates) >= 80:
                         break
                 logger.debug(
                     f"{search_prefix} API 查询完成：站点资源={len(data.get('data') or [])}，"
@@ -507,11 +507,21 @@ class HDHiveSearchService(OwnerDelegator):
         """
         self._hdhive_budget.reset_task()
         if self._hdhive_enabled and self._hdhive_auto_unlock:
-            logger.debug(f"HDHive ({self._hdhive_query_mode}) 任务积分账本已初始化")
+            logger.debug(
+                f"HDHive ({self._hdhive_query_mode}) 任务积分账本已初始化："
+                f"任务总预算={self._hdhive_budget.task_limit}，"
+                f"单订阅预算={self._hdhive_budget.subscribe_limit}，"
+                f"已解锁链接缓存={self._hdhive_budget.cached_url_count()}"
+            )
 
     def has_hdhive_unlock_budget(self, unlock_points: int) -> bool:
         """判断当前任务和订阅是否还有足够积分解锁指定资源。"""
-        return self._hdhive_budget.can_spend(unlock_points)
+        status = self._hdhive_budget.status(unlock_points)
+        logger.debug(
+            "HDHive 积分预算检查："
+            f"{self._hdhive_budget.format_snapshot(unlock_points)}"
+        )
+        return bool(status and status.allowed)
 
     def reset_sub_spent_points(self, sub_key: str = ""):
         """
@@ -520,13 +530,16 @@ class HDHiveSearchService(OwnerDelegator):
         :param sub_key: 订阅唯一标识，如 "逐玉_S1"
         """
         spent_points = self._hdhive_budget.reset_subscribe(sub_key)
-        if sub_key:
-            if self._hdhive_enabled and self._hdhive_auto_unlock:
-                if spent_points > 0:
-                    logger.debug(
-                        f"HDHive 订阅 {sub_key} 历史已花费 {spent_points} 积分，剩余预算 {max(0, self._hdhive_max_points_per_sub - spent_points)}")
-                else:
-                    logger.debug(f"HDHive 订阅 {sub_key} 尚无积分消费记录")
+        if sub_key and self._hdhive_enabled and self._hdhive_auto_unlock:
+            logger.debug(
+                f"HDHive 订阅积分账本：key={sub_key}，"
+                f"历史已花费={spent_points}，"
+                f"单订阅预算={self._hdhive_budget.subscribe_limit}，"
+                f"单订阅剩余={max(0, self._hdhive_budget.subscribe_limit - spent_points)}，"
+                f"本轮任务已花费={self._hdhive_budget.task_spent}，"
+                f"任务总预算={self._hdhive_budget.task_limit}，"
+                f"任务剩余={max(0, self._hdhive_budget.task_limit - self._hdhive_budget.task_spent)}"
+            )
 
     def clear_sub_points(self, sub_key: str):
         """
@@ -615,7 +628,7 @@ class HDHiveSearchService(OwnerDelegator):
             normalized_slug,
         )
         cache_key = normalize_platform_cache_key(cache_key)
-        cached_url = self._hdhive_unlocked_urls.get(cache_key)
+        cached_url = self._hdhive_budget.cached_url(cache_key)
         if cached_url:
             logger.debug(
                 f"{search_prefix} 复用已解锁 HDHive 资源链接："
@@ -695,7 +708,9 @@ class HDHiveSearchService(OwnerDelegator):
                     unlock_data.get("actual_points")
                 ) or 0
 
-            self._hdhive_budget.record(actual_points)
+            actual_points, _, _ = self._hdhive_budget.record_result(
+                cache_key, share_url, actual_points
+            )
             if not share_url:
                 if actual_points <= 0:
                     logger.error(
@@ -707,9 +722,6 @@ class HDHiveSearchService(OwnerDelegator):
                     f"{actual_points} 积分，但未返回资源链接；积分账本已记录"
                 )
                 return None
-
-            # 只有服务端实际返回链接后才缓存，失败或已失效的资源仍可按原流程重试。
-            self._hdhive_unlocked_urls.set(cache_key, share_url)
 
             if actual_points <= 0:
                 logger.debug(

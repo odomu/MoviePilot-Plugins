@@ -6,6 +6,11 @@ export function createButailingGroups() {
             icon: "mdi-magnet",
             fields: [
                 {
+                    key: "butailing_base_url",
+                    label: "服务地址",
+                    cols: 12
+                },
+                {
                     key: "test_butailing",
                     label: "测试搜索",
                     type: "test-source",

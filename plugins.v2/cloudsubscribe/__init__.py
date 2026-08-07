@@ -62,6 +62,7 @@ from .search.juying import JuyingClient
 from .search.pansou import PanSouClient
 from .search.pinglian import PinglianClient
 from .search.seedhub import SeedHubClient
+from .search.online_docs import OnlineDocumentClient
 
 _COMPONENT_TYPES = (
     PageApi,
@@ -94,7 +95,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -248,6 +249,8 @@ class CloudSubscribe(_PluginBase):
     _pinglian_result_limit: int = 20
     _pinglian_request_interval: float = 1.0
     _pinglian_timeout: int = 30
+    _online_docs: List[Dict[str, Any]] = []
+    _online_docs_resource_types: List[str] = []
 
     # 订阅过滤模式："exclude" 排除模式（处理除勾选外的全部订阅）/ "include" 指定模式（仅处理勾选的订阅）
     _subscribe_filter_mode: str = "exclude"
@@ -362,6 +365,7 @@ class CloudSubscribe(_PluginBase):
     _butailing_client: Optional[ButailingClient] = None
     _juying_client: Optional[JuyingClient] = None
     _pinglian_client: Optional[PinglianClient] = None
+    _online_docs_client: Optional[OnlineDocumentClient] = None
     _p115_manager: Optional[P115ClientManager] = None
     _p123_drive: Optional[P123Drive] = None
     _quark_drive: Optional[QuarkDrive] = None
@@ -625,7 +629,7 @@ class CloudSubscribe(_PluginBase):
 
             source_names = (
                 "hdhive", "dian115", "pansou", "juying", "seedhub", "butailing",
-                "pinglian",
+                "pinglian", "online_docs",
             )
             raw_order = config.get("search_source_order", []) or []
             if isinstance(raw_order, str):
@@ -638,6 +642,26 @@ class CloudSubscribe(_PluginBase):
             selected_sources = set(self._search_source_order)
             self._pansou_enabled = "pansou" in selected_sources
             self._pansou_url = config.get("pansou_url", "https://so.252035.xyz/")
+            self._hdhive_base_url = str(
+                config.get("hdhive_base_url", "https://hdhive.com") or "https://hdhive.com").strip()
+            self._dian115_base_url = str(
+                config.get("dian115_base_url", "https://m.dian115.com") or "https://m.dian115.com").strip()
+            self._juying_base_url = str(
+                config.get("juying_base_url", "https://www.jying.top") or "https://www.jying.top").strip()
+            self._seedhub_base_url = str(
+                config.get("seedhub_base_url", "https://www.seedhub.cc") or "https://www.seedhub.cc").strip()
+            self._butailing_base_url = str(config.get("butailing_base_url",
+                                                      "https://web5.mukaku.com/prod/api/v1/") or "https://web5.mukaku.com/prod/api/v1/").strip()
+            self._pinglian_base_url = str(
+                config.get("pinglian_base_url", "https://pinglian.lol") or "https://pinglian.lol").strip()
+            raw_doc_urls = config.get("online_docs") or config.get("online_docs_urls") or []
+            if isinstance(raw_doc_urls, str):
+                raw_doc_urls = re.split(r"[,，\n]+", raw_doc_urls)
+            self._online_docs_resource_types = [str(value).strip().lower() for value in
+                                                (config.get("online_docs_resource_types") or []) if str(value).strip()]
+            self._online_docs = OnlineDocumentClient._normalize_documents(
+                raw_doc_urls, self._online_docs_resource_types
+            )
             self._pansou_username = config.get("pansou_username", "")
             self._pansou_password = config.get("pansou_password", "")
             self._pansou_auth_enabled = config.get("pansou_auth_enabled", False)
@@ -1082,6 +1106,7 @@ class CloudSubscribe(_PluginBase):
         self._butailing_client = None
         self._juying_client = None
         self._pinglian_client = None
+        self._online_docs_client = None
         proxy = settings.PROXY
         if proxy:
             logger.info(f"使用PROXY: {proxy}")
@@ -1099,11 +1124,12 @@ class CloudSubscribe(_PluginBase):
             )
 
         if self._seedhub_enabled:
-            self._seedhub_client = SeedHubClient(proxy=proxy)
+            self._seedhub_client = SeedHubClient(base_url=self._seedhub_base_url, proxy=proxy)
         if self._butailing_enabled:
-            self._butailing_client = ButailingClient(proxy=proxy)
+            self._butailing_client = ButailingClient(base_url=self._butailing_base_url, proxy=proxy)
         if self._juying_enabled:
             self._juying_client = JuyingClient(
+                base_url=self._juying_base_url,
                 username=self._juying_username,
                 password=self._juying_password,
                 proxy=proxy,
@@ -1116,6 +1142,7 @@ class CloudSubscribe(_PluginBase):
                 logger.warning("聚影已启用但未配置网页登录账号和密码，将无法使用聚影搜索")
         if self._pinglian_enabled:
             self._pinglian_client = PinglianClient(
+                base_url=self._pinglian_base_url,
                 username=self._pinglian_username,
                 password=self._pinglian_password,
                 proxy=proxy,
@@ -1126,6 +1153,11 @@ class CloudSubscribe(_PluginBase):
             )
             if not self._pinglian_username or not self._pinglian_password:
                 logger.warning("盘链已启用但未配置网页登录账号和密码，将无法使用盘链搜索")
+        if "online_docs" in self._search_source_order and self._online_docs:
+            self._online_docs_client = OnlineDocumentClient(
+                documents=self._online_docs,
+                proxy=proxy,
+            )
 
         # OpenAPI 模式初始化官方客户端；WebAPI 由搜索服务按需创建唯一客户端。
         if self._hdhive_query_mode == "api":
@@ -1467,6 +1499,7 @@ class CloudSubscribe(_PluginBase):
             butailing_client=self._butailing_client,
             juying_client=self._juying_client,
             pinglian_client=self._pinglian_client,
+            online_docs_client=self._online_docs_client,
             pansou_enabled=self._pansou_enabled,
             hdhive_enabled=self._hdhive_enabled,
             dian115_enabled=self._dian115_enabled,
@@ -1629,6 +1662,12 @@ class CloudSubscribe(_PluginBase):
             "alipan_request_timeout": self._alipan_request_timeout,
             "cloud_drive": self._cloud_drive_key,
             "pansou_url": self._pansou_url,
+            "hdhive_base_url": self._hdhive_base_url,
+            "dian115_base_url": self._dian115_base_url,
+            "juying_base_url": self._juying_base_url,
+            "seedhub_base_url": self._seedhub_base_url,
+            "butailing_base_url": self._butailing_base_url,
+            "pinglian_base_url": self._pinglian_base_url,
             "pansou_username": self._pansou_username,
             "pansou_password": self._pansou_password,
             "pansou_auth_enabled": self._pansou_auth_enabled,
@@ -1654,6 +1693,7 @@ class CloudSubscribe(_PluginBase):
             "pinglian_result_limit": self._pinglian_result_limit,
             "pinglian_request_interval": self._pinglian_request_interval,
             "pinglian_timeout": self._pinglian_timeout,
+            "online_docs": self._online_docs,
             # HDHive 配置
             "hdhive_query_mode": self._hdhive_query_mode,
             "hdhive_api_key": self._hdhive_api_key,

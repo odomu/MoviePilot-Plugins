@@ -801,7 +801,7 @@ const headers = [
   {title: "类型", key: "resource_types", sortable: false, width: "14%"},
   {title: "来源", key: "sources", sortable: false, width: "12%"},
   {title: "汇总", key: "summary", sortable: false, width: "18%"},
-  {title: "最新时间", key: "latest_time", width: 140},
+  {title: "时间", key: "latest_time", width: 140},
   {title: "", key: "actions", sortable: false, width: 104},
   {title: "", key: "data-table-expand", width: 48},
 ];
@@ -902,7 +902,7 @@ const groupedItems = computed(() => {
   return [...groups.values()]
       .map((group) => ({
         ...group,
-        records: [...group.records].sort(compareTimeDesc),
+        records: [...group.records],
         resource_types: uniqueOptions(
             group.records.map((record) => resourceType(record)),
         ),
@@ -1070,8 +1070,8 @@ function resourceTypeColor(value) {
 }
 
 function sourceLink(item) {
-  const link = String(item.source_url || item.share_url || "").trim();
-  return /^(https?:|ed2k:|magnet:)/i.test(link) ? link : "";
+  const link = String(item.source_url || "").trim();
+  return /^https?:\/\//i.test(link) ? link : "";
 }
 
 function mediaDetailLink(item) {

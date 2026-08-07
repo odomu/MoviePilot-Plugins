@@ -1,6 +1,7 @@
 """配置页选项与详情页数据 API。"""
 
 import copy
+import re
 from urllib.parse import urlencode
 
 from app.core.config import settings
@@ -26,6 +27,7 @@ class PageApi(OwnerDelegator):
         ]
         if self._sync_handler:
             history = self._sync_handler.prepare_history_records(history)
+        history.sort(key=self._history_episode_sort_key, reverse=True)
         return {
             "success": True,
             "data": {
@@ -44,6 +46,35 @@ class PageApi(OwnerDelegator):
                 },
             },
         }
+
+    @staticmethod
+    def _history_episode_sort_key(record: dict) -> tuple:
+        """按季、集数数值倒序，避免 E100 被字符串排序到 E20 后面。"""
+        try:
+            season = int(record.get("season") or 0)
+        except (TypeError, ValueError):
+            season = 0
+        try:
+            episode = int(record.get("episode") or 0)
+        except (TypeError, ValueError):
+            episode = 0
+        if episode <= 0:
+            target_episodes = record.get("target_episodes")
+            values = (
+                target_episodes
+                if isinstance(target_episodes, (list, tuple, set))
+                else re.findall(r"\d+", str(target_episodes or ""))
+            )
+            episodes = []
+            for value in values:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    episodes.append(number)
+            episode = max(episodes, default=0)
+        return season, episode, str(record.get("time") or "")
 
     def api_vue_ui_options(self) -> dict:
         cache_key = f"instance:{id(self)}"

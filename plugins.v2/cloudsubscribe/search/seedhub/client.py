@@ -417,13 +417,15 @@ class SeedHubClient:
             selected = None
             for keyword in normalized_keywords:
                 text = self._get_text(f"{self.base_url}/s/{quote(keyword)}/")
-                selected = self._select_candidate(
-                    self._parse_search_candidates(text),
-                    titles,
-                    "" if test_mode else year,
-                    media_type,
-                    None if test_mode else season,
-                )
+                candidates = self._parse_search_candidates(text)
+                if test_mode:
+                    selected = next(
+                        (item for item in candidates if item.get("movie_id")), None
+                    )
+                else:
+                    selected = self._select_candidate(
+                        candidates, titles, year, media_type, season
+                    )
                 if selected:
                     break
             if not selected:

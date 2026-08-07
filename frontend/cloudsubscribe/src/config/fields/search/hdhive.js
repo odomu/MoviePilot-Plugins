@@ -17,6 +17,11 @@ export function createHdhiveGroups(options = {}) {
                     cols: 12,
                 },
                 {
+                    key: "hdhive_base_url",
+                    label: "服务地址",
+                    ols: 12,
+                },
+                {
                     key: "hdhive_query_mode",
                     label: "查询模式",
                     type: "select",

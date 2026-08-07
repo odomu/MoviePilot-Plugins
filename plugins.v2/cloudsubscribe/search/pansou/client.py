@@ -534,7 +534,7 @@ class PanSouClient:
                         for value in (expected_titles or [])
                         if str(value or "").strip()
                     ))
-                    if (
+                    if not test_mode and (
                             not self._title_matches_search_key(keyword, title)
                             and not any(
                         self._title_matches_search_key(value, title)

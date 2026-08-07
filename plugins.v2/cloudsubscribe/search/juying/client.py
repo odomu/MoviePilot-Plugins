@@ -35,6 +35,7 @@ class JuyingClient:
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
 
@@ -42,6 +43,7 @@ class JuyingClient:
             self,
             username: str,
             password: str,
+            base_url: str = BASE_URL,
             proxy: Any = None,
             request_timeout: int = 30,
             request_interval: float = 1.0,
@@ -49,7 +51,7 @@ class JuyingClient:
             get_data_func: Optional[Callable] = None,
             save_data_func: Optional[Callable] = None,
     ):
-        self.base_url = self.BASE_URL
+        self.base_url = str(base_url or self.BASE_URL).rstrip("/")
         self.username = str(username or "").strip()
         self.password = str(password or "")
         self._proxies = normalize_proxies(proxy)
@@ -65,7 +67,7 @@ class JuyingClient:
             "聚影",
             f"{self.base_url}|{self.username.casefold()}|{self._proxies}",
             request_interval=request_interval,
-            minimum_interval=0.5,
+            minimum_interval=1,
         )
         self._access_gate = AccountActionGate.shared(
             "聚影解锁接口",
@@ -254,13 +256,24 @@ class JuyingClient:
                     message = str(body.get("message") or body.get("detail") or "")
                 except ValueError:
                     pass
+            if response.status_code == 403 and protected_access:
+                logger.warning(
+                    "聚影资源 access 返回 HTTP 403："
+                    f"path={path}，token={'present' if self._token else 'missing'}，"
+                    f"csrf={'present' if self._session.cookies.get('csrftoken') else 'missing'}，"
+                    f"message={message or '<empty>'}"
+                )
+                raise JuyingError(
+                    message or "聚影资源访问票据已失效",
+                    "juying_access_forbidden",
+                )
             raise JuyingError(
                 message or f"聚影请求失败（HTTP {response.status_code}）",
                 "juying_request_failed",
             )
         if not self._json_response(response):
             raise JuyingError(
-                "聚影返回了非 JSON 页面，可能触发了站点验证或接口已改版",
+                "聚影返回了非 JSON 页面，接口响应协议异常或已改版",
                 "juying_schema_changed",
             )
         try:

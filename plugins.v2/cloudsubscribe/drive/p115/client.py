@@ -378,6 +378,44 @@ class P115ClientManager:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    @staticmethod
+    def _http_status_code(error: Exception) -> Optional[int]:
+        """尽力提取 HTTP 状态码；诊断代码自身不得遮蔽原始异常。"""
+        response = getattr(error, "response", None)
+        candidates = (
+            getattr(error, "status_code", None),
+            getattr(response, "status_code", None),
+        )
+        for value in candidates:
+            try:
+                return int(value) if value not in (None, "") else None
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _login_ssoent(self) -> str:
+        """返回当前客户端渠道标识，不读取或输出 Cookie 内容。"""
+        client = self.client
+        for name in ("ssoent", "login_ssoent", "app"):
+            try:
+                value = getattr(client, name, None)
+            except Exception:
+                continue
+            if value not in (None, "") and not callable(value):
+                return str(value)
+        return str(APP_TO_SSOENT.get("ios") or "ios") if PAVAILABLE else "unknown"
+
+    @staticmethod
+    def _error_summary(error: Exception) -> str:
+        """生成有界错误摘要，兼容 p115client 的字典型异常参数。"""
+        try:
+            message = str(error).strip()
+        except Exception:
+            message = ""
+        name = type(error).__name__
+        summary = f"{name}: {message}" if message else name
+        return summary[:500]
+
     def check_login(self) -> bool:
         """检查登录状态，并缓存会员状态供离线下载判断。"""
         self._login_checked = True

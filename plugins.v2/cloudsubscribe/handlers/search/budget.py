@@ -36,6 +36,7 @@ class PointBudgetLedger:
             history_key: str,
             task_limit: int,
             subscribe_limit: int,
+            unlocked_cache: Any = None,
     ):
         self.history_key = str(history_key or "")
         self.task_limit = max(0, int(task_limit or 0))
@@ -45,6 +46,7 @@ class PointBudgetLedger:
         self._task_spent = 0
         self._get_data: Optional[Callable[[str], Any]] = None
         self._save_data: Optional[Callable[[str, Any], None]] = None
+        self._unlocked_cache = unlocked_cache
 
     @property
     def get_data_func(self) -> Optional[Callable[[str], Any]]:
@@ -117,6 +119,23 @@ class PointBudgetLedger:
         status = self.status(points)
         return bool(status and status.allowed)
 
+    def cached_url(self, identity: Any) -> str:
+        """返回积分资源已取得的链接，供所有积分渠道统一防重复解锁。"""
+        if self._unlocked_cache is None:
+            return ""
+        return str(self._unlocked_cache.get(str(identity)) or "").strip()
+
+    def cached_url_count(self) -> int:
+        if self._unlocked_cache is None:
+            return 0
+        return len(list(self._unlocked_cache.items()))
+
+    def clear_cached_urls(self) -> int:
+        count = self.cached_url_count()
+        if self._unlocked_cache is not None:
+            self._unlocked_cache.clear()
+        return count
+
     def status(self, points: Any) -> Optional[PointBudgetStatus]:
         """返回规范化后的额度快照；积分无效时返回 ``None``。"""
         normalized = self.normalize_points(points)
@@ -130,6 +149,19 @@ class PointBudgetLedger:
                 task_limit=self.task_limit,
                 subscribe_limit=self.subscribe_limit,
             )
+
+    def format_snapshot(self, points: Any = 0) -> str:
+        """统一生成积分渠道 DEBUG 日志使用的预算快照。"""
+        status = self.status(points)
+        if status is None:
+            return f"请求={points}（无效）"
+        return (
+            f"请求={status.requested}，"
+            f"任务={status.task_spent}/{status.task_limit}，"
+            f"订阅key={self.subscribe_key or '<none>'}，"
+            f"订阅={status.subscribe_spent}/{status.subscribe_limit}，"
+            f"允许={status.allowed}"
+        )
 
     def record(self, points: Any) -> int:
         normalized = self.normalize_points(points)
@@ -145,6 +177,19 @@ class PointBudgetLedger:
                 history[key] = subscribe_spent
                 self._save_history(history)
             return normalized
+
+    def record_result(
+            self, identity: Any, url: str, points: Any
+    ) -> tuple[int, int, int]:
+        """统一记录服务端实际扣分，并仅为有效链接建立幂等缓存。"""
+        with self.lock:
+            before_task = self._task_spent
+            before_subscribe = self.subscribe_spent
+            actual_points = self.record(points)
+            normalized_url = str(url or "").strip()
+            if normalized_url and self._unlocked_cache is not None:
+                self._unlocked_cache.set(str(identity), normalized_url)
+            return actual_points, before_task, before_subscribe
 
     def remaining(self) -> tuple[int, int]:
         with self.lock:

@@ -170,9 +170,15 @@ class Dian115ResourceService:
                 f"预算={int(max_unlock_points)}"
             )
         payload["actual_points"] = actual_points
+        already = bool(
+            unlock.get("already")
+            or unlock.get("is_unlocked")
+            or payload.get("already")
+        )
         logger.debug(
             f"Dian115 分享获取完成：share_id={normalized_share_id}，"
             f"actual_points={actual_points}，"
+            f"already={already}，"
             f"耗时={time.monotonic() - started:.2f}s"
         )
         with self._lock:

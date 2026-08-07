@@ -3,7 +3,7 @@
 import re
 import threading
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from app.log import logger
 
@@ -87,7 +87,8 @@ class JuyingResourceService:
         return best[2] if best is not None else None
 
     def _find_movie(self, title: str, alternative_titles: List[str], year: str,
-                    media_type: str, tmdb_id: Optional[int]):
+                    media_type: str, tmdb_id: Optional[int],
+                    test_mode: bool = False):
         titles = list(dict.fromkeys(str(value).strip() for value in [title, *alternative_titles]
                                     if str(value or "").strip()))
         attempted = set()
@@ -101,8 +102,14 @@ class JuyingResourceService:
                 if query_year:
                     params["year"] = query_year
                 payload = self._client.request_json("GET", "/api/app/movies/", params=params)
+                rows = [
+                    row for row in (payload.get("results") or [])
+                    if isinstance(row, dict)
+                ]
+                if test_mode and rows:
+                    return rows[0]
                 selected = self._select_movie(
-                    (row for row in (payload.get("results") or []) if isinstance(row, dict)),
+                    rows,
                     titles, year, media_type, tmdb_id,
                 )
                 if selected:
@@ -166,49 +173,37 @@ class JuyingResourceService:
             return 0
         return f"{text}GB" if re.fullmatch(r"\d+(?:\.\d+)?", text) else text
 
-    def _source_url(self, *values: Any) -> str:
-        """只接受聚影站内返回的真实页面链接。"""
-        expected_host = str(
-            urlparse(self._client.base_url).hostname or ""
-        ).casefold()
-        for value in values:
-            candidate = str(value or "").strip()
-            if not candidate:
-                continue
-            resolved = urljoin(f"{self._client.base_url}/", candidate)
-            parsed = urlparse(resolved)
-            if (
-                    parsed.scheme == "https"
-                    and str(parsed.hostname or "").casefold() == expected_host
-            ):
-                return resolved
-        return self._client.base_url
-
     def _load_search_context(self, title: str, alternative_titles: List[str], year: str,
                              media_type: str, tmdb_id: Optional[int], season: Optional[int],
                              force: bool = False,
-                             filter_season: bool = True) -> List[Dict[str, Any]]:
+                             filter_season: bool = True,
+                             test_mode: bool = False) -> List[Dict[str, Any]]:
         cache_key = (media_type, tmdb_id or 0, normalize_title(title),
                      tuple(normalize_title(item) for item in alternative_titles), year,
-                     season or 0, bool(filter_season))
+                     season or 0, bool(filter_season), bool(test_mode))
         cache_key = normalize_platform_cache_key(cache_key)
         if not force:
             cached = self._search_cache.get(cache_key)
             if cached is not None:
                 logger.debug(f"[JUYING] 资源搜索缓存命中，候选 {len(cached)} 个")
                 return [dict(item) for item in cached]
-        movie = self._find_movie(title, alternative_titles, year, media_type, tmdb_id)
+        movie = self._find_movie(
+            title, alternative_titles, year, media_type, tmdb_id,
+            test_mode=test_mode,
+        )
         if not movie:
             self._search_cache.set(cache_key, [])
             return []
-        media_source_url = self._source_url(
-            movie.get("source_url"), movie.get("detail_url"), movie.get("url")
-        )
+        movie_id = self._safe_int(movie.get("id"))
+        if not movie_id:
+            self._search_cache.set(cache_key, [])
+            return []
+        source_url = f"{self._client.base_url}/movie/{movie_id}"
         context = {"title": title, "alternative_titles": alternative_titles, "year": year,
                    "media_type": media_type, "tmdb_id": tmdb_id, "season": season,
-                   "filter_season": filter_season}
+                   "filter_season": filter_season, "test_mode": test_mode}
         public_rows = []
-        for row in self._load_resources(int(movie.get("id"))):
+        for row in self._load_resources(movie_id):
             resource_type = self._resource_type(row)
             resource_id = str(row.get("id") or "").strip()
             if not resource_type or not resource_id:
@@ -221,7 +216,8 @@ class JuyingResourceService:
                 continue
             self._resource_cache.set(resource_id, dict(row))
             self._resource_context.set(resource_id, dict(context))
-            public_rows.append({"resource_id": resource_id, "title": resource_title,
+            public_rows.append({"resource_id": resource_id,
+                                "title": resource_title,
                                 "description": str(
                                     row.get("resource_description") or row.get("description") or "").strip(),
                                 "size": self._resource_size(row.get("file_size")),
@@ -230,10 +226,7 @@ class JuyingResourceService:
                                 "link_hidden_reason": str(row.get("link_hidden_reason") or ""),
                                 "update_time": str(row.get("created_at") or ""),
                                 "uploader": str(row.get("uploader") or ""),
-                                "source_url": self._source_url(
-                                    row.get("source_url"), row.get("detail_url"),
-                                    row.get("url"), media_source_url,
-                                )})
+                                "source_url": source_url})
         self._search_cache.set(
             cache_key, [dict(item) for item in public_rows]
         )
@@ -324,8 +317,12 @@ class JuyingResourceService:
                 json={"access_ticket": ticket},
             )
         except JuyingError as error:
-            if error.code != "juying_request_failed":
+            if error.code not in {"juying_request_failed", "juying_access_forbidden"}:
                 raise
+            logger.debug(
+                f"[JUYING] 资源 #{resource_id} access={error.code}，"
+                "强制刷新资源列表后重试一次"
+            )
             refreshed = self._reload_resource(resource_id)
             refreshed_ticket = str((refreshed or {}).get("access_ticket") or "").strip()
             if not refreshed_ticket or refreshed_ticket == ticket:
@@ -351,12 +348,16 @@ class JuyingResourceService:
                media_type: str, tmdb_id: Optional[int], season: Optional[int],
                resource_type_order: Iterable[str], limit: int = 5,
                test_mode: bool = False) -> List[Dict[str, Any]]:
-        normalized_limit = max(1, min(int(limit or 5), 20))
-        allowed_order = list(dict.fromkeys(
-            str(value).strip().casefold()
-            for value in resource_type_order
-            if str(value).strip().casefold() in self.SUPPORTED_RESOURCE_TYPES
-        ))
+        normalized_limit = max(1, min(int(limit or 5), 80))
+        allowed_order = (
+            list(self.SUPPORTED_RESOURCE_TYPE_ORDER)
+            if test_mode
+            else list(dict.fromkeys(
+                str(value).strip().casefold()
+                for value in resource_type_order
+                if str(value).strip().casefold() in self.SUPPORTED_RESOURCE_TYPES
+            ))
+        )
         if not allowed_order:
             return []
         alternatives = [str(value).strip() for value in alternative_titles if str(value or "").strip()]
@@ -364,7 +365,8 @@ class JuyingResourceService:
             rows = self._load_search_context(str(title or "").strip(), alternatives,
                                              extract_year(year), "tv" if media_type == "tv" else "movie",
                                              tmdb_id, season,
-                                             filter_season=not test_mode)
+                                             filter_season=not test_mode,
+                                             test_mode=test_mode)
             order_map = {value: index for index, value in enumerate(allowed_order)}
             fallback_order = len(allowed_order)
             rows.sort(

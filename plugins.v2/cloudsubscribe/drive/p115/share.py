@@ -1,7 +1,6 @@
 """115 分享链接校验与文件遍历。"""
 
 import copy
-import threading
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -462,26 +461,9 @@ class ShareService(OwnerDelegator):
                 return True
             source_hash = self._normalize_hash(source_sha1)
             if target_name and len(source_hash) == 40:
-                recovered = self._recover_duplicate_transfer(
-                    share_code=share_code,
-                    receive_code=receive_code,
-                    file_ids=[str(file_id)],
-                    save_path=save_path,
-                    rename_items={
-                        str(file_id): {
-                            "sha1": source_hash,
-                            "target_name": target_name,
-                        }
-                    },
-                )
-                if str(file_id) in recovered:
-                    logger.info(
-                        f"115重复文件已通过独立目录恢复：{target_name}"
-                    )
-                    return True
                 logger.info(
-                    f"115目标文件已存在或仍在系统处理，"
-                    f"已转入文件后处理：{target_name}"
+                    f"115返回文件已存在，目标文件尚未可见，"
+                    f"交由既有后处理复核：{target_name}"
                 )
                 return True
             return False
@@ -619,23 +601,13 @@ class ShareService(OwnerDelegator):
                 ready, unresolved = self.rename_files_by_sha1_batch(
                     save_path, rename_items or {}, page_ids
                 )
-                recovered = {}
-                if unresolved:
-                    recovered = self._recover_duplicate_transfer(
-                        share_code=share_code,
-                        receive_code=receive_code,
-                        file_ids=unresolved,
-                        save_path=save_path,
-                        rename_items=rename_items or {},
-                    )
-                    ready.update(recovered)
-                verified_ids = [fid for fid in page_ids if str(fid) in ready]
-                success_ids.extend(verified_ids)
-                failed_ids.extend(fid for fid in page_ids if fid not in verified_ids)
+                # 4200045 只表示本次接收目标已存在，禁止再次调用 share_receive
+                # 创建独立目录并执行重命名、移动、删除。未即时可见的文件由
+                # 既有后处理按 SHA1 在暂存目录和最终目录中继续复核。
+                success_ids.extend(page_ids)
                 logger.warning(
                     f"第 {page_num} 页返回文件已存在，目录复核后确认 "
-                    f"{len(verified_ids) - len(recovered)} 个，独立目录恢复 "
-                    f"{len(recovered)} 个，仍失败 {len(page_ids) - len(verified_ids)} 个"
+                    f"{len(ready)} 个，待后处理复核 {len(unresolved)} 个"
                 )
             else:
                 logger.warning(
@@ -652,104 +624,6 @@ class ShareService(OwnerDelegator):
 
         logger.debug(f"批量转存完成: 成功 {len(success_ids)} 个，失败 {len(failed_ids)} 个")
         return success_ids, failed_ids
-
-    def _recover_duplicate_transfer(
-            self,
-            share_code: str,
-            receive_code: str,
-            file_ids: List[str],
-            save_path: str,
-            rename_items: Dict[str, Dict[str, str]],
-    ) -> Dict[str, dict]:
-        """目标目录不存在重复文件时，使用独立目录重新接收并移回目标目录。"""
-        if not file_ids:
-            return {}
-        retry_name = (
-            f"CloudSubscribe接收重试-{int(time.time() * 1000)}-"
-            f"{threading.get_ident()}"
-        )
-        retry_path = f"{str(save_path).rstrip('/')}/{retry_name}"
-        retry_cid = self.get_pid_by_path(retry_path, mkdir=True)
-        if retry_cid == -1:
-            logger.warning("115重复文件恢复失败：无法创建独立接收目录")
-            return {}
-
-        logger.info(
-            f"115目标目录未找到已接收文件，改用独立目录重试："
-            f"{retry_path}，文件 {len(file_ids)} 个"
-        )
-        retry_result = self._do_transfer(
-            share_code=share_code,
-            receive_code=receive_code,
-            file_id=",".join(str(file_id) for file_id in file_ids),
-            parent_id=retry_cid,
-            save_path=retry_path,
-            max_retries=1,
-        )
-        if retry_result is False:
-            logger.warning("115独立目录重试失败，保留目录供后续复核")
-            self._cleanup_empty_retry_directory(retry_path, retry_cid)
-            return {}
-
-        files = []
-        for attempt in range(3):
-            files = self.list_files_by_cid(retry_cid)
-            if files:
-                break
-            if attempt < 2:
-                time.sleep(1)
-
-        files_by_sha1 = {
-            self._normalize_hash(item.get("sha1") or item.get("sha")): item
-            for item in files
-            if len(self._normalize_hash(item.get("sha1") or item.get("sha"))) == 40
-        }
-        files_by_name = {
-            str(item.get("name") or item.get("n") or "").strip(): item
-            for item in files
-            if str(item.get("name") or item.get("n") or "").strip()
-        }
-        pending = {}
-        for file_id in file_ids:
-            key = str(file_id)
-            rename_item = rename_items.get(key) or {}
-            target_name = str(rename_item.get("target_name") or "").strip()
-            source_sha1 = self._normalize_hash(rename_item.get("sha1"))
-            item = files_by_sha1.get(source_sha1) if len(source_sha1) == 40 else None
-            if not item and target_name:
-                item = files_by_name.get(target_name)
-            if not item or not target_name:
-                continue
-            pending[key] = {
-                "item": dict(item),
-                "target_name": target_name,
-            }
-
-        renamed = self.rename_file_items_batch(retry_path, pending)
-        moved = self.move_file_items_batch(renamed, save_path)
-        if moved:
-            logger.info(
-                f"115独立目录恢复完成：{len(moved)}/{len(file_ids)} 个文件已移回 "
-                f"{save_path}"
-            )
-        self._cleanup_empty_retry_directory(retry_path, retry_cid)
-        return moved
-
-    def _cleanup_empty_retry_directory(self, retry_path: str, retry_cid: Any) -> None:
-        """仅在独立接收目录确认为空时移入回收站，避免残留额外文件夹。"""
-        checked = False
-        items = []
-        for attempt in range(3):
-            checked, items = self.list_files_by_cid_checked(retry_cid)
-            if not checked or not items:
-                break
-            if attempt < 2:
-                time.sleep(1)
-        if not checked or items:
-            return
-        if self.delete_file(retry_cid):
-            self.path_cache.delete(retry_path)
-            logger.info(f"115空接收重试目录已清理：{retry_path}")
 
     def _do_transfer(
             self,

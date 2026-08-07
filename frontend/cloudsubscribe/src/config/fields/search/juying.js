@@ -15,6 +15,11 @@ export function createJuyingGroups(options = {}) {
                     cols: 12,
                 },
                 {
+                    key: "juying_base_url",
+                    label: "服务地址",
+                    cols: 12,
+                },
+                {
                     key: "juying_username",
                     label: "网页登录账号",
                     cols: 6,

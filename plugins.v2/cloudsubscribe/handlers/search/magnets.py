@@ -106,7 +106,7 @@ class ExternalResourceSearchService(OwnerDelegator):
                 expected_year=getattr(mediainfo, "year", None),
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
-                limit=self._seedhub_result_limit,
+                limit=80 if test_mode else self._seedhub_result_limit,
                 test_mode=test_mode,
             )
         except SeedHubError as error:
@@ -144,7 +144,7 @@ class ExternalResourceSearchService(OwnerDelegator):
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
                 douban_id=douban_id,
-                limit=self._butailing_result_limit,
+                limit=80 if test_mode else self._butailing_result_limit,
                 test_mode=test_mode,
             )
         except ButailingError as error:
@@ -178,7 +178,7 @@ class ExternalResourceSearchService(OwnerDelegator):
                 tmdb_id=getattr(mediainfo, "tmdb_id", None),
                 season=season,
                 resource_type_order=self._juying_resource_types,
-                limit=self._juying_result_limit,
+                limit=80 if test_mode else self._juying_result_limit,
                 test_mode=test_mode,
             )
         except JuyingError as error:
@@ -203,13 +203,18 @@ class ExternalResourceSearchService(OwnerDelegator):
         if not self._pinglian_client:
             return []
         titles = self._media_titles(mediainfo)
+        logger.debug(
+            f"{prefix} 开始查询：关键词={','.join(titles) or '无'}，"
+            f"模式={'测试' if test_mode else '正式'}，"
+            f"资源类型={'全部（测试）' if test_mode else '/'.join(self._resource_type_order_config) or '无'}"
+        )
         try:
             resources = self._pinglian_client.search(
                 title=titles[0] if titles else "",
                 alternative_titles=titles[1:],
                 year=getattr(mediainfo, "year", None),
                 resource_type_order=self._resource_type_order_config,
-                limit=self._pinglian_result_limit,
+                limit=80 if test_mode else self._pinglian_result_limit,
                 test_mode=test_mode,
             )
         except PinglianError as error:

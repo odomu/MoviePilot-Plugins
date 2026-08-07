@@ -15,6 +15,11 @@ export function createDian115Groups(options = {}) {
                     cols: 12,
                 },
                 {
+                    key: "dian115_base_url",
+                    label: "服务地址",
+                    cols: 12,
+                },
+                {
                     key: "dian115_email",
                     label: "登录邮箱",
                     cols: 6,

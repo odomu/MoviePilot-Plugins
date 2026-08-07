@@ -345,7 +345,11 @@ class RequestGate:
         status = int(getattr(response, "status_code", 0) or 0)
         if status not in {403, 429, 500, 502, 503, 504}:
             return
-        if status == 403 and self._challenge_detector:
+        if status == 403:
+            # 没有挑战识别器时，403 只能表示接口拒绝，不能武断地当作风控。
+            # 否则普通权限/会话错误会触发全渠道 60 秒冷却并掩盖真实原因。
+            if not self._challenge_detector:
+                return
             try:
                 if not self._challenge_detector(response):
                     return

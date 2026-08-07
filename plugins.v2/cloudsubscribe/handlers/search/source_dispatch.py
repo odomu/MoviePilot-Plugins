@@ -80,6 +80,22 @@ class SourceDispatchService(OwnerDelegator):
                 raise_errors=test_mode,
                 test_mode=test_mode,
             )
+        if source == "online_docs":
+            titles = []
+            for value in (
+                    getattr(mediainfo, "title", ""),
+                    getattr(mediainfo, "original_title", ""),
+                    getattr(mediainfo, "original_name", ""),
+            ):
+                text = str(value or "").strip()
+                if text and text not in titles:
+                    titles.append(text)
+            return self._online_docs_client.search(
+                keyword=titles[0] if titles else "",
+                alternative_titles=titles[1:],
+                limit=100 if test_mode else 20,
+                test_mode=test_mode,
+            )
         raise ValueError("不支持的搜索渠道")
 
     def _prepare_source_results(

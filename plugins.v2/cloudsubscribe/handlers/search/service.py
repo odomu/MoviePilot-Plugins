@@ -44,7 +44,7 @@ class SearchHandler:
     _DIAN115_SEARCH_CACHE_VERSION = 1
     _SUPPORTED_SOURCES = frozenset({
         "hdhive", "dian115", "pansou", "seedhub", "butailing", "juying",
-        "pinglian",
+        "pinglian", "online_docs",
     })
 
     @staticmethod
@@ -66,6 +66,7 @@ class SearchHandler:
             butailing_client=None,
             juying_client=None,
             pinglian_client=None,
+            online_docs_client=None,
             pansou_enabled: bool = False,
             hdhive_enabled: bool = False,
             dian115_enabled: bool = False,
@@ -134,6 +135,7 @@ class SearchHandler:
         self._butailing_client = butailing_client
         self._juying_client = juying_client
         self._pinglian_client = pinglian_client
+        self._online_docs_client = online_docs_client
         self._juying_resources = (
             JuyingResourceService(juying_client) if juying_client else None
         )
@@ -144,6 +146,7 @@ class SearchHandler:
         self._butailing_enabled = bool(butailing_enabled)
         self._juying_enabled = bool(juying_enabled)
         self._pinglian_enabled = bool(pinglian_enabled)
+        self._online_docs_enabled = bool(online_docs_client)
         self._hdhive_username = hdhive_username
         self._hdhive_password = hdhive_password
         self._hdhive_query_mode = str(hdhive_query_mode or "web")
@@ -175,17 +178,25 @@ class SearchHandler:
         self._dian115_client = None
         self._dian115_resources = None
         self._dian115_client_lock = threading.RLock()
+        dian115_cache_identity = self._dian115_email.casefold()
+        self._dian115_unlocked_urls = create_platform_ttl_cache(
+            "search:dian115_unlocked_urls", dian115_cache_identity,
+            maxsize=512,
+            ttl=30 * 60,
+        )
         self._hdhive_max_unlock_points = hdhive_max_unlock_points
         self._hdhive_max_points_per_sub = hdhive_max_points_per_sub
         self._hdhive_budget = PointBudgetLedger(
             HDHiveSearchService._HISTORY_KEY,
             self._hdhive_max_unlock_points,
             self._hdhive_max_points_per_sub,
+            unlocked_cache=self._hdhive_unlocked_urls,
         )
         self._dian115_budget = PointBudgetLedger(
             Dian115SearchService._HISTORY_KEY,
             self._dian115_max_unlock_points,
             self._dian115_max_points_per_sub,
+            unlocked_cache=self._dian115_unlocked_urls,
         )
         self._pansou_channels = self._normalize_pansou_values(pansou_channels)
         self._pansou_plugins = self._normalize_pansou_values(pansou_plugins)
@@ -376,6 +387,10 @@ class SearchHandler:
         ):
             available.append("pinglian")
 
+        if self._online_docs_enabled:
+            available.append("online_docs")
+
+
         available_set = set(available)
         return [
             source for source in self._search_source_order
@@ -546,14 +561,15 @@ class SearchHandler:
         search_count = len(list(self._search_cache.items()))
         self._search_cache.clear()
         self._platform_filter_signature_cache.clear()
-        unlocked_count = len(list(self._hdhive_unlocked_urls.items()))
-        self._hdhive_unlocked_urls.clear()
+        unlocked_count = self._hdhive_budget.clear_cached_urls()
+        dian115_unlocked_count = self._dian115_budget.clear_cached_urls()
 
         with self._hdhive_web_lock:
             web_count = self._clear_client_cache(self._hdhive_web_resources)
         return {
             "search_results": search_count,
             "hdhive_unlocked_urls": unlocked_count,
+            "dian115_unlocked_urls": dian115_unlocked_count,
             "hdhive_web": web_count,
             "hdhive_openapi": self._clear_client_cache(self._hdhive_client),
             "seedhub": self._clear_client_cache(self._seedhub_client),

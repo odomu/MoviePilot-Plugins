@@ -17,18 +17,19 @@ class ButailingError(RuntimeError):
 class ButailingClient:
     """通过不太灵 API 精确定位作品并提取 Magnet。"""
 
+    _DEFAULT_BASE_URL = "https://web5.mukaku.com/prod/api/v1/"
     _DEFAULT_APP_ID = "83768d9ad4"
     _DEFAULT_IDENTITY = "23734adac0301bccdcb107c4aa21f96c"
 
     def __init__(
             self,
-            base_url: str = "https://web5.mukaku.com/prod/api/v1/",
+            base_url: str = _DEFAULT_BASE_URL,
             app_id: str = _DEFAULT_APP_ID,
             identity: str = _DEFAULT_IDENTITY,
             proxy: Any = None,
             request_timeout: int = 30,
     ):
-        self.base_url = str(base_url).rstrip("/") + "/"
+        self.base_url = str(base_url or self._DEFAULT_BASE_URL).rstrip("/") + "/"
         self._app_id = str(app_id or self._DEFAULT_APP_ID)
         self._identity = str(identity or self._DEFAULT_IDENTITY)
         self._proxies = normalize_proxies(proxy)
@@ -195,14 +196,15 @@ class ButailingClient:
         with lock:
             selected = None
             for keyword in normalized_keywords:
-                selected = self._select_row(
-                    self._search_rows(keyword),
-                    titles,
-                    "" if test_mode else year,
-                    media_type,
-                    None if test_mode else season,
-                    douban_id,
-                )
+                rows = self._search_rows(keyword)
+                if test_mode:
+                    selected = next(
+                        (row for row in rows if row.get("doub_id")), None
+                    )
+                else:
+                    selected = self._select_row(
+                        rows, titles, year, media_type, season, douban_id
+                    )
                 if selected:
                     break
             if not selected:
@@ -235,7 +237,7 @@ class ButailingClient:
                     "pan_type": "magnet",
                     "source": "butailing",
                     "source_service": "butailing",
-                    "source_url": "https://web5.mukaku.com/",
+                    "source_url": f"https://web5.mukaku.com/mv/{selected_douban_id}",
                     "douban_id": int(selected_douban_id),
                 })
                 if len(results) >= normalized_limit:

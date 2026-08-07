@@ -873,7 +873,10 @@ class SyncHandler:
             tmdb_id = int(getattr(subscribe, "tmdbid", 0) or 0)
         except (TypeError, ValueError):
             tmdb_id = 0
-        if title and tmdb_id > 0:
+        media_category = str(
+            getattr(subscribe, "media_category", "") or ""
+        ).strip()
+        if title and tmdb_id > 0 and media_category:
             try:
                 mediainfo = MediaInfo(
                     type=media_type,
@@ -2194,7 +2197,10 @@ class SyncHandler:
             if cache_key in self._platform_root_cache:
                 return self._platform_root_cache.get(cache_key)
 
-        directory = DirectoryHelper().get_dir(media=mediainfo, include_unsorted=True)
+        # 整理目标必须命中平台配置的媒体分类目录。
+        # include_unsorted=True 会把“未分类”目录（通常就是媒体根目录）
+        # 当作有效结果，导致电视剧绕过“电视剧”分类文件夹直接落到根目录。
+        directory = DirectoryHelper().get_dir(media=mediainfo, include_unsorted=False)
         resolved = None
         if directory:
             updates = {"library_path": root_path}

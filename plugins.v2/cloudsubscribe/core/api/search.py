@@ -4,6 +4,7 @@ import ast
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from app.core.config import settings
 from app.core.metainfo import MetaInfo
@@ -30,6 +31,7 @@ class SearchApi(OwnerDelegator):
             "pansou_result_limit", "pansou_timeout",
         }),
         "hdhive": frozenset({
+            "hdhive_base_url",
             "hdhive_query_mode", "hdhive_api_key", "hdhive_client_id",
             "hdhive_access_token", "hdhive_refresh_token",
             "hdhive_token_expires_at", "hdhive_username", "hdhive_password",
@@ -38,10 +40,12 @@ class SearchApi(OwnerDelegator):
             "hdhive_torrentclaw_subtitle_languages",
         }),
         "dian115": frozenset({
+            "dian115_base_url",
             "dian115_email", "dian115_password", "dian115_candidate_limit",
             "dian115_request_interval", "dian115_unlocks_per_minute",
         }),
         "juying": frozenset({
+            "juying_base_url",
             "juying_username", "juying_password", "juying_result_limit",
             "juying_request_interval", "juying_unlocks_per_minute",
         }),
@@ -50,6 +54,9 @@ class SearchApi(OwnerDelegator):
         "pinglian": frozenset({
             "pinglian_username", "pinglian_password", "pinglian_result_limit",
             "pinglian_request_interval", "pinglian_timeout",
+        }),
+        "online_docs": frozenset({
+            "online_docs", "online_docs_urls", "online_docs_resource_types"
         }),
     }
 
@@ -81,6 +88,7 @@ class SearchApi(OwnerDelegator):
         from ...search.pansou import PanSouClient
         from ...search.pinglian import PinglianClient
         from ...search.seedhub import SeedHubClient
+        from ...search.online_docs import OnlineDocumentClient
 
         def as_list(value: Any) -> list:
             if isinstance(value, list):
@@ -117,6 +125,16 @@ class SearchApi(OwnerDelegator):
                 "ed2k", "magnet",
             }
         ))
+        # 测试只验证渠道原始候选，不继承当前目标网盘的优先级或类型白名单。
+        # 各渠道仍会自行识别真实资源类型，但不会因目标盘配置而丢弃候选。
+        if source in {
+            "hdhive", "dian115", "juying", "seedhub",
+            "butailing", "pinglian", "pansou",
+        }:
+            resource_type_order = [
+                "115", "123", "quark", "guangya", "tianyi", "alipan",
+                "ed2k", "magnet",
+            ]
         if not resource_type_order:
             raise ValueError("请至少选择一种资源类型")
 
@@ -160,13 +178,16 @@ class SearchApi(OwnerDelegator):
                 save_data_func=self.save_data,
             )
 
-        seedhub_client = SeedHubClient(proxy=proxy) if source == "seedhub" else None
+        seedhub_client = SeedHubClient(base_url=str(config.get("seedhub_base_url") or ""),
+                                       proxy=proxy) if source == "seedhub" else None
         butailing_client = (
-            ButailingClient(proxy=proxy) if source == "butailing" else None
+            ButailingClient(base_url=str(config.get("butailing_base_url") or ""),
+                            proxy=proxy) if source == "butailing" else None
         )
         juying_client = None
         if source == "juying":
             juying_client = JuyingClient(
+                base_url=str(config.get("juying_base_url") or ""),
                 username=str(config.get("juying_username") or ""),
                 password=str(config.get("juying_password") or ""),
                 proxy=proxy,
@@ -180,8 +201,14 @@ class SearchApi(OwnerDelegator):
                 save_data_func=self.save_data,
             )
         pinglian_client = None
+        online_docs_client = OnlineDocumentClient(
+            config.get("online_docs") or config.get("online_docs_urls") or [],
+            config.get("online_docs_resource_types") or [],
+            proxy=proxy,
+        ) if source == "online_docs" else None
         if source == "pinglian":
             pinglian_client = PinglianClient(
+                base_url=str(config.get("pinglian_base_url") or ""),
                 username=str(config.get("pinglian_username") or ""),
                 password=str(config.get("pinglian_password") or ""),
                 proxy=proxy,
@@ -206,6 +233,7 @@ class SearchApi(OwnerDelegator):
             butailing_enabled=source == "butailing",
             juying_enabled=source == "juying",
             pinglian_enabled=source == "pinglian",
+            online_docs_client=online_docs_client,
             hdhive_username=str(config.get("hdhive_username") or ""),
             hdhive_password=str(config.get("hdhive_password") or ""),
             hdhive_query_mode=hdhive_query_mode,
@@ -343,6 +371,7 @@ class SearchApi(OwnerDelegator):
             "seedhub": "SeedHub",
             "butailing": "不太灵",
             "pinglian": "盘链",
+            "online_docs": "在线文档",
         }
         if source not in source_names:
             return {"success": False, "message": "不支持的搜索渠道"}
@@ -440,13 +469,16 @@ class SearchApi(OwnerDelegator):
                 "success": False,
                 "message": f"{source_names[source]} 测试失败：{error}",
             }
+        total_result_count = len(results or [])
         results = self._balanced_test_results(
             results, self._SEARCH_TEST_RESULT_LIMIT
         )
+        displayed_result_count = len(results or [])
         logger.debug(
             f"[{title}{f' S{season:02d}' if season else ''}]"
             f"[{source.upper()}] 只读渠道测试完成："
-            f"候选={len(results or [])}，耗时={time.monotonic() - test_started:.2f}s"
+            f"候选总数={total_result_count}，展示={displayed_result_count}，"
+            f"耗时={time.monotonic() - test_started:.2f}s"
         )
 
         resource_type_names = {
@@ -520,6 +552,14 @@ class SearchApi(OwnerDelegator):
             return tags
 
         for item in (results or [])[:100]:
+            source_url = ""
+            for value in (item.get("source_url"), item.get("media_page_url")):
+                candidate = str(value or "").strip()
+                parsed = urlparse(candidate)
+                if (parsed.scheme in {"http", "https"} and parsed.netloc
+                        and (parsed.path.rstrip("/") or parsed.query)):
+                    source_url = candidate
+                    break
             resource_type = str(
                 item.get("resource_type") or item.get("pan_type") or "unknown"
             ).strip().lower()
@@ -541,9 +581,7 @@ class SearchApi(OwnerDelegator):
                 "size_bytes": item.get("size") or 0,
                 "tags": display_tags(item),
                 "description": str(item.get("description") or "").strip(),
-                "source_url": str(
-                    item.get("source_url") or item.get("media_page_url") or ""
-                ).strip(),
+                "source_url": source_url,
                 "unlock_points": unlock_points,
                 "need_unlock": bool(item.get("need_unlock")),
                 "need_access": bool(item.get("need_access")),
@@ -555,7 +593,7 @@ class SearchApi(OwnerDelegator):
             )
         return {
             "success": True,
-            "message": f"{source_names[source]} 测试完成，找到 {len(results or [])} 个候选",
+            "message": f"{source_names[source]} 测试完成，找到 {total_result_count} 个候选",
             "data": {
                 "source": source,
                 "source_name": source_names[source],
@@ -564,7 +602,8 @@ class SearchApi(OwnerDelegator):
                     f"{f' ({getattr(mediainfo, 'year', None)})' if getattr(mediainfo, 'year', None) else ''}"
                     f"{f' S{season:02d}' if season else ''}"
                 ),
-                "count": len(results or []),
+                "count": total_result_count,
+                "displayed_count": displayed_result_count,
                 "items": items,
                 "resource_types": [
                     {

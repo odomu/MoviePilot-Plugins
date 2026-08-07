@@ -44,13 +44,13 @@ class PanSouSearchService(OwnerDelegator):
             titles.append(title_en)
         search_results = self._pansou_client.search(
             keyword=keyword,
-            cloud_types=[
+            cloud_types=[] if test_mode else [
                 "aliyun" if value == "alipan" else value
                 for value in self._resource_type_order_config
             ],
-            channels=self._pansou_channels,
-            plugins=self._pansou_plugins,
-            limit=self._pansou_result_limit,
+            channels=[] if test_mode else self._pansou_channels,
+            plugins=[] if test_mode else self._pansou_plugins,
+            limit=100 if test_mode else self._pansou_result_limit,
             expected_titles=titles,
             expected_year=getattr(mediainfo, "year", None),
             filter_config={} if test_mode else self._pansou_filter,
@@ -81,7 +81,8 @@ class PanSouSearchService(OwnerDelegator):
             for group in results.values()
             if isinstance(group, list)
             for item in group
-            if self._pansou_resource_type(item) in self._resource_type_order_config
+            if test_mode
+               or self._pansou_resource_type(item) in self._resource_type_order_config
         ]
         magnet_results = [
             item for item in candidates if self._pansou_resource_type(item) == "magnet"
@@ -106,7 +107,9 @@ class PanSouSearchService(OwnerDelegator):
         usable = [
             resource
             for resource in candidates
-            if resource.get("resource_type") != "magnet" or resource.get("magnet_metadata")
+            if test_mode
+               or resource.get("resource_type") != "magnet"
+               or resource.get("magnet_metadata")
             if test_mode or self._pansou_media_type_matches(resource, media_type)
         ]
         logger.debug(

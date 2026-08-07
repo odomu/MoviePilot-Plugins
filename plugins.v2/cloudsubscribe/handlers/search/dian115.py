@@ -358,25 +358,41 @@ class Dian115SearchService(OwnerDelegator):
     def reset_task_spent_points(self) -> None:
         self._dian115_budget.reset_task()
         if self._dian115_enabled and self._dian115_auto_unlock:
-            logger.debug("Dian115 任务积分账本已初始化")
+            logger.debug(
+                "Dian115 任务积分账本已初始化："
+                f"任务总预算={self._dian115_budget.task_limit}，"
+                f"单订阅预算={self._dian115_budget.subscribe_limit}，"
+                f"已解锁链接缓存={self._dian115_budget.cached_url_count()}"
+            )
 
     def reset_sub_spent_points(self, sub_key: str = "") -> None:
         spent_points = self._dian115_budget.reset_subscribe(sub_key)
         if sub_key and self._dian115_enabled and self._dian115_auto_unlock:
-            if spent_points > 0:
-                logger.debug(
-                    f"Dian115 订阅 {sub_key} 历史已花费 {spent_points} 积分，"
-                    f"剩余预算 {max(0, self._dian115_max_points_per_sub - spent_points)}"
-                )
-            else:
-                logger.debug(f"Dian115 订阅 {sub_key} 尚无积分消费记录")
+            logger.debug(
+                f"Dian115 订阅积分账本：key={sub_key}，"
+                f"历史已花费={spent_points}，"
+                f"单订阅预算={self._dian115_budget.subscribe_limit}，"
+                f"单订阅剩余={max(0, self._dian115_budget.subscribe_limit - spent_points)}，"
+                f"本轮任务已花费={self._dian115_budget.task_spent}，"
+                f"任务总预算={self._dian115_budget.task_limit}，"
+                f"任务剩余={max(0, self._dian115_budget.task_limit - self._dian115_budget.task_spent)}"
+            )
 
     def clear_sub_points(self, sub_key: str) -> None:
         if self._dian115_budget.clear_subscribe(sub_key):
             logger.debug(f"Dian115 已清除订阅 {sub_key} 的历史积分记录")
 
     def has_dian115_unlock_budget(self, unlock_points: int) -> bool:
-        return self._dian115_budget.can_spend(unlock_points)
+        status = self._dian115_budget.status(unlock_points)
+        if status is None:
+            logger.debug(f"Dian115 积分预算检查失败：积分值无效={unlock_points}")
+            return False
+        logger.debug(
+            "Dian115 积分预算检查："
+            f"{self._dian115_budget.format_snapshot(unlock_points)}，"
+            f"上下文={'订阅' if self._dian115_budget.subscribe_key else '任务初始化/测试'}"
+        )
+        return status.allowed
 
     def unlock_dian115_resource(
             self,
@@ -390,11 +406,33 @@ class Dian115SearchService(OwnerDelegator):
     ) -> Optional[str]:
         prefix = f"[{search_label}][DIAN115]" if search_label else "[DIAN115]"
         with self._dian115_budget.lock:
+            cache_key = str(int(share_id or 0))
+            cached_url = self._dian115_budget.cached_url(cache_key)
+            if cached_url:
+                logger.debug(
+                    f"{prefix} 复用已取得的 Dian115 分享链接："
+                    f"share_id={share_id}，订阅={self._dian115_budget.subscribe_key or '<none>'}，"
+                    "跳过重复解锁和积分记账"
+                )
+                return cached_url
             budget_status = self._dian115_budget.status(unlock_points)
-            if not budget_status or not budget_status.allowed:
+            if not budget_status:
+                logger.warning(
+                    f"{prefix} 解锁积分无效：share_id={share_id}，points={unlock_points}"
+                )
+                return None
+            logger.debug(
+                f"{prefix} Dian115 解锁预算快照：share_id={share_id}，"
+                f"resource_id={resource_id}，media={media_type or '<unknown>'}，"
+                f"tmdb_id={tmdb_id}，season={season}，"
+                f"{self._dian115_budget.format_snapshot(unlock_points)}"
+            )
+            if not budget_status.allowed:
                 logger.warning(
                     f"{prefix} 积分预算不足：share_id={share_id}，"
-                    f"需要 {unlock_points} 积分"
+                    f"需要={budget_status.requested}，"
+                    f"任务={budget_status.task_spent}/{budget_status.task_limit}，"
+                    f"订阅={budget_status.subscribe_spent}/{budget_status.subscribe_limit}"
                 )
                 return None
             unlock_points = budget_status.requested
@@ -410,8 +448,12 @@ class Dian115SearchService(OwnerDelegator):
                 actual_points = self._dian115_budget.normalize_points(
                     result.get("actual_points")
                 ) or 0
-                self._dian115_budget.record(actual_points)
                 url = self._unlock_payload_url(result)
+                actual_points, before_task, before_subscribe = (
+                    self._dian115_budget.record_result(
+                        cache_key, url, actual_points
+                    )
+                )
                 if not url:
                     logger.error(
                         f"{prefix} 解锁响应未返回可用链接：share_id={share_id}，"
@@ -425,6 +467,13 @@ class Dian115SearchService(OwnerDelegator):
                     )
                 remaining_task, remaining_subscribe = (
                     self._dian115_budget.remaining()
+                )
+                logger.debug(
+                    f"{prefix} Dian115 积分记账：share_id={share_id}，"
+                    f"服务端实际扣分={actual_points}，"
+                    f"任务={before_task}->{self._dian115_budget.task_spent}，"
+                    f"订阅={before_subscribe}->{self._dian115_budget.subscribe_spent}，"
+                    f"缓存已取得链接=True"
                 )
                 logger.info(
                     f"{prefix} 已取得分享链接：share_id={share_id}，"

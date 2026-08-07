@@ -193,6 +193,48 @@
                   hide-details="auto"
                   class="config-switch"
               />
+              <div v-else-if="field.type === 'online-documents'" class="online-documents">
+                <div v-if="field.hint" class="text-caption text-medium-emphasis mb-3">{{ field.hint }}</div>
+                <div
+                    v-for="(document, documentIndex) in onlineDocuments(field.key)"
+                    :key="documentIndex"
+                    class="online-document-row"
+                >
+                  <v-text-field
+                      v-model="document.url"
+                      label="文档地址"
+                      placeholder="https://docs.qq.com/..."
+                      density="compact"
+                      variant="outlined"
+                      hide-details="auto"
+                  />
+                  <v-select
+                      v-model="document.resource_types"
+                      label="资源类型"
+                      :items="field.items || []"
+                      multiple
+                      chips
+                      closable-chips
+                      density="compact"
+                      variant="outlined"
+                      hide-details="auto"
+                  />
+                  <v-btn
+                      icon="mdi-plus"
+                      variant="text"
+                      color="primary"
+                      title="在下方添加文档"
+                      @click="addOnlineDocument(field.key, documentIndex)"
+                  />
+                  <v-btn
+                      icon="mdi-delete-outline"
+                      variant="text"
+                      color="error"
+                      title="删除此文档"
+                      @click="removeOnlineDocument(field.key, documentIndex)"
+                  />
+                </div>
+              </div>
               <v-select
                   v-else-if="field.type === 'select'"
                   v-model="config[field.key]"
@@ -336,6 +378,14 @@ const emit = defineEmits([
 const hasText = (value) => Boolean(String(value || "").trim());
 
 function isTestSourceConfigured(source) {
+  if (source === "online_docs") {
+    return Array.isArray(props.config.online_docs) &&
+        props.config.online_docs.some((document) =>
+            hasText(document?.url) &&
+            Array.isArray(document?.resource_types) &&
+            document.resource_types.length,
+        );
+  }
   if (!Array.isArray(props.config.resource_type_order) || !props.config.resource_type_order.length)
     return false;
   if (source === "pansou") {
@@ -360,6 +410,24 @@ function testSourceTitle(source) {
   return isTestSourceConfigured(source)
       ? "测试当前搜索渠道"
       : "请先完成渠道账号配置并选择资源类型";
+}
+
+function onlineDocuments(key) {
+  if (!Array.isArray(props.config[key])) props.config[key] = [];
+  return props.config[key];
+}
+
+function addOnlineDocument(key, index) {
+  onlineDocuments(key).splice(index + 1, 0, {url: "", resource_types: []});
+}
+
+function removeOnlineDocument(key, index) {
+  const documents = onlineDocuments(key);
+  if (documents.length <= 1) {
+    documents.splice(0, 1, {url: "", resource_types: []});
+    return;
+  }
+  documents.splice(index, 1);
 }
 const activeSubtab = ref(props.section.subtabs?.[0]?.value || "");
 const availableGroups = computed(() =>
@@ -478,5 +546,27 @@ function mediaLibraryWebhookUrl(field, serverName) {
   display: flex;
   align-items: center;
   gap: 2px;
+}
+
+.online-documents {
+  min-width: 0;
+}
+
+.online-document-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(220px, 1fr) 40px 40px;
+  align-items: start;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+@media (max-width: 720px) {
+  .online-document-row {
+    grid-template-columns: minmax(0, 1fr) 40px 40px;
+  }
+
+  .online-document-row :deep(.v-select) {
+    grid-column: 1;
+  }
 }
 </style>

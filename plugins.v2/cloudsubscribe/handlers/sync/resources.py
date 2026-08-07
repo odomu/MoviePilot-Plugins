@@ -53,22 +53,15 @@ class ResourceTransferService(OwnerDelegator):
             points = int(points) if points is not None else None
         except (TypeError, ValueError):
             points = None
-        source_url = str(
-            resource.get("source_url")
-            or resource.get("page_url")
-            or resource.get("detail_url")
-            or share_url
-            or ""
-        ).strip()
-        return {
+        source_url = str(resource.get("source_url") or "").strip()
+        result = {
             "resource_type": resource_type,
             "source": source,
-            "source_url": source_url,
-            "media_page_url": str(
-                resource.get("media_page_url") or ""
-            ).strip(),
             "points": points,
         }
+        if source_url:
+            result["source_url"] = source_url
+        return result
 
     def _expand_resource_urls(
             self,

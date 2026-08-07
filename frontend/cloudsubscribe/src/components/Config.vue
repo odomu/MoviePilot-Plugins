@@ -151,10 +151,9 @@
                     v-model="sourceTest.title"
                     label="媒体名称"
                     maxlength="100"
-                    counter="100"
                     autofocus
                     clearable
-                    hide-details="auto"
+                    hide-details
                 />
               </v-col>
               <v-col cols="12" sm="4">
@@ -164,8 +163,7 @@
                     type="number"
                     min="1"
                     max="999"
-                    hint="电影会自动忽略"
-                    hide-details="auto"
+                    hide-details
                 />
               </v-col>
             </v-row>
@@ -253,10 +251,23 @@
               {{ testError }}
             </v-alert>
             <div v-if="testSubmitted" class="source-test-result">
-              <v-divider class="my-4"/>
-              <div class="text-body-2 mb-3">
-                {{ testChannelSummary }} · {{ testResult.media }} ·
-                {{ testResult.count || 0 }} 个候选
+              <div class="source-test-summary">
+                <div class="source-test-summary__line">
+                  <span class="source-test-summary__context">
+                    {{ testChannelSummary }} · {{ testResult.media }}
+                  </span>
+                  <span>
+                    共 <strong>{{ testResult.count || 0 }}</strong> 个搜索结果
+                  </span>
+                  <span>
+                    当前展示
+                    <strong>{{ testResult.displayed_count ?? (testResult.items || []).length }}</strong>
+                    个
+                  </span>
+                </div>
+              </div>
+              <div class="source-test-notice text-medium-emphasis mb-3">
+                测试结果可能受渠道测试展示上限限制数量，正式搜索仍按配置的候选上限执行
               </div>
               <v-tabs
                   v-if="testResourceTabs.length > 1"
@@ -303,6 +314,7 @@
                             :rel="
                             item.source_url ? 'noopener noreferrer' : undefined
                           "
+                            :title="item.source_url ? '打开来源资源页' : undefined"
                         >
                           {{
                             item.source_name ||
@@ -413,6 +425,23 @@ const props = defineProps({
 const emit = defineEmits(["save", "close", "switch", "layout"]);
 const api = props.api;
 const config = reactive(JSON.parse(JSON.stringify(props.initialConfig || {})));
+if (!Array.isArray(config.online_docs) || !config.online_docs.length) {
+  const legacyUrls = Array.isArray(config.online_docs_urls)
+      ? config.online_docs_urls
+      : String(config.online_docs_urls || "").split(/[,，\n]+/);
+  const legacyTypes = Array.isArray(config.online_docs_resource_types)
+      ? config.online_docs_resource_types
+      : [];
+  config.online_docs = legacyUrls
+      .map((url) => String(url || "").trim())
+      .filter(Boolean)
+      .map((url) => ({url, resource_types: [...legacyTypes]}));
+}
+if (!config.online_docs.length) {
+  config.online_docs.push({url: "", resource_types: []});
+}
+config.online_docs_urls = [];
+config.online_docs_resource_types = [];
 const activeTab = ref("basic");
 const qrVisible = ref(false),
     qrProvider = ref("115"),
@@ -454,11 +483,14 @@ const testResourceTabs = computed(() => {
       ? testResult.value.resource_types
       : [];
   if (!types.length) return [];
+  const displayedCount = Number(
+      testResult.value?.displayed_count ?? testResult.value?.items?.length ?? 0,
+  );
   return [
     {
       value: "all",
       title: "全部",
-      count: Number(testResult.value?.count || 0),
+      count: displayedCount,
     },
     ...types,
   ];
@@ -473,12 +505,7 @@ const filteredTestItems = computed(() => {
   );
 });
 const testChannelSummary = computed(() => {
-  const source = testResult.value?.source_name || "搜索渠道";
-  const types = Array.isArray(testResult.value?.resource_types)
-      ? testResult.value.resource_types
-      : [];
-  if (types.length <= 1) return source;
-  return `${source} · 多渠道（${types.map((item) => item.title).join(" / ")}）`;
+  return testResult.value?.source_name || "搜索渠道";
 });
 const sourceNames = {
   pansou: "PanSou",
@@ -488,6 +515,7 @@ const sourceNames = {
   seedhub: "SeedHub",
   butailing: "不太灵",
   pinglian: "盘链",
+  online_docs: "在线文档",
 };
 const sourceTestConfigKeys = {
   pansou: [
@@ -541,6 +569,7 @@ const sourceTestConfigKeys = {
     "pinglian_request_interval",
     "pinglian_timeout",
   ],
+  online_docs: ["online_docs"],
 };
 const sourceTest = reactive({
   source: "",
@@ -1203,6 +1232,46 @@ watch(
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
+  margin-top: 8px;
+}
+
+.source-test-summary {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border-left: 3px solid rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.07);
+}
+
+.source-test-summary__context {
+  color: rgba(var(--v-theme-on-surface), 0.72);
+}
+
+.source-test-summary__line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: nowrap;
+  gap: 14px;
+  overflow-x: auto;
+  white-space: nowrap;
+  color: rgba(var(--v-theme-on-surface), 0.86);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  scrollbar-width: none;
+}
+
+.source-test-summary__line::-webkit-scrollbar {
+  display: none;
+}
+
+.source-test-summary__line strong {
+  color: rgb(var(--v-theme-primary));
+  font-size: 0.9375rem;
+}
+
+.source-test-notice {
+  font-size: 0.81rem;
+  line-height: 1.4;
 }
 
 .source-test-result-scroll {

@@ -52,6 +52,7 @@ class Dian115Client:
             self,
             email: str,
             password: str,
+            base_url: str = BASE_URL,
             proxy: Any = None,
             request_interval: float = 1.0,
             unlocks_per_minute: int = 6,
@@ -65,6 +66,7 @@ class Dian115Client:
                 code="curl_cffi_missing",
             )
         self._email = str(email or "").strip()
+        self.base_url = str(base_url or self.BASE_URL).rstrip("/")
         self._password = str(password or "").strip()
         self._proxies = normalize_proxies(proxy)
         self._timeout = max(5, min(int(timeout or 30), 120))
@@ -80,7 +82,7 @@ class Dian115Client:
         self._lock = threading.RLock()
         self._request_gate = RequestGate.shared(
             "Dian115",
-            f"{self.BASE_URL}|{self._email.casefold()}|{self._proxies}",
+            f"{self.base_url}|{self._email.casefold()}|{self._proxies}",
             request_interval=request_interval,
             minimum_interval=0.2,
             risk_cooldown_seconds=self._RISK_COOLDOWN_SECONDS,
@@ -227,7 +229,7 @@ class Dian115Client:
                     self._request_gate,
                     self._session.request,
                     method,
-                    urljoin(f"{self.BASE_URL}/", path.lstrip("/")),
+                    urljoin(f"{self.base_url}/", path.lstrip("/")),
                     proxies=self._proxies,
                     timeout=self._timeout,
                     **kwargs,
