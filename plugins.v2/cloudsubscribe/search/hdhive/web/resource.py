@@ -9,11 +9,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urljoin
 
-from app.core.cache import TTLCache
 from app.log import logger
 
 from .client import HDHiveClient, HDHiveWebError
 from ...matching import positive_ints, unique_texts
+from ....utils.cache import create_platform_ttl_cache
 
 HDHIVE_DETAIL_RESOURCE_TYPES = frozenset({"115", "quark", "guangya", "ed2k"})
 HDHIVE_RESOURCE_TYPES = HDHIVE_DETAIL_RESOURCE_TYPES | {"magnet"}
@@ -25,9 +25,13 @@ class HDHiveResourceService:
     BASE_URL = "https://hdhive.com"
     _RESOURCE_CACHE_TTL = 5 * 60
     _RESOURCE_CACHE_LIMIT = 128
+    _SCHEMA_FAILURE_TTL = 60
     _TORRENTCLAW_CACHE_TTL = 30 * 60
     _TORRENTCLAW_CACHE_LIMIT = 128
     _TORRENTCLAW_REQUEST_INTERVAL = 60.0
+    _TORRENTCLAW_STATE_LOCK = threading.RLock()
+    _TORRENTCLAW_LAST_REQUEST_AT: Dict[str, float] = {}
+    _TORRENTCLAW_RETRY_UNTIL: Dict[str, float] = {}
     _NEXT_REDIRECT_RE = re.compile(
         r"NEXT_REDIRECT;(?:replace|push);"
         r"((?:\\/|/)(?:movie|tv)(?:\\/|/)[A-Za-z0-9_-]+);[0-9]{3};",
@@ -54,20 +58,26 @@ class HDHiveResourceService:
             torrentclaw_subtitle_languages or ["zh"]
         )
         session_key = client.cache_namespace
-        self._resource_cache = TTLCache(
-            region=f"cloudsubscribe:hdhive_web_rows:{session_key}",
+        self._resource_cache = create_platform_ttl_cache(
+            "hdhive:web:rows",
+            session_key,
             maxsize=self._RESOURCE_CACHE_LIMIT,
             ttl=self._RESOURCE_CACHE_TTL,
         )
-        self._torrentclaw_cache = TTLCache(
-            region=f"cloudsubscribe:hdhive_web_torrentclaw:{session_key}",
+        self._schema_failure_cache = create_platform_ttl_cache(
+            "hdhive:web:schema_failures",
+            session_key,
+            maxsize=self._RESOURCE_CACHE_LIMIT,
+            ttl=self._SCHEMA_FAILURE_TTL,
+        )
+        self._torrentclaw_cache = create_platform_ttl_cache(
+            "hdhive:web:torrentclaw",
+            session_key,
             maxsize=self._TORRENTCLAW_CACHE_LIMIT,
             ttl=self._TORRENTCLAW_CACHE_TTL,
         )
         self._resource_locks = tuple(threading.Lock() for _ in range(32))
         self._lock = threading.RLock()
-        self._last_torrentclaw_request_at = 0.0
-        self._torrentclaw_retry_until = 0.0
 
     def matches_config(
             self,
@@ -89,6 +99,7 @@ class HDHiveResourceService:
                 "torrentclaw": len(list(self._torrentclaw_cache.items())),
             }
             self._resource_cache.clear()
+            self._schema_failure_cache.clear()
             self._torrentclaw_cache.clear()
             return counts
 
@@ -159,14 +170,33 @@ class HDHiveResourceService:
             for value in (resource_types or [])
             if str(value or "").strip().lower() in HDHIVE_RESOURCE_TYPES
         ))
-        cache_key = f"v1:{normalized_type}:{int(tmdb_id)}:{','.join(enabled_types)}"
+        if not enabled_types:
+            return []
+        cache_key = f"v2:{normalized_type}:{int(tmdb_id)}"
+        requested = set(enabled_types)
+
+        def select_rows(raw_rows: Any) -> List[Dict[str, Any]]:
+            rows = [
+                dict(row) for row in (raw_rows or [])
+                if isinstance(row, dict)
+                   and HDHiveResourceService._resource_type(row) in requested
+            ]
+            if self._torrentclaw_enabled and "magnet" in requested:
+                rows.extend(self._load_torrentclaw_rows(
+                    normalized_type, int(tmdb_id), log_prefix
+                ))
+            return HDHiveResourceService._deduplicate(rows)
+
         if not force_refresh:
             cached = self._resource_cache.get(cache_key)
             if isinstance(cached, list):
                 logger.debug(
                     f"{log_prefix} WebAPI 命中资源页缓存：{len(cached)} 条原始资源"
                 )
-                return copy.deepcopy(cached)
+                return select_rows(cached)
+            if self._schema_failure_cache.get(cache_key):
+                logger.debug(f"{log_prefix} WebAPI 命中详情解析失败短缓存，跳过重复请求")
+                return []
         cache_lock = self._resource_locks[hash(cache_key) % len(self._resource_locks)]
         with cache_lock:
             if not force_refresh:
@@ -176,69 +206,89 @@ class HDHiveResourceService:
                         f"{log_prefix} WebAPI 等待并命中资源页缓存："
                         f"{len(cached)} 条原始资源"
                     )
-                    return copy.deepcopy(cached)
-            detail_path = self._client.request(
-                "GET",
-                f"/tmdb/{normalized_type}/{int(tmdb_id)}",
-                headers={
-                    "accept": (
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                        "*/*;q=0.8"
-                    ),
-                    "cache-control": "no-cache",
-                    "referer": f"{self._client.BASE_URL}/",
-                },
-                response_handler=self._detail_path_from_response,
-            )
-            group_data = self._client.request(
-                "GET",
-                detail_path,
-                headers={
-                    "accept": (
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                        "*/*;q=0.8"
-                    ),
-                    "cache-control": "no-cache",
-                    "referer": f"{self._client.BASE_URL}/",
-                },
-                response_handler=self._group_data_from_response,
-            )
-            requested = set(enabled_types)
-            rows = [
-                row for row in self._flatten_group_data(group_data)
-                if HDHiveResourceService._resource_type(row) in requested
-            ]
+                    return select_rows(cached)
+                if self._schema_failure_cache.get(cache_key):
+                    logger.debug(
+                        f"{log_prefix} WebAPI 等待并命中详情解析失败短缓存，"
+                        "跳过重复请求"
+                    )
+                    return []
+            try:
+                detail_path = self._client.request(
+                    "GET",
+                    f"/tmdb/{normalized_type}/{int(tmdb_id)}",
+                    headers={
+                        "accept": (
+                            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                            "*/*;q=0.8"
+                        ),
+                        "cache-control": "no-cache",
+                        "referer": f"{self._client.BASE_URL}/",
+                    },
+                    response_handler=self._detail_path_from_response,
+                )
+                group_data = self._client.request(
+                    "GET",
+                    detail_path,
+                    headers={
+                        "accept": (
+                            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                            "*/*;q=0.8"
+                        ),
+                        "cache-control": "no-cache",
+                        "referer": f"{self._client.BASE_URL}/",
+                    },
+                    response_handler=self._group_data_from_response,
+                )
+            except HDHiveWebError as error:
+                if error.code == "schema_changed":
+                    self._schema_failure_cache.set(cache_key, True)
+                    logger.debug(f"{log_prefix} WebAPI 详情结构未识别，写入 60 秒短缓存")
+                    return []
+                raise
+            rows = self._flatten_group_data(group_data)
             if not group_data:
                 logger.debug(f"{log_prefix} WebAPI 详情页无资源分组，按正常空结果处理")
-            if self._torrentclaw_enabled and "magnet" in requested:
-                rows.extend(self._load_torrentclaw_rows(
-                    normalized_type, int(tmdb_id), log_prefix
-                ))
-            rows = HDHiveResourceService._deduplicate(rows)
             self._resource_cache.set(cache_key, copy.deepcopy(rows))
-            return rows
+            return select_rows(rows)
 
     def _detail_path_from_response(self, response) -> str:
+        headers = getattr(response, "headers", {}) or {}
+        current_path = str(
+            headers.get("x-current-path")
+            or headers.get("x-current-url")
+            or ""
+        ).strip()
+        if current_path:
+            current_path = current_path.split("?", 1)[0]
+            if re.fullmatch(r"/(?:tv|movie)/[A-Za-z0-9_-]+", current_path, re.I):
+                return current_path
         redirect_match = self._NEXT_REDIRECT_RE.search(
             self._client.response_text(response)
         )
         if redirect_match:
             return redirect_match.group(1).replace("\\/", "/")
-        self._client.activate_risk_cooldown("TMDB 入口响应异常保护")
         raise HDHiveWebError(
-            "HDHive TMDB 入口响应异常，已进入 600 秒风险保护冷却",
-            code="rate_limited",
+            "HDHive TMDB 入口未返回资源详情路径",
+            code="schema_changed",
         )
 
     def _group_data_from_response(self, response) -> Dict[str, Any]:
+        html = self._client.response_text(response)
         try:
-            return self._parse_group_data(self._client.response_text(response))
+            return self._parse_group_data(html)
         except HDHiveWebError as error:
             if error.code != "schema_changed":
                 raise
-            self._client.activate_risk_cooldown("详情页异常保护")
+            risk_markers = (
+                "cf-chl-", "challenge-platform", "captcha", "访问频繁",
+                "页面过期", "请刷新页面", "安全验证",
+            )
+            if not any(marker.lower() in html.lower() for marker in risk_markers):
+                raise
+            self._client.activate_risk_cooldown("详情页挑战保护")
             raise HDHiveWebError(
-                "HDHive 详情页响应异常，已进入 600 秒风险保护冷却",
+                "HDHive 详情页触发安全验证，已进入 600 秒风险保护冷却",
                 code="rate_limited",
             ) from error
 
@@ -246,17 +296,25 @@ class HDHiveResourceService:
             self, media_type: str, tmdb_id: int, log_prefix: str
     ) -> List[Dict[str, Any]]:
         cache_key = f"{media_type}:{tmdb_id}"
+        state_key = self._client.cache_namespace
         cached = self._torrentclaw_cache.get(cache_key)
         if isinstance(cached, dict):
             return HDHiveResourceService._torrentclaw_rows(cached)
         with self._lock:
-            now = time.monotonic()
-            wait_seconds = max(
-                self._torrentclaw_retry_until - now,
-                self._TORRENTCLAW_REQUEST_INTERVAL
-                - (now - self._last_torrentclaw_request_at),
-                0.0,
-            )
+            with self._TORRENTCLAW_STATE_LOCK:
+                now = time.monotonic()
+                last_request_at = self._TORRENTCLAW_LAST_REQUEST_AT.get(
+                    state_key, 0.0
+                )
+                retry_until = self._TORRENTCLAW_RETRY_UNTIL.get(
+                    state_key, 0.0
+                )
+                wait_seconds = max(
+                    retry_until - now,
+                    self._TORRENTCLAW_REQUEST_INTERVAL
+                    - (now - last_request_at),
+                    0.0,
+                )
             if wait_seconds > 0:
                 logger.debug(
                     f"{log_prefix} TorrentClaw 等待限速 {wait_seconds:.1f}s"
@@ -272,7 +330,8 @@ class HDHiveResourceService:
                     "referer": f"{self._client.BASE_URL}/",
                 },
             )
-            self._last_torrentclaw_request_at = time.monotonic()
+            with self._TORRENTCLAW_STATE_LOCK:
+                self._TORRENTCLAW_LAST_REQUEST_AT[state_key] = time.monotonic()
             try:
                 payload = response.json()
             except ValueError as error:
@@ -283,7 +342,10 @@ class HDHiveResourceService:
             if "获取过于频繁" in message:
                 retry_match = re.search(r"(\d+)\s*秒后重试", message)
                 retry_seconds = int(retry_match.group(1)) if retry_match else 60
-                self._torrentclaw_retry_until = time.monotonic() + retry_seconds + 1
+                with self._TORRENTCLAW_STATE_LOCK:
+                    self._TORRENTCLAW_RETRY_UNTIL[state_key] = (
+                            time.monotonic() + retry_seconds + 1
+                    )
                 logger.debug(
                     f"{log_prefix} TorrentClaw 限流，{retry_seconds}s 后可重试"
                 )
@@ -520,20 +582,36 @@ class HDHiveResourceService:
             slug: str,
             unlock_points: int,
             resource_type: str,
+            media_page_url: str = "",
     ) -> Dict[str, Any]:
-        """通过签名解锁接口获取结构化分享链接。"""
+        """刷新资源页上下文后，通过签名解锁接口获取结构化分享链接。"""
         normalized_slug = str(slug or "").strip()
         normalized_type = str(resource_type or "").strip().lower()
         if not normalized_slug or normalized_type not in HDHIVE_DETAIL_RESOURCE_TYPES:
             raise HDHiveWebError("HDHive 资源标识或类型无效", code="invalid_resource")
         listed_points = max(0, int(unlock_points or 0))
         endpoint = f"/api/customer/resources/{normalized_slug}/unlock"
-        return self._client.signed_request(
+        detail_path = self._resource_detail_path(normalized_type, normalized_slug)
+        resource_url = f"{self.BASE_URL}{detail_path}"
+        referer = str(media_page_url or f"{self.BASE_URL}/").strip()
+        return self._client.signed_unlock_request(
             "POST",
             endpoint,
+            resource_page_path=detail_path,
             body=b"",
             headers={
                 "accept": "application/json",
+                "origin": self.BASE_URL,
+                "referer": resource_url,
+                "cache-control": "no-store",
+            },
+            page_headers={
+                "accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "*/*;q=0.8"
+                ),
+                "cache-control": "no-cache",
+                "referer": referer,
             },
             response_handler=lambda response: self._unlock_response(
                 response, listed_points, normalized_type
@@ -543,7 +621,7 @@ class HDHiveResourceService:
     def _unlock_response(
             self, response, listed_points: int, normalized_type: str
     ) -> Dict[str, Any]:
-        """在客户端串行锁内解析解锁结果并及时启动风险保护。"""
+        """在客户端串行锁内解析解锁结果并隔离页面上下文失败。"""
         try:
             payload = response.json()
         except ValueError as error:
@@ -567,12 +645,15 @@ class HDHiveResourceService:
             ).strip()
             if any(marker in message for marker in ("页面过期", "请刷新页面")):
                 self._resource_cache.clear()
-                self._client.activate_risk_cooldown(
-                    "资源页面过期保护", seconds=60
-                )
                 raise HDHiveWebError(
-                    f"HDHive 资源页面已过期，已停止自动重试：{message}",
+                    f"HDHive 资源页上下文刷新后仍已过期，停止本次解锁：{message}",
                     code="page_expired",
+                    status_code=response.status_code,
+                )
+            if response.status_code == 429:
+                raise HDHiveWebError(
+                    f"HDHive 获取资源触发 HTTP 429 风控：{message or '请求过于频繁'}",
+                    code="rate_limited",
                     status_code=response.status_code,
                 )
             raise HDHiveWebError(

@@ -6,12 +6,18 @@ from threading import Event as ThreadEvent, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.db import SessionFactory
+from app.db.models.subscribe import Subscribe
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.schemas.types import MediaType
 
 from .runtime import sync_lock
 from ...core import CloudDriveCapability, OwnerDelegator
+from ...utils.cache import create_platform_ttl_cache
+
+_SUBSCRIBE_MEDIA_KEY_CACHE = create_platform_ttl_cache(
+    "sync:subscribe_media_keys", maxsize=512, ttl=60
+)
 
 
 class SyncExecutionService(OwnerDelegator):
@@ -40,15 +46,7 @@ class SyncExecutionService(OwnerDelegator):
         )
 
     @staticmethod
-    def _subscribe_search_media_key(subscribe_id: Optional[int]) -> tuple:
-        """使用媒体身份合并重复订阅，避免同一媒体因不同订阅 ID 重复搜索。"""
-        if subscribe_id is None:
-            return ("ALL",)
-        try:
-            subscribe = SubscribeOper().get(int(subscribe_id))
-        except Exception as error:
-            logger.warning(f"读取订阅媒体身份失败，回退按 ID 合并：{subscribe_id} - {error}")
-            subscribe = None
+    def _media_key_from_subscribe(subscribe_id: int, subscribe: Any) -> tuple:
         if not subscribe:
             return ("ID", int(subscribe_id))
         media_type = str(getattr(subscribe, "type", "") or "")
@@ -63,6 +61,53 @@ class SyncExecutionService(OwnerDelegator):
             if media_type == MediaType.TV.value else 0
         )
         return media_type, media_id, season
+
+    @classmethod
+    def _subscribe_search_media_keys(
+            cls, subscribe_ids
+    ) -> Dict[Optional[int], tuple]:
+        """批量生成队列媒体键，同一阶段每个订阅只解析一次。"""
+        values = list(dict.fromkeys(subscribe_ids or []))
+        result: Dict[Optional[int], tuple] = {}
+        missing: Dict[int, List[Any]] = {}
+        for subscribe_id in values:
+            if subscribe_id is None:
+                result[subscribe_id] = ("ALL",)
+                continue
+            try:
+                normalized_id = int(subscribe_id)
+            except (TypeError, ValueError):
+                result[subscribe_id] = ("ID", str(subscribe_id))
+                continue
+            cached = _SUBSCRIBE_MEDIA_KEY_CACHE.get(str(normalized_id))
+            if isinstance(cached, (list, tuple)):
+                result[subscribe_id] = tuple(cached)
+            else:
+                missing.setdefault(normalized_id, []).append(subscribe_id)
+
+        if missing:
+            rows_by_id: Dict[int, Any] = {}
+            try:
+                with SessionFactory() as db:
+                    rows = db.query(Subscribe).filter(
+                        Subscribe.id.in_(list(missing))
+                    ).all()
+                rows_by_id = {
+                    int(row.id): row for row in rows
+                    if getattr(row, "id", None) is not None
+                }
+            except Exception as error:
+                logger.warning(
+                    f"批量读取订阅媒体身份失败，回退按 ID 合并：{error}"
+                )
+            for normalized_id, original_ids in missing.items():
+                media_key = cls._media_key_from_subscribe(
+                    normalized_id, rows_by_id.get(normalized_id)
+                )
+                _SUBSCRIBE_MEDIA_KEY_CACHE.set(str(normalized_id), media_key)
+                for original_id in original_ids:
+                    result[original_id] = media_key
+        return result
 
     def _prepare_searchable_subscribes(
             self, subscribes: List[Any]
@@ -83,7 +128,7 @@ class SyncExecutionService(OwnerDelegator):
             )
             if not repaired:
                 unresolved_count += 1
-                logger.warning(
+                logger.debug(
                     "订阅缺少 TMDB ID 且自动修复失败，任务创建前跳过："
                     f"#{getattr(subscribe, 'id', '')} "
                     f"{getattr(subscribe, 'name', '')} "
@@ -146,17 +191,19 @@ class SyncExecutionService(OwnerDelegator):
         duplicate_count = 0
         duplicate_details = []
         for group in grouped.values():
-            ordered = sorted(
+            canonical_item = min(
                 group,
                 key=lambda item: int(getattr(item, "id", 0) or 0),
             )
-            canonical.append(ordered[0])
-            duplicates = ordered[1:]
+            canonical.append(canonical_item)
+            duplicates = [
+                item for item in group if item is not canonical_item
+            ]
             duplicate_count += len(duplicates)
             if duplicates:
                 duplicate_details.append(
-                    f"{getattr(ordered[0], 'name', '')}：保留 "
-                    f"#{getattr(ordered[0], 'id', '')}，跳过 "
+                    f"{getattr(canonical_item, 'name', '')}：保留 "
+                    f"#{getattr(canonical_item, 'id', '')}，跳过 "
                     + ", ".join(
                         f"#{getattr(item, 'id', '')}" for item in duplicates
                     )
@@ -179,13 +226,18 @@ class SyncExecutionService(OwnerDelegator):
     ) -> bool:
         """接收平台订阅搜索，并保留平台传入的状态范围。"""
         normalized_state = self._normalize_subscribe_state(subscribe_state)
-        media_key = self._subscribe_search_media_key(subscribe_id)
-        debounce_key = (media_key, normalized_state)
         now = time.monotonic()
         queue_lock = self._subscribe_search_queue_lock
         with queue_lock:
             if self._subscribe_search_queue_shutdown.is_set():
                 return False
+            media_keys = self._subscribe_search_media_keys({
+                subscribe_id,
+                *self._subscribe_search_active,
+                *self._subscribe_search_pending,
+            })
+            media_key = media_keys[subscribe_id]
+            debounce_key = (media_key, normalized_state)
             recent = self._subscribe_search_recent
             expired_before = now - self._SUBSCRIBE_SEARCH_DEBOUNCE_SECONDS
             self._subscribe_search_recent = {
@@ -194,13 +246,13 @@ class SyncExecutionService(OwnerDelegator):
                 if completed_at > expired_before
             }
             active_media_keys = {
-                self._subscribe_search_media_key(queued_id)
+                media_keys[queued_id]
                 for queued_id in self._subscribe_search_active
             }
             pending_media_id = next((
                 queued_id
                 for queued_id in self._subscribe_search_pending
-                if self._subscribe_search_media_key(queued_id) == media_key
+                if media_keys[queued_id] == media_key
             ), None)
             if debounce_key in self._subscribe_search_recent:
                 queue_state = "防抖合并"
@@ -304,8 +356,9 @@ class SyncExecutionService(OwnerDelegator):
                 )
                 with self._subscribe_search_queue_lock:
                     completed_at = time.monotonic()
+                    media_keys = self._subscribe_search_media_keys(batch)
                     for queued_id, queued_state in batch.items():
-                        recent_key = self._subscribe_search_media_key(queued_id)
+                        recent_key = media_keys[queued_id]
                         self._subscribe_search_recent[(recent_key, queued_state)] = completed_at
                     self._subscribe_search_active = {}
         finally:
@@ -340,6 +393,7 @@ class SyncExecutionService(OwnerDelegator):
             manual_resources: Optional[List[Dict[str, Any]]] = None,
             manual_target: Optional[Dict[str, Any]] = None,
             upgrade_request: Optional[Dict[str, Any]] = None,
+            manual_upgrade: bool = False,
     ) -> bool:
         if self._stop_requested():
             logger.info("同步任务已收到停止请求，取消执行")
@@ -422,22 +476,35 @@ class SyncExecutionService(OwnerDelegator):
             subscribes = [self._sync_handler.build_transient_media_target(
                 manual_target,
                 target_id=-1,
-                manual_upgrade=False,
+                manual_upgrade=manual_upgrade,
             )]
         else:
             with SessionFactory() as db:
                 subscribe_oper = SubscribeOper(db=db)
                 if subscribe_ids is not None:
-                    subscribes = []
+                    normalized_ids = []
                     seen_ids = set()
                     for queued_id in subscribe_ids:
-                        normalized_id = int(queued_id or 0)
+                        try:
+                            normalized_id = int(queued_id or 0)
+                        except (TypeError, ValueError):
+                            continue
                         if normalized_id <= 0 or normalized_id in seen_ids:
                             continue
                         seen_ids.add(normalized_id)
-                        subscribe = subscribe_oper.get(normalized_id)
-                        if subscribe:
-                            subscribes.append(subscribe)
+                        normalized_ids.append(normalized_id)
+                    rows = (
+                        db.query(Subscribe).filter(
+                            Subscribe.id.in_(normalized_ids)
+                        ).all()
+                        if normalized_ids else []
+                    )
+                    rows_by_id = {int(row.id): row for row in rows}
+                    subscribes = [
+                        rows_by_id[subscribe_id]
+                        for subscribe_id in normalized_ids
+                        if subscribe_id in rows_by_id
+                    ]
                 elif subscribe_id:
                     subscribe = subscribe_oper.get(subscribe_id)
                     subscribes = [subscribe] if subscribe else []
@@ -454,8 +521,17 @@ class SyncExecutionService(OwnerDelegator):
                 )
             return True
 
-        tv_subscribes = [s for s in subscribes if s.type == MediaType.TV.value]
-        movie_subscribes = [s for s in subscribes if s.type == MediaType.MOVIE.value]
+        if manual_upgrade:
+            for subscribe in subscribes:
+                setattr(subscribe, "_manual_upgrade", True)
+
+        tv_subscribes = []
+        movie_subscribes = []
+        for subscribe in subscribes:
+            if subscribe.type == MediaType.TV.value:
+                tv_subscribes.append(subscribe)
+            elif subscribe.type == MediaType.MOVIE.value:
+                movie_subscribes.append(subscribe)
 
         if not tv_subscribes and not movie_subscribes:
             logger.debug("当前没有电影或电视剧订阅")
@@ -565,12 +641,13 @@ class SyncExecutionService(OwnerDelegator):
             ).append(record)
         transfer_details: List[Dict[str, Any]] = []
         transferred_count = 0
-        active_tv_count = sum(
-            subscribe.type == MediaType.TV.value for subscribe in active_subscribes
-        )
-        active_movie_count = sum(
-            subscribe.type == MediaType.MOVIE.value for subscribe in active_subscribes
-        )
+        active_tv_count = 0
+        active_movie_count = 0
+        for subscribe in active_subscribes:
+            if subscribe.type == MediaType.TV.value:
+                active_tv_count += 1
+            elif subscribe.type == MediaType.MOVIE.value:
+                active_movie_count += 1
         scope_label = (
             f"手动洗版 {total_subscribes} 项"
             if upgrade_request
@@ -608,10 +685,11 @@ class SyncExecutionService(OwnerDelegator):
         if self._sync_handler:
             self._sync_handler.reset_transfer_budget()
         self._register_sync_tasks(active_subscribes)
-        grouped_subscribes = {
-            self._sync_media_key(subscribe): [subscribe]
-            for subscribe in active_subscribes
-        }
+        grouped_subscribes = {}
+        for subscribe in active_subscribes:
+            grouped_subscribes.setdefault(
+                self._sync_media_key(subscribe), []
+            ).append(subscribe)
 
         completed_subscribes = 0
         if grouped_subscribes:
@@ -880,6 +958,7 @@ class SyncExecutionService(OwnerDelegator):
             manual_resources: Optional[List[Dict[str, Any]]] = None,
             manual_target: Optional[Dict[str, Any]] = None,
             upgrade_request: Optional[Dict[str, Any]] = None,
+            manual_upgrade: bool = False,
             wait_for_slot: bool = False,
             queue_revision: Optional[int] = None,
             result: Optional[Dict[str, Any]] = None,
@@ -951,6 +1030,7 @@ class SyncExecutionService(OwnerDelegator):
                     subscribe_states=subscribe_states,
                     manual_resources=manual_resources,
                     manual_target=manual_target,
+                    manual_upgrade=manual_upgrade,
                     upgrade_request=upgrade_request,
                 )
             except Exception as e:

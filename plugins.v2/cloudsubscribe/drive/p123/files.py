@@ -1,10 +1,12 @@
 """123 网盘目录、查询与文件变更能力。"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional
+
+from app.core.cache import TTLCache
 
 from .client import P123_AVAILABLE, check_response, is_success
-from ..common import CloudDriveFileServiceBase, safe_int
+from ..common import CloudDriveFileServiceBase, create_directory_cache, safe_int
 from ...core.cloud import CloudFile
 from ...core.transfer import HttpFileDownloadService
 
@@ -69,7 +71,14 @@ class P123FileService(CloudDriveFileServiceBase):
     page_size: int = 100
     root_directory_id = "0"
     provider_name = "123"
-    _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": "0"})
+    provider_key = "p123"
+    _directory_cache: TTLCache = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._directory_cache = create_directory_cache("p123", self.client)
+
+    def _invalidate_directory_cache(self) -> None:
+        self._directory_cache.clear()
 
     def download_file(self, file_item: CloudFile, local_path: str,
                       progress_callback=None, stop_requested=None,
@@ -116,21 +125,28 @@ class P123FileService(CloudDriveFileServiceBase):
     def _list(self, directory_id: str) -> List[CloudFile]:
         if not P123_AVAILABLE or iterdir is None:
             raise RuntimeError("p123client 未安装")
-        return [
+        directory_id = str(directory_id or "0")
+        cached = self._directory_cache.get(directory_id)
+        if cached is not None:
+            return list(cached)
+        result = [
             file_item
             for item in iterdir(
                 self.client,
-                payload=int(directory_id or 0),
+                payload=int(directory_id),
                 max_depth=1,
                 keep_raw=True,
             )
             if (file_item := cloud_file(item)) is not None
         ]
+        self._directory_cache.set(directory_id, tuple(result))
+        return result
 
     def _create_folder(self, name: str, parent_id: str) -> Optional[CloudFile]:
         response = self.client.fs_mkdir(name, parent_id=int(parent_id or 0))
         if not self._is_success(response):
             return None
+        self._invalidate_directory_cache()
         data = response.get("data") or {}
         return cloud_file(data.get("Info") or data.get("info") or data)
 
@@ -140,7 +156,12 @@ class P123FileService(CloudDriveFileServiceBase):
 
     def rename_file(self, path: str, item: CloudFile, target_name: str) -> bool:
         response = self.client.fs_rename_one((int(item.id), target_name))
-        return self._is_success(response)
+        success = self._is_success(response)
+        if success:
+            self._invalidate_directory_cache()
+            if item.is_directory:
+                self._invalidate_path_cache()
+        return success
 
     def move_file(
             self, item: CloudFile, save_path: str, target_name: str
@@ -153,6 +174,9 @@ class P123FileService(CloudDriveFileServiceBase):
         )
         if not self._is_success(response):
             return None
+        self._invalidate_directory_cache()
+        if item.is_directory:
+            self._invalidate_path_cache()
         if target_name and target_name != item.name:
             if not self.rename_file(save_path, item, target_name):
                 return None
@@ -160,4 +184,8 @@ class P123FileService(CloudDriveFileServiceBase):
 
     def delete_file(self, file_id: str) -> bool:
         response = self.client.fs_trash(int(file_id), event="intoRecycle")
-        return self._is_success(response)
+        success = self._is_success(response)
+        if success:
+            self._invalidate_directory_cache()
+            self._invalidate_path_cache()
+        return success

@@ -24,7 +24,7 @@ export function createHdhiveGroups(options = {}) {
                         {title: "WebAPI", value: "web"},
                         {title: "OpenAPI", value: "api"},
                     ],
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "hdhive_api_key",
@@ -94,7 +94,7 @@ export function createHdhiveGroups(options = {}) {
                 {
                     key: "hdhive_username",
                     label: "HDHive 用户名",
-                    cols: 6,
+                    cols: 4,
                     show: (config) =>
                         config.hdhive_query_mode === "web",
                 },
@@ -102,7 +102,7 @@ export function createHdhiveGroups(options = {}) {
                     key: "hdhive_password",
                     label: "HDHive 密码",
                     type: "password",
-                    cols: 6,
+                    cols: 4,
                     show: (config) =>
                         config.hdhive_query_mode === "web",
                 },
@@ -149,7 +149,7 @@ export function createHdhiveGroups(options = {}) {
         },
         {
             tab: "hdhive",
-            title: "HDHive 搜索与风控",
+            title: "搜索与风控",
             icon: "mdi-shield-search",
             hint: "资源缓存减少重复访问；WebAPI 每分钟最多请求 10 次，异常页面会触发 10 分钟保护冷却。",
             fields: [
@@ -160,7 +160,7 @@ export function createHdhiveGroups(options = {}) {
                     type: "number",
                     min: 1,
                     max: 20,
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "hdhive_request_interval",
@@ -171,7 +171,7 @@ export function createHdhiveGroups(options = {}) {
                     max: 10,
                     step: 0.5,
                     suffix: "秒",
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "hdhive_unlocks_per_minute",
@@ -182,7 +182,7 @@ export function createHdhiveGroups(options = {}) {
                     max: 5,
                     step: 1,
                     suffix: "次/分钟",
-                    cols: 6,
+                    cols: 4,
                     show: (config) =>
                         config.hdhive_query_mode === "web",
                 },

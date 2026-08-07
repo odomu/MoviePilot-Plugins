@@ -7,11 +7,11 @@ import re
 from threading import RLock
 from urllib.parse import parse_qs, urlsplit
 
-from app.core.cache import TTLCache
 from app.log import logger
 
 from ..common import iter_transfer_batches
 from ...core.cloud import ShareLinkStatus
+from ...utils.cache import create_platform_ttl_cache
 
 
 class AliPanShareService:
@@ -21,8 +21,9 @@ class AliPanShareService:
         self.client = client
         self.files = files
         self._shares = {}
-        self._share_listing_cache = TTLCache(
-            region="cloudsubscribe:alipan:share_listings",
+        self._share_listing_cache = create_platform_ttl_cache(
+            "alipan:share_listings",
+            client,
             maxsize=1024,
             ttl=10 * 60,
         )

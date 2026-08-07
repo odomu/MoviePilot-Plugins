@@ -10,17 +10,23 @@ from urllib.parse import parse_qs, urlparse
 
 from app.core.config import settings
 from app.log import logger
-from cachetools import TTLCache
 from fastapi import Request
 
 from .page import clear_ui_options_cache
 from .. import CloudDriveCapability, OwnerDelegator
+from ...utils.cache import create_platform_ttl_cache
 
-_ACCOUNT_INFO_CACHE = TTLCache(maxsize=16, ttl=5 * 60)
-_ACCOUNT_REFRESH_GUARD = TTLCache(maxsize=16, ttl=30)
+_ACCOUNT_INFO_CACHE = create_platform_ttl_cache(
+    "account:info", maxsize=16, ttl=5 * 60
+)
+_ACCOUNT_REFRESH_GUARD = create_platform_ttl_cache(
+    "account:refresh_guard", maxsize=16, ttl=30
+)
 _ACCOUNT_INFO_LOCK = RLock()
 _ACCOUNT_INFO_DATA_KEY = "account_info_cache"
-_HDHIVE_OAUTH_PENDING = TTLCache(maxsize=16, ttl=10 * 60)
+_HDHIVE_OAUTH_PENDING = create_platform_ttl_cache(
+    "hdhive:oauth_pending", maxsize=16, ttl=10 * 60
+)
 _HDHIVE_OAUTH_LOCK = RLock()
 
 
@@ -240,15 +246,15 @@ class AccountApi(OwnerDelegator):
                     _ACCOUNT_INFO_CACHE.get(normalized_key) or stored_account
             )
             if cached_account:
-                _ACCOUNT_INFO_CACHE[normalized_key] = cached_account
-            if refresh and normalized_key in _ACCOUNT_REFRESH_GUARD:
+                _ACCOUNT_INFO_CACHE.set(normalized_key, cached_account)
+            if refresh and _ACCOUNT_REFRESH_GUARD.get(normalized_key):
                 return cached_account or {
                     "connected": False,
                     "error": "账户信息正在冷却，请稍后再刷新",
                 }, True
             if not refresh and cached_account:
                 return cached_account, False
-            _ACCOUNT_REFRESH_GUARD[normalized_key] = True
+            _ACCOUNT_REFRESH_GUARD.set(normalized_key, True)
 
         account = (
             self._load_drive_account(source, force=refresh)
@@ -257,7 +263,7 @@ class AccountApi(OwnerDelegator):
         )
         account["refreshed_at"] = int(time.time())
         with _ACCOUNT_INFO_LOCK:
-            _ACCOUNT_INFO_CACHE[normalized_key] = account
+            _ACCOUNT_INFO_CACHE.set(normalized_key, account)
             stored = self.get_data(_ACCOUNT_INFO_DATA_KEY) or {}
             stored = dict(stored) if isinstance(stored, dict) else {}
             stored[normalized_key] = account
@@ -275,7 +281,7 @@ class AccountApi(OwnerDelegator):
             stored = self.get_data(_ACCOUNT_INFO_DATA_KEY) or {}
             account = stored.get(account_key) if isinstance(stored, dict) else None
             if account:
-                _ACCOUNT_INFO_CACHE[account_key] = account
+                _ACCOUNT_INFO_CACHE.set(account_key, account)
                 return account
             return fallback
 
@@ -354,12 +360,12 @@ class AccountApi(OwnerDelegator):
             finally:
                 client.close()
             with _HDHIVE_OAUTH_LOCK:
-                _HDHIVE_OAUTH_PENDING[state] = {
+                _HDHIVE_OAUTH_PENDING.set(state, {
                     "client_id": client_id,
                     "redirect_uri": redirect_uri,
                     "scope": scope,
                     "response_mode": response_mode,
-                }
+                })
             return {
                 "success": True,
                 "message": "HDHive 授权页已准备，请在 10 分钟内完成授权",
@@ -422,7 +428,7 @@ class AccountApi(OwnerDelegator):
             except HDHiveOpenAPIError as error:
                 warning = f"Token 已获取，但读取授权用户失败：[{error.code}] {error.message}"
             with _HDHIVE_OAUTH_LOCK:
-                _HDHIVE_OAUTH_PENDING.pop(state, None)
+                _HDHIVE_OAUTH_PENDING.delete(state)
             return {
                 "success": True,
                 "message": "HDHive OpenAPI 用户授权成功",
@@ -454,8 +460,8 @@ def clear_account_cache(account_key: str = "") -> None:
     normalized_key = str(account_key or "").strip().lower()
     with _ACCOUNT_INFO_LOCK:
         if normalized_key:
-            _ACCOUNT_INFO_CACHE.pop(normalized_key, None)
-            _ACCOUNT_REFRESH_GUARD.pop(normalized_key, None)
+            _ACCOUNT_INFO_CACHE.delete(normalized_key)
+            _ACCOUNT_REFRESH_GUARD.delete(normalized_key)
         else:
             _ACCOUNT_INFO_CACHE.clear()
             _ACCOUNT_REFRESH_GUARD.clear()

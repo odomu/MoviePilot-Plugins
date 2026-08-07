@@ -72,6 +72,13 @@ export function createPansouGroups(options = {}) {
             icon: "mdi-filter-cog-outline",
             fields: [
                 {
+                    key: "pansou_refresh",
+                    label: "强制刷新",
+                    hint: "开启时绕过PanSou服务端缓存；关闭可显著提高重复搜索速度",
+                    type: "switch",
+                    cols: 12,
+                },
+                {
                     key: "pansou_filter_include",
                     label: "必须包含任一关键词",
                     hint: "include：结果中至少包含一个关键词（OR）",
@@ -94,7 +101,7 @@ export function createPansouGroups(options = {}) {
                     type: "number",
                     min: 1,
                     max: 100,
-                    cols: 3,
+                    cols: 4,
                 },
                 {
                     key: "pansou_result_limit",
@@ -103,14 +110,7 @@ export function createPansouGroups(options = {}) {
                     type: "number",
                     min: 1,
                     max: 100,
-                    cols: 3,
-                },
-                {
-                    key: "pansou_refresh",
-                    label: "强制刷新",
-                    hint: "开启时绕过PanSou服务端缓存；关闭可显著提高重复搜索速度",
-                    type: "switch",
-                    cols: 3,
+                    cols: 4,
                 },
                 {
                     key: "pansou_timeout",
@@ -119,7 +119,7 @@ export function createPansouGroups(options = {}) {
                     type: "number",
                     min: 5,
                     max: 120,
-                    cols: 3,
+                    cols: 4,
                 },
             ],
         },

@@ -1,6 +1,6 @@
 """光鸭目录与文件操作能力。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from ..common import CloudDriveFileServiceBase, extract_list, safe_int
@@ -55,7 +55,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
     page_size: int = 100
     root_directory_id = ""
     provider_name = "光鸭"
-    _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": ""})
+    provider_key = "guangya"
 
     def download_file(self, file_item: CloudFile, local_path: str,
                       progress_callback=None, stop_requested=None,
@@ -151,7 +151,10 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/rename",
             json_data={"fileId": item.id, "newName": target_name},
         )
-        return self._is_success(response)
+        success = self._is_success(response)
+        if success and item.is_directory:
+            self._invalidate_path_cache()
+        return success
 
     def move_file(
             self, item: CloudFile, save_path: str, target_name: str
@@ -166,6 +169,8 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         )
         if not self._is_success(moved):
             return None
+        if item.is_directory:
+            self._invalidate_path_cache()
         if target_name and target_name != item.name:
             if not self.rename_file(save_path, item, target_name):
                 return None
@@ -177,4 +182,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/delete_file",
             json_data={"fileIds": [file_id]},
         )
-        return self._is_success(response)
+        success = self._is_success(response)
+        if success:
+            self._invalidate_path_cache()
+        return success

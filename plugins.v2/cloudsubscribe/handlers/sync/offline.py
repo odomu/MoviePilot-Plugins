@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.db import SessionFactory
+from app.db.models.subscribe import Subscribe
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.schemas.types import MediaType
@@ -340,6 +341,25 @@ class OfflineTaskService(OwnerDelegator):
         media_context_cache: Dict[
             Tuple[Any, ...], Tuple[Any, Dict[str, Any]]
         ] = {}
+        subscribe_ids = {
+            int((pending.get(key) or {}).get("subscribe_id") or 0)
+            for key in due_keys
+            if int((pending.get(key) or {}).get("subscribe_id") or 0) > 0
+        }
+        subscribe_cache: Dict[int, Any] = {}
+        if subscribe_ids:
+            try:
+                with SessionFactory() as db:
+                    subscribes = db.query(Subscribe).filter(
+                        Subscribe.id.in_(sorted(subscribe_ids))
+                    ).all()
+                    subscribe_cache = {
+                        int(subscribe.id): subscribe for subscribe in subscribes
+                    }
+                for subscribe_id in subscribe_ids - set(subscribe_cache):
+                    subscribe_cache[subscribe_id] = None
+            except Exception as error:
+                logger.debug(f"批量读取后处理订阅失败，将按需查询：{error}")
 
         def queue_subscription_completion(
                 item: Dict[str, Any], media, media_data: Dict[str, Any]
@@ -497,6 +517,63 @@ class OfflineTaskService(OwnerDelegator):
                         item["moved_at"] = now
                         moved_files[pending_key] = target_file
 
+                # 洗版旧文件先按目录批量改为备份名；后续仍逐项确认新文件和 STRM
+                # 就绪后再删除备份，保留单集失败时的回滚边界。
+                upgrade_backup_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for pending_key in due_keys:
+                    item = pending.get(pending_key) or {}
+                    if (
+                            not item.get("upgrade")
+                            or str(item.get("upgrade_mode") or self._upgrade_mode)
+                            == "coexist"
+                            or item.get("upgrade_old_backed_up")
+                    ):
+                        continue
+                    old_dir = str(
+                        item.get("upgrade_old_cloud_dir")
+                        or item.get("cloud_dir") or "/"
+                    ).rstrip("/") or "/"
+                    old_name = str(item.get("upgrade_old_file_name") or "").strip()
+                    old_id = str(item.get("upgrade_old_file_id") or "").strip()
+                    directory_valid, old_index = directory_snapshot(old_dir)
+                    if not directory_valid:
+                        continue
+                    old_file = next(
+                        (
+                            value for value in old_index.values()
+                            if old_id and str(getattr(value, "id", "")) == old_id
+                        ),
+                        None,
+                    ) or old_index.get(old_name)
+                    if not old_file:
+                        continue
+                    old_path = Path(old_name)
+                    backup_name = (
+                        f".{old_path.stem}.cloudsubscribe-upgrade-"
+                        f"{str(pending_key).replace(':', '')[:10]}.bak{old_path.suffix}"
+                    )
+                    upgrade_backup_groups.setdefault(old_dir, {})[pending_key] = {
+                        "item": old_file,
+                        "target_name": backup_name,
+                    }
+                    item["upgrade_backup_name"] = backup_name
+
+                for old_dir, rename_items in upgrade_backup_groups.items():
+                    renamed = self._cloud_batch_mutations.rename_files(
+                        old_dir, rename_items
+                    )
+                    for pending_key, backup_file in renamed.items():
+                        item = pending.get(pending_key)
+                        if not item:
+                            continue
+                        item["upgrade_old_backed_up"] = True
+                        item["upgrade_old_file_id"] = str(
+                            getattr(backup_file, "id", "")
+                            or item.get("upgrade_old_file_id") or ""
+                        )
+                    if renamed:
+                        directory_snapshots.pop(old_dir, None)
+
             metadata_batches = {}
             for pending_key in due_keys:
                 item = pending.get(pending_key)
@@ -516,15 +593,17 @@ class OfflineTaskService(OwnerDelegator):
                         failed += 1
                         continue
                     if not task_done:
-                        if now - created_at >= self._FILE_FINALIZE_TIMEOUT:
-                            reason = "Magnet 离线下载超过24小时未完成"
+                        if now - created_at >= self._OFFLINE_TIMEOUT:
+                            reason = "Magnet 离线下载超过 30 分钟未完成，已退出"
                             self._mark_offline_history_status(pending_key, "失败", reason)
                             pending.pop(pending_key, None)
                             failed += 1
                         else:
                             self._schedule_finalize_retry(item, now)
                         continue
-                    finalized = self._finalize_magnet_package(item, pending_key)
+                    finalized = self._finalize_magnet_package(
+                        item, pending_key, subscribe_cache=subscribe_cache
+                    )
                     if finalized is None:
                         self._schedule_finalize_retry(item, now)
                         continue
@@ -549,7 +628,7 @@ class OfflineTaskService(OwnerDelegator):
                         continue
                     if task is not None and not task_done:
                         if now - created_at >= self._OFFLINE_TIMEOUT:
-                            reason = "115 离线下载超过24小时未完成"
+                            reason = "115 离线下载超过 30 分钟未完成，已退出"
                             logger.error(f"{reason}：{file_name}")
                             self._mark_offline_history_status(pending_key, "失败", reason)
                             pending.pop(pending_key, None)
@@ -571,7 +650,7 @@ class OfflineTaskService(OwnerDelegator):
                             continue
                     if not task_done:
                         if now - created_at >= self._OFFLINE_TIMEOUT:
-                            reason = "115 离线下载超过24小时未完成"
+                            reason = "115 离线下载超过 30 分钟未完成，已退出"
                             logger.error(f"{reason}：{file_name}")
                             self._mark_offline_history_status(pending_key, "失败", reason)
                             pending.pop(pending_key, None)
@@ -740,6 +819,9 @@ class OfflineTaskService(OwnerDelegator):
                         logger.warning(f"后处理元数据解析失败：{file_name}，{error}")
 
                 if not self._strm_generate_enabled or not self._strm_generator or not self._local_resource_path:
+                    if not self._finalize_subtitle_files(item, directory_snapshot):
+                        self._schedule_finalize_retry(item, now)
+                        continue
                     if item.get("upgrade") and str(
                             item.get("upgrade_mode") or self._upgrade_mode
                     ) != "coexist":
@@ -755,6 +837,7 @@ class OfflineTaskService(OwnerDelegator):
                         mediainfo=media,
                         media_data=media_data,
                         finish_subscription=media is None,
+                        subscribe_cache=subscribe_cache,
                     )
                     if detail:
                         finalized_details.append(detail)
@@ -771,6 +854,11 @@ class OfflineTaskService(OwnerDelegator):
                     logger.error(f"STRM 生成后文件不存在或为空：{strm_path}")
                     strm_path = None
                 if strm_path:
+                    if not self._finalize_subtitle_files(
+                            item, directory_snapshot, strm_path=strm_path
+                    ):
+                        self._schedule_finalize_retry(item, now)
+                        continue
                     if item.get("upgrade") and str(
                             item.get("upgrade_mode") or self._upgrade_mode
                     ) != "coexist":
@@ -792,6 +880,7 @@ class OfflineTaskService(OwnerDelegator):
                         mediainfo=media,
                         media_data=media_data,
                         finish_subscription=media is None,
+                        subscribe_cache=subscribe_cache,
                     )
                     if detail:
                         finalized_details.append(detail)
@@ -876,15 +965,26 @@ class OfflineTaskService(OwnerDelegator):
         return result
 
     def _finalize_magnet_package(
-            self, item: Dict[str, Any], pending_key: str
+            self,
+            item: Dict[str, Any],
+            pending_key: str,
+            subscribe_cache: Optional[Dict[int, Any]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """读取完成后的真实文件树，只移动实际匹配的媒体文件。"""
         mediainfo, media_data = self._restore_pending_media_context(item, pending_key)
         if not mediainfo:
             return []
         subscribe_id = int(item.get("subscribe_id") or 0)
-        with SessionFactory() as db:
-            subscribe = SubscribeOper(db=db).get(subscribe_id) if subscribe_id else None
+        subscribe = (
+            subscribe_cache.get(subscribe_id)
+            if subscribe_cache is not None and subscribe_id in subscribe_cache
+            else None
+        )
+        if subscribe_id and (
+                subscribe_cache is None or subscribe_id not in subscribe_cache
+        ):
+            with SessionFactory() as db:
+                subscribe = SubscribeOper(db=db).get(subscribe_id)
         if not subscribe and item.get("transient_target"):
             subscribe = SimpleNamespace(**(item.get("target_subscribe") or {}))
         if not subscribe:
@@ -1140,8 +1240,13 @@ class OfflineTaskService(OwnerDelegator):
             len(self._OFFLINE_CHECK_DELAYS) - 1,
         )
         item["check_index"] = check_index
-        item["next_check_at"] = now + self._OFFLINE_CHECK_DELAYS[check_index]
+        retry_at = now + self._OFFLINE_CHECK_DELAYS[check_index]
+        if str(item.get("task_type") or "share") in {"ed2k", "magnet"}:
+            created_at = float(item.get("created_at") or now)
+            retry_at = min(retry_at, created_at + self._OFFLINE_TIMEOUT)
+        item["next_check_at"] = retry_at
+        retry_minutes = max(1, int(max(0, retry_at - now) + 59) // 60)
         logger.debug(
             f"文件后处理尚未完成：{item.get('file_name')}，"
-            f"{self._OFFLINE_CHECK_DELAYS[check_index] // 60}分钟后复查"
+            f"{retry_minutes} 分钟后复查"
         )

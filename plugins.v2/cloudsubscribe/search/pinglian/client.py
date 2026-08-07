@@ -154,8 +154,10 @@ class PinglianClient:
         self._request_timeout = max(5, min(int(request_timeout or 30), 120))
         self._session = requests.Session(impersonate="chrome")
         self._session.headers.update(self._HEADERS)
-        self._request_gate = RequestGate(
-            "盘链", request_interval=request_interval, minimum_interval=0.5
+        self._request_gate = RequestGate.shared(
+            "盘链",
+            f"{self.base_url}|{self.username.casefold()}|{self._proxies}",
+            request_interval=request_interval, minimum_interval=0.5
         )
         self._get_data_func = get_data_func
         self._save_data_func = save_data_func
@@ -304,6 +306,14 @@ class PinglianClient:
             self._login(force=True)
             return self._request(method, path, retry_auth=False, **kwargs)
         if response.status_code == 429:
+            retry_after = response.headers.get("retry-after") or ""
+            try:
+                cooldown = max(60, min(600, int(float(retry_after))))
+            except (TypeError, ValueError):
+                cooldown = 60
+            self._request_gate.activate_cooldown(
+                cooldown, status=429, reason="盘链 HTTP 429"
+            )
             raise PinglianError("盘链请求过于频繁，请稍后重试", "pinglian_rate_limited")
         if response.status_code >= 400:
             raise PinglianError(
@@ -336,7 +346,7 @@ class PinglianClient:
     def _select_video(
             rows: Iterable[Dict[str, Any]], titles: List[str], year: str
     ) -> Optional[Dict[str, Any]]:
-        ranked = []
+        best = None
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
                 continue
@@ -348,9 +358,10 @@ class PinglianClient:
                 continue
             exact = any(name.casefold() == title.casefold() for title in titles)
             score = (200 if exact else 100) + (50 if year and row_year == year else 0)
-            ranked.append((score, -index, row))
-        ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        return ranked[0][2] if ranked else None
+            ranked = (score, -index, row)
+            if best is None or (score, -index) > (best[0], best[1]):
+                best = ranked
+        return best[2] if best is not None else None
 
     @staticmethod
     def _host_matches(host: str, domains: Iterable[str]) -> bool:
@@ -501,12 +512,17 @@ class PinglianClient:
                 for candidate in candidates:
                     grouped.setdefault(candidate[2], []).append(candidate)
                 candidates = []
+                offsets = {resource_type: 0 for resource_type in grouped}
                 while grouped:
                     for resource_type in list(grouped):
                         rows = grouped[resource_type]
-                        candidates.append(rows.pop(0))
-                        if not rows:
+                        offset = offsets[resource_type]
+                        candidates.append(rows[offset])
+                        offset += 1
+                        offsets[resource_type] = offset
+                        if offset >= len(rows):
                             grouped.pop(resource_type)
+                            offsets.pop(resource_type, None)
             results = []
             seen = set()
             for _, row, resource_type, token in candidates:

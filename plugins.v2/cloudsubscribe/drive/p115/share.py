@@ -188,7 +188,8 @@ class ShareService(OwnerDelegator):
             share_url: str,
             cid: int = 0,
             max_depth: int = 3,
-            target_season: int = None
+            target_season: int = None,
+            log_prefix: str = "",
     ) -> List[dict]:
         """
         列出分享链接内的文件
@@ -197,12 +198,14 @@ class ShareService(OwnerDelegator):
         :param cid: 目录 ID，0 为根目录
         :param max_depth: 最大递归深度
         :param target_season: 目标季数，用于优化递归（跳过明显不匹配的目录）
+        :param log_prefix: 并发任务日志前缀
         :return: 文件列表
         """
+        prefix = f"{log_prefix} " if log_prefix else ""
         if self.is_ed2k_url(share_url):
             file_info = self.parse_ed2k_link(share_url)
             if not file_info:
-                logger.error("无效的 ED2K 文件链接")
+                logger.error(f"{prefix}无效的 ED2K 文件链接")
                 return []
             return [{
                 "id": file_info["hash"],
@@ -215,13 +218,13 @@ class ShareService(OwnerDelegator):
                 "resource_type": "ed2k",
             }]
         if self.is_magnet_url(share_url):
-            logger.debug("Magnet 文件清单需等待115离线下载完成后读取")
+            logger.debug(f"{prefix}Magnet 文件清单需等待115离线下载完成后读取")
             return []
 
         cache_key = f"{share_url}|{cid}|{max_depth}|{target_season}"
         cached = self._share_file_cache.get(cache_key)
         if cached is not None:
-            logger.debug(f"复用115分享文件缓存：{share_url}")
+            logger.debug(f"{prefix}复用115分享文件缓存：{share_url}")
             return copy.deepcopy(cached)
 
         if not self.client:
@@ -232,7 +235,7 @@ class ShareService(OwnerDelegator):
         receive_code = info.get("receive_code")
 
         if not share_code or not receive_code:
-            logger.error("无效的分享链接或解析失败")
+            logger.error(f"{prefix}无效的分享链接或解析失败")
             return []
 
         files = self._list_share_files_recursive(
@@ -241,7 +244,8 @@ class ShareService(OwnerDelegator):
             cid=cid,
             depth=1,
             max_depth=max_depth,
-            target_season=target_season
+            target_season=target_season,
+            log_prefix=log_prefix,
         )
         if files:
             self._share_file_cache[cache_key] = copy.deepcopy(files)
@@ -254,7 +258,8 @@ class ShareService(OwnerDelegator):
             cid: int = 0,
             depth: int = 1,
             max_depth: int = 3,
-            target_season: int = None
+            target_season: int = None,
+            log_prefix: str = "",
     ) -> List[dict]:
         """递归列出分享文件（带速率限制和季数过滤优化）"""
         if depth > max_depth:
@@ -293,7 +298,10 @@ class ShareService(OwnerDelegator):
                     if target_season is not None:
                         skip_dir = self._should_skip_season_dir(dir_name, target_season)
                         if skip_dir:
-                            logger.info(f"跳过非目标季目录: {dir_name} (目标: S{target_season})")
+                            prefix = f"{log_prefix} " if log_prefix else ""
+                            logger.info(
+                                f"{prefix}跳过非目标季目录：{dir_name}（目标：S{target_season}）"
+                            )
                             continue
 
                     sub_cid = int(item.get("id", 0))
@@ -303,7 +311,8 @@ class ShareService(OwnerDelegator):
                         cid=sub_cid,
                         depth=depth + 1,
                         max_depth=max_depth,
-                        target_season=target_season
+                        target_season=target_season,
+                        log_prefix=log_prefix,
                     )
                     files.extend(children)
                     continue
@@ -311,7 +320,8 @@ class ShareService(OwnerDelegator):
                 files.append(file_info)
 
         except Exception as e:
-            logger.error(f"列出分享文件失败: {e}")
+            prefix = f"{log_prefix} " if log_prefix else ""
+            logger.error(f"{prefix}列出分享文件失败：{e}")
 
         return files
 
@@ -488,6 +498,7 @@ class ShareService(OwnerDelegator):
             batch_size: int = 20,
             batch_interval: float = 3.0,
             rename_items: Dict[str, Dict[str, str]] = None,
+            **kwargs: Any,
     ) -> Tuple[List[str], List[str]]:
         """
         批量转存分享中的多个文件，减少 API 调用次数以避免风控
@@ -737,7 +748,7 @@ class ShareService(OwnerDelegator):
         if not checked or items:
             return
         if self.delete_file(retry_cid):
-            self.path_cache.invalidate(retry_path)
+            self.path_cache.delete(retry_path)
             logger.info(f"115空接收重试目录已清理：{retry_path}")
 
     def _do_transfer(

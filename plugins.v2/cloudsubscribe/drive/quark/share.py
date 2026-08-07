@@ -7,12 +7,12 @@ import time
 from threading import RLock
 from typing import Any, Dict, Iterable
 
-from app.core.cache import TTLCache
 from app.log import logger
 
 from .files import cloud_file, list_data
 from ..common import safe_int
 from ...core.cloud import ShareLinkStatus
+from ...utils.cache import create_platform_ttl_cache
 
 
 class QuarkShareService:
@@ -23,14 +23,20 @@ class QuarkShareService:
         self.client = client
         self.page_size = files.page_size
         self._share_items: Dict[str, Dict[str, Dict[str, str]]] = {}
-        self._share_tokens = TTLCache(
-            region="cloudsubscribe:quark:share_tokens",
+        self._share_tokens = create_platform_ttl_cache(
+            "quark:share_tokens",
+            client,
             maxsize=256,
             ttl=10 * 60,
         )
         self._share_items_lock = RLock()
         self._transfer_blocked_until = 0.0
         self._transfer_block_reason = ""
+
+    @property
+    def transfer_risk_blocked(self) -> bool:
+        """返回转存接口是否因明确的账号风控信号处于熔断期。"""
+        return time.monotonic() < self._transfer_blocked_until
 
     def _get_share_token(self, share_id: str, password: str = "") -> Dict[str, Any]:
         return self.client.request(
@@ -252,8 +258,8 @@ class QuarkShareService:
                 f"文件数={len(normalized) or '全部'}，目录={save_path}"
             )
             with self._share_items_lock:
-                self._share_tokens.pop(
-                    f"{info['share_id']}|{info['receive_code']}", None
+                self._share_tokens.delete(
+                    f"{info['share_id']}|{info['receive_code']}"
                 )
         return success
 

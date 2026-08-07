@@ -2,13 +2,13 @@
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Optional
 
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
+from app.utils.string import StringUtils
 
 from ...core import OwnerDelegator
 from ...drive.common import format_size
@@ -18,17 +18,7 @@ class UpgradeRuleScoringService(OwnerDelegator):
     @staticmethod
     def _resource_size_bytes(value: object) -> int:
         """将搜索卡片的大小展示值转换为字节。"""
-        if isinstance(value, (int, float)):
-            return max(0, int(value))
-        match = re.search(
-            r"([\d.]+)\s*(B|KB|MB|GB|TB)\b",
-            str(value or ""),
-            re.IGNORECASE,
-        )
-        if not match:
-            return 0
-        unit = match.group(2).upper()
-        return int(float(match.group(1)) * 1024 ** ("B", "KB", "MB", "GB", "TB").index(unit))
+        return max(0, int(StringUtils.num_filesize(value) or 0))
 
     def _should_upgrade_candidate(
             self,

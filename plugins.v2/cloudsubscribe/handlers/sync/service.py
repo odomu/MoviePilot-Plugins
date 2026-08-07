@@ -8,7 +8,6 @@ import hashlib
 import re
 import threading
 import time
-from collections import OrderedDict
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 from typing import List, Dict, Any, Set, Optional, Callable, Tuple, Mapping
@@ -26,10 +25,13 @@ from app.schemas.types import MediaType, NotificationType
 
 from .baseline import UpgradeBaselineService
 from .history import HistoryService
+from .matching import FileMatchingService
 from .movie import MovieSyncProcessor
 from .offline import OfflineTaskService
 from .pt_upgrade import PtUpgradeService
+from .resources import ResourceTransferService
 from .rule_scoring import UpgradeRuleScoringService
+from .subtitles import SubtitleService
 from .television import TelevisionSyncProcessor
 from .upgrade import UpgradeService
 from ..notification import EmbyMediaResolver, MediaServerNotifier
@@ -44,14 +46,18 @@ from ...core import (
     MediaScraper,
 )
 from ...utils import FileMatcher, MediaFileParser, StrmGenerator, StrmTemplateError
+from ...utils.cache import create_platform_ttl_cache, normalize_platform_cache_key
 
 _COMPONENT_TYPES = (
     MovieSyncProcessor,
     TelevisionSyncProcessor,
     HistoryService,
+    FileMatchingService,
     OfflineTaskService,
     UpgradeBaselineService,
     UpgradeRuleScoringService,
+    ResourceTransferService,
+    SubtitleService,
     UpgradeService,
     PtUpgradeService,
 )
@@ -70,6 +76,9 @@ class SyncHandler:
     _RESOURCE_SEASON_DIR_CACHE_LIMIT = 256
     _SUBSCRIBE_DEFER_CACHE_LIMIT = 512
     _SUBSCRIBE_CALENDAR_CACHE_LIMIT = 512
+    _RUNTIME_CACHE_TTL = 6 * 60 * 60
+    _SUBSCRIBE_DEFER_CACHE_TTL = 32 * 24 * 60 * 60
+    _SUBSCRIBE_CALENDAR_CACHE_TTL = 26 * 60 * 60
     _CLOUD_MEDIA_ROOT = "/"
     _OFFLINE_RESOURCE_URL_RE = re.compile(
         r"ed2k://\|file\|[^|\r\n]+\|\d+\|[0-9A-Fa-f]{32}"
@@ -164,7 +173,10 @@ class SyncHandler:
         """
         self._cloud_drive = cloud_drive
         self._cross_transfer_enabled = bool(cross_transfer_enabled)
-        self._cross_transfer_media_types = set(cross_transfer_media_types or ("movie", "tv"))
+        self._cross_transfer_media_types = {
+            self._normalize_cross_transfer_media_type(value)
+            for value in (cross_transfer_media_types or ("movie", "tv"))
+        }
         self._cloud_drive_registry = cloud_drive_registry
         self._cross_transfer_manager = cross_transfer_manager
         self._cloud_auth = self._optional_cloud_service(
@@ -231,6 +243,9 @@ class SyncHandler:
         if self._enable_pt_upgrade and not self._cloud_upload:
             logger.warning("PT洗版已启用，但当前网盘不支持本地文件上传")
         self._upgrade_subscribe_ids = list(upgrade_subscribe_ids or [])
+        self._upgrade_subscribe_id_set = {
+            str(value) for value in self._upgrade_subscribe_ids
+        }
         self._upgrade_mode = (
             str(upgrade_mode or "largest").strip().lower()
             if str(upgrade_mode or "largest").strip().lower()
@@ -324,33 +339,48 @@ class SyncHandler:
         self._sync_metrics: Dict[str, Dict[str, int]] = {}
         self._media_recognition_lock = threading.RLock()
         self._platform_media_recognition_lock = threading.Lock()
-        self._media_recognition_cache: OrderedDict[Tuple[Any, ...], Any] = OrderedDict()
+        self._media_recognition_cache = create_platform_ttl_cache(
+            "sync:media_recognition", self,
+            maxsize=self._MEDIA_RECOGNITION_CACHE_LIMIT,
+            ttl=self._RUNTIME_CACHE_TTL,
+        )
         self._media_recognition_inflight: Dict[Tuple[Any, ...], Future] = {}
         self._resource_season_dir_lock = threading.RLock()
-        self._resource_season_dir_cache: OrderedDict[
-            Tuple[Any, ...], Optional[Path]
-        ] = OrderedDict()
+        self._resource_season_dir_cache = create_platform_ttl_cache(
+            "sync:resource_season_dirs", self,
+            maxsize=self._RESOURCE_SEASON_DIR_CACHE_LIMIT,
+            ttl=self._RUNTIME_CACHE_TTL,
+        )
         self._platform_root_lock = threading.RLock()
-        self._platform_root_cache: OrderedDict[
-            Tuple[Any, ...], Optional[Path]
-        ] = OrderedDict()
+        self._platform_root_cache = create_platform_ttl_cache(
+            "sync:platform_roots", self,
+            maxsize=self._PLATFORM_ROOT_CACHE_LIMIT,
+            ttl=self._RUNTIME_CACHE_TTL,
+        )
         self._subscribe_defer_lock = threading.RLock()
-        self._subscribe_defer_cache: OrderedDict[
-            Tuple[Any, ...], Dict[str, str]
-        ] = OrderedDict()
-        self._subscribe_calendar_cache: OrderedDict[
-            Tuple[Any, ...], Dict[str, Any]
-        ] = OrderedDict()
+        self._subscribe_defer_cache = create_platform_ttl_cache(
+            "sync:subscribe_defer", self,
+            maxsize=self._SUBSCRIBE_DEFER_CACHE_LIMIT,
+            ttl=self._SUBSCRIBE_DEFER_CACHE_TTL,
+        )
+        self._subscribe_calendar_cache = create_platform_ttl_cache(
+            "sync:subscribe_calendar", self,
+            maxsize=self._SUBSCRIBE_CALENDAR_CACHE_LIMIT,
+            ttl=self._SUBSCRIBE_CALENDAR_CACHE_TTL,
+        )
         self._baseline_cache_lock = threading.RLock()
-        self._baseline_transfer_cache: Dict[
-            Tuple[Any, ...], Dict[int, List[Dict[str, Any]]]
-        ] = {}
-        self._baseline_plugin_cache: Dict[
-            Tuple[Any, ...], Dict[int, List[Dict[str, Any]]]
-        ] = {}
-        self._baseline_emby_cache: Dict[
-            Tuple[Any, ...], Dict[int, Dict[str, Any]]
-        ] = {}
+        self._baseline_transfer_cache = create_platform_ttl_cache(
+            "sync:baseline_transfer", self, maxsize=256,
+            ttl=self._RUNTIME_CACHE_TTL,
+        )
+        self._baseline_plugin_cache = create_platform_ttl_cache(
+            "sync:baseline_plugin", self, maxsize=256,
+            ttl=self._RUNTIME_CACHE_TTL,
+        )
+        self._baseline_emby_cache = create_platform_ttl_cache(
+            "sync:baseline_emby", self, maxsize=256,
+            ttl=self._RUNTIME_CACHE_TTL,
+        )
 
     def _is_cloud_upgrade_subscribe(self, subscribe: Any) -> bool:
         """判断订阅是否属于插件网盘洗版范围。"""
@@ -364,7 +394,7 @@ class SyncHandler:
                 or not bool(getattr(subscribe, "best_version", False))
         ):
             return False
-        selected_ids = {str(value) for value in (self._upgrade_subscribe_ids or [])}
+        selected_ids = self._upgrade_subscribe_id_set
         return not selected_ids or str(getattr(subscribe, "id", "")) in selected_ids
 
     @staticmethod
@@ -466,23 +496,14 @@ class SyncHandler:
         """缓存明确的未来上映/播出日期，日期到达后自动失效。"""
         if not defer_until or defer_until <= datetime.date.today():
             return False
-        key = self._subscribe_defer_key(subscribe)
-        subscribe_id = key[0]
+        cache_key = normalize_platform_cache_key(
+            self._subscribe_defer_key(subscribe)
+        )
         with self._subscribe_defer_lock:
-            stale_keys = [
-                cached_key
-                for cached_key in self._subscribe_defer_cache
-                if cached_key[0] == subscribe_id and cached_key != key
-            ]
-            for stale_key in stale_keys:
-                self._subscribe_defer_cache.pop(stale_key, None)
-            self._subscribe_defer_cache[key] = {
+            self._subscribe_defer_cache.set(cache_key, {
                 "defer_until": defer_until.isoformat(),
                 "reason": str(reason or "尚未上映或播出"),
-            }
-            self._subscribe_defer_cache.move_to_end(key)
-            while len(self._subscribe_defer_cache) > self._SUBSCRIBE_DEFER_CACHE_LIMIT:
-                self._subscribe_defer_cache.popitem(last=False)
+            })
         logger.debug(
             f"订阅已延期至 {defer_until.isoformat()}："
             f"{getattr(subscribe, 'name', '')}，{reason}"
@@ -491,25 +512,17 @@ class SyncHandler:
 
     def get_subscribe_defer(self, subscribe: Any) -> Optional[Dict[str, str]]:
         """返回仍有效的订阅延期信息；订阅范围变化或日期到达时立即失效。"""
-        key = self._subscribe_defer_key(subscribe)
-        subscribe_id = key[0]
+        cache_key = normalize_platform_cache_key(
+            self._subscribe_defer_key(subscribe)
+        )
         today = datetime.date.today()
         with self._subscribe_defer_lock:
-            entry = self._subscribe_defer_cache.get(key)
+            entry = self._subscribe_defer_cache.get(cache_key)
             if entry:
                 defer_until = self._calendar_date(entry.get("defer_until"))
                 if defer_until and defer_until > today:
-                    self._subscribe_defer_cache.move_to_end(key)
                     return dict(entry)
-                self._subscribe_defer_cache.pop(key, None)
-                return None
-            stale_keys = [
-                cached_key
-                for cached_key in self._subscribe_defer_cache
-                if cached_key[0] == subscribe_id
-            ]
-            for stale_key in stale_keys:
-                self._subscribe_defer_cache.pop(stale_key, None)
+                self._subscribe_defer_cache.delete(cache_key)
         return None
 
     def get_tv_subscribe_calendar(
@@ -527,24 +540,17 @@ class SyncHandler:
         if tmdb_id <= 0 or total_episode < start_episode:
             return None
 
-        key = (*self._subscribe_defer_key(subscribe), tmdb_id)
+        cache_key = normalize_platform_cache_key(
+            (*self._subscribe_defer_key(subscribe), tmdb_id)
+        )
         today = datetime.date.today()
         checked_on = today.isoformat()
-        subscribe_id = key[0]
         with self._subscribe_defer_lock:
-            entry = self._subscribe_calendar_cache.get(key)
+            entry = self._subscribe_calendar_cache.get(cache_key)
             if entry and entry.get("checked_on") == checked_on:
-                self._subscribe_calendar_cache.move_to_end(key)
                 return dict(entry)
-            stale_keys = [
-                cached_key
-                for cached_key in self._subscribe_calendar_cache
-                if cached_key[0] == subscribe_id and cached_key != key
-            ]
-            for stale_key in stale_keys:
-                self._subscribe_calendar_cache.pop(stale_key, None)
             if entry:
-                self._subscribe_calendar_cache.pop(key, None)
+                self._subscribe_calendar_cache.delete(cache_key)
 
         try:
             from app.chain.tmdb import TmdbChain
@@ -655,13 +661,7 @@ class SyncHandler:
             "defer_until": defer_until.isoformat() if defer_until else "",
         }
         with self._subscribe_defer_lock:
-            self._subscribe_calendar_cache[key] = entry
-            self._subscribe_calendar_cache.move_to_end(key)
-            while (
-                    len(self._subscribe_calendar_cache)
-                    > self._SUBSCRIBE_CALENDAR_CACHE_LIMIT
-            ):
-                self._subscribe_calendar_cache.popitem(last=False)
+            self._subscribe_calendar_cache.set(cache_key, entry)
 
         if defer_until:
             self.defer_subscribe_until(
@@ -860,11 +860,87 @@ class SyncHandler:
                 progress=max(0, min(100, int(progress))),
             )
 
+    def _subscribe_mediainfo(
+            self,
+            subscribe: Any,
+            media_type: MediaType,
+            *,
+            cache: bool = True,
+    ) -> Optional[MediaInfo]:
+        """优先复用订阅卡片信息，仅在关键字段缺失时回退媒体识别。"""
+        title = str(getattr(subscribe, "name", "") or "").strip()
+        try:
+            tmdb_id = int(getattr(subscribe, "tmdbid", 0) or 0)
+        except (TypeError, ValueError):
+            tmdb_id = 0
+        if title and tmdb_id > 0:
+            try:
+                mediainfo = MediaInfo(
+                    type=media_type,
+                    title=title,
+                    year=getattr(subscribe, "year", None),
+                    tmdb_id=tmdb_id,
+                )
+                for source_field, media_field in (
+                        ("doubanid", "douban_id"),
+                        ("bangumiid", "bangumi_id"),
+                        ("anilistid", "anilist_id"),
+                        ("original_title", "original_title"),
+                        ("poster", "poster_path"),
+                        ("backdrop", "backdrop_path"),
+                        ("description", "overview"),
+                        ("vote", "vote_average"),
+                        ("release_date", "release_date"),
+                        ("media_category", "category"),
+                ):
+                    value = getattr(subscribe, source_field, None)
+                    if value in (None, "") or not hasattr(
+                            mediainfo, media_field
+                    ):
+                        continue
+                    try:
+                        setattr(mediainfo, media_field, value)
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                logger.debug(
+                    f"复用订阅卡片媒体信息：{title}（TMDB={tmdb_id}），"
+                    "跳过 TMDB 详情查询"
+                )
+                return mediainfo
+            except (TypeError, ValueError) as error:
+                logger.debug(
+                    f"订阅卡片媒体信息无效，回退平台识别：{title} - {error}"
+                )
+
+        meta = MetaInfo(title)
+        meta.year = getattr(subscribe, "year", None)
+        meta.type = media_type
+        season = (
+            int(getattr(subscribe, "season", 0) or 1)
+            if media_type == MediaType.TV else 0
+        )
+        if season:
+            meta.begin_season = season
+        return self._recognize_media_once(
+            (
+                "subscribe_fallback", media_type.value,
+                getattr(subscribe, "tmdbid", None),
+                getattr(subscribe, "doubanid", None), title,
+                getattr(subscribe, "year", None), season, bool(cache),
+            ),
+            meta=meta,
+            mtype=media_type,
+            tmdbid=getattr(subscribe, "tmdbid", None),
+            doubanid=getattr(subscribe, "doubanid", None),
+            cache=cache,
+        )
+
     def _recognize_media_once(self, key: Tuple[Any, ...], **kwargs: Any):
+        cache_key = normalize_platform_cache_key(key)
         with self._media_recognition_lock:
-            if key in self._media_recognition_cache:
-                self._media_recognition_cache.move_to_end(key)
-                return self._media_recognition_cache[key]
+            cached = self._media_recognition_cache.get(cache_key)
+            if cached is not None:
+                return cached
             future = self._media_recognition_inflight.get(key)
             owner = future is None
             if owner:
@@ -889,10 +965,7 @@ class SyncHandler:
 
         if mediainfo:
             with self._media_recognition_lock:
-                self._media_recognition_cache[key] = mediainfo
-                self._media_recognition_cache.move_to_end(key)
-                while len(self._media_recognition_cache) > self._MEDIA_RECOGNITION_CACHE_LIMIT:
-                    self._media_recognition_cache.popitem(last=False)
+                self._media_recognition_cache.set(cache_key, mediainfo)
         future.set_result(mediainfo)
         with self._media_recognition_lock:
             if self._media_recognition_inflight.get(key) is future:
@@ -1008,7 +1081,7 @@ class SyncHandler:
                 time.monotonic() + self._transfer_risk_cooldown,
             )
         logger.warning(
-            f"{key} 分享转存连续失败，冷却 {self._transfer_risk_cooldown} 秒"
+            f"{key} 分享转存检测到风控，冷却 {self._transfer_risk_cooldown} 秒"
         )
 
     def _transfer_episode_items(
@@ -1082,7 +1155,7 @@ class SyncHandler:
                             str(item["file"].get("sha1") or ""),
                             parent_task_id=parent_task_id,
                             stop_requested=batch_stop_requested,
-                            media_type=getattr(getattr(mediainfo, "type", None), "value", ""),
+                            media_type=getattr(getattr(mediainfo, "type", None), "name", ""),
                         )
                     except Exception as error:
                         if batch_stop_requested():
@@ -1142,10 +1215,6 @@ class SyncHandler:
                 success_ids = [
                     file_id for file_id, success in outcomes.items() if success
                 ]
-                if outcomes and not success_ids and all(
-                        success is False for success in outcomes.values()
-                ):
-                    self._activate_share_transfer_cooldown(provider_key)
             else:
                 processed_items = selected_items
                 success_ids, failed_ids = self._timed_sync_call(
@@ -1159,7 +1228,12 @@ class SyncHandler:
                     risk_cooldown=self._transfer_risk_cooldown,
                     rename_items=rename_items,
                 )
-                if failed_ids and not success_ids:
+                if (
+                        failed_ids and not success_ids
+                        and bool(getattr(
+                    self._share_transfer, "transfer_risk_blocked", False
+                ))
+                ):
                     self._activate_share_transfer_cooldown(provider_key)
         except Exception as error:
             message = str(error)
@@ -1172,6 +1246,21 @@ class SyncHandler:
 
         success_id_set = {str(file_id) for file_id in (success_ids or [])}
         self._release_transfer_slots(reserved - len(success_id_set))
+        transferred_subtitle_ids = set()
+        for item in processed_items:
+            if str(item["file"]["id"]) not in success_id_set:
+                continue
+            subtitle_files = item.get("subtitle_files") or []
+            item["subtitles"] = self._transfer_companion_subtitles(
+                share_url=str(item["file"].get("url") or share_url),
+                files=[item["file"], *subtitle_files],
+                video_file=item["file"],
+                target_video_name=item["target_name"],
+                media_type="tv",
+                season=season,
+                episode=item.get("episode"),
+                transferred_ids=transferred_subtitle_ids,
+            ) if subtitle_files else []
         batch_strm_results = self._generate_or_queue_strm_batch(
             [
                 {
@@ -1200,6 +1289,7 @@ class SyncHandler:
                     "upgrade_old_file_name": item.get("upgrade_old_file_name"),
                     "upgrade_old_file_id": item.get("upgrade_old_file_id"),
                     "upgrade_old_size": item.get("upgrade_old_size") or 0,
+                    "subtitles": item.get("subtitles") or [],
                 }
                 for item in processed_items
                 if str(item["file"]["id"]) in success_id_set
@@ -1235,57 +1325,6 @@ class SyncHandler:
                 "pending_key": pending_key,
             })
         return results, reserved
-
-    def _match_episode_files(
-            self,
-            files: list,
-            mediainfo: MediaInfo,
-            subscribe,
-            season: int,
-            episodes: List[int],
-    ) -> Dict[int, tuple]:
-        """按结构收集剧集候选，再使用规则组选择文件。"""
-        episode_list = list(dict.fromkeys(int(value) for value in episodes))
-        candidates = FileMatcher.episode_candidates(
-            files, season, episode_list, mediainfo=mediainfo
-        )
-        return {
-            episode: self._search_handler.select_file_candidate(
-                candidates.get(episode) or [], mediainfo, subscribe
-            )
-            for episode in episode_list
-        }
-
-    def _match_movie_file(
-            self, files: list, mediainfo: MediaInfo, subscribe,
-            resource_title: str = "",
-    ) -> tuple:
-        """按媒体文件结构收集电影候选，再使用规则组选择。"""
-        matched = self._search_handler.select_file_candidate(
-            FileMatcher.movie_candidates(files, mediainfo=mediainfo),
-            mediainfo,
-            subscribe,
-        )
-        if matched[0]:
-            return matched
-
-        # 文件名被网盘混淆时，仅允许“资源标题匹配 + 唯一大视频”进入兜底，
-        # 避免短剧合集、音乐包或多文件资源被误当成目标电影。
-        fallback = FileMatcher.movie_candidates(files)
-        if (
-                len(fallback) != 1
-                or not FileMatcher.media_name_matches(resource_title, mediainfo)
-        ):
-            return None, 0
-        actual = fallback[0]
-        scoring_item = dict(actual)
-        scoring_item["name"] = (
-            f"{str(resource_title).strip()}{Path(str(actual.get('name') or '')).suffix}"
-        )
-        selected, score = self._search_handler.select_file_candidate(
-            [scoring_item], mediainfo, subscribe
-        )
-        return (actual, score) if selected else (None, 0)
 
     def _generate_strm(
             self,
@@ -1350,16 +1389,20 @@ class SyncHandler:
                 file_name=file_name,
             )
             media_path = mapped_path.with_suffix(Path(file_name).suffix)
+            scrape_items = self._metadata_scraper.filter_missing_items([{
+                "media_path": media_path,
+                "season": season,
+                "episode": episode,
+            }], mediainfo)
+            if not scrape_items:
+                logger.debug(f"跳过元数据刮削：{media_path.parent}，NFO 和图片均已存在")
+                return media_path
             logger.info(
                 f"开始元数据刮削：{media_path}，"
                 f"NFO={'是' if self._nfo_scrape_enabled else '否'}，"
                 f"图片={'是' if self._image_scrape_enabled else '否'}"
             )
-            created = self._metadata_scraper.scrape_batch([{
-                "media_path": media_path,
-                "season": season,
-                "episode": episode,
-            }], mediainfo)
+            created = self._metadata_scraper.scrape_batch(scrape_items, mediainfo)
             if created:
                 logger.info(f"元数据刮削完成：{media_path.parent}，新增 {created} 个文件")
             else:
@@ -1400,6 +1443,15 @@ class SyncHandler:
                     "season": season,
                     "episode": episode,
                 })
+            scrape_items = self._metadata_scraper.filter_missing_items(
+                scrape_items, mediainfo
+            )
+            if not scrape_items:
+                logger.debug(
+                    f"跳过批量元数据刮削：{mediainfo.title_year}，"
+                    "NFO 和图片均已存在"
+                )
+                return
             logger.debug(
                 f"开始批量元数据刮削：{mediainfo.title_year}，"
                 f"{len(scrape_items)} 个媒体文件，"
@@ -1582,6 +1634,141 @@ class SyncHandler:
         ).hexdigest().upper()
         return source_hash, identity
 
+    def _pending_identity(
+            self,
+            share_url: str,
+            cloud_dir: str,
+            file_name: str,
+            source_identity: str,
+    ) -> Tuple[str, str, str]:
+        """统一计算后处理键，避免单项和批量流程产生不同规则。"""
+        info_hash = self._offline_hash(share_url)
+        if info_hash:
+            return (
+                info_hash,
+                "magnet" if self._is_magnet_url(share_url) else "ed2k",
+                info_hash,
+            )
+        path_digest = hashlib.sha1(
+            f"{str(cloud_dir or '').rstrip('/')}/{file_name}".encode("utf-8")
+        ).hexdigest()[:12]
+        provider_key = str(
+            getattr(self._cloud_drive, "key", "cloud") or "cloud"
+        )
+        return (
+            f"{provider_key}:{source_identity}:{path_digest}",
+            "share",
+            "",
+        )
+
+    def _build_pending_record(
+            self,
+            *,
+            current: Dict[str, Any],
+            pending_key: str,
+            task_type: str,
+            info_hash: str,
+            source_hash: str,
+            share_url: str,
+            cloud_dir: str,
+            file_name: str,
+            staging_dir: str,
+            staging_name: str,
+            file_size: int,
+            now: float,
+            mediainfo: MediaInfo,
+            media_data: Optional[Dict[str, Any]] = None,
+            subscribe_id: Optional[int] = None,
+            success_episodes: Optional[List[int]] = None,
+            notification_episodes: Optional[List[int]] = None,
+            season: Optional[int] = None,
+            sub_key: str = "",
+            upgrade: bool = False,
+            upgrade_mode: str = "",
+            upgrade_old_cloud_dir: str = "",
+            upgrade_old_file_name: str = "",
+            upgrade_old_file_id: str = "",
+            upgrade_old_size: int = 0,
+            subtitles: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """构造单个后处理记录；单项和批量入口共用同一字段规则。"""
+        current = current or {}
+        success_values = success_episodes or current.get("success_episodes") or []
+        notification_values = (
+                notification_episodes
+                or current.get("notification_episodes")
+                or success_values
+                or current.get("success_episodes")
+                or []
+        )
+        return {
+            **current,
+            "pending_key": pending_key,
+            "task_type": task_type,
+            "task_id": info_hash,
+            "source_sha1": source_hash,
+            "share_url": share_url,
+            "cloud_dir": cloud_dir,
+            "file_name": file_name,
+            "staging_dir": staging_dir,
+            "staging_name": staging_name,
+            "file_size": int(file_size or current.get("file_size") or 0),
+            "upgrade": bool(upgrade or current.get("upgrade")),
+            "upgrade_mode": str(
+                upgrade_mode or current.get("upgrade_mode") or self._upgrade_mode
+            ),
+            "upgrade_old_cloud_dir": str(
+                upgrade_old_cloud_dir
+                or current.get("upgrade_old_cloud_dir")
+                or ""
+            ),
+            "upgrade_old_file_name": str(
+                upgrade_old_file_name
+                or current.get("upgrade_old_file_name")
+                or ""
+            ),
+            "upgrade_old_file_id": str(
+                upgrade_old_file_id or current.get("upgrade_old_file_id") or ""
+            ),
+            "upgrade_old_size": int(
+                upgrade_old_size or current.get("upgrade_old_size") or 0
+            ),
+            "created_at": float(current.get("created_at") or now),
+            "next_check_at": now + self._OFFLINE_CHECK_DELAYS[0],
+            "check_index": int(current.get("check_index") or 0),
+            "history_ready": False,
+            "mediainfo": (
+                media_data
+                if media_data is not None
+                else self._serialize_mediainfo(mediainfo)
+            ),
+            "subscribe_id": subscribe_id or current.get("subscribe_id"),
+            "success_episodes": sorted(
+                {
+                    int(episode)
+                    for episode in success_values
+                    if int(episode) > 0
+                }
+            ),
+            "season": (
+                max(1, int(season or current.get("season") or 1))
+                if getattr(mediainfo, "type", None) == MediaType.TV
+                else None
+            ),
+            "episode": next(iter(notification_episodes or success_episodes or []), None),
+            "notification_episodes": sorted(
+                {
+                    int(episode)
+                    for episode in notification_values
+                    if int(episode) > 0
+                }
+            ),
+            "sub_key": str(sub_key or current.get("sub_key") or ""),
+            "subtitles": copy.deepcopy(
+                subtitles if subtitles is not None else current.get("subtitles") or []
+            ),
+        }
+
     def _queue_file_finalize(
             self,
             share_url: str,
@@ -1603,8 +1790,8 @@ class SyncHandler:
             upgrade_old_file_name: str = "",
             upgrade_old_file_id: str = "",
             upgrade_old_size: int = 0,
+            subtitles: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        info_hash = self._offline_hash(share_url)
         effective_staging_dir = str(staging_dir or cloud_dir).rstrip("/") or "/"
         effective_staging_name = str(staging_name or file_name)
         source_hash, source_identity = self._finalize_source_identity(
@@ -1614,75 +1801,39 @@ class SyncHandler:
             logger.error(f"无法登记文件后处理任务：{file_name}")
             return ""
         now = time.time()
-        if info_hash:
-            pending_key = info_hash
-            task_type = "magnet" if self._is_magnet_url(share_url) else "ed2k"
-        else:
-            path_digest = hashlib.sha1(
-                f"{cloud_dir.rstrip('/')}/{file_name}".encode("utf-8")
-            ).hexdigest()[:12]
-            provider_key = str(getattr(self._cloud_drive, "key", "cloud") or "cloud")
-            pending_key = f"{provider_key}:{source_identity}:{path_digest}"
-            task_type = "share"
+        pending_key, task_type, info_hash = self._pending_identity(
+            share_url, cloud_dir, file_name, source_identity
+        )
         with self._offline_pending_lock:
             pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
             current = pending.get(pending_key) or {}
-            pending[pending_key] = {
-                **current,
-                "pending_key": pending_key,
-                "task_type": task_type,
-                "task_id": info_hash,
-                "source_sha1": source_hash,
-                "share_url": share_url,
-                "cloud_dir": cloud_dir,
-                "file_name": file_name,
-                "staging_dir": effective_staging_dir,
-                "staging_name": effective_staging_name,
-                "file_size": int(file_size or current.get("file_size") or 0),
-                "upgrade": bool(upgrade or current.get("upgrade")),
-                "upgrade_mode": str(upgrade_mode or current.get("upgrade_mode") or self._upgrade_mode),
-                "upgrade_old_cloud_dir": str(upgrade_old_cloud_dir or current.get("upgrade_old_cloud_dir") or ""),
-                "upgrade_old_file_name": str(upgrade_old_file_name or current.get("upgrade_old_file_name") or ""),
-                "upgrade_old_file_id": str(upgrade_old_file_id or current.get("upgrade_old_file_id") or ""),
-                "upgrade_old_size": int(upgrade_old_size or current.get("upgrade_old_size") or 0),
-                "created_at": float(current.get("created_at") or now),
-                "next_check_at": now + self._OFFLINE_CHECK_DELAYS[0],
-                "check_index": int(current.get("check_index") or 0),
-                "history_ready": False,
-                "mediainfo": self._serialize_mediainfo(mediainfo),
-                "subscribe_id": subscribe_id or current.get("subscribe_id"),
-                "success_episodes": sorted(
-                    {
-                        int(episode)
-                        for episode in (
-                            success_episodes or current.get("success_episodes") or []
-                    )
-                        if int(episode) > 0
-                    }
-                ),
-                "season": (
-                    max(1, int(season or current.get("season") or 1))
-                    if getattr(mediainfo, "type", None) == MediaType.TV
-                    else None
-                ),
-                "episode": next(
-                    iter(notification_episodes or success_episodes or []), None
-                ),
-                "notification_episodes": sorted(
-                    {
-                        int(episode)
-                        for episode in (
-                            notification_episodes
-                            or current.get("notification_episodes")
-                            or success_episodes
-                            or current.get("success_episodes")
-                            or []
-                    )
-                        if int(episode) > 0
-                    }
-                ),
-                "sub_key": str(sub_key or current.get("sub_key") or ""),
-            }
+            pending[pending_key] = self._build_pending_record(
+                current=current,
+                pending_key=pending_key,
+                task_type=task_type,
+                info_hash=info_hash,
+                source_hash=source_hash,
+                share_url=share_url,
+                cloud_dir=cloud_dir,
+                file_name=file_name,
+                staging_dir=effective_staging_dir,
+                staging_name=effective_staging_name,
+                file_size=file_size,
+                now=now,
+                mediainfo=mediainfo,
+                subscribe_id=subscribe_id,
+                success_episodes=success_episodes,
+                notification_episodes=notification_episodes,
+                season=season,
+                sub_key=sub_key,
+                upgrade=upgrade,
+                upgrade_mode=upgrade_mode,
+                upgrade_old_cloud_dir=upgrade_old_cloud_dir,
+                upgrade_old_file_name=upgrade_old_file_name,
+                upgrade_old_file_id=upgrade_old_file_id,
+                upgrade_old_size=upgrade_old_size,
+                subtitles=subtitles,
+            )
             self._save_offline_pending(pending)
             pending_count = len(pending)
         self._notify_offline_pending_changed(pending_count)
@@ -1716,6 +1867,7 @@ class SyncHandler:
             upgrade_old_file_name: str = "",
             upgrade_old_file_id: str = "",
             upgrade_old_size: int = 0,
+            subtitles: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Optional[Path], str]:
         strm_path = None
         if not staging_dir:
@@ -1755,6 +1907,7 @@ class SyncHandler:
             upgrade_old_file_name=upgrade_old_file_name,
             upgrade_old_file_id=upgrade_old_file_id,
             upgrade_old_size=upgrade_old_size,
+            subtitles=subtitles,
         )
         return None, pending_key
 
@@ -1778,7 +1931,6 @@ class SyncHandler:
                 share_url = item["share_url"]
                 cloud_dir = item["cloud_dir"]
                 file_name = item["file_name"]
-                info_hash = self._offline_hash(share_url)
                 staging_dir = str(
                     item.get("staging_dir") or cloud_dir
                 ).rstrip("/") or "/"
@@ -1789,87 +1941,38 @@ class SyncHandler:
                     staging_name,
                     item.get("file_size") or 0,
                 )
-                if info_hash:
-                    pending_key = info_hash
-                    task_type = "magnet" if self._is_magnet_url(share_url) else "ed2k"
-                else:
-                    path_digest = hashlib.sha1(
-                        f"{cloud_dir.rstrip('/')}/{file_name}".encode("utf-8")
-                    ).hexdigest()[:12]
-                    provider_key = str(
-                        getattr(self._cloud_drive, "key", "cloud") or "cloud"
-                    )
-                    pending_key = f"{provider_key}:{source_identity}:{path_digest}"
-                    task_type = "share"
+                pending_key, task_type, info_hash = self._pending_identity(
+                    share_url, cloud_dir, file_name, source_identity
+                )
                 current = pending.get(pending_key) or {}
-                pending[pending_key] = {
-                    **current,
-                    "pending_key": pending_key,
-                    "task_type": task_type,
-                    "task_id": info_hash,
-                    "source_sha1": source_hash,
-                    "share_url": share_url,
-                    "cloud_dir": cloud_dir,
-                    "file_name": file_name,
-                    "staging_dir": staging_dir,
-                    "staging_name": staging_name,
-                    "file_size": int(
-                        item.get("file_size") or current.get("file_size") or 0
-                    ),
-                    "upgrade": bool(item.get("upgrade") or current.get("upgrade")),
-                    "upgrade_mode": str(item.get("upgrade_mode") or current.get("upgrade_mode") or self._upgrade_mode),
-                    "upgrade_old_cloud_dir": str(
-                        item.get("upgrade_old_cloud_dir") or current.get("upgrade_old_cloud_dir") or ""),
-                    "upgrade_old_file_name": str(
-                        item.get("upgrade_old_file_name") or current.get("upgrade_old_file_name") or ""),
-                    "upgrade_old_file_id": str(
-                        item.get("upgrade_old_file_id") or current.get("upgrade_old_file_id") or ""),
-                    "upgrade_old_size": int(item.get("upgrade_old_size") or current.get("upgrade_old_size") or 0),
-                    "created_at": float(current.get("created_at") or now),
-                    "next_check_at": now + self._OFFLINE_CHECK_DELAYS[0],
-                    "check_index": int(current.get("check_index") or 0),
-                    "history_ready": False,
-                    "mediainfo": media_data,
-                    "subscribe_id": subscribe_id or current.get("subscribe_id"),
-                    "success_episodes": sorted(
-                        {
-                            int(episode)
-                            for episode in (
-                                item.get("success_episodes")
-                                or current.get("success_episodes")
-                                or []
-                        )
-                            if int(episode) > 0
-                        }
-                    ),
-                    "season": (
-                        max(1, int(season or current.get("season") or 1))
-                        if getattr(mediainfo, "type", None) == MediaType.TV
-                        else None
-                    ),
-                    "episode": next(
-                        iter(
-                            item.get("notification_episodes")
-                            or item.get("success_episodes")
-                            or []
-                        ),
-                        None,
-                    ),
-                    "notification_episodes": sorted(
-                        {
-                            int(episode)
-                            for episode in (
-                                item.get("notification_episodes")
-                                or current.get("notification_episodes")
-                                or item.get("success_episodes")
-                                or current.get("success_episodes")
-                                or []
-                        )
-                            if int(episode) > 0
-                        }
-                    ),
-                    "sub_key": str(sub_key or current.get("sub_key") or ""),
-                }
+                pending[pending_key] = self._build_pending_record(
+                    current=current,
+                    pending_key=pending_key,
+                    task_type=task_type,
+                    info_hash=info_hash,
+                    source_hash=source_hash,
+                    share_url=share_url,
+                    cloud_dir=cloud_dir,
+                    file_name=file_name,
+                    staging_dir=staging_dir,
+                    staging_name=staging_name,
+                    file_size=item.get("file_size") or 0,
+                    now=now,
+                    mediainfo=mediainfo,
+                    media_data=media_data,
+                    subscribe_id=subscribe_id,
+                    success_episodes=item.get("success_episodes"),
+                    notification_episodes=item.get("notification_episodes"),
+                    season=season,
+                    sub_key=sub_key,
+                    upgrade=bool(item.get("upgrade")),
+                    upgrade_mode=item.get("upgrade_mode") or "",
+                    upgrade_old_cloud_dir=item.get("upgrade_old_cloud_dir") or "",
+                    upgrade_old_file_name=item.get("upgrade_old_file_name") or "",
+                    upgrade_old_file_id=item.get("upgrade_old_file_id") or "",
+                    upgrade_old_size=item.get("upgrade_old_size") or 0,
+                    subtitles=item.get("subtitles") or [],
+                )
                 result[str(item["result_key"])] = pending_key
             if result:
                 self._save_offline_pending(pending)
@@ -2086,10 +2189,10 @@ class SyncHandler:
             getattr(subscribe, "id", None),
             getattr(subscribe, "media_category", None),
         )
+        cache_key = normalize_platform_cache_key(key)
         with self._platform_root_lock:
-            if key in self._platform_root_cache:
-                self._platform_root_cache.move_to_end(key)
-                return self._platform_root_cache[key]
+            if cache_key in self._platform_root_cache:
+                return self._platform_root_cache.get(cache_key)
 
         directory = DirectoryHelper().get_dir(media=mediainfo, include_unsorted=True)
         resolved = None
@@ -2107,10 +2210,7 @@ class SyncHandler:
                 resolved = Path(classified_root)
 
         with self._platform_root_lock:
-            self._platform_root_cache[key] = resolved
-            self._platform_root_cache.move_to_end(key)
-            while len(self._platform_root_cache) > self._PLATFORM_ROOT_CACHE_LIMIT:
-                self._platform_root_cache.popitem(last=False)
+            self._platform_root_cache.set(cache_key, resolved)
         return resolved
 
     def _platform_rename_path(
@@ -2200,10 +2300,10 @@ class SyncHandler:
             getattr(subscribe, "media_category", None),
             int(season or 0),
         )
+        platform_cache_key = normalize_platform_cache_key(cache_key)
         with self._resource_season_dir_lock:
-            if cache_key in self._resource_season_dir_cache:
-                self._resource_season_dir_cache.move_to_end(cache_key)
-                return self._resource_season_dir_cache[cache_key]
+            if platform_cache_key in self._resource_season_dir_cache:
+                return self._resource_season_dir_cache.get(platform_cache_key)
             resolved = None
             try:
                 rename_path = self._platform_rename_path(
@@ -2218,13 +2318,7 @@ class SyncHandler:
                     resolved = rename_path.parent
             except Exception as error:
                 logger.warning(f"资源路径解析失败：{mediainfo.title_year}，{error}")
-            self._resource_season_dir_cache[cache_key] = resolved
-            self._resource_season_dir_cache.move_to_end(cache_key)
-            while (
-                    len(self._resource_season_dir_cache)
-                    > self._RESOURCE_SEASON_DIR_CACHE_LIMIT
-            ):
-                self._resource_season_dir_cache.popitem(last=False)
+            self._resource_season_dir_cache.set(platform_cache_key, resolved)
             return resolved
 
     def _get_local_resource_files(
@@ -2447,271 +2541,6 @@ class SyncHandler:
         return "、".join(ranges)
 
     @staticmethod
-    def _resource_preview_episodes(resource: Dict[str, Any], season: int) -> Set[int]:
-        """读取搜索阶段已取得的文件预览，不额外请求115接口。"""
-        preview_episodes = resource.get("preview_episodes") or {}
-        values = preview_episodes.get(str(season), preview_episodes.get(season, []))
-        episodes = set()
-        for value in values or []:
-            try:
-                episodes.add(int(value))
-            except (TypeError, ValueError):
-                continue
-        return episodes
-
-    @staticmethod
-    def _resource_history_meta(resource: Dict[str, Any], share_url: str) -> Dict[str, Any]:
-        source = str(resource.get("source") or "unknown").strip().lower()
-        resource_type = str(
-            resource.get("resource_type") or resource.get("pan_type") or ""
-        ).strip().lower()
-        if not resource_type:
-            resource_type = "ed2k" if str(share_url).lower().startswith("ed2k://") else "115"
-        points = resource.get("unlock_points")
-        try:
-            points = int(points) if points is not None else None
-        except (TypeError, ValueError):
-            points = None
-        source_url = str(
-            resource.get("source_url")
-            or resource.get("page_url")
-            or resource.get("detail_url")
-            or share_url
-            or ""
-        ).strip()
-        return {
-            "resource_type": resource_type,
-            "source": source,
-            "source_url": source_url,
-            "media_page_url": str(
-                resource.get("media_page_url") or ""
-            ).strip(),
-            "points": points,
-        }
-
-    @staticmethod
-    def _expand_resource_urls(
-            resources: List[Dict[str, Any]],
-            resource_index: int,
-            resource: Dict[str, Any],
-            value: Any,
-    ) -> str:
-        """展开列表或字符串中的多条离线链接，后续条目不重复计算积分。"""
-        raw_values = value if isinstance(value, (list, tuple)) else [value]
-        urls = []
-        for raw_value in raw_values:
-            text = str(raw_value or "").replace("｜", "|").strip()
-            if not text:
-                continue
-            matches = list(SyncHandler._OFFLINE_RESOURCE_URL_RE.finditer(text))
-            extracted = [match.group(0).strip() for match in matches]
-            remainder = SyncHandler._OFFLINE_RESOURCE_URL_RE.sub("", text).strip()
-            candidates = extracted if extracted and not remainder else [text]
-            for url in candidates:
-                if url not in urls:
-                    urls.append(url)
-        if not urls:
-            return ""
-
-        resource["url"] = urls[0]
-        resource["need_unlock"] = False
-        resource["need_access"] = False
-        if len(urls) > 1:
-            expanded = []
-            for url in urls[1:]:
-                item = copy.deepcopy(resource)
-                item["url"] = url
-                item["unlock_points"] = 0
-                expanded.append(item)
-            resources[resource_index + 1:resource_index + 1] = expanded
-            source_name = str(resource.get("source") or "资源源").upper()
-            logger.debug(
-                f"{source_name} 同一资源包含 {len(urls)} 条链接，"
-                "已展开处理且积分仅计一次"
-            )
-        return urls[0]
-
-    def _resolve_candidate_resource_url(
-            self,
-            resources: List[Dict[str, Any]],
-            resource_index: int,
-            resource: Dict[str, Any],
-            search_label: str,
-            log_prefix: str = "",
-    ) -> str:
-        """统一处理积分搜索源的延迟解锁，并展开一次返回的多条链接。"""
-        share_url = str(resource.get("url") or "").strip()
-        if share_url:
-            return self._expand_resource_urls(
-                resources, resource_index, resource, share_url
-            )
-        if not (
-                resource.get("need_unlock") or resource.get("need_access")
-        ):
-            return ""
-        slug = str(resource.get("slug") or "").strip()
-        if not slug:
-            return ""
-        try:
-            unlock_points = int(resource.get("unlock_points") or 0)
-        except (TypeError, ValueError):
-            unlock_points = 0
-        prefix = f"{log_prefix} " if log_prefix else ""
-        resource_title = str(resource.get("title") or "").strip()
-        source = str(resource.get("source") or "").strip().lower()
-        is_dian115 = source == "dian115"
-        has_budget = (
-            self._search_handler.has_dian115_unlock_budget(unlock_points)
-            if is_dian115
-            else self._search_handler.has_hdhive_unlock_budget(unlock_points)
-        )
-        source_label = "Dian115" if is_dian115 else "HDHive"
-        if not has_budget:
-            logger.debug(
-                f"{prefix}跳过 {source_label} 资源 {resource_title}："
-                f"需要 {unlock_points} 积分，当前预算不足"
-            )
-            return ""
-        action_label = "获取免费资源链接" if unlock_points <= 0 else "消耗积分解锁"
-        media_page_url = str(resource.get("media_page_url") or "").strip()
-        media_page_suffix = f"，媒体页：{media_page_url}" if media_page_url else ""
-        logger.info(
-            f"{prefix}遇到尚未取得链接的 {source_label} 资源 {resource_title} "
-            f"(slug: {slug})，尝试{action_label}{media_page_suffix}"
-        )
-        if is_dian115:
-            unlocked = self._search_handler.unlock_dian115_resource(
-                int(resource.get("dian115_share_id") or slug),
-                int(resource.get("dian115_resource_id") or 0),
-                unlock_points,
-                search_label=search_label,
-                tmdb_id=int(resource.get("dian115_tmdb_id") or 0),
-                media_type=str(resource.get("dian115_media_type") or ""),
-                season=int(resource.get("dian115_season") or 0),
-            )
-        else:
-            unlocked = self._search_handler.unlock_hdhive_resource(
-                slug,
-                unlock_points,
-                resource.get("resource_type"),
-                media_page_url=media_page_url,
-                search_label=search_label,
-            )
-        if self._stop_requested() or not unlocked:
-            if not self._stop_requested():
-                logger.error(
-                    f"{prefix}未能取得 {source_label} 资源链接：{resource_title}"
-                )
-            return ""
-        return self._expand_resource_urls(
-            resources, resource_index, resource, unlocked
-        )
-
-    def _validate_resource_url(
-            self,
-            share_url: str,
-            resource_label: str = "分享链接",
-            log_prefix: str = "",
-    ) -> bool:
-        """使用当前网盘 Provider 的统一能力校验资源链接。"""
-        share_service = self._resource_provider_for_url(share_url).require(
-            CloudDriveCapability.SHARE_TRANSFER
-        ) if self._resource_provider_for_url(share_url) else self._share_transfer
-        if not share_service:
-            return False
-        status = self._timed_sync_call(
-            "share_validation",
-            share_service.check_share_status,
-            share_url,
-        )
-        if status.is_valid:
-            return True
-        prefix = f"{log_prefix} " if log_prefix else ""
-        logger.debug(
-            f"{prefix}{resource_label}无效："
-            f"{self._resource_log_reference(share_url)}，原因：{status.status_text}"
-        )
-        return False
-
-    def _validated_resource_files(
-            self,
-            share_url: str,
-            resource_title: str = "",
-            target_season: Optional[int] = None,
-            log_prefix: str = "",
-    ) -> List[Dict[str, Any]]:
-        """校验分享并读取文件列表，供电影、剧集和洗版共同使用。"""
-        if not self._validate_resource_url(
-                share_url, resource_label="分享链接", log_prefix=log_prefix
-        ):
-            return []
-        kwargs = {"target_season": target_season} if target_season is not None else {}
-        provider = self._resource_provider_for_url(share_url)
-        share_service = provider.require(CloudDriveCapability.SHARE_TRANSFER) if provider else self._share_transfer
-        if not share_service:
-            return []
-        files = self._timed_sync_call(
-            "share_listing",
-            share_service.list_share_files,
-            share_url,
-            **kwargs,
-        ) or []
-        files = list(MediaFileParser.iter_files(files))
-        if not files:
-            label = resource_title or self._resource_log_reference(share_url)
-            logger.debug(f"{log_prefix + ' ' if log_prefix else ''}分享链接无内容：{label}")
-        return list(files)
-
-    def _transfer_history_status(self, success: bool, share_url: str) -> str:
-        if not success:
-            return "失败"
-        return "下载中" if self._is_offline_url(share_url) else "成功"
-
-    @staticmethod
-    def _supported_resource_type(resource: Dict[str, Any], share_url: str) -> str:
-        resource_type = str(
-            resource.get("resource_type") or resource.get("pan_type") or ""
-        ).strip().lower()
-        if resource_type:
-            return resource_type
-        normalized_url = str(share_url).lstrip().lower()
-        if normalized_url.startswith("ed2k://"):
-            return "ed2k"
-        if normalized_url.startswith("magnet:?"):
-            return "magnet"
-        for marker, value in (
-                ("quark", "quark"), ("189.cn", "tianyi"),
-                ("cloud.189", "tianyi"), ("guangya", "guangya"),
-                ("123pan", "123"), ("123.cn", "123"),
-                ("123684.com", "123"), ("123865.com", "123"),
-                ("alipan.com", "alipan"), ("aliyundrive.com", "alipan"),
-        ):
-            if marker in normalized_url:
-                return value
-        return "115"
-
-    def _resource_provider_for_url(self, share_url: str) -> Optional[CloudDriveProvider]:
-        if not self._cloud_drive_registry:
-            return self._cloud_drive
-        key = self._supported_resource_type({}, share_url)
-        aliases = {
-            "189": "tianyi", "aliyun": "alipan"
-        }
-        try:
-            return self._cloud_drive_registry.get(aliases.get(key, key))
-        except KeyError:
-            return self._cloud_drive if key == "115" else None
-
-    @staticmethod
-    def _cloud_file_from_dict(item: Dict[str, Any]) -> CloudFile:
-        return CloudFile(
-            id=str(item.get("id") or ""), name=str(item.get("name") or ""),
-            is_directory=False, size=int(item.get("size") or 0),
-            sha1=str(item.get("sha1") or ""), md5=str(item.get("md5") or ""),
-            native=item,
-        )
-
-    @staticmethod
     def _normalize_cloud_path(path: str) -> str:
         return str(PurePosixPath("/" + str(path or "/").strip().lstrip("/")))
 
@@ -2759,8 +2588,14 @@ class SyncHandler:
             source and self._cloud_drive and source.key != self._cloud_drive.key
         )
         if cross_provider:
-            item_media_type = str(file_item.get("media_type") or media_type or "").strip().lower()
+            item_media_type = self._normalize_cross_transfer_media_type(
+                file_item.get("media_type") or media_type
+            )
             if item_media_type and item_media_type not in self._cross_transfer_media_types:
+                logger.debug(
+                    f"跨盘转存跳过：{source.name} -> {self._cloud_drive.name}，"
+                    f"媒体类型 {item_media_type} 未启用"
+                )
                 return False
             required = (
                     self._cross_transfer_enabled
@@ -2769,6 +2604,7 @@ class SyncHandler:
                     and source.supports(CloudDriveCapability.FILE_QUERY)
                     and source.supports(CloudDriveCapability.FILE_DOWNLOAD)
                     and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
+                    and self._cloud_drive.supports(CloudDriveCapability.FILE_QUERY)
             )
             if not required:
                 logger.warning(
@@ -2876,65 +2712,6 @@ class SyncHandler:
             save_path=save_path, target_name=target_name,
             source_sha1=source_sha1,
         ))
-
-    def _is_supported_resource(self, resource: Dict[str, Any], share_url: str) -> bool:
-        if not self._cloud_drive:
-            return False
-        resource_type = self._supported_resource_type(resource, share_url)
-        if not self._cloud_drive.supports_resource_type(resource_type):
-            if not self._cross_transfer_enabled:
-                return False
-            source = self._resource_provider_for_url(share_url)
-            if not source or not source.supports(CloudDriveCapability.SHARE_TRANSFER):
-                return False
-            if not source.supports(CloudDriveCapability.FILE_DOWNLOAD):
-                return False
-            if not self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD):
-                return False
-        if resource_type in {"ed2k", "magnet"}:
-            return self._offline_download is not None
-        source = self._resource_provider_for_url(share_url)
-        return bool(source and source.supports(CloudDriveCapability.SHARE_TRANSFER))
-
-    @classmethod
-    def _format_resource_summary(cls, resources: List[Dict[str, Any]]) -> str:
-        labels = {"share": "网盘分享", "ed2k": "ED2K", "magnet": "Magnet"}
-        summary_counts: Dict[str, Dict[str, int]] = {}
-        seen = set()
-        for resource in resources or []:
-            resource_type = cls._supported_resource_type(
-                resource, str(resource.get("url") or "")
-            )
-            label = labels.get(resource_type, resource_type.upper() or "未知")
-            identity = str(
-                resource.get("unlock_group") or resource.get("source_url")
-                or resource.get("url") or resource.get("title") or ""
-            )
-            key = (resource_type, identity)
-            if key in seen:
-                continue
-            seen.add(key)
-            counts = summary_counts.setdefault(
-                label, {"total": 0, "available": 0, "paid": 0, "official": 0}
-            )
-            counts["total"] += 1
-            if resource.get("is_official"):
-                counts["official"] += 1
-            if resource.get("need_unlock"):
-                counts["paid"] += 1
-            else:
-                counts["available"] += 1
-        summaries = []
-        for label, counts in summary_counts.items():
-            statuses = [f"可用 {counts['available']}"]
-            if counts["paid"]:
-                statuses.append(f"待解锁 {counts['paid']}")
-            if counts["official"]:
-                statuses.append(f"官组 {counts['official']}")
-            summaries.append(
-                f"{label} {counts['total']}（{'，'.join(statuses)}）"
-            )
-        return f"共 {len(seen)} 个资源页：" + "；".join(summaries)
 
     @staticmethod
     def _reconcile_subscribe_physical_episodes(
@@ -3055,22 +2832,8 @@ class SyncHandler:
                 if total_ep <= 0:
                     continue
 
-                meta = MetaInfo(subscribe.name)
-                meta.year = subscribe.year
-                meta.begin_season = season
-                meta.type = MediaType.TV
-                mediainfo = self._recognize_media_once(
-                    (
-                        "guardian", MediaType.TV.value,
-                        getattr(subscribe, 'tmdbid', None),
-                        getattr(subscribe, 'doubanid', None), subscribe.name,
-                        subscribe.year, season, True,
-                    ),
-                    meta=meta,
-                    mtype=MediaType.TV,
-                    tmdbid=getattr(subscribe, 'tmdbid', None),
-                    doubanid=getattr(subscribe, 'doubanid', None),
-                    cache=True,
+                mediainfo = self._subscribe_mediainfo(
+                    subscribe, MediaType.TV
                 )
                 if not mediainfo:
                     continue

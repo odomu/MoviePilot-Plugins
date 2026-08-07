@@ -3,7 +3,6 @@ HDHive OpenAPI 客户端
 基于官方 Python SDK 适配：应用 Secret (X-API-Key) + OAuth 用户 Access Token (Bearer) 双层认证
 参考文档: https://hdhive.com/docs/open
 """
-import copy
 import json
 import secrets
 import threading
@@ -14,6 +13,11 @@ from typing import Any, Callable, Dict, Optional
 from app.log import logger
 
 from ...http_client import RequestGate, gated_request, normalize_proxies, requests
+from ....utils.cache import (
+    cached_resource_call,
+    create_platform_ttl_cache,
+    normalize_platform_cache_key,
+)
 
 
 class HDHiveOpenAPIError(Exception):
@@ -83,13 +87,21 @@ class HDHiveOpenAPIClient:
         self.on_token_update = on_token_update
         self._proxies = normalize_proxies(proxy)
         self._session = requests.Session(impersonate="chrome")
-        self._resource_cache: Dict[tuple[str, str], tuple[float, Dict[str, Any]]] = {}
-        self._detail_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+        cache_identity = f"{self.base_url}|{self.client_id}|{self.access_token}"
+        self._resource_cache = create_platform_ttl_cache(
+            "hdhive_open:resources", cache_identity,
+            maxsize=self._RESOURCE_CACHE_LIMIT, ttl=self._RESOURCE_CACHE_TTL,
+        )
+        self._detail_cache = create_platform_ttl_cache(
+            "hdhive_open:details", cache_identity,
+            maxsize=self._DETAIL_CACHE_LIMIT, ttl=self._DETAIL_CACHE_TTL,
+        )
         self._resource_locks = tuple(threading.Lock() for _ in range(16))
         self._detail_locks = tuple(threading.Lock() for _ in range(32))
         self._lock = threading.RLock()
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "HDHive OpenAPI",
+            cache_identity,
             request_interval=self.request_interval,
             minimum_interval=0.2,
             risk_cooldown_seconds=self._RISK_COOLDOWN_SECONDS,
@@ -111,40 +123,12 @@ class HDHiveOpenAPIClient:
         """清空 OpenAPI 资源列表和分享详情缓存。"""
         with self._lock:
             counts = {
-                "resources": len(self._resource_cache),
-                "details": len(self._detail_cache),
+                "resources": len(list(self._resource_cache.items())),
+                "details": len(list(self._detail_cache.items())),
             }
             self._resource_cache.clear()
             self._detail_cache.clear()
             return counts
-
-    @staticmethod
-    def _cached_copy(
-            cache: Dict[Any, tuple[float, Dict[str, Any]]], key: Any
-    ) -> Optional[Dict[str, Any]]:
-        cached = cache.get(key)
-        if not cached or cached[0] <= time.monotonic():
-            cache.pop(key, None)
-            return None
-        return copy.deepcopy(cached[1])
-
-    @staticmethod
-    def _store_cache(
-            cache: Dict[Any, tuple[float, Dict[str, Any]]],
-            key: Any,
-            value: Dict[str, Any],
-            ttl: int,
-            limit: int,
-    ) -> None:
-        now = time.monotonic()
-        expired = [item for item, cached in cache.items() if cached[0] <= now]
-        for item in expired:
-            cache.pop(item, None)
-        overflow = len(cache) - limit + 1
-        if overflow > 0:
-            for item in sorted(cache, key=lambda entry: cache[entry][0])[:overflow]:
-                cache.pop(item, None)
-        cache[key] = (now + ttl, copy.deepcopy(value))
 
     def build_authorize_url(
             self,
@@ -263,32 +247,21 @@ class HDHiveOpenAPIClient:
         if media_type not in ("movie", "tv"):
             raise HDHiveOpenAPIError("400", f"不支持的媒体类型: {media_type}")
         normalized_tmdb_id = str(tmdb_id).strip()
-        cache_key = (media_type, normalized_tmdb_id)
-        with self._lock:
-            cached = None if force_refresh else self._cached_copy(
-                self._resource_cache, cache_key
-            )
-        if cached is not None:
-            return cached
+        cache_key = normalize_platform_cache_key(
+            (media_type, normalized_tmdb_id)
+        )
         path = "/api/open/resources/{}/{}".format(
             urllib.parse.quote(str(media_type), safe=""),
             urllib.parse.quote(normalized_tmdb_id, safe=""),
         )
-        cache_lock = self._resource_locks[hash(cache_key) % len(self._resource_locks)]
-        with cache_lock:
-            with self._lock:
-                cached = None if force_refresh else self._cached_copy(
-                    self._resource_cache, cache_key
-                )
-            if cached is not None:
-                return cached
-            data = self._request("GET", path)
-            with self._lock:
-                self._store_cache(
-                    self._resource_cache, cache_key, data,
-                    self._RESOURCE_CACHE_TTL, self._RESOURCE_CACHE_LIMIT,
-                )
-            return data
+        return cached_resource_call(
+            self._resource_cache,
+            cache_key,
+            lambda: self._request("GET", path),
+            locks=self._resource_locks,
+            access_lock=self._lock,
+            force_refresh=force_refresh,
+        )
 
     def get_share_details(
             self, slug: str, force_refresh: bool = False
@@ -297,29 +270,15 @@ class HDHiveOpenAPIClient:
         slug = str(slug or "").strip()
         if not slug:
             raise HDHiveOpenAPIError("400", "资源 slug 不能为空")
-        with self._lock:
-            cached = None if force_refresh else self._cached_copy(
-                self._detail_cache, slug
-            )
-        if cached is not None:
-            return cached
-        cache_lock = self._detail_locks[hash(slug) % len(self._detail_locks)]
-        with cache_lock:
-            with self._lock:
-                cached = None if force_refresh else self._cached_copy(
-                    self._detail_cache, slug
-                )
-            if cached is not None:
-                return cached
-            data = self._request(
-                "GET", f"/api/open/shares/{urllib.parse.quote(slug, safe='')}"
-            )
-            with self._lock:
-                self._store_cache(
-                    self._detail_cache, slug, data,
-                    self._DETAIL_CACHE_TTL, self._DETAIL_CACHE_LIMIT,
-                )
-            return data
+        path = f"/api/open/shares/{urllib.parse.quote(slug, safe='')}"
+        return cached_resource_call(
+            self._detail_cache,
+            slug,
+            lambda: self._request("GET", path),
+            locks=self._detail_locks,
+            access_lock=self._lock,
+            force_refresh=force_refresh,
+        )
 
     def unlock_resource(
             self, slug: str, max_unlock_points: Optional[int] = None
@@ -378,7 +337,7 @@ class HDHiveOpenAPIClient:
             actual_points = confirmed_points
         data["actual_points"] = actual_points
         with self._lock:
-            self._detail_cache.pop(slug, None)
+            self._detail_cache.delete(slug)
             self._resource_cache.clear()
         return data
 

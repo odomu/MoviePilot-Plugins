@@ -144,25 +144,81 @@ class SyncRuntimeService(OwnerDelegator):
             ))
             return tasks
 
-    def _pending_finalize_count(self, subscribe: Any) -> int:
+    def _pending_finalize_items(self, subscribe: Any) -> List[Dict[str, Any]]:
         if not self._sync_handler:
-            return 0
+            return []
         normalized_id = int(getattr(subscribe, "id", 0) or 0)
         sub_key = (
             self._sync_handler.subscription_budget_key(subscribe)
             if bool(getattr(subscribe, "_transient_target", False))
             else ""
         )
-        return sum(
-            (
+        return [
+            item
+            for item in self._sync_handler.get_pending_finalize_tasks()
+            if (
                     normalized_id > 0
                     and int(item.get("subscribe_id") or 0) == normalized_id
             ) or (
                     bool(sub_key)
                     and str(item.get("sub_key") or "") == sub_key
             )
-            for item in self._sync_handler.get_pending_finalize_tasks()
+        ]
+
+    def _pending_finalize_count(self, subscribe: Any) -> int:
+        return len(self._pending_finalize_items(subscribe))
+
+    def _postprocessing_text(
+            self, items: List[Dict[str, Any]]
+    ) -> Tuple[str, str]:
+        """描述后处理当前等待点、目标文件和下一次检查时间。"""
+        if not items:
+            return "文件后处理已结束", ""
+        stage_counts: Dict[str, int] = {}
+        file_names = []
+        next_check_at = 0.0
+        for item in items:
+            task_type = str(item.get("task_type") or "share").lower()
+            if not item.get("download_completed_at") and not item.get("moved_at"):
+                stage = {
+                    "magnet": "等待 Magnet 下载完成",
+                    "ed2k": "等待 115 离线下载完成",
+                }.get(task_type, "等待网盘文件就绪")
+            elif not item.get("moved_at"):
+                stage = "整理、移动并重命名文件"
+            else:
+                stage = "完成字幕与本地媒体文件处理"
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+            file_name = str(item.get("file_name") or "").strip()
+            if file_name and file_name not in file_names:
+                file_names.append(file_name)
+            candidate_check = float(item.get("next_check_at") or 0)
+            if candidate_check > 0:
+                next_check_at = (
+                    min(next_check_at, candidate_check)
+                    if next_check_at else candidate_check
+                )
+
+        stage_text = "；".join(
+            f"{stage} {count} 个" for stage, count in stage_counts.items()
         )
+        actions = "完成文件整理与字幕处理"
+        if bool(getattr(self._sync_handler, "_strm_generate_enabled", False)):
+            actions += "并生成 STRM"
+        phase = f"{stage_text}；就绪后将{actions}"
+
+        visible_names = file_names[:2]
+        file_text = "、".join(visible_names)
+        if len(file_names) > len(visible_names):
+            file_text += f" 等 {len(file_names)} 个文件"
+        message_parts = [f"文件：{file_text}"] if file_text else []
+        remaining = max(0, int(next_check_at - time.time() + 0.999))
+        if remaining > 0:
+            if remaining < 60:
+                message_parts.append(f"约 {remaining} 秒后复查")
+            else:
+                message_parts.append(f"约 {(remaining + 59) // 60} 分钟后复查")
+        return phase, "；".join(message_parts)
 
     def _refresh_postprocessing_sync_tasks(self) -> None:
         """按持久化后处理记录恢复并刷新订阅任务状态。"""
@@ -184,6 +240,7 @@ class SyncRuntimeService(OwnerDelegator):
             media_data = item.get("mediainfo") or {}
             group = groups.setdefault(task_id, {
                 "count": 0,
+                "items": [],
                 "subscribe_id": subscribe_id if subscribe_id > 0 else None,
                 "sub_key": sub_key,
                 "title": str(media_data.get("title") or "未命名订阅"),
@@ -197,6 +254,7 @@ class SyncRuntimeService(OwnerDelegator):
                 ),
             })
             group["count"] += 1
+            group["items"].append(item)
             if str(item.get("share_url") or "").lower().startswith("pt://"):
                 group["task_kind"] = "pt_upgrade"
             elif item.get("upgrade") and group["task_kind"] == "subscribe":
@@ -224,10 +282,12 @@ class SyncRuntimeService(OwnerDelegator):
                 if task and task.get("status") in {"queued", "running", "stopping"}:
                     continue
                 pending_count = int(group["count"])
+                phase, message = self._postprocessing_text(group["items"])
                 values = {
                     "status": "postprocessing",
                     "task_kind": group["task_kind"],
-                    "phase": f"文件后处理中（{pending_count} 个）",
+                    "phase": phase,
+                    "message": message,
                     "progress": 95,
                     "pending_count": pending_count,
                     "finished_at": None,
@@ -319,7 +379,11 @@ class SyncRuntimeService(OwnerDelegator):
                     )
                 transferred_count += int(task_count or 0)
                 stopped = bool(task_event and task_event.is_set())
-                pending_count = self._pending_finalize_count(subscribe)
+                pending_items = self._pending_finalize_items(subscribe)
+                pending_count = len(pending_items)
+                postprocess_phase, postprocess_message = (
+                    self._postprocessing_text(pending_items)
+                )
                 self._update_sync_task(
                     task_id,
                     status=(
@@ -329,7 +393,7 @@ class SyncRuntimeService(OwnerDelegator):
                     ),
                     phase=(
                         "已停止" if stopped
-                        else f"文件后处理中（{pending_count} 个）"
+                        else postprocess_phase
                         if pending_count
                         else f"已转存 {int(task_count or 0)} 个文件"
                         if int(task_count or 0) > 0
@@ -337,6 +401,7 @@ class SyncRuntimeService(OwnerDelegator):
                     ),
                     progress=95 if pending_count and not stopped else 100,
                     pending_count=pending_count,
+                    message=postprocess_message if pending_count else "",
                     transferred=int(task_count or 0),
                     finished_at=None if pending_count and not stopped else time.time(),
                 )
@@ -404,44 +469,37 @@ class SyncRuntimeService(OwnerDelegator):
             if not any(item.get("status") in active_statuses for item in transfers):
                 continue
             parent = tasks_by_id[parent_id]
-            total = sum(int(item.get("total") or 0) for item in transfers)
-            transferred = sum(
-                int(item.get("transferred") or 0) for item in transfers
-            )
-            speed = sum(
-                float(item.get("speed_bytes_per_second") or 0)
-                for item in transfers
-            )
-            stage_transfers = [
-                item for item in transfers
-                if item.get("status") in active_statuses
-                   and int(item.get("stage_total") or 0) > 0
-            ]
-            stage_transferred = sum(
-                int(item.get("stage_transferred") or 0)
-                for item in stage_transfers
-            )
-            stage_total = sum(
-                int(item.get("stage_total") or 0)
-                for item in stage_transfers
-            )
-            if total > 0:
-                progress = int(sum(
-                    int(item.get("progress") or 0)
-                    * int(item.get("total") or 0)
-                    for item in transfers
-                ) / total)
-            else:
-                progress = int(sum(
-                    int(item.get("progress") or 0) for item in transfers
-                ) / len(transfers))
+            total = 0
+            transferred = 0
+            speed = 0.0
+            weighted_progress = 0
+            unweighted_progress = 0
+            stage_transferred = 0
+            stage_total = 0
             messages: Dict[str, int] = {}
             for item in transfers:
+                item_total = int(item.get("total") or 0)
+                total += item_total
+                transferred += int(item.get("transferred") or 0)
+                speed += float(item.get("speed_bytes_per_second") or 0)
+                progress_value = int(item.get("progress") or 0)
+                weighted_progress += progress_value * item_total
+                unweighted_progress += progress_value
+                if (
+                        item.get("status") in active_statuses
+                        and int(item.get("stage_total") or 0) > 0
+                ):
+                    stage_transferred += int(item.get("stage_transferred") or 0)
+                    stage_total += int(item.get("stage_total") or 0)
                 message = str(
                     item.get("error") or item.get("message")
                     or item.get("phase") or "正在跨盘转存"
                 )
                 messages[message] = messages.get(message, 0) + 1
+            if total > 0:
+                progress = int(weighted_progress / total)
+            else:
+                progress = int(unweighted_progress / len(transfers))
             if len(transfers) == 1:
                 phase = next(iter(messages))
             else:
@@ -688,9 +746,14 @@ class SyncRuntimeService(OwnerDelegator):
                 "deferred": 1,
             }
         try:
-            return self._monitor_offline_task_groups(
-                sync_handler, offline_service, kwargs
-            )
+            notification_batch_started = sync_handler.begin_notification_batch()
+            try:
+                return self._monitor_offline_task_groups(
+                    sync_handler, offline_service, kwargs
+                )
+            finally:
+                if notification_batch_started:
+                    sync_handler.finish_notification_batch()
         finally:
             self._offline_monitor_lock.release()
 

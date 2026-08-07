@@ -10,17 +10,17 @@ from io import BytesIO
 from typing import Optional, List, Dict, Any, Callable
 
 import qrcode
-from app.core.cache import TTLCache
 from app.log import logger
 
 from .files import P115FileService
 from .offline import OfflineDownloadService
-from .path_cache import PathCache
 from .rate_limiter import RateLimiter
 from .share import ShareService
 from .upload import P115UploadService
+from ..common import create_directory_path_cache
 from ...core import get_component, resolve_component
 from ...utils import DEFAULT_METADATA_URL_TEMPLATE
+from ...utils.cache import create_platform_ttl_cache
 
 try:
     from p115client import P115Client, check_response
@@ -271,31 +271,33 @@ class P115ClientManager:
 
         # 路径缓存（带 TTL）
         _path_cache_ttl = path_cache_ttl if path_cache_ttl is not None else self.DEFAULT_PATH_CACHE_TTL
-        self.path_cache = PathCache(
-            default_ttl=_path_cache_ttl,
-            region=f"cloudsubscribe:ppaths:{cache_scope}",
+        self.path_cache = create_directory_path_cache(
+            "p115",
+            cache_scope,
+            0,
+            ttl=_path_cache_ttl,
         )
-        # 根目录始终缓存
-        self.path_cache.set("/", 0)
 
         # 分享信息缓存（URL -> {share_code, receive_code}）
         self._share_info_cache_limit = 500
         self._share_cache_ttl = max(60, int(share_cache_ttl_minutes or 30) * 60)
         self._share_status_cache_limit = 500
         self._share_file_cache_limit = 300
-        cache_region = f"cloudsubscribe:p115:{cache_scope}"
-        self._share_info_cache = TTLCache(
-            region=f"{cache_region}:share_info",
+        self._share_info_cache = create_platform_ttl_cache(
+            "p115:share_info",
+            cache_scope,
             maxsize=self._share_info_cache_limit,
             ttl=self._share_cache_ttl,
         )
-        self._share_status_cache = TTLCache(
-            region=f"{cache_region}:share_status",
+        self._share_status_cache = create_platform_ttl_cache(
+            "p115:share_status",
+            cache_scope,
             maxsize=self._share_status_cache_limit,
             ttl=self._share_cache_ttl,
         )
-        self._share_file_cache = TTLCache(
-            region=f"{cache_region}:share_files",
+        self._share_file_cache = create_platform_ttl_cache(
+            "p115:share_files",
+            cache_scope,
             maxsize=self._share_file_cache_limit,
             ttl=max(self._share_cache_ttl, 24 * 60 * 60),
         )
@@ -311,13 +313,15 @@ class P115ClientManager:
         self._offline_quota_cache: Dict[str, Any] = {}
         self._offline_quota_cache_time = 0.0
         self._offline_quota_refreshing = False
-        self._target_file_cache = TTLCache(
-            region=f"{cache_region}:target_files",
+        self._target_file_cache = create_platform_ttl_cache(
+            "p115:target_files",
+            cache_scope,
             maxsize=200,
             ttl=60,
         )
-        self._account_info_cache = TTLCache(
-            region=f"{cache_region}:account_info",
+        self._account_info_cache = create_platform_ttl_cache(
+            "p115:account_info",
+            cache_scope,
             maxsize=2,
             ttl=3600,
         )
@@ -384,7 +388,7 @@ class P115ClientManager:
 
         try:
             self.rate_limiter.wait()
-            user_info = self.client.user_my_info(**self._ios_request_kwargs(app=False))
+            user_info = self.client.user_my_info()
             if user_info.get("state"):
                 data = user_info.get("data") or {}
                 vip_data = data.get("vip") or {}
@@ -400,10 +404,17 @@ class P115ClientManager:
                     vip_text = f"{vip_text}（有效期：{self.vip_expire_date}）"
                 logger.info(f"115 登录成功: {uname}，会员状态: {vip_text}")
                 return True
-            logger.error(user_info.get("error") or user_info.get("message") or "115 登录状态无效")
+            logger.error(
+                f"115 登录状态无效：ssoent={self._login_ssoent()}，"
+                f"{user_info.get('error') or user_info.get('message') or '接口未返回原因'}"
+            )
             return False
         except Exception as e:
-            logger.error(f"检查 115 登录状态失败: {e}")
+            logger.error(
+                f"检查 115 登录状态失败："
+                f"HTTP={self._http_status_code(e) or 'unknown'}，"
+                f"ssoent={self._login_ssoent()}，{self._error_summary(e)}"
+            )
             return False
 
     def get_account_info(self, cache_ttl: int = 3600) -> Dict[str, Any]:
@@ -421,23 +432,26 @@ class P115ClientManager:
 
             try:
                 self.rate_limiter.wait()
-                user_response = self.client.user_my_info(
-                    **self._ios_request_kwargs(app=False)
-                )
+                user_response = self.client.user_my_info()
                 check_response(user_response)
                 user_data = user_response.get("data") or {}
                 vip_data = user_data.get("vip") or {}
                 face_data = user_data.get("face") or {}
 
-                self.rate_limiter.wait()
-                space_response = self.client.fs_index_info(
-                    payload=0,
-                    **self._ios_request_kwargs(app=False),
-                )
-                check_response(space_response)
-                space_data = (
-                        (space_response.get("data") or {}).get("space_info") or {}
-                )
+                space_data = {}
+                try:
+                    self.rate_limiter.wait()
+                    space_response = self.client.fs_index_info(payload=0)
+                    check_response(space_response)
+                    space_data = (
+                            (space_response.get("data") or {}).get("space_info") or {}
+                    )
+                except Exception as error:
+                    logger.warning(
+                        f"获取115空间信息失败但登录仍有效："
+                        f"HTTP={self._http_status_code(error) or 'unknown'}，"
+                        f"ssoent={self._login_ssoent()}，{self._error_summary(error)}"
+                    )
 
                 is_forever = self._as_bool(vip_data.get("is_forever"))
                 account_info = {
@@ -465,7 +479,7 @@ class P115ClientManager:
                     },
                 }
             except Exception as error:
-                logger.debug(f"获取115账号信息失败：{error}")
+                logger.debug(f"获取115账号信息失败：{self._error_summary(error)}")
                 account_info = {
                     "connected": False,
                     "error": "账号信息不可用，请检查 Cookie 后重试",

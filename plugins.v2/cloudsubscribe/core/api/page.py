@@ -6,12 +6,14 @@ from urllib.parse import urlencode
 from app.core.config import settings
 from app.log import logger
 from app.schemas.types import NotificationType
-from cachetools import TTLCache, cached
 
 from .. import CloudDriveCapability, OwnerDelegator
 from ..config import UIConfig
+from ...utils.cache import create_platform_ttl_cache
 
-_UI_OPTIONS_CACHE = TTLCache(maxsize=1, ttl=2 * 60)
+_UI_OPTIONS_CACHE = create_platform_ttl_cache(
+    "ui:options", maxsize=1, ttl=2 * 60
+)
 
 
 class PageApi(OwnerDelegator):
@@ -43,8 +45,11 @@ class PageApi(OwnerDelegator):
             },
         }
 
-    @cached(cache=_UI_OPTIONS_CACHE)
     def api_vue_ui_options(self) -> dict:
+        cache_key = f"instance:{id(self)}"
+        cached = _UI_OPTIONS_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            return copy.deepcopy(cached)
         from ...search.pansou import PanSouClient
 
         providers = (
@@ -156,7 +161,7 @@ class PageApi(OwnerDelegator):
             if str(item.get("type") or "").strip().lower() == "emby"
                and str(item.get("value") or "").strip()
         }
-        return {
+        result = {
             "success": True,
             "data": {
                 "defaults": UIConfig.get_default_config(),
@@ -175,6 +180,8 @@ class PageApi(OwnerDelegator):
                 "pansou": pansou_options,
             },
         }
+        _UI_OPTIONS_CACHE.set(cache_key, copy.deepcopy(result))
+        return result
 
     def api_vue_cloud_directories(
             self, path: str = "/", provider: str = ""
@@ -245,6 +252,6 @@ class PageApi(OwnerDelegator):
 
 
 def clear_ui_options_cache() -> int:
-    count = len(_UI_OPTIONS_CACHE)
+    count = len(list(_UI_OPTIONS_CACHE.items()))
     _UI_OPTIONS_CACHE.clear()
     return count

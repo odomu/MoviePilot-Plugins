@@ -7,15 +7,16 @@ from pathlib import Path
 from typing import Any, Dict
 
 import httpx
-from app.core.cache import TTLCache
 from app.core.config import settings
 from app.core.metainfo import MetaInfo
 from torf import Magnet, Torrent, TorfError
 
+from .cache import create_platform_ttl_cache
+
 _TORRENT_CACHE_TTL = 30 * 60
 DEFAULT_METADATA_URL_TEMPLATE = "https://itorrents.org/torrent/{info_hash}.torrent"
-_TORRENT_METADATA_CACHE = TTLCache(
-    region="cloudsubscribe:magnet_metadata",
+_TORRENT_METADATA_CACHE = create_platform_ttl_cache(
+    "magnet:metadata",
     maxsize=256,
     ttl=_TORRENT_CACHE_TTL,
 )

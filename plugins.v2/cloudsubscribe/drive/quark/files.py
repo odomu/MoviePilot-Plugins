@@ -5,7 +5,14 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Dict, List, Optional
 
-from ..common import CloudDriveFileServiceBase, extract_list, safe_int
+from app.core.cache import TTLCache
+
+from ..common import (
+    CloudDriveFileServiceBase,
+    create_directory_cache,
+    extract_list,
+    safe_int,
+)
 from ...core.cloud import CloudFile
 from ...core.transfer import HttpFileDownloadService
 
@@ -56,13 +63,15 @@ class QuarkFileService(CloudDriveFileServiceBase):
     page_size: int = 100
     root_directory_id = "0"
     provider_name = "夸克"
-    _path_ids: Dict[str, str] = field(default_factory=lambda: {"/": "0"})
+    provider_key = "quark"
     _directory_lock: RLock = field(default_factory=RLock, repr=False)
+    _directory_cache: TTLCache = field(init=False, repr=False)
 
-    def resolve_directory(self, path: str, create: bool = False):
-        # 夸克会把并发创建同一目录判定为正在下载/同名冲突。
-        with self._directory_lock:
-            return super().resolve_directory(path, create=create)
+    def __post_init__(self):
+        self._directory_cache = create_directory_cache("quark", self.client)
+
+    def _invalidate_directory_cache(self) -> None:
+        self._directory_cache.clear()
 
     def download_file(self, file_item: CloudFile, local_path: str,
                       progress_callback=None, stop_requested=None,
@@ -139,6 +148,10 @@ class QuarkFileService(CloudDriveFileServiceBase):
         )
 
     def _list(self, directory_id: str) -> List[CloudFile]:
+        directory_id = str(directory_id or self.root_directory_id)
+        cached = self._directory_cache.get(directory_id)
+        if cached is not None:
+            return list(cached)
         files: List[CloudFile] = []
         page = 1
         while True:
@@ -150,6 +163,7 @@ class QuarkFileService(CloudDriveFileServiceBase):
             data = self.client.data(response)
             total = safe_int(data.get("total") if isinstance(data, dict) else 0)
             if len(raw_items) < self.page_size or (total and len(files) >= total):
+                self._directory_cache.set(directory_id, tuple(files))
                 return files
             page += 1
 
@@ -162,8 +176,10 @@ class QuarkFileService(CloudDriveFileServiceBase):
         else:
             created = cloud_file(self.client.data(response))
             if created:
+                self._invalidate_directory_cache()
                 return created
 
+        self._invalidate_directory_cache()
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             time.sleep(0.5)
@@ -189,7 +205,12 @@ class QuarkFileService(CloudDriveFileServiceBase):
             "POST", "file/rename",
             json_data={"fid": item.id, "file_name": target_name},
         )
-        return self._is_success(response)
+        success = self._is_success(response)
+        if success:
+            self._invalidate_directory_cache()
+            if item.is_directory:
+                self._invalidate_path_cache()
+        return success
 
     def move_file(
             self, item: CloudFile, save_path: str, target_name: str
@@ -208,6 +229,9 @@ class QuarkFileService(CloudDriveFileServiceBase):
         )
         if not self._is_success(moved):
             return None
+        self._invalidate_directory_cache()
+        if item.is_directory:
+            self._invalidate_path_cache()
         if target_name and target_name != item.name:
             if not self.rename_file(save_path, item, target_name):
                 return None
@@ -218,4 +242,8 @@ class QuarkFileService(CloudDriveFileServiceBase):
             "POST", "file/delete",
             json_data={"action_type": 2, "filelist": [file_id], "exclude_fids": []},
         )
-        return self._is_success(response)
+        success = self._is_success(response)
+        if success:
+            self._invalidate_directory_cache()
+            self._invalidate_path_cache()
+        return success

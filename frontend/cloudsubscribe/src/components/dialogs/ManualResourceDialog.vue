@@ -158,6 +158,14 @@
               density="compact"
               :disabled="submitting"
           />
+          <v-checkbox
+              v-model="manualUpgrade"
+              label="将手动资源作为洗版候选"
+              density="compact"
+              hide-details
+              class="mt-2"
+              :disabled="submitting"
+          />
         </template>
 
         <template v-else>
@@ -345,6 +353,7 @@ const subscribeId = ref(null);
 const actionMode = ref("links");
 const targetMode = ref("subscribe");
 const resourceLinks = ref("");
+const manualUpgrade = ref(false);
 const tmdbKeyword = ref("");
 const tmdbCandidates = ref([]);
 const selectedMedia = ref(null);
@@ -694,11 +703,13 @@ async function submit() {
         subscribe_id: targetMode.value === "subscribe" ? subscribeId.value : null,
         media: targetMode.value === "tmdb" ? media : null,
         resource_links: resourceLinks.value.split(/\r?\n/),
+        manual_upgrade: manualUpgrade.value,
       }));
     }
     if (result.success === false) throw new Error(result.message || "提交失败");
     emit("started", result.message || "任务已启动");
     resourceLinks.value = "";
+    manualUpgrade.value = false;
     selectedMediaItems.value = [];
     confirmVisible.value = false;
     emit("update:modelValue", false);

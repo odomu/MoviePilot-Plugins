@@ -4,7 +4,6 @@ import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.core.metainfo import MetaInfo
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
@@ -76,22 +75,8 @@ class MovieSyncProcessor(OwnerDelegator):
             # 原生 best_version 决定是否为洗版订阅，插件范围进一步限制处理对象。
             is_best_version = manual_upgrade or self._is_cloud_upgrade_subscribe(subscribe)
 
-            # 生成元数据
-            meta = MetaInfo(subscribe.name)
-            meta.year = subscribe.year
-            meta.type = MediaType.MOVIE
-
-            # 识别媒体信息
-            mediainfo: MediaInfo = self._recognize_media_once(
-                (
-                    "subscribe", MediaType.MOVIE.value, subscribe.tmdbid,
-                    subscribe.doubanid, subscribe.name, subscribe.year, 0, True,
-                ),
-                meta=meta,
-                mtype=MediaType.MOVIE,
-                tmdbid=subscribe.tmdbid,
-                doubanid=subscribe.doubanid,
-                cache=True,
+            mediainfo: MediaInfo = self._subscribe_mediainfo(
+                subscribe, MediaType.MOVIE
             )
             if not mediainfo:
                 logger.warning(f"无法识别媒体信息：{subscribe.name}")
@@ -244,18 +229,32 @@ class MovieSyncProcessor(OwnerDelegator):
             # 手动资源直接进入现有匹配转存链，否则查询搜索源。
             self._set_task_phase(subscribe, "搜索候选资源", 45)
             if manual_resources:
-                p115_results = [dict(resource) for resource in manual_resources]
+                source_order = ["manual"]
+                source_results = {
+                    "manual": [dict(resource) for resource in manual_resources]
+                }
                 logger.info(
-                    f"手动处理电影 {mediainfo.title}：收到 {len(p115_results)} 个资源链接"
+                    f"手动处理电影 {mediainfo.title}："
+                    f"收到 {len(source_results['manual'])} 个资源链接"
                 )
             else:
-                p115_results = self._search_handler.search_resources(
+                source_order = self._search_handler.get_enabled_sources()
+                source_results = self._search_handler.search_sources(
+                    sources=source_order,
                     mediainfo=mediainfo,
                     media_type=MediaType.MOVIE,
                     subscribe=subscribe,
                 )
+            resource_batches = self._build_transfer_resource_batches(
+                source_order, source_results
+            )
+            candidate_resources = [
+                resource
+                for _, resources, _ in resource_batches
+                for resource in resources
+            ]
 
-            if not p115_results:
+            if not candidate_resources:
                 if self._stop_requested():
                     return transferred_count
                 logger.info(f"未找到电影 {mediainfo.title} 的可处理资源")
@@ -267,22 +266,22 @@ class MovieSyncProcessor(OwnerDelegator):
             )
             result_sources = "/".join(dict.fromkeys(
                 str(resource.get("source") or "unknown").upper()
-                for resource in p115_results
+                for resource in candidate_resources
             ))
             logger.debug(
                 f"[{search_label}][{result_sources}] 找到候选资源："
-                f"{self._format_resource_summary(p115_results)}"
+                f"{self._format_resource_summary(candidate_resources)}"
             )
 
             # 遍历搜索结果，尝试找到并转存电影
             movie_transferred = False
-            for resource_index, resource in enumerate(p115_results):
+            for resource_index, resource in enumerate(candidate_resources):
                 if movie_transferred or self._stop_requested():
                     break
                 self._set_task_phase(
                     subscribe,
-                    f"检查候选资源 {resource_index + 1}/{len(p115_results)}",
-                    60 + int((resource_index + 1) / len(p115_results) * 22),
+                    f"检查候选资源 {resource_index + 1}/{len(candidate_resources)}",
+                    60 + int((resource_index + 1) / len(candidate_resources) * 22),
                 )
 
                 share_url = resource.get("url", "")
@@ -319,7 +318,7 @@ class MovieSyncProcessor(OwnerDelegator):
                             )
                             continue
                 share_url = self._resolve_candidate_resource_url(
-                    p115_results,
+                    candidate_resources,
                     resource_index,
                     resource,
                     search_label,
@@ -422,15 +421,28 @@ class MovieSyncProcessor(OwnerDelegator):
                     if not share_files:
                         continue
 
+                    require_media_match = self._is_cross_drive_resource(
+                        resource, share_url
+                    )
                     matched_file, current_score = self._match_movie_file(
-                        share_files, mediainfo, subscribe, resource_title
+                        share_files,
+                        mediainfo,
+                        subscribe,
+                        resource_title,
+                        require_media_match=require_media_match,
                     )
 
                     if not matched_file:
-                        logger.debug(
-                            f"分享内容未被平台识别为目标电影："
-                            f"{mediainfo.title_year}，已跳过该资源"
-                        )
+                        if require_media_match:
+                            logger.debug(
+                                f"跨盘分享内容未被平台识别为目标电影："
+                                f"{mediainfo.title_year}，已跳过该资源"
+                            )
+                        else:
+                            logger.debug(
+                                f"目标网盘分享未找到符合规则的电影文件："
+                                f"{mediainfo.title_year}，已跳过该资源"
+                            )
                         continue
 
                     if matched_file:
@@ -493,6 +505,7 @@ class MovieSyncProcessor(OwnerDelegator):
                                 self._cloud_transfer_path,
                                 None if self._is_offline_url(share_url) else target_name,
                                 matched_file.get("sha1"),
+                                media_type="movie",
                             )
                         except Exception:
                             self._release_transfer_slots(1)
@@ -504,6 +517,16 @@ class MovieSyncProcessor(OwnerDelegator):
                                     f"用户已停止转存：{mediainfo.title}"
                                 )
                                 break
+
+                        subtitles = []
+                        if success and not self._is_offline_url(share_url):
+                            subtitles = self._transfer_companion_subtitles(
+                                share_url=share_url,
+                                files=share_files,
+                                video_file=matched_file,
+                                target_video_name=target_name,
+                                media_type="movie",
+                            )
 
                         # 记录历史
                         history_item = self._build_transfer_history_item(
@@ -557,6 +580,7 @@ class MovieSyncProcessor(OwnerDelegator):
                                     if existing_movie else ""
                                 ),
                                 upgrade_old_size=upgrade_old_size,
+                                subtitles=subtitles,
                             )
                             if not strm_path and not pending_key:
                                 history_item["status"] = "失败"

@@ -9,10 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote, unquote, urlparse
 
-from cachetools import TTLCache
-
 from ..http_client import RequestGate, gated_request, normalize_proxies, requests
 from ..matching import extract_season, extract_year, title_matches, unique_texts
+from ...utils.cache import (
+    create_platform_ttl_cache,
+    normalize_platform_cache_key,
+)
 
 
 class SeedHubError(RuntimeError):
@@ -57,16 +59,21 @@ class SeedHubClient:
         self._browser_proxy = self._normalize_browser_proxy(proxy)
         self._request_timeout = max(5, min(int(request_timeout or 20), 60))
         self._resolve_concurrency = max(1, min(int(resolve_concurrency or 6), 8))
-        self._search_cache = TTLCache(maxsize=128, ttl=15 * 60)
-        self._magnet_cache = TTLCache(maxsize=1024, ttl=60 * 60)
+        self._search_cache = create_platform_ttl_cache(
+            "seedhub:search", self.base_url, maxsize=128, ttl=15 * 60
+        )
+        self._magnet_cache = create_platform_ttl_cache(
+            "seedhub:magnets", self.base_url, maxsize=1024, ttl=60 * 60
+        )
         self._cache_lock = threading.RLock()
         self._search_locks = tuple(threading.Lock() for _ in range(16))
         self._browser_lock = threading.RLock()
         self._browser_state_version = 0
         self._browser_cookie_header = ""
         self._browser_user_agent = ""
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "SeedHub",
+            f"{self.base_url}|{self._proxies}",
             request_interval=0.3,
             minimum_interval=0.2,
             challenge_detector=self._is_challenge_response,
@@ -165,17 +172,20 @@ class SeedHubClient:
                     "user_agent": page.evaluate("navigator.userAgent") or "",
                 }
 
-            result = PlaywrightHelper().action(
+            result = self._request_gate.run(lambda: PlaywrightHelper().action(
                 url=url,
                 callback=snapshot,
                 proxies=self._browser_proxy,
                 headless=True,
                 timeout=max(30, self._request_timeout),
-            )
+            ))
             if not isinstance(result, dict):
                 return ""
             text = str(result.get("text") or "")
             if not text or self._is_cloudflare_challenge(text):
+                self._request_gate.activate_cooldown(
+                    60, reason="SeedHub 浏览器验证"
+                )
                 return ""
             seedhub_host = str(urlparse(self.base_url).hostname or "").lower()
             cookies = [
@@ -266,7 +276,7 @@ class SeedHubClient:
             media_type: str,
             season: Optional[int],
     ) -> Optional[Dict[str, str]]:
-        ranked = []
+        best = None
         for index, candidate in enumerate(candidates):
             if not self._type_matches(candidate.get("media_type"), media_type):
                 continue
@@ -289,9 +299,10 @@ class SeedHubClient:
                 score += 40
             if season and candidate_season == season:
                 score += 60
-            ranked.append((score, -index, candidate))
-        ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        return ranked[0][2] if ranked else None
+            ranked = (score, -index, candidate)
+            if best is None or (score, -index) > (best[0], best[1]):
+                best = ranked
+        return best[2] if best is not None else None
 
     def _parse_entries(self, text: str) -> List[Dict[str, str]]:
         entries = []
@@ -331,7 +342,7 @@ class SeedHubClient:
         if not magnet.lower().startswith("magnet:?"):
             return ""
         with self._cache_lock:
-            self._magnet_cache[seed_id] = magnet
+            self._magnet_cache.set(seed_id, magnet)
         return magnet
 
     def _resolve_entries(
@@ -395,6 +406,7 @@ class SeedHubClient:
         year = extract_year(expected_year)
         cache_key = (tuple(normalized_keywords), tuple(titles), year, media_type,
                      season, normalized_limit, bool(test_mode))
+        cache_key = normalize_platform_cache_key(cache_key)
         lock = self._search_locks[hash(cache_key) % len(self._search_locks)]
         with lock:
             with self._cache_lock:
@@ -416,7 +428,7 @@ class SeedHubClient:
                     break
             if not selected:
                 with self._cache_lock:
-                    self._search_cache[cache_key] = []
+                    self._search_cache.set(cache_key, [])
                 return []
 
             movie_id = selected["movie_id"]
@@ -431,14 +443,16 @@ class SeedHubClient:
                 entries = matching_entries
             results = self._resolve_entries(movie_id, entries, normalized_limit)
             with self._cache_lock:
-                self._search_cache[cache_key] = [dict(item) for item in results]
+                self._search_cache.set(
+                    cache_key, [dict(item) for item in results]
+                )
             return results
 
     def clear_cache(self) -> Dict[str, int]:
         with self._cache_lock:
             counts = {
-                "search": len(self._search_cache),
-                "magnet": len(self._magnet_cache),
+                "search": len(list(self._search_cache.items())),
+                "magnet": len(list(self._magnet_cache.items())),
             }
             self._search_cache.clear()
             self._magnet_cache.clear()

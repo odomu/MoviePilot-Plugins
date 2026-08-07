@@ -5,10 +5,9 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
-from cachetools import TTLCache
-
 from ..http_client import RequestGate, gated_request, normalize_proxies, requests
 from ..matching import extract_season, extract_year, title_matches, unique_texts
+from ...utils.cache import create_platform_ttl_cache
 
 
 class ButailingError(RuntimeError):
@@ -34,12 +33,18 @@ class ButailingClient:
         self._identity = str(identity or self._DEFAULT_IDENTITY)
         self._proxies = normalize_proxies(proxy)
         self._request_timeout = max(5, min(int(request_timeout or 30), 60))
-        self._list_cache = TTLCache(maxsize=128, ttl=15 * 60)
-        self._detail_cache = TTLCache(maxsize=256, ttl=30 * 60)
+        cache_identity = f"{self.base_url}|{self._app_id}|{self._identity}"
+        self._list_cache = create_platform_ttl_cache(
+            "butailing:lists", cache_identity, maxsize=128, ttl=15 * 60
+        )
+        self._detail_cache = create_platform_ttl_cache(
+            "butailing:details", cache_identity, maxsize=256, ttl=30 * 60
+        )
         self._cache_lock = threading.RLock()
         self._search_locks = tuple(threading.Lock() for _ in range(16))
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "不太灵",
+            f"{cache_identity}|{self._proxies}",
             request_interval=0.3,
             minimum_interval=0.2,
             serial_requests=False,
@@ -96,7 +101,7 @@ class ButailingClient:
         rows = data.get("data") if isinstance(data, dict) else []
         rows = [dict(item) for item in rows or [] if isinstance(item, dict)]
         with self._cache_lock:
-            self._list_cache[keyword] = [dict(item) for item in rows]
+            self._list_cache.set(keyword, [dict(item) for item in rows])
         return rows
 
     def _detail(self, douban_id: int) -> Dict[str, Any]:
@@ -109,7 +114,7 @@ class ButailingClient:
         data = payload.get("data") or {}
         detail = dict(data) if isinstance(data, dict) else {}
         with self._cache_lock:
-            self._detail_cache[cache_key] = dict(detail)
+            self._detail_cache.set(cache_key, dict(detail))
         return detail
 
     @staticmethod
@@ -129,7 +134,7 @@ class ButailingClient:
             douban_id: Optional[int],
     ) -> Optional[Dict[str, Any]]:
         target_type = 2 if media_type == "tv" else 1
-        ranked = []
+        best = None
         for index, row in enumerate(rows):
             try:
                 row_type = int(row.get("type") or 0)
@@ -162,9 +167,10 @@ class ButailingClient:
                 score += 100
             elif season and candidate_season is None:
                 score += 10
-            ranked.append((score, -index, row))
-        ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        return ranked[0][2] if ranked else None
+            ranked = (score, -index, row)
+            if best is None or (score, -index) > (best[0], best[1]):
+                best = ranked
+        return best[2] if best is not None else None
 
     def search(
             self,
@@ -239,8 +245,8 @@ class ButailingClient:
     def clear_cache(self) -> Dict[str, int]:
         with self._cache_lock:
             counts = {
-                "list": len(self._list_cache),
-                "detail": len(self._detail_cache),
+                "list": len(list(self._list_cache.items())),
+                "detail": len(list(self._detail_cache.items())),
             }
             self._list_cache.clear()
             self._detail_cache.clear()

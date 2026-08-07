@@ -6,6 +6,13 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
+from app.core.cache import TTLCache
+
+from ..common import (
+    create_directory_cache,
+    create_directory_path_cache,
+    resolve_directory_path,
+)
 from ...core.cloud import CloudFile, DirectoryListing, DirectoryLookup
 from ...core.transfer import HttpFileDownloadService
 
@@ -33,6 +40,16 @@ def cloud_file(item: dict | None) -> CloudFile | None:
 class AliPanFileService:
     client: Any
     _items: dict[str, dict] = field(default_factory=dict)
+    _directory_cache: TTLCache = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._directory_cache = create_directory_cache("alipan", self.client)
+        self._directory_path_cache = create_directory_path_cache(
+            "alipan", self.client, "root"
+        )
+
+    def _invalidate_directory_cache(self) -> None:
+        self._directory_cache.clear()
 
     def _remember(self, item: dict) -> CloudFile | None:
         value = cloud_file(item)
@@ -53,31 +70,35 @@ class AliPanFileService:
         return self._items.get(str(file_id or ""))
 
     def resolve_directory(self, path: str, create: bool = False) -> DirectoryLookup:
-        current_id = "root"
         self._items["root"] = self._root()
-        for part in PurePosixPath("/" + str(path or "").strip("/")).parts:
-            if part == "/":
-                continue
-            child = next(
-                (item for item in self._list_native(current_id)
-                 if item.get("type") == "folder" and item.get("name") == part),
-                None,
-            )
-            if not child and create:
-                child = self.client.request("/adrive/v2/file/createWithFolders", {
-                    "drive_id": self.client.drive_id,
-                    "parent_file_id": current_id,
-                    "name": part,
-                    "type": "folder",
-                    "check_name_mode": "refuse",
-                })
-            if not child:
-                return DirectoryLookup(True, None)
-            current_id = str(child.get("file_id") or "")
-            self._items[current_id] = child
-        return DirectoryLookup(True, current_id)
+        return resolve_directory_path(
+            path,
+            root_directory_id="root",
+            path_cache=self._directory_path_cache,
+            list_children=lambda directory_id: self.list_directory(directory_id).files,
+            create_child=self._create_folder,
+            create=create,
+            provider_name="阿里云盘",
+        )
+
+    def _create_folder(self, name: str, parent_id: str) -> CloudFile | None:
+        child = self.client.request("/adrive/v2/file/createWithFolders", {
+            "drive_id": self.client.drive_id,
+            "parent_file_id": parent_id,
+            "name": name,
+            "type": "folder",
+            "check_name_mode": "refuse",
+        })
+        if not child:
+            return None
+        self._invalidate_directory_cache()
+        return self._remember(child)
 
     def _list_native(self, directory_id: str) -> list[dict]:
+        directory_id = str(directory_id or "root")
+        cached = self._directory_cache.get(directory_id)
+        if cached is not None:
+            return [dict(item) for item in cached]
         marker = ""
         result = []
         while True:
@@ -89,6 +110,9 @@ class AliPanFileService:
             result.extend(data.get("items") or [])
             marker = str(data.get("next_marker") or "")
             if not marker:
+                self._directory_cache.set(
+                    directory_id, tuple(dict(item) for item in result)
+                )
                 return result
 
     def list_directory(self, directory_id: str) -> DirectoryListing:
@@ -141,7 +165,12 @@ class AliPanFileService:
             "drive_id": self.client.drive_id, "file_id": item.id,
             "name": target_name, "check_name_mode": "refuse",
         })
-        return bool(data.get("file_id"))
+        success = bool(data.get("file_id"))
+        if success:
+            self._invalidate_directory_cache()
+            if item.is_directory:
+                self._directory_path_cache.clear()
+        return success
 
     def move_file(self, item: CloudFile, save_path: str, target_name: str) -> CloudFile | None:
         lookup = self.resolve_directory(save_path, create=True)
@@ -159,6 +188,9 @@ class AliPanFileService:
         self.client.request("/v2/batch", {
             "requests": requests_payload, "resource": "file",
         })
+        self._invalidate_directory_cache()
+        if item.is_directory:
+            self._directory_path_cache.clear()
         if target_name and target_name != item.name:
             self.rename_file(save_path, item, target_name)
         return self.find_file(save_path, target_name or item.name)
@@ -172,7 +204,11 @@ class AliPanFileService:
             }],
             "resource": "file",
         })
-        return bool((data.get("responses") or [{}])[0].get("id"))
+        success = bool((data.get("responses") or [{}])[0].get("id"))
+        if success:
+            self._invalidate_directory_cache()
+            self._directory_path_cache.clear()
+        return success
 
     def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
         data = self.client.request("/v2/file/get_download_url", {

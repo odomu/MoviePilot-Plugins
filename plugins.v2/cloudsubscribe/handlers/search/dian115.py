@@ -45,8 +45,8 @@ class Dian115SearchService(OwnerDelegator):
                     proxy=proxy,
                     request_interval=self._dian115_request_interval,
                     unlocks_per_minute=self._dian115_unlocks_per_minute,
-                    get_data_func=self._dian115_get_data_func,
-                    save_data_func=self._dian115_save_data_func,
+                    get_data_func=self._dian115_budget.get_data_func,
+                    save_data_func=self._dian115_budget.save_data_func,
                 )
                 self._dian115_client = client
                 self._dian115_resources = None
@@ -353,34 +353,15 @@ class Dian115SearchService(OwnerDelegator):
 
     def set_data_funcs(self, get_func, save_func) -> None:
         """注入订阅积分历史的持久化读写函数。"""
-        with self._dian115_budget_lock:
-            self._dian115_get_data_func = get_func
-            self._dian115_save_data_func = save_func
-
-    def _load_dian115_points_history(self) -> Dict[str, int]:
-        if not self._dian115_get_data_func:
-            return {}
-        data = self._dian115_get_data_func(self._HISTORY_KEY) or {}
-        return data if isinstance(data, dict) else {}
-
-    def _save_dian115_points_history(self, data: Dict[str, int]) -> None:
-        if self._dian115_save_data_func:
-            self._dian115_save_data_func(self._HISTORY_KEY, data)
+        self._dian115_budget.set_data_funcs(get_func, save_func)
 
     def reset_task_spent_points(self) -> None:
-        with self._dian115_budget_lock:
-            self._dian115_current_spent_points = 0
-            self._dian115_sub_spent_points = 0
-            self._dian115_current_sub_key = ""
+        self._dian115_budget.reset_task()
         if self._dian115_enabled and self._dian115_auto_unlock:
             logger.debug("Dian115 任务积分账本已初始化")
 
     def reset_sub_spent_points(self, sub_key: str = "") -> None:
-        with self._dian115_budget_lock:
-            self._dian115_current_sub_key = sub_key
-            history = self._load_dian115_points_history() if sub_key else {}
-            self._dian115_sub_spent_points = int(history.get(sub_key, 0) or 0)
-            spent_points = self._dian115_sub_spent_points
+        spent_points = self._dian115_budget.reset_subscribe(sub_key)
         if sub_key and self._dian115_enabled and self._dian115_auto_unlock:
             if spent_points > 0:
                 logger.debug(
@@ -391,25 +372,11 @@ class Dian115SearchService(OwnerDelegator):
                 logger.debug(f"Dian115 订阅 {sub_key} 尚无积分消费记录")
 
     def clear_sub_points(self, sub_key: str) -> None:
-        with self._dian115_budget_lock:
-            history = self._load_dian115_points_history()
-            if sub_key in history:
-                del history[sub_key]
-                self._save_dian115_points_history(history)
-                logger.debug(f"Dian115 已清除订阅 {sub_key} 的历史积分记录")
+        if self._dian115_budget.clear_subscribe(sub_key):
+            logger.debug(f"Dian115 已清除订阅 {sub_key} 的历史积分记录")
 
     def has_dian115_unlock_budget(self, unlock_points: int) -> bool:
-        try:
-            points = max(0, int(unlock_points or 0))
-        except (TypeError, ValueError):
-            return False
-        with self._dian115_budget_lock:
-            return (
-                    self._dian115_current_spent_points + points
-                    <= self._dian115_max_unlock_points
-                    and self._dian115_sub_spent_points + points
-                    <= self._dian115_max_points_per_sub
-            )
+        return self._dian115_budget.can_spend(unlock_points)
 
     def unlock_dian115_resource(
             self,
@@ -422,13 +389,15 @@ class Dian115SearchService(OwnerDelegator):
             season: int = 0,
     ) -> Optional[str]:
         prefix = f"[{search_label}][DIAN115]" if search_label else "[DIAN115]"
-        with self._dian115_budget_lock:
-            if not self.has_dian115_unlock_budget(unlock_points):
+        with self._dian115_budget.lock:
+            budget_status = self._dian115_budget.status(unlock_points)
+            if not budget_status or not budget_status.allowed:
                 logger.warning(
                     f"{prefix} 积分预算不足：share_id={share_id}，"
                     f"需要 {unlock_points} 积分"
                 )
                 return None
+            unlock_points = budget_status.requested
             try:
                 result = self._get_dian115_resources().unlock_share(
                     share_id,
@@ -438,15 +407,10 @@ class Dian115SearchService(OwnerDelegator):
                     media_type=media_type,
                     season=season,
                 )
-                actual_points = max(0, int(result.get("actual_points") or 0))
-                self._dian115_current_spent_points += actual_points
-                self._dian115_sub_spent_points += actual_points
-                if self._dian115_current_sub_key:
-                    history = self._load_dian115_points_history()
-                    history[self._dian115_current_sub_key] = (
-                        self._dian115_sub_spent_points
-                    )
-                    self._save_dian115_points_history(history)
+                actual_points = self._dian115_budget.normalize_points(
+                    result.get("actual_points")
+                ) or 0
+                self._dian115_budget.record(actual_points)
                 url = self._unlock_payload_url(result)
                 if not url:
                     logger.error(
@@ -459,11 +423,14 @@ class Dian115SearchService(OwnerDelegator):
                         f"{prefix} 实际扣费高于搜索时价格："
                         f"预计={unlock_points}，实际={actual_points}"
                     )
+                remaining_task, remaining_subscribe = (
+                    self._dian115_budget.remaining()
+                )
                 logger.info(
                     f"{prefix} 已取得分享链接：share_id={share_id}，"
                     f"消耗 {actual_points} 积分；"
-                    f"任务剩余 {max(0, self._dian115_max_unlock_points - self._dian115_current_spent_points)}，"
-                    f"当前订阅剩余 {max(0, self._dian115_max_points_per_sub - self._dian115_sub_spent_points)}"
+                    f"任务剩余 {remaining_task}，"
+                    f"当前订阅剩余 {remaining_subscribe}"
                 )
                 return url
             except Dian115Error as error:

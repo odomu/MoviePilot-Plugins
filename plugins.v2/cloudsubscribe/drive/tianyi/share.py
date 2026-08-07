@@ -9,11 +9,11 @@ from threading import RLock
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from app.core.cache import TTLCache
 from app.log import logger
 
 from ..common import iter_transfer_batches
 from ...core.cloud import ShareLinkStatus
+from ...utils.cache import create_platform_ttl_cache
 
 
 class TianyiShareService:
@@ -21,8 +21,9 @@ class TianyiShareService:
         self.client = client
         self.files = files
         self._share_items: dict[str, dict[str, dict[str, Any]]] = {}
-        self._share_info_cache = TTLCache(
-            region="cloudsubscribe:tianyi:share_info",
+        self._share_info_cache = create_platform_ttl_cache(
+            "tianyi:share_info",
+            client,
             maxsize=256,
             ttl=10 * 60,
         )

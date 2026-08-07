@@ -36,7 +36,7 @@ export function createPinglianGroups(options = {}) {
         },
         {
             tab: "pinglian",
-            title: "盘链搜索",
+            title: "搜索与风控",
             icon: "mdi-tune-variant",
             fields: [
                 {
@@ -44,14 +44,14 @@ export function createPinglianGroups(options = {}) {
                     label: "候选上限",
                     type: "number",
                     min: 1,
-                    max: 80,
+                    max: 10,
                     cols: 4,
                 },
                 {
                     key: "pinglian_request_interval",
                     label: "请求访问间隔",
                     type: "number",
-                    min: 0.5,
+                    min: 1,
                     max: 10,
                     step: 0.5,
                     suffix: "秒",

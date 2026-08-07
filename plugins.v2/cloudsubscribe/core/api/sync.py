@@ -382,6 +382,7 @@ class SyncApi(OwnerDelegator):
             "subscribe_id": subscribe_id or None,
             "manual_resources": resources,
             "manual_target": media_target,
+            "manual_upgrade": bool((payload or {}).get("manual_upgrade")),
         }
         if wait:
             result: Dict[str, Any] = {}

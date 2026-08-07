@@ -61,12 +61,13 @@ class JuyingClient:
         self._save_data_func = save_data_func
         self._lock = threading.RLock()
         self._circuit_open_until = 0.0
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "聚影",
+            f"{self.base_url}|{self.username.casefold()}|{self._proxies}",
             request_interval=request_interval,
             minimum_interval=0.5,
         )
-        self._access_gate = AccountActionGate(
+        self._access_gate = AccountActionGate.shared(
             "聚影解锁接口",
             f"juying:{self.username.casefold()}",
             max_actions=unlocks_per_minute,
@@ -240,6 +241,9 @@ class JuyingClient:
                 seconds = max(60, min(600, int(float(retry_after))))
             except (TypeError, ValueError):
                 seconds = 300
+            self._request_gate.activate_cooldown(
+                seconds, status=429, reason="聚影 HTTP 429"
+            )
             self._circuit_open_until = time.monotonic() + seconds
             raise JuyingError("聚影请求过于频繁，已临时暂停该渠道", "juying_rate_limited")
         if response.status_code >= 400:

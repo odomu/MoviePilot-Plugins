@@ -94,7 +94,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -1751,8 +1751,6 @@ class CloudSubscribe(_PluginBase):
             "timeout_slow_write": self._timeout_slow_write,
             "self_heal_interval": self._self_heal_interval,
         })
-
-    # 停止插件服务
 
     def stop_service(self, preserve_subscribe_queue: bool = False):
         """停止服务"""

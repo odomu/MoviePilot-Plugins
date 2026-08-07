@@ -36,7 +36,7 @@ export function createJuyingGroups(options = {}) {
         },
         {
             tab: "juying",
-            title: "聚影搜索与风控",
+            title: "搜索与风控",
             icon: "mdi-shield-search",
             hint: "影片、资源和票据接口共用限速；缓存搜索结果和短时访问票据，减少重复请求。",
             fields: [
@@ -46,7 +46,7 @@ export function createJuyingGroups(options = {}) {
                     type: "number",
                     min: 1,
                     max: 20,
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "juying_unlocks_per_minute",
@@ -56,7 +56,7 @@ export function createJuyingGroups(options = {}) {
                     min: 1,
                     max: 12,
                     suffix: "次",
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "juying_request_interval",
@@ -67,7 +67,7 @@ export function createJuyingGroups(options = {}) {
                     max: 10,
                     step: 0.5,
                     suffix: "秒",
-                    cols: 6,
+                    cols: 4,
                 },
             ],
         },

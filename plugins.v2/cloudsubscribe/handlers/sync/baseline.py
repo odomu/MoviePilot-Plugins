@@ -10,6 +10,7 @@ from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
 from ...core import OwnerDelegator
+from ...utils.cache import normalize_platform_cache_key
 
 
 class UpgradeBaselineService(OwnerDelegator):
@@ -74,7 +75,9 @@ class UpgradeBaselineService(OwnerDelegator):
         """一次查询整季整理历史，按集建立文件候选索引。"""
         from app.db.transferhistory_oper import TransferHistoryOper
 
-        cache_key = self._baseline_key(subscribe, season)
+        cache_key = normalize_platform_cache_key(
+            self._baseline_key(subscribe, season)
+        )
         with self._baseline_cache_lock:
             cached = self._baseline_transfer_cache.get(cache_key)
             if cached is not None:
@@ -116,8 +119,8 @@ class UpgradeBaselineService(OwnerDelegator):
                     self._record_value(record, "episodes")):
                 episode_files.setdefault(episode, []).append(item)
         with self._baseline_cache_lock:
-            self._baseline_transfer_cache[cache_key] = self._copy_episode_items(
-                episode_files
+            self._baseline_transfer_cache.set(
+                cache_key, self._copy_episode_items(episode_files)
             )
         return episode_files
 
@@ -125,7 +128,9 @@ class UpgradeBaselineService(OwnerDelegator):
             self, subscribe, season: int
     ) -> Dict[int, List[Dict[str, Any]]]:
         """按显式 episode 字段读取插件转存历史，不依赖 STRM 文件名。"""
-        cache_key = self._baseline_key(subscribe, season)
+        cache_key = normalize_platform_cache_key(
+            self._baseline_key(subscribe, season)
+        )
         with self._baseline_cache_lock:
             cached = self._baseline_plugin_cache.get(cache_key)
             if cached is not None:
@@ -157,8 +162,8 @@ class UpgradeBaselineService(OwnerDelegator):
                 "source": "插件转存记录",
             })
         with self._baseline_cache_lock:
-            self._baseline_plugin_cache[cache_key] = self._copy_episode_items(
-                episode_files
+            self._baseline_plugin_cache.set(
+                cache_key, self._copy_episode_items(episode_files)
             )
         return episode_files
 
@@ -184,10 +189,10 @@ class UpgradeBaselineService(OwnerDelegator):
             if isinstance(item, dict):
                 candidates.setdefault(episode_number, []).append(dict(item))
 
-        emby_key = (
+        emby_key = normalize_platform_cache_key((
             *self._baseline_key(subscribe, season),
             int(getattr(mediainfo, "tmdb_id", 0) or 0),
-        )
+        ))
         with self._baseline_cache_lock:
             cached_emby = self._baseline_emby_cache.get(emby_key)
         if cached_emby is None:
@@ -197,10 +202,10 @@ class UpgradeBaselineService(OwnerDelegator):
                 season=season,
             )
             with self._baseline_cache_lock:
-                self._baseline_emby_cache[emby_key] = {
+                self._baseline_emby_cache.set(emby_key, {
                     int(episode): dict(item)
                     for episode, item in emby_media.items()
-                }
+                })
         else:
             emby_media = {
                 int(episode): dict(item)

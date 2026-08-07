@@ -6,10 +6,13 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urljoin, urlparse
 
 from app.log import logger
-from cachetools import TTLCache
 
 from .client import JuyingClient, JuyingError
 from ..matching import extract_season, extract_year, normalize_title, title_matches
+from ...utils.cache import (
+    create_platform_ttl_cache,
+    normalize_platform_cache_key,
+)
 
 
 class JuyingResourceService:
@@ -37,9 +40,17 @@ class JuyingResourceService:
     def __init__(self, client: JuyingClient):
         self._client = client
         self._lock = threading.RLock()
-        self._search_cache = TTLCache(maxsize=128, ttl=15 * 60)
-        self._resource_cache = TTLCache(maxsize=1024, ttl=5 * 60)
-        self._resource_context = TTLCache(maxsize=1024, ttl=15 * 60)
+        cache_identity = f"{getattr(client, 'base_url', '')}|{id(client)}"
+        self._search_cache = create_platform_ttl_cache(
+            "juying:search", cache_identity, maxsize=128, ttl=15 * 60
+        )
+        self._resource_cache = create_platform_ttl_cache(
+            "juying:resources", cache_identity, maxsize=1024, ttl=5 * 60
+        )
+        self._resource_context = create_platform_ttl_cache(
+            "juying:resource_context", cache_identity,
+            maxsize=1024, ttl=15 * 60,
+        )
 
     @staticmethod
     def _safe_int(value: Any) -> int:
@@ -57,7 +68,7 @@ class JuyingResourceService:
             self, rows: Iterable[Dict[str, Any]], expected_titles: List[str],
             expected_year: str, media_type: str, tmdb_id: Optional[int],
     ) -> Optional[Dict[str, Any]]:
-        ranked = []
+        best = None
         for index, row in enumerate(rows):
             exact_tmdb = bool(tmdb_id and self._safe_int(row.get("tmdb_id")) == int(tmdb_id))
             if not exact_tmdb and not self._type_matches(row.get("movie_type"), media_type):
@@ -70,9 +81,10 @@ class JuyingResourceService:
             if media_type == "tv" and expected_year and row_year and row_year != expected_year:
                 continue
             score = (1000 if exact_tmdb else 200) + (60 if row_year == expected_year else 0)
-            ranked.append((score, -index, row))
-        ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        return ranked[0][2] if ranked else None
+            candidate = (score, -index, row)
+            if best is None or (score, -index) > (best[0], best[1]):
+                best = candidate
+        return best[2] if best is not None else None
 
     def _find_movie(self, title: str, alternative_titles: List[str], year: str,
                     media_type: str, tmdb_id: Optional[int]):
@@ -179,6 +191,7 @@ class JuyingResourceService:
         cache_key = (media_type, tmdb_id or 0, normalize_title(title),
                      tuple(normalize_title(item) for item in alternative_titles), year,
                      season or 0, bool(filter_season))
+        cache_key = normalize_platform_cache_key(cache_key)
         if not force:
             cached = self._search_cache.get(cache_key)
             if cached is not None:
@@ -186,7 +199,7 @@ class JuyingResourceService:
                 return [dict(item) for item in cached]
         movie = self._find_movie(title, alternative_titles, year, media_type, tmdb_id)
         if not movie:
-            self._search_cache[cache_key] = []
+            self._search_cache.set(cache_key, [])
             return []
         media_source_url = self._source_url(
             movie.get("source_url"), movie.get("detail_url"), movie.get("url")
@@ -206,8 +219,8 @@ class JuyingResourceService:
             if (filter_season and media_type == "tv" and season
                     and resource_season not in (None, season)):
                 continue
-            self._resource_cache[resource_id] = dict(row)
-            self._resource_context[resource_id] = dict(context)
+            self._resource_cache.set(resource_id, dict(row))
+            self._resource_context.set(resource_id, dict(context))
             public_rows.append({"resource_id": resource_id, "title": resource_title,
                                 "description": str(
                                     row.get("resource_description") or row.get("description") or "").strip(),
@@ -221,7 +234,9 @@ class JuyingResourceService:
                                     row.get("source_url"), row.get("detail_url"),
                                     row.get("url"), media_source_url,
                                 )})
-        self._search_cache[cache_key] = [dict(item) for item in public_rows]
+        self._search_cache.set(
+            cache_key, [dict(item) for item in public_rows]
+        )
         return public_rows
 
     def _reload_resource(self, resource_id: str) -> Optional[Dict[str, Any]]:
@@ -350,8 +365,13 @@ class JuyingResourceService:
                                              extract_year(year), "tv" if media_type == "tv" else "movie",
                                              tmdb_id, season,
                                              filter_season=not test_mode)
-            rows.sort(key=lambda item: allowed_order.index(item["resource_type"])
-            if item["resource_type"] in allowed_order else len(allowed_order))
+            order_map = {value: index for index, value in enumerate(allowed_order)}
+            fallback_order = len(allowed_order)
+            rows.sort(
+                key=lambda item: order_map.get(
+                    item["resource_type"], fallback_order
+                )
+            )
             results = []
             for row in rows:
                 if row["resource_type"] not in allowed_order:
@@ -389,8 +409,11 @@ class JuyingResourceService:
 
     def clear_cache(self) -> Dict[str, int]:
         with self._lock:
-            counts = {"search": len(self._search_cache), "resource": len(self._resource_cache),
-                      "context": len(self._resource_context)}
+            counts = {
+                "search": len(list(self._search_cache.items())),
+                "resource": len(list(self._resource_cache.items())),
+                "context": len(list(self._resource_context.items())),
+            }
             self._search_cache.clear()
             self._resource_cache.clear()
             self._resource_context.clear()

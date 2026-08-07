@@ -444,18 +444,18 @@ class HistoryService(OwnerDelegator):
     ) -> int:
         if not self._platform_transfer_history_enabled and not reconcile:
             return 0
-        entries = [
-            entry
+        entries_by_src = {
+            entry["src"]: entry
             for record in (records if self._platform_transfer_history_enabled else [])
             if isinstance(record, dict)
             for entry in self._platform_history_entries(record)
-        ]
+        }
+        entries = list(entries_by_src.values())
         if not entries and not reconcile:
             return 0
         try:
             from app.db import SessionFactory
             from app.db.models.transferhistory import TransferHistory
-            from app.db.transferhistory_oper import TransferHistoryOper
             from sqlalchemy import or_
 
             if not self._platform_history_lock.acquire(timeout=1.0):
@@ -466,11 +466,9 @@ class HistoryService(OwnerDelegator):
             removed = 0
             try:
                 with SessionFactory() as db:
-                    oper = TransferHistoryOper(db=db)
                     columns = set(TransferHistory.__table__.columns.keys())
-                    existing_by_src = {}
+                    desired_sources = {entry["src"] for entry in entries}
                     if reconcile:
-                        desired_sources = {entry["src"] for entry in entries}
                         managed = db.query(TransferHistory).filter(or_(
                             TransferHistory.src.like("cloudsubscribe://%"),
                             TransferHistory.downloader == "网盘订阅助手",
@@ -481,13 +479,16 @@ class HistoryService(OwnerDelegator):
                                 db.delete(item)
                                 existing_by_src.pop(item.src, None)
                                 removed += 1
-                        if removed:
-                            db.commit()
-                    for entry in entries:
+                    else:
                         existing = (
-                            existing_by_src.get(entry["src"])
-                            if reconcile else oper.get_by_src(entry["src"])
+                            db.query(TransferHistory).filter(
+                                TransferHistory.src.in_(sorted(desired_sources))
+                            ).all()
+                            if desired_sources else []
                         )
+                        existing_by_src = {item.src: item for item in existing}
+                    for entry in entries:
+                        existing = existing_by_src.get(entry["src"])
                         if existing:
                             changed_fields = {
                                 key: value
@@ -496,14 +497,17 @@ class HistoryService(OwnerDelegator):
                                    and getattr(existing, key, None) != value
                             }
                             if changed_fields:
-                                existing.update(db, changed_fields)
+                                for key, value in changed_fields.items():
+                                    setattr(existing, key, value)
                                 updated += 1
                             continue
-                        oper.add(**{
+                        db.add(TransferHistory(**{
                             key: value for key, value in entry.items()
                             if key in columns
-                        })
+                        }))
                         added += 1
+                    if added or updated or removed:
+                        db.commit()
             finally:
                 self._platform_history_lock.release()
             if added or updated or removed:
@@ -1042,6 +1046,7 @@ class HistoryService(OwnerDelegator):
             mediainfo: Optional[MediaInfo] = None,
             media_data: Optional[Dict[str, Any]] = None,
             finish_subscription: bool = True,
+            subscribe_cache: Optional[Dict[int, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if mediainfo is None:
             mediainfo, restored_data = self._restore_pending_media_context(
@@ -1055,10 +1060,13 @@ class HistoryService(OwnerDelegator):
             subscribe = None
             subscribe_id = int(item.get("subscribe_id") or 0)
             if subscribe_id:
-                try:
-                    subscribe = SubscribeOper().get(subscribe_id)
-                except Exception as error:
-                    logger.debug(f"读取后处理订阅失败：{subscribe_id}，{error}")
+                if subscribe_cache is not None and subscribe_id in subscribe_cache:
+                    subscribe = subscribe_cache[subscribe_id]
+                else:
+                    try:
+                        subscribe = SubscribeOper().get(subscribe_id)
+                    except Exception as error:
+                        logger.debug(f"读取后处理订阅失败：{subscribe_id}，{error}")
             target_subscribe = subscribe or SimpleNamespace(
                 name=mediainfo.title,
                 year=mediainfo.year,
@@ -1144,6 +1152,8 @@ class HistoryService(OwnerDelegator):
         """按电视剧标题、年份和季聚合延迟完成的文件。"""
         aggregated: List[Dict[str, Any]] = []
         tv_index: Dict[Tuple[str, str, int, str], Dict[str, Any]] = {}
+        episode_sets: Dict[Tuple[str, str, int, str], Set[int]] = {}
+        file_name_sets: Dict[Tuple[str, str, int, str], Set[str]] = {}
         for raw_detail in transfer_details:
             detail = copy.deepcopy(raw_detail)
             if detail.get("type") != "电视剧":
@@ -1169,19 +1179,23 @@ class HistoryService(OwnerDelegator):
                 file_name = str(detail.get("file_name") or "").strip()
                 if file_name:
                     detail["file_names"] = [file_name]
+                    file_name_sets[key] = {file_name}
+                episode_sets[key] = set(detail["episodes"])
                 tv_index[key] = detail
                 aggregated.append(detail)
                 continue
-            current["episodes"] = sorted(
-                set(current.get("episodes") or []) | set(detail["episodes"])
-            )
+            episode_sets[key].update(detail["episodes"])
             file_name = str(detail.get("file_name") or "").strip()
             if file_name:
                 file_names = current.setdefault("file_names", [])
-                if file_name not in file_names:
+                known_names = file_name_sets.setdefault(key, set(file_names))
+                if file_name not in known_names:
+                    known_names.add(file_name)
                     file_names.append(file_name)
             if not current.get("image") and detail.get("image"):
                 current["image"] = detail["image"]
+        for key, detail in tv_index.items():
+            detail["episodes"] = sorted(episode_sets[key])
         return aggregated
 
     def _send_finalized_batch(
@@ -1209,8 +1223,21 @@ class HistoryService(OwnerDelegator):
     def _mark_offline_history_status(
             self, pending_key: str, status: str, reason: str = ""
     ) -> None:
+        self._mark_offline_history_status_batch({pending_key}, status, reason)
+
+    def _mark_offline_history_status_batch(
+            self, pending_keys: Set[str], status: str, reason: str = ""
+    ) -> None:
+        """一次扫描并持久化多个离线任务对应的历史记录。"""
         if not self._get_data or not self._save_data:
             return
+        normalized_keys = {
+            str(value or "").strip() for value in pending_keys
+            if str(value or "").strip()
+        }
+        if not normalized_keys:
+            return
+        uppercase_keys = {value.upper() for value in normalized_keys}
         platform_records = []
         with self._offline_pending_lock:
             history = self._get_data("history") or []
@@ -1218,7 +1245,10 @@ class HistoryService(OwnerDelegator):
             for item in history:
                 link = str(item.get("share_url") or "").upper()
                 item_key = str(item.get("finalize_key") or "")
-                if item_key != pending_key and pending_key.upper() not in link:
+                if (
+                        item_key not in normalized_keys
+                        and not any(value in link for value in uppercase_keys)
+                ):
                     continue
                 item["status"] = status
                 item.pop("finalize_key", None)
@@ -1253,8 +1283,9 @@ class HistoryService(OwnerDelegator):
         )
         if not removed_keys:
             return 0
-        for key in removed_keys:
-            self._mark_offline_history_status(key, "失败", "后处理任务已由用户删除")
+        self._mark_offline_history_status_batch(
+            removed_keys, "失败", "后处理任务已由用户删除"
+        )
         self._notify_offline_pending_changed(pending_count)
         return len(removed_keys)
 
@@ -1624,6 +1655,8 @@ class HistoryService(OwnerDelegator):
         episode_cache: Dict[Tuple[str, str, int], Dict[int, Dict[str, Any]]] = {}
         seen = set()
         with SessionFactory() as db:
+            normalized_selections = []
+            rows_by_server: Dict[str, set[str]] = {}
             for selection in selections[:200]:
                 server = str(selection.get("server") or "").strip()
                 item_id = str(selection.get("item_id") or "").strip()
@@ -1637,10 +1670,23 @@ class HistoryService(OwnerDelegator):
                 storage_server = self._media_server_storage_name(
                     server, services[server]
                 )
-                row = db.query(MediaServerItem).filter(
+                normalized_selections.append((
+                    selection, server, item_id, kind, storage_server,
+                ))
+                rows_by_server.setdefault(storage_server, set()).add(item_id)
+
+            rows_by_key = {}
+            for storage_server, item_ids in rows_by_server.items():
+                rows = db.query(MediaServerItem).filter(
                     func.lower(MediaServerItem.server) == storage_server,
-                    MediaServerItem.item_id == item_id,
-                ).first()
+                    MediaServerItem.item_id.in_(item_ids),
+                ).all()
+                rows_by_key.update({
+                    (storage_server, str(row.item_id)): row for row in rows
+                })
+
+            for selection, server, item_id, kind, storage_server in normalized_selections:
+                row = rows_by_key.get((storage_server, item_id))
                 if not row or not row.tmdbid:
                     raise LookupError("所选媒体库内容已不存在或缺少 TMDB ID")
                 media_type = self._media_server_item_type(row.item_type)

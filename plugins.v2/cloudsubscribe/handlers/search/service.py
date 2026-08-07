@@ -7,29 +7,33 @@ import hashlib
 import json
 import re
 import threading
-import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from app.core.cache import TTLCache
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
+from .budget import PointBudgetLedger
 from .dian115 import Dian115SearchService
 from .hdhive import HDHiveSearchService
 from .magnets import ExternalResourceSearchService
+from .platform_rules import PlatformRuleService
+from .source_dispatch import SourceDispatchService
 from .sources import PanSouSearchService
 from ...core import get_component, resolve_component
 from ...search.juying import JuyingResourceService
 from ...search.matching import positive_ints, unique_texts
+from ...utils.cache import create_platform_ttl_cache
 
 _COMPONENT_TYPES = (
     HDHiveSearchService,
     Dian115SearchService,
     ExternalResourceSearchService,
     PanSouSearchService,
+    PlatformRuleService,
+    SourceDispatchService,
 )
 
 
@@ -149,6 +153,16 @@ class SearchHandler:
         self._hdhive_web_client = None
         self._hdhive_web_resources = None
         self._hdhive_web_lock = threading.RLock()
+        self._hdhive_unlock_operation_lock = threading.Lock()
+        # 同一搜索服务生命周期内复用已取得的分享链接，避免重复调用解锁接口。
+        hdhive_cache_identity = (
+            f"{self._hdhive_query_mode}:{self._hdhive_username}"
+        )
+        self._hdhive_unlocked_urls = create_platform_ttl_cache(
+            "search:hdhive_unlocked_urls", hdhive_cache_identity,
+            maxsize=256,
+            ttl=30 * 60,
+        )
         self._dian115_email = str(dian115_email or "").strip()
         self._dian115_password = str(dian115_password or "").strip()
         self._dian115_auto_unlock = bool(dian115_auto_unlock)
@@ -161,20 +175,18 @@ class SearchHandler:
         self._dian115_client = None
         self._dian115_resources = None
         self._dian115_client_lock = threading.RLock()
-        self._dian115_budget_lock = threading.RLock()
-        self._dian115_budget_context = threading.local()
-        self._dian115_current_spent_points = 0
-        self._dian115_sub_spent_points = 0
-        self._dian115_current_sub_key = ""
-        self._dian115_get_data_func = None
-        self._dian115_save_data_func = None
-        self._budget_lock = threading.RLock()
-        self._budget_context = threading.local()
         self._hdhive_max_unlock_points = hdhive_max_unlock_points
         self._hdhive_max_points_per_sub = hdhive_max_points_per_sub
-        self._current_spent_points = 0
-        self._sub_spent_points = 0
-        self._current_sub_key = ""
+        self._hdhive_budget = PointBudgetLedger(
+            HDHiveSearchService._HISTORY_KEY,
+            self._hdhive_max_unlock_points,
+            self._hdhive_max_points_per_sub,
+        )
+        self._dian115_budget = PointBudgetLedger(
+            Dian115SearchService._HISTORY_KEY,
+            self._dian115_max_unlock_points,
+            self._dian115_max_points_per_sub,
+        )
         self._pansou_channels = self._normalize_pansou_values(pansou_channels)
         self._pansou_plugins = self._normalize_pansou_values(pansou_plugins)
         self._pansou_cloud_types = [
@@ -190,6 +202,9 @@ class SearchHandler:
             ["115", "ed2k"]
             if resource_type_order is None else resource_type_order
         )
+        self._resource_type_order_map = {}
+        for index, value in enumerate(self._resource_type_order_config):
+            self._resource_type_order_map.setdefault(value, index)
         try:
             self._pansou_concurrency = (
                 max(1, min(int(pansou_concurrency), 100))
@@ -251,10 +266,14 @@ class SearchHandler:
         )
         self._enable_cloud_upgrade = bool(enable_cloud_upgrade)
         self._upgrade_subscribe_ids = list(upgrade_subscribe_ids or [])
+        self._upgrade_subscribe_id_set = {
+            str(value) for value in self._upgrade_subscribe_ids
+        }
         self._search_cache_limit = 200
         self._search_negative_ttl = min(self._search_cache_ttl, 10 * 60)
-        self._search_cache = TTLCache(
-            region="cloudsubscribe:search_results",
+        self._search_cache = create_platform_ttl_cache(
+            "search:results",
+            self,
             maxsize=self._search_cache_limit,
             ttl=self._search_cache_ttl,
         )
@@ -263,6 +282,9 @@ class SearchHandler:
         self._platform_filter_lock = threading.RLock()
         self._platform_filter_module = None
         self._platform_filter_signature = ""
+        self._platform_filter_signature_cache = create_platform_ttl_cache(
+            "platform:filter_rules", maxsize=1, ttl=5
+        )
         self._should_stop = should_stop
 
     def _is_cloud_upgrade_subscribe(self, subscribe: Any) -> bool:
@@ -277,40 +299,8 @@ class SearchHandler:
                 or not bool(getattr(subscribe, "best_version", False))
         ):
             return False
-        selected_ids = {str(value) for value in (self._upgrade_subscribe_ids or [])}
+        selected_ids = self._upgrade_subscribe_id_set
         return not selected_ids or str(getattr(subscribe, "id", "")) in selected_ids
-
-    @property
-    def _sub_spent_points(self) -> int:
-        return int(getattr(self._budget_context, "sub_spent_points", 0) or 0)
-
-    @_sub_spent_points.setter
-    def _sub_spent_points(self, value: int) -> None:
-        self._budget_context.sub_spent_points = int(value or 0)
-
-    @property
-    def _current_sub_key(self) -> str:
-        return str(getattr(self._budget_context, "current_sub_key", "") or "")
-
-    @_current_sub_key.setter
-    def _current_sub_key(self, value: str) -> None:
-        self._budget_context.current_sub_key = str(value or "")
-
-    @property
-    def _dian115_sub_spent_points(self) -> int:
-        return int(getattr(self._dian115_budget_context, "sub_spent_points", 0) or 0)
-
-    @_dian115_sub_spent_points.setter
-    def _dian115_sub_spent_points(self, value: int) -> None:
-        self._dian115_budget_context.sub_spent_points = int(value or 0)
-
-    @property
-    def _dian115_current_sub_key(self) -> str:
-        return str(getattr(self._dian115_budget_context, "current_sub_key", "") or "")
-
-    @_dian115_current_sub_key.setter
-    def _dian115_current_sub_key(self, value: str) -> None:
-        self._dian115_budget_context.current_sub_key = str(value or "")
 
     def _stop_requested(self) -> bool:
         try:
@@ -386,7 +376,11 @@ class SearchHandler:
         ):
             available.append("pinglian")
 
-        return [source for source in self._search_source_order if source in available]
+        available_set = set(available)
+        return [
+            source for source in self._search_source_order
+            if source in available_set
+        ]
 
     @property
     def source_concurrency_enabled(self) -> bool:
@@ -528,9 +522,15 @@ class SearchHandler:
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """返回搜索缓存占用，并顺带清理过期项。"""
-        active = [item for _, item in self._search_cache.items() if isinstance(item, dict)]
-        positive = sum(not item.get("negative") for item in active)
-        negative = len(active) - positive
+        positive = 0
+        negative = 0
+        for _, item in self._search_cache.items():
+            if not isinstance(item, dict):
+                continue
+            if item.get("negative"):
+                negative += 1
+            else:
+                positive += 1
         return {
             "enabled": self._search_cache_enabled,
             "entries": positive + negative,
@@ -545,11 +545,15 @@ class SearchHandler:
         """清空搜索结果及各搜索源的详情、预览和响应缓存。"""
         search_count = len(list(self._search_cache.items()))
         self._search_cache.clear()
+        self._platform_filter_signature_cache.clear()
+        unlocked_count = len(list(self._hdhive_unlocked_urls.items()))
+        self._hdhive_unlocked_urls.clear()
 
         with self._hdhive_web_lock:
             web_count = self._clear_client_cache(self._hdhive_web_resources)
         return {
             "search_results": search_count,
+            "hdhive_unlocked_urls": unlocked_count,
             "hdhive_web": web_count,
             "hdhive_openapi": self._clear_client_cache(self._hdhive_client),
             "seedhub": self._clear_client_cache(self._seedhub_client),
@@ -708,16 +712,6 @@ class SearchHandler:
         return label
 
     @staticmethod
-    def _resource_size(value: Any) -> int:
-        if isinstance(value, (int, float)):
-            return max(0, int(value))
-        match = re.search(r"([\d.]+)\s*(B|KB|MB|GB|TB)", str(value or ""), re.IGNORECASE)
-        if not match:
-            return 0
-        unit = match.group(2).upper()
-        return int(float(match.group(1)) * 1024 ** ("B", "KB", "MB", "GB", "TB").index(unit))
-
-    @staticmethod
     def _resource_timestamp(value: Any) -> float:
         text = str(value or "").strip()
         if not text:
@@ -803,12 +797,9 @@ class SearchHandler:
 
     def _resource_type_order(self, resource: Dict[str, Any]) -> int:
         """按配置的资源类型优先级排序。"""
-        try:
-            return self._resource_type_order_config.index(
-                self._resource_type(resource)
-            )
-        except ValueError:
-            return len(self._resource_type_order_config)
+        return self._resource_type_order_map.get(
+            self._resource_type(resource), len(self._resource_type_order_config)
+        )
 
     def _resource_sort_key(
             self, resource: Dict[str, Any], season: Optional[int], targets: set
@@ -831,241 +822,31 @@ class SearchHandler:
     ) -> List[Dict]:
         """按类型、可用性、HDHive 官组、集数覆盖和积分筛选排序。"""
         targets = positive_ints(target_episodes)
-        resources = [
-            item for item in resources
-            if self._resource_type(item) in self._resource_type_order_config
-               and self._resource_target_coverage(item, season, targets)[0] < 3
-        ]
-        return sorted(
-            resources,
-            key=lambda item: self._resource_sort_key(item, season, targets),
-        )
+        prepared = []
+        for item in resources:
+            resource_type = self._resource_type(item)
+            type_order = self._resource_type_order_map.get(resource_type)
+            if type_order is None:
+                continue
+            coverage = self._resource_target_coverage(item, season, targets)
+            if coverage[0] >= 3:
+                continue
+            sort_key = (
+                type_order,
+                self._resource_availability_order(item),
+                item.get("is_official") is not True,
+                *coverage,
+                self._resource_unlock_points(item.get("unlock_points")),
+                -int(item.get("platform_priority") or 0),
+                -self._resource_timestamp(item.get("update_time")),
+            )
+            prepared.append((sort_key, item))
+        prepared.sort(key=lambda pair: pair[0])
+        return [item for _, item in prepared]
 
     def _hdhive_update_sort_key(self, resource: Dict[str, Any]) -> tuple:
         """HDHive 最新更新时间优先，其余规则作为稳定的次级顺序。"""
         return (-self._resource_timestamp(resource.get("update_time")),)
-
-    @staticmethod
-    def _resource_filter_title(resource: Dict[str, Any]) -> str:
-        """将搜索源的结构化发布信息还原为可识别的规则标题。"""
-        video_info = resource.get("video_info") or {}
-        language_values = []
-        for value in (
-                resource.get("languages"), resource.get("subtitle_languages")
-        ):
-            if isinstance(value, (list, tuple, set)):
-                language_values.extend(value)
-            elif value:
-                language_values.append(value)
-        fields = (
-            resource.get("title"),
-            resource.get("resolution"),
-            resource.get("quality"),
-            resource.get("source_type"),
-            resource.get("codec"),
-            resource.get("audio_codec"),
-            resource.get("audio_channels"),
-            resource.get("hdr_type"),
-            video_info.get("hdr") if isinstance(video_info, dict) else "",
-            resource.get("release_group"),
-            " ".join(str(value) for value in language_values if str(value).strip()),
-            resource.get("subtitle"),
-            resource.get("description"),
-        )
-        return " ".join(dict.fromkeys(
-            str(value).strip() for value in fields if str(value or "").strip()
-        ))
-
-    def _filter_by_platform_rules(
-            self,
-            resources: List[Dict],
-            mediainfo: MediaInfo,
-            subscribe: Any = None,
-            season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-    ) -> List[Dict]:
-        """使用平台规则组筛选并按平台优先级排序。"""
-        if not resources:
-            return []
-        resources = self._prefilter_resource_order(
-            resources, season=season, target_episodes=target_episodes
-        )
-        try:
-            from app.schemas import TorrentInfo
-
-            rule_groups = self._platform_rule_groups(subscribe)
-            if not rule_groups:
-                return list(resources)
-
-            torrents = []
-            resource_by_url = {}
-            for index, resource in enumerate(resources):
-                title = self._resource_filter_title(resource)
-                page_url = f"https://cloudsubscribe.invalid/resource/{index}"
-                torrent = TorrentInfo(
-                    title=title or f"resource-{index}",
-                    description=str(resource.get("description") or ""),
-                    page_url=page_url,
-                    size=self._resource_size(resource.get("size")),
-                    labels=[],
-                )
-                torrents.append(torrent)
-                resource_by_url[page_url] = resource
-
-            matched = self.filter_torrents_by_rules(
-                rule_groups=rule_groups,
-                torrent_list=torrents,
-                mediainfo=mediainfo,
-            ) or []
-            matched.sort(
-                key=lambda item: int(getattr(item, "pri_order", 0) or 0),
-                reverse=True,
-            )
-            filtered = []
-            for item in matched:
-                resource = resource_by_url.get(getattr(item, "page_url", None))
-                if resource is None:
-                    continue
-                resource = dict(resource)
-                resource["platform_priority"] = int(
-                    getattr(item, "pri_order", 0) or 0
-                )
-                filtered.append(resource)
-            targets = positive_ints(target_episodes)
-            filtered.sort(
-                key=lambda resource: self._resource_sort_key(
-                    resource, season, targets
-                )
-            )
-            logger.debug(
-                f"平台优先级规则组筛选资源：{len(resources)} -> {len(filtered)}，"
-                f"规则组：{rule_groups}"
-            )
-            return filtered
-        except Exception as error:
-            logger.error(f"平台优先级规则组筛选失败，已拒绝本批资源：{error}")
-            return []
-
-    def _platform_rule_groups(self, subscribe: Any = None) -> List[str]:
-        """读取订阅指定规则组，否则使用对应的全局规则组。"""
-        from app.db.systemconfig_oper import SystemConfigOper
-        from app.schemas.types import SystemConfigKey
-
-        rule_groups = list(getattr(subscribe, "filter_groups", None) or [])
-        if rule_groups:
-            return rule_groups
-        config_key = (
-            SystemConfigKey.BestVersionFilterRuleGroups
-            if self._is_cloud_upgrade_subscribe(subscribe)
-            else SystemConfigKey.SubscribeFilterRuleGroups
-        )
-        return list(SystemConfigOper().get(config_key) or [])
-
-    def rank_file_candidates(
-            self,
-            files: List[Any],
-            mediainfo: MediaInfo,
-            subscribe: Any = None,
-    ) -> List[tuple]:
-        """使用规则组筛选实际文件并返回 ``(文件, pri_order)``。"""
-        candidates = [item for item in files or [] if item]
-        if not candidates:
-            return []
-        rule_groups = self._platform_rule_groups(subscribe)
-        if not rule_groups:
-            return sorted(
-                ((item, 0) for item in candidates),
-                key=lambda pair: self._resource_size(pair[0].get("size")),
-                reverse=True,
-            )
-
-        from app.schemas import TorrentInfo
-
-        torrents = []
-        by_url = {}
-        for index, item in enumerate(candidates):
-            page_url = f"https://cloudsubscribe.invalid/file/{index}"
-            torrent = TorrentInfo(
-                title=str(item.get("name") or f"file-{index}"),
-                description="",
-                page_url=page_url,
-                size=self._resource_size(item.get("size")),
-                labels=[],
-            )
-            torrents.append(torrent)
-            by_url[page_url] = item
-        try:
-            matched = self.filter_torrents_by_rules(
-                rule_groups=rule_groups,
-                torrent_list=torrents,
-                mediainfo=mediainfo,
-            )
-        except Exception as error:
-            logger.error(f"平台优先级规则匹配文件失败：{error}")
-            return []
-        ranked = [
-            (by_url[item.page_url], int(item.pri_order or 0))
-            for item in matched or []
-            if getattr(item, "page_url", None) in by_url
-        ]
-        ranked.sort(
-            key=lambda pair: (pair[1], self._resource_size(pair[0].get("size"))),
-            reverse=True,
-        )
-        return ranked
-
-    def select_file_candidate(
-            self,
-            files: List[Any],
-            mediainfo: MediaInfo,
-            subscribe: Any = None,
-    ) -> tuple:
-        ranked = self.rank_file_candidates(files, mediainfo, subscribe)
-        return ranked[0] if ranked else (None, 0)
-
-    def filter_torrents_by_rules(
-            self,
-            rule_groups: List[str],
-            torrent_list: List[Any],
-            mediainfo: MediaInfo,
-    ) -> List[Any]:
-        """复用MoviePilot过滤模块，避免每次搜索或评分重复加载规则集。"""
-        with self._platform_filter_lock:
-            signature = self._platform_rules_signature()
-            if (
-                    self._platform_filter_module is None
-                    or signature != self._platform_filter_signature
-            ):
-                from app.modules.filter import FilterModule
-                self._platform_filter_module = FilterModule()
-                self._platform_filter_module.init_module()
-                self._platform_filter_signature = signature
-                logger.debug("MoviePilot平台过滤规则已同步到 CloudSubscribe")
-            return self._platform_filter_module.filter_torrents(
-                rule_groups=rule_groups,
-                torrent_list=torrent_list,
-                mediainfo=mediainfo,
-            ) or []
-
-    @staticmethod
-    def _platform_rules_signature() -> str:
-        """检测平台规则配置变化，避免长期复用已经过期的 FilterModule。"""
-        from app.db.systemconfig_oper import SystemConfigOper
-        from app.schemas.types import SystemConfigKey
-
-        oper = SystemConfigOper()
-        payload = {
-            "groups": oper.get(SystemConfigKey.UserFilterRuleGroups) or [],
-            "rules": oper.get(SystemConfigKey.CustomFilterRules) or [],
-        }
-        serialized = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
 
     def search_resources(
             self,
@@ -1084,7 +865,7 @@ class SearchHandler:
         :param mediainfo: 媒体信息
         :param media_type: 媒体类型（MOVIE 或 TV）
         :param season: 季号（电视剧必需）
-        :return: 115网盘资源列表
+        :return: 当前同步链可处理的网盘资源列表
         """
         sources = self.get_enabled_sources()
         search_label = self._search_label(mediainfo, media_type, season)
@@ -1126,217 +907,3 @@ class SearchHandler:
                 return results
 
         return []
-
-    def _run_source_search(
-            self,
-            source: str,
-            mediainfo: MediaInfo,
-            media_type: MediaType,
-            season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-            target_episode_air_dates: Optional[Dict[int, str]] = None,
-            subscribe: Any = None,
-            test_mode: bool = False,
-    ) -> Optional[List[Dict]]:
-        """统一搜索源分发。"""
-        if source == "hdhive":
-            return self._search_hdhive(
-                mediainfo,
-                media_type,
-                season,
-                target_episodes=target_episodes,
-                target_episode_air_dates=target_episode_air_dates,
-                subscribe=subscribe,
-                test_mode=test_mode,
-            )
-        if source == "dian115":
-            return self._search_dian115(
-                mediainfo,
-                media_type,
-                season,
-                target_episodes=target_episodes,
-                subscribe=subscribe,
-                test_mode=test_mode,
-            )
-        if source == "pansou":
-            if media_type == MediaType.MOVIE:
-                return self._search_pansou_movie(mediainfo, test_mode=test_mode)
-            return self._search_pansou_tv(
-                mediainfo, season, test_mode=test_mode
-            )
-        if source == "seedhub":
-            return self._search_seedhub(
-                mediainfo,
-                media_type,
-                season,
-                raise_errors=test_mode,
-                test_mode=test_mode,
-            )
-        if source == "butailing":
-            return self._search_butailing(
-                mediainfo,
-                media_type,
-                season,
-                subscribe=subscribe,
-                raise_errors=test_mode,
-                test_mode=test_mode,
-            )
-        if source == "juying":
-            return self._search_juying(
-                mediainfo,
-                media_type,
-                season,
-                raise_errors=test_mode,
-                test_mode=test_mode,
-            )
-        if source == "pinglian":
-            return self._search_pinglian(
-                mediainfo,
-                media_type,
-                season,
-                raise_errors=test_mode,
-                test_mode=test_mode,
-            )
-        raise ValueError("不支持的搜索渠道")
-
-    def _prepare_source_results(
-            self,
-            results: List[Dict],
-            source: str,
-            mediainfo: MediaInfo,
-            subscribe: Any,
-            season: Optional[int],
-            target_episodes: Optional[List[int]],
-            apply_platform_rules: bool,
-    ) -> List[Dict]:
-        for result in results:
-            result.setdefault("source", source)
-        ordered = self._prefilter_resource_order(
-            results, season=season, target_episodes=target_episodes
-        )
-        if source == "hdhive":
-            return sorted(ordered, key=self._hdhive_update_sort_key)
-        if not apply_platform_rules:
-            return ordered
-        return self._filter_by_platform_rules(
-            ordered,
-            mediainfo,
-            subscribe,
-            season=season,
-            target_episodes=target_episodes,
-        )
-
-    def test_source(
-            self,
-            source: str,
-            mediainfo: MediaInfo,
-            media_type: MediaType,
-            season: Optional[int] = None,
-    ) -> List[Dict]:
-        """强制刷新单个来源，仅返回候选，不进入转存或离线任务。"""
-        source = str(source or "").strip().lower()
-        if source not in self._SUPPORTED_SOURCES:
-            raise ValueError("不支持的搜索渠道")
-        cache_key = self._search_cache_key(
-            source, mediainfo, media_type, season, None, None
-        )
-        try:
-            self._search_cache.pop(cache_key)
-        except KeyError:
-            pass
-        client = {
-            "seedhub": self._seedhub_client,
-            "butailing": self._butailing_client,
-            "juying": self._juying_resources,
-            "pinglian": self._pinglian_client,
-        }.get(source)
-        if client:
-            client.clear_cache()
-        results = self._run_source_search(
-            source, mediainfo, media_type, season, test_mode=True
-        ) or []
-        for result in results:
-            result.setdefault("source", source)
-        return list(results)
-
-    def search_single_source(
-            self,
-            source: str,
-            mediainfo: MediaInfo,
-            media_type: MediaType,
-            season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-            target_episode_air_dates: Optional[Dict[int, str]] = None,
-            subscribe: Any = None,
-            apply_platform_rules: bool = True,
-    ) -> List[Dict]:
-        """
-        使用指定的单一搜索源查询资源
-
-        :param source: 搜索源名称（如 "hdhive"、"dian115"、"pansou"）
-        :param mediainfo: 媒体信息
-        :param media_type: 媒体类型
-        :param season: 季号（电视剧时使用）
-        :return: 115网盘资源列表
-        """
-        source = str(source or "").strip().lower()
-        if self._stop_requested():
-            return []
-        if source not in self._SUPPORTED_SOURCES:
-            search_label = self._search_label(mediainfo, media_type, season)
-            logger.warning(f"[{search_label}][{source.upper()}] 未知的搜索源")
-            return []
-        cache_key = self._search_cache_key(
-            source, mediainfo, media_type, season, target_episodes, subscribe
-        )
-        search_label = self._search_label(mediainfo, media_type, season)
-        use_cache = source != "juying"
-        results = (
-            self._get_cached_results(cache_key, source, search_label)
-            if use_cache else None
-        )
-        if results is not None:
-            return self._prepare_source_results(
-                results,
-                source,
-                mediainfo,
-                subscribe,
-                season,
-                target_episodes,
-                apply_platform_rules,
-            )
-
-        external_started = time.monotonic()
-        try:
-            results = self._run_source_search(
-                source,
-                mediainfo,
-                media_type,
-                season,
-                target_episodes,
-                target_episode_air_dates,
-                subscribe,
-            )
-        finally:
-            self._record_search_metric(source, "external_calls")
-            self._record_search_metric(
-                source,
-                "external_elapsed_ms",
-                int((time.monotonic() - external_started) * 1000),
-            )
-        if self._stop_requested():
-            return []
-        if results is None:
-            return []
-        label = f"[{search_label}][{source.upper()}]"
-        if use_cache:
-            self._set_cached_results(cache_key, label, results, source=source)
-        return self._prepare_source_results(
-            results,
-            source,
-            mediainfo,
-            subscribe,
-            season,
-            target_episodes,
-            apply_platform_rules,
-        )

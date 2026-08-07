@@ -7,12 +7,12 @@ from threading import RLock
 from typing import Any, Dict, Iterable
 from urllib.parse import parse_qs, urlsplit
 
-from app.core.cache import TTLCache
 from app.log import logger
 
 from .files import cloud_file, list_data
 from ..common import iter_transfer_batches, safe_int
 from ...core.cloud import ShareLinkStatus
+from ...utils.cache import create_platform_ttl_cache
 
 
 class GuangyaShareService:
@@ -23,8 +23,9 @@ class GuangyaShareService:
         self._offline = offline_service
         self.client = client
         self.page_size = files.page_size
-        self._share_token_cache = TTLCache(
-            region="cloudsubscribe:guangya:share_tokens",
+        self._share_token_cache = create_platform_ttl_cache(
+            "guangya:share_tokens",
+            client,
             maxsize=256,
             ttl=10 * 60,
         )
@@ -214,8 +215,8 @@ class GuangyaShareService:
         success = self.client.is_success(response)
         if not success:
             with self._share_token_lock:
-                self._share_token_cache.pop(
-                    f"{info['share_id']}|{info['password']}", None
+                self._share_token_cache.delete(
+                    f"{info['share_id']}|{info['password']}"
                 )
         return success
 

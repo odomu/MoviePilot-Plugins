@@ -6,6 +6,7 @@ from typing import Optional, Type
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
 from app.core.plugin import PluginManager
+from app.utils.string import StringUtils
 from pydantic import BaseModel
 
 from .schemas import (
@@ -145,14 +146,7 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
             return str(value or "未知")
         if size <= 0:
             return "未知"
-        units = ("B", "KB", "MB", "GB", "TB")
-        amount = float(size)
-        unit = units[0]
-        for unit in units:
-            if amount < 1024 or unit == units[-1]:
-                break
-            amount /= 1024
-        return f"{amount:.1f} {unit}"
+        return StringUtils.format_size(size)
 
     @classmethod
     def _format_search_message(cls, result: dict) -> str:

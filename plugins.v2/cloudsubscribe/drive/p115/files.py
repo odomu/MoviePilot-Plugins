@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from app.log import logger
 
-from ..common import safe_int
+from ..common import normalize_path, safe_int
 from ...core import OwnerDelegator
 from ...core.cloud import CloudFile, DirectoryListing, DirectoryLookup
 from ...core.transfer import HttpFileDownloadService
@@ -249,19 +249,17 @@ class P115FileService(OwnerDelegator):
         """逐级解析目录；返回检查是否成功以及目录 CID。"""
         if not self.client:
             return False, -1
-        normalized = str(path or "").replace("\\", "/")
-        if "://" in normalized:
-            logger.warning(f"115目录路径不能是URL，已跳过目录解析：{normalized}")
+        raw_path = str(path or "").replace("\\", "/")
+        if "://" in raw_path:
+            logger.warning(f"115目录路径不能是URL，已跳过目录解析：{raw_path}")
             return False, -1
-        if not normalized.startswith("/"):
-            normalized = f"/{normalized}"
-        normalized = normalized.rstrip("/")
-        if not normalized or normalized == "/":
+        normalized = normalize_path(raw_path)
+        if normalized == "/":
             return True, 0
 
         cached_cid = self.path_cache.get(normalized)
         if cached_cid is not None:
-            return True, cached_cid
+            return True, int(cached_cid)
 
         parent_id = 0
         current_path = ""
@@ -269,7 +267,7 @@ class P115FileService(OwnerDelegator):
             current_path = f"{current_path}/{part}"
             cached = self.path_cache.get(current_path)
             if cached is not None:
-                parent_id = cached
+                parent_id = int(cached)
                 continue
 
             try:
@@ -534,6 +532,8 @@ class P115FileService(OwnerDelegator):
             if pickcode:
                 renamed_item["pickcode"] = str(pickcode)
             self._cache_target_file(save_path, target_name, renamed_item)
+            if item.get("is_dir"):
+                self.path_cache.clear()
             logger.info(
                 f"115 文件重命名成功："
                 f"{current_name} -> {target_name}"
@@ -722,6 +722,8 @@ class P115FileService(OwnerDelegator):
                     return None
             moved.update({"name": target_name, "n": target_name})
             self._cache_target_file(save_path, target_name, moved)
+            if item.get("is_dir"):
+                self.path_cache.clear()
             return moved
         except Exception as error:
             logger.error(f"移动离线文件失败：{source_name} -> {save_path}/{target_name}，{error}")
@@ -769,6 +771,7 @@ class P115FileService(OwnerDelegator):
         try:
             self._delete_items([file_id])
             self._target_file_cache.clear()
+            self.path_cache.clear()
             logger.info(f"115文件已移入回收站：file_id={file_id}")
             return True
         except Exception as error:
@@ -782,6 +785,7 @@ class P115FileService(OwnerDelegator):
         try:
             deleted = self._delete_items(file_ids)
             self._target_file_cache.clear()
+            self.path_cache.clear()
             logger.info(f"115文件批量移入回收站：{len(deleted)} 个")
             return deleted
         except Exception as error:
@@ -910,7 +914,6 @@ class P115FileService(OwnerDelegator):
     def clear_path_cache(self):
         """清空路径缓存"""
         self.path_cache.clear()
-        self.path_cache.set("/", 0)
 
     def find_file_in_dir(self, dir_path: str, filename: str) -> Optional[dict]:
         """在指定115目录下查找文件名匹配的文件

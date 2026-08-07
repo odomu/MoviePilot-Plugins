@@ -1,6 +1,5 @@
 """Dian115 资源详情缓存与分享解锁协议。"""
 
-import copy
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -9,6 +8,11 @@ from app.log import logger
 
 from .client import Dian115Client, Dian115Error
 from .protocol import resource_path, share_path
+from ...utils.cache import (
+    cached_resource_call,
+    create_platform_ttl_cache,
+    normalize_platform_cache_key,
+)
 
 
 class Dian115ResourceService:
@@ -19,9 +23,12 @@ class Dian115ResourceService:
 
     def __init__(self, client: Dian115Client):
         self._client = client
-        self._detail_cache: Dict[
-            tuple[int, str, int], tuple[float, Dict[str, Any]]
-        ] = {}
+        self._detail_cache = create_platform_ttl_cache(
+            "dian115:resource_details",
+            getattr(client, "_email", id(client)),
+            maxsize=self._DETAIL_CACHE_LIMIT,
+            ttl=self._DETAIL_CACHE_TTL,
+        )
         self._detail_locks = tuple(threading.Lock() for _ in range(32))
         self._lock = threading.RLock()
 
@@ -30,26 +37,9 @@ class Dian115ResourceService:
 
     def clear_cache(self) -> int:
         with self._lock:
-            count = len(self._detail_cache)
+            count = len(list(self._detail_cache.items()))
             self._detail_cache.clear()
             return count
-
-    def _prune_detail_cache_locked(self, now: Optional[float] = None) -> None:
-        current = time.monotonic() if now is None else now
-        expired = [
-            key for key, (expires_at, _) in self._detail_cache.items()
-            if expires_at <= current
-        ]
-        for key in expired:
-            self._detail_cache.pop(key, None)
-        overflow = len(self._detail_cache) - self._DETAIL_CACHE_LIMIT + 1
-        if overflow > 0:
-            oldest = sorted(
-                self._detail_cache,
-                key=lambda key: self._detail_cache[key][0],
-            )[:overflow]
-            for key in oldest:
-                self._detail_cache.pop(key, None)
 
     def resource_detail(
             self,
@@ -62,27 +52,11 @@ class Dian115ResourceService:
         normalized_id = int(tmdb_id)
         normalized_type = str(media_type or "").strip().lower()
         normalized_season = int(season or 0)
-        cache_key = (normalized_id, normalized_type, normalized_season)
-        now = time.monotonic()
-        with self._lock:
-            cached = self._detail_cache.get(cache_key)
-            if not force_refresh and cached and cached[0] > now:
-                logger.debug(
-                    f"Dian115 详情命中缓存：tmdb={normalized_id}，"
-                    f"type={normalized_type}，season={normalized_season}"
-                )
-                return copy.deepcopy(cached[1])
-        detail_lock = self._detail_locks[hash(cache_key) % len(self._detail_locks)]
-        with detail_lock:
-            now = time.monotonic()
-            with self._lock:
-                cached = self._detail_cache.get(cache_key)
-                if not force_refresh and cached and cached[0] > now:
-                    logger.debug(
-                        f"Dian115 详情等待后命中缓存：tmdb={normalized_id}，"
-                        f"type={normalized_type}，season={normalized_season}"
-                    )
-                    return copy.deepcopy(cached[1])
+        cache_key = normalize_platform_cache_key(
+            (normalized_id, normalized_type, normalized_season)
+        )
+
+        def load_detail() -> Dict[str, Any]:
             path = resource_path(
                 normalized_type, normalized_id, normalized_season
             )
@@ -95,13 +69,25 @@ class Dian115ResourceService:
             )
             payload["resource_key"] = key
             payload["resource_path"] = path
-            with self._lock:
-                self._prune_detail_cache_locked()
-                self._detail_cache[cache_key] = (
-                    time.monotonic() + self._DETAIL_CACHE_TTL,
-                    copy.deepcopy(payload),
-                )
             return payload
+
+        def log_cache_hit(waited: bool = False) -> None:
+            stage = "等待后" if waited else ""
+            logger.debug(
+                f"Dian115 详情{stage}命中缓存：tmdb={normalized_id}，"
+                f"type={normalized_type}，season={normalized_season}"
+            )
+
+        return cached_resource_call(
+            self._detail_cache,
+            cache_key,
+            load_detail,
+            locks=self._detail_locks,
+            access_lock=self._lock,
+            force_refresh=force_refresh,
+            on_hit=lambda _: log_cache_hit(),
+            on_wait_hit=lambda _: log_cache_hit(waited=True),
+        )
 
     def unlock_share(
             self,
@@ -192,9 +178,10 @@ class Dian115ResourceService:
         with self._lock:
             normalized_type = str(media_type or "").strip().lower()
             if int(tmdb_id or 0) > 0 and normalized_type in {"movie", "tv"}:
-                self._detail_cache.pop(
-                    (int(tmdb_id), normalized_type, int(season or 0)),
-                    None,
+                self._detail_cache.delete(
+                    normalize_platform_cache_key(
+                        (int(tmdb_id), normalized_type, int(season or 0))
+                    )
                 )
             else:
                 self._detail_cache.clear()

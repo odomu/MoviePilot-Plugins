@@ -41,13 +41,27 @@
             </v-chip>
           </div>
           <div class="task-meta">
-            <span class="task-phase text-caption text-medium-emphasis">{{
-                task.task_kind === "cross_transfer"
+            <div class="task-phase-wrap">
+              <span class="task-phase text-caption text-medium-emphasis">{{
+                  task.status === "postprocessing"
+                      ? postprocessingSummary(task)
+                      : task.task_kind === "cross_transfer"
                     ? task.error || task.message || task.phase
                     : task.status === "failed"
                     ? task.message || task.phase || "处理失败"
                     : task.phase || "等待调度"
               }}</span>
+              <v-btn
+                  v-if="task.status === 'postprocessing'"
+                  class="task-detail-toggle"
+                  :icon="isTaskExpanded(task.id) ? 'mdi-chevron-up' : 'mdi-information-outline'"
+                  variant="text"
+                  size="x-small"
+                  :title="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
+                  :aria-label="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
+                  @click="toggleTaskDetails(task.id)"
+              />
+            </div>
             <span
                 v-if="
                 (task.transfer_active ||
@@ -74,6 +88,25 @@
               height="5"
               rounded
           />
+          <v-expand-transition>
+            <div
+                v-if="task.status === 'postprocessing' && isTaskExpanded(task.id)"
+                class="task-details text-caption"
+            >
+              <div class="task-detail-row">
+                <span class="task-detail-label">当前阶段</span>
+                <span>{{ task.phase || "等待处理" }}</span>
+              </div>
+              <div v-if="task.message" class="task-detail-row">
+                <span class="task-detail-label">处理信息</span>
+                <span>{{ task.message }}</span>
+              </div>
+              <div class="task-detail-row">
+                <span class="task-detail-label">待处理</span>
+                <span>{{ Number(task.pending_count || 0) }} 个文件</span>
+              </div>
+            </div>
+          </v-expand-transition>
         </div>
         <v-btn
             v-if="canStop(task)"
@@ -119,7 +152,7 @@
   </div>
 </template>
 <script setup>
-import {computed} from "vue";
+import {computed, ref} from "vue";
 
 const props = defineProps({
   runtime: {type: Object, required: true},
@@ -127,12 +160,35 @@ const props = defineProps({
 });
 const emit = defineEmits(["stop-task"]);
 const active = computed(() => props.active);
+const expandedTaskIds = ref(new Set());
 const tasks = computed(() =>
     (props.runtime.tasks || []).filter((task) =>
         task.task_kind === "cross_transfer" ||
         ["queued", "running", "stopping", "postprocessing"].includes(task.status),
     ),
 );
+
+function postprocessingSummary(task) {
+  const pendingCount = Number(task?.pending_count || 0);
+  return pendingCount > 0
+      ? `${pendingCount} 个文件待完成后处理`
+      : "正在完成文件后处理";
+}
+
+function isTaskExpanded(taskId) {
+  return expandedTaskIds.value.has(taskId);
+}
+
+function toggleTaskDetails(taskId) {
+  const nextIds = new Set(expandedTaskIds.value);
+  if (nextIds.has(taskId)) {
+    nextIds.delete(taskId);
+  } else {
+    nextIds.add(taskId);
+  }
+  expandedTaskIds.value = nextIds;
+}
+
 function canStop(task) {
   return ["queued", "running", "stopping", "postprocessing"].includes(
       task?.status,
@@ -317,6 +373,39 @@ function displayTotal(task) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.task-phase-wrap {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+}
+
+.task-detail-toggle {
+  flex: 0 0 auto;
+}
+
+.task-details {
+  display: grid;
+  gap: 4px;
+  margin-top: 7px;
+  padding: 7px 0 1px;
+  border-top: 1px dashed rgba(var(--v-border-color), 0.18);
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+}
+
+.task-detail-row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 8px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.task-detail-label {
+  color: rgba(var(--v-theme-on-surface), var(--v-high-emphasis-opacity));
+  font-weight: 500;
 }
 
 .task-transfer {

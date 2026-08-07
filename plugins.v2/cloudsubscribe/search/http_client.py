@@ -1,9 +1,11 @@
 """搜索请求兼容入口与共享请求节流器。"""
 
 import random
+import re
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Dict, Optional
 
@@ -111,8 +113,48 @@ def gated_idempotent_request(
             time.sleep(max(0.0, float(retry_delay)))
 
 
+class RequestGateCancelled(RuntimeError):
+    """请求在等待限速槽位时收到停止信号。"""
+
+
+class RequestGateCooldown(RuntimeError):
+    """调用方要求冷却期快速失败。"""
+
+    def __init__(self, remaining: float, status: int = 0):
+        super().__init__(f"请求渠道冷却中，剩余 {remaining:.1f} 秒")
+        self.remaining = max(0.0, float(remaining or 0.0))
+        self.status = int(status or 0)
+
+
 class RequestGate:
     """串行协调登录、挑战和业务接口的请求间隔及风控冷却。"""
+
+    # 所有搜索渠道的登录、列表、详情和解锁接口共用此最低间隔。
+    _GLOBAL_MINIMUM_INTERVAL = 1.0
+    _SHARED_LOCK = threading.RLock()
+    _SHARED_GATES: Dict[tuple, "RequestGate"] = {}
+
+    @classmethod
+    def shared(cls, name: str, identity: Any, **kwargs) -> "RequestGate":
+        """按渠道身份复用门控，避免客户端重建后瞬间打满接口。"""
+        config = (
+            round(float(kwargs.get("request_interval", 0.2) or 0.2), 3),
+            round(float(kwargs.get("minimum_interval", 0.2) or 0.2), 3),
+            int(kwargs.get("risk_cooldown_seconds", 60) or 60),
+            int(kwargs.get("server_error_cooldown_seconds", 5) or 5),
+            bool(kwargs.get("serial_requests", True)),
+            int(kwargs.get("max_requests_per_window", 0) or 0),
+            round(float(kwargs.get("request_window_seconds", 60.0) or 60.0), 3),
+        )
+        key = (str(name or "搜索接口"), str(identity or "default"), config)
+        with cls._SHARED_LOCK:
+            gate = cls._SHARED_GATES.get(key)
+            if gate is None:
+                gate = cls(name, **kwargs)
+                cls._SHARED_GATES[key] = gate
+                if len(cls._SHARED_GATES) > 256:
+                    cls._SHARED_GATES.pop(next(iter(cls._SHARED_GATES)))
+            return gate
 
     def __init__(
             self,
@@ -128,7 +170,9 @@ class RequestGate:
     ):
         self._name = str(name or "搜索接口")
         self._request_interval = max(
-            minimum_interval, min(float(request_interval or minimum_interval), 10.0)
+            self._GLOBAL_MINIMUM_INTERVAL,
+            minimum_interval,
+            min(float(request_interval or minimum_interval), 10.0),
         )
         self._risk_cooldown_seconds = max(1, int(risk_cooldown_seconds or 60))
         self._server_error_cooldown_seconds = max(
@@ -143,6 +187,7 @@ class RequestGate:
         self._cooldown_until = 0.0
         self._cooldown_status = 0
         self._lock = threading.RLock()
+        self._sequence_local = threading.local()
 
     @property
     def request_interval(self) -> float:
@@ -172,14 +217,52 @@ class RequestGate:
                 self._apply_cooldown(response)
             return response
         with self._lock:
-            self._wait_for_slot_locked()
-            self._record_request_locked()
+            self._wait_for_slot_locked(
+                cancel_check=getattr(
+                    self._sequence_local, "cancel_check", None
+                ),
+                fail_on_cooldown=bool(getattr(
+                    self._sequence_local, "fail_on_cooldown", False
+                )),
+            )
+            return self._run_request_locked(request)
+
+    def _run_request_locked(self, request: Callable):
+        self._record_request_locked()
+        try:
+            response = request()
+            self._apply_cooldown(response)
+            return response
+        finally:
+            self._last_request_at = time.monotonic()
+
+    @contextmanager
+    def immediate_sequence(
+            self,
+            request_count: int = 1,
+            cancel_check: Optional[Callable[[], bool]] = None,
+            fail_on_cooldown: bool = False,
+    ):
+        """串行执行强关联请求，但每次请求仍遵守最低间隔。"""
+        with self._lock:
+            previous_cancel = getattr(
+                self._sequence_local, "cancel_check", None
+            )
+            previous_fail = bool(getattr(
+                self._sequence_local, "fail_on_cooldown", False
+            ))
+            self._wait_for_slot_locked(
+                required_slots=request_count,
+                cancel_check=cancel_check,
+                fail_on_cooldown=fail_on_cooldown,
+            )
+            self._sequence_local.cancel_check = cancel_check
+            self._sequence_local.fail_on_cooldown = fail_on_cooldown
             try:
-                response = request()
-                self._apply_cooldown(response)
-                return response
+                yield
             finally:
-                self._last_request_at = time.monotonic()
+                self._sequence_local.cancel_check = previous_cancel
+                self._sequence_local.fail_on_cooldown = previous_fail
 
     def _reserve_request_slot(self) -> None:
         with self._lock:
@@ -187,27 +270,48 @@ class RequestGate:
             self._record_request_locked()
             self._last_request_at = time.monotonic()
 
-    def _wait_for_slot_locked(self) -> None:
+    def _wait_for_slot_locked(
+            self,
+            required_slots: int = 1,
+            cancel_check: Optional[Callable[[], bool]] = None,
+            fail_on_cooldown: bool = False,
+    ) -> None:
         now = time.monotonic()
         self._prune_request_history_locked(now)
         window_wait = 0.0
+        required = max(1, int(required_slots or 1))
         if (
                 self._max_requests_per_window
-                and len(self._request_history) >= self._max_requests_per_window
+                and required > self._max_requests_per_window
         ):
+            raise ValueError("连续请求数不能超过限流窗口容量")
+        overflow = (
+            len(self._request_history) + required - self._max_requests_per_window
+            if self._max_requests_per_window else 0
+        )
+        if overflow > 0:
+            expiry_index = min(overflow - 1, len(self._request_history) - 1)
             window_wait = max(
-                self._request_window_seconds - (now - self._request_history[0]),
+                self._request_window_seconds
+                - (now - self._request_history[expiry_index]),
                 0.0,
             )
+        cooldown_wait = max(self._cooldown_until - now, 0.0)
+        if fail_on_cooldown and cooldown_wait > 0:
+            raise RequestGateCooldown(cooldown_wait, self._cooldown_status)
         wait_seconds = max(
-            self._cooldown_until - now,
+            cooldown_wait,
             window_wait,
-            self._request_interval * random.uniform(0.85, 1.25)
+            self._request_interval * random.uniform(1.0, 1.25)
             - (now - self._last_request_at),
             0.0,
         )
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
+        deadline = time.monotonic() + wait_seconds
+        while wait_seconds > 0:
+            if cancel_check and cancel_check():
+                raise RequestGateCancelled("请求等待已停止")
+            time.sleep(min(wait_seconds, 0.25))
+            wait_seconds = deadline - time.monotonic()
 
     def _prune_request_history_locked(self, now: float) -> None:
         while (
@@ -251,10 +355,26 @@ class RequestGate:
         try:
             seconds = max(1, min(int(float(retry_after)), 10 * 60))
         except (TypeError, ValueError):
-            seconds = (
-                self._server_error_cooldown_seconds
-                if status >= 500 else self._risk_cooldown_seconds
-            )
+            seconds = 0
+            if status == 429:
+                try:
+                    body = getattr(response, "text", "") or ""
+                    if not body:
+                        raw = getattr(response, "content", b"")
+                        body = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+                    matched = re.search(
+                        r"(?:冷却|重试|限制|retry)[^0-9]{0,24}(\d+)\s*(?:秒|s|seconds?)?",
+                        body[:4096],
+                        re.IGNORECASE,
+                    )
+                    seconds = int(matched.group(1)) if matched else 0
+                except (TypeError, ValueError, UnicodeError):
+                    seconds = 0
+            if not seconds:
+                seconds = (
+                    self._server_error_cooldown_seconds
+                    if status >= 500 else self._risk_cooldown_seconds
+                )
         cooldown_until = time.monotonic() + seconds
         if cooldown_until >= self._cooldown_until:
             self._cooldown_until = cooldown_until
@@ -270,6 +390,36 @@ class AccountActionGate:
     _STATE_LOCK = threading.RLock()
     _LOCKS: Dict[str, threading.RLock] = {}
     _HISTORIES: Dict[str, deque] = {}
+    _GATES: Dict[tuple, "AccountActionGate"] = {}
+
+    @classmethod
+    def shared(
+            cls,
+            name: str,
+            account_key: str,
+            max_actions: int,
+            maximum_actions: int,
+            window_seconds: float = 60.0,
+    ) -> "AccountActionGate":
+        key = (
+            str(account_key or "default"),
+            max(1, min(int(max_actions or 1), int(maximum_actions or 1))),
+            round(float(window_seconds or 60.0), 3),
+        )
+        with cls._STATE_LOCK:
+            gate = cls._GATES.get(key)
+            if gate is None:
+                gate = cls(
+                    name,
+                    account_key,
+                    max_actions=max_actions,
+                    maximum_actions=maximum_actions,
+                    window_seconds=window_seconds,
+                )
+                cls._GATES[key] = gate
+                if len(cls._GATES) > 256:
+                    cls._GATES.pop(next(iter(cls._GATES)))
+            return gate
 
     def __init__(
             self,

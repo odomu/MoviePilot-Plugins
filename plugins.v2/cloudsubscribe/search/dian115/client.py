@@ -78,15 +78,16 @@ class Dian115Client:
         self._get_data_func = get_data_func
         self._save_data_func = save_data_func
         self._lock = threading.RLock()
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "Dian115",
+            f"{self.BASE_URL}|{self._email.casefold()}|{self._proxies}",
             request_interval=request_interval,
             minimum_interval=0.2,
             risk_cooldown_seconds=self._RISK_COOLDOWN_SECONDS,
             server_error_cooldown_seconds=self._SERVER_ERROR_COOLDOWN_SECONDS,
             challenge_detector=self._is_challenge_response,
         )
-        self._unlock_gate = AccountActionGate(
+        self._unlock_gate = AccountActionGate.shared(
             "Dian115 解锁接口",
             f"dian115:{self._email.casefold()}",
             max_actions=unlocks_per_minute,
@@ -107,7 +108,7 @@ class Dian115Client:
                 and self._password == str(password or "").strip()
                 and self._proxies == normalize_proxies(proxy)
                 and self._request_gate.request_interval
-                == max(0.2, min(float(request_interval or 1.0), 10.0))
+                == max(1.0, min(float(request_interval or 1.0), 10.0))
                 and self._unlock_gate.max_actions
                 == max(1, min(int(unlocks_per_minute or 6), 10))
         )
@@ -430,6 +431,8 @@ class Dian115Client:
             }
             context = await launch_context_async(**browser_options)
             page = await context.new_page()
+            # 浏览器导航无法直接套同步 requests 门控，先占用同一账号请求槽。
+            self._request_gate.run(lambda: None)
             await page.goto(
                 f"{self.BASE_URL}/login",
                 wait_until="domcontentloaded",

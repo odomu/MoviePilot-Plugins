@@ -32,7 +32,7 @@ class PanSouSearchService(OwnerDelegator):
         PanSou 搜索的通用逻辑
 
         :param keyword: 搜索关键词
-        :return: 115分享与可提交到115离线下载的ED2K、Magnet资源列表
+        :return: 已规范化的多网盘分享及离线资源列表
         """
         titles = [str(getattr(mediainfo, "title", "") or "").strip()]
         title_en = str(
@@ -142,7 +142,7 @@ class PanSouSearchService(OwnerDelegator):
         仅使用 PanSou 搜索电影资源
 
         :param mediainfo: 媒体信息
-        :return: 115网盘资源列表
+        :return: PanSou 电影候选资源列表
         """
         if not self._pansou_client:
             logger.warning(f"PanSou 客户端未初始化，跳过 PanSou 查询")
@@ -165,7 +165,7 @@ class PanSouSearchService(OwnerDelegator):
 
         :param mediainfo: 媒体信息
         :param season: 季号
-        :return: 115网盘资源列表
+        :return: PanSou 电视剧候选资源列表
         """
         if not self._pansou_client:
             logger.warning(f"PanSou 客户端未初始化，跳过 PanSou 查询")

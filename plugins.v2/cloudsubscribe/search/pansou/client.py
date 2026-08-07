@@ -107,8 +107,9 @@ class PanSouClient:
         # 代理设置（兼容字符串和字典格式）
         self._proxies = normalize_proxies(proxy)
         self._auth_lock = threading.RLock()
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "PanSou",
+            f"{self.base_url}|{self.username.casefold()}|{self._proxies}",
             request_interval=0.2,
             minimum_interval=0.1,
         )

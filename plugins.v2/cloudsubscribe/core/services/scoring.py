@@ -1,6 +1,5 @@
 """订阅已有资源评分。"""
 
-from app.core.metainfo import MetaInfo
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
@@ -40,21 +39,8 @@ class SubscriptionScoringService(OwnerDelegator):
             season = int(subscribe.season or 1)
             label = f"{subscribe.name} S{season:02d}"
             try:
-                meta = MetaInfo(subscribe.name)
-                meta.year = subscribe.year
-                meta.begin_season = season
-                meta.type = MediaType.TV
-                mediainfo = self._sync_handler._recognize_media_once(
-                    (
-                        "scoring", MediaType.TV.value, subscribe.tmdbid,
-                        getattr(subscribe, "doubanid", None), subscribe.name,
-                        subscribe.year, season, True,
-                    ),
-                    meta=meta,
-                    mtype=MediaType.TV,
-                    tmdbid=subscribe.tmdbid,
-                    doubanid=getattr(subscribe, "doubanid", None),
-                    cache=True,
+                mediainfo = self._sync_handler._subscribe_mediainfo(
+                    subscribe, MediaType.TV
                 )
                 if not mediainfo:
                     failed += 1

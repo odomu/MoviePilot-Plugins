@@ -10,6 +10,7 @@ from app.core.metainfo import MetaInfo
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
+from app.utils.string import StringUtils
 
 from .. import OwnerDelegator
 from ..config import UIConfig
@@ -186,7 +187,7 @@ class SearchApi(OwnerDelegator):
                 proxy=proxy,
                 request_timeout=int(config.get("pinglian_timeout", 30) or 30),
                 request_interval=float(
-                    config.get("pinglian_request_interval", 1) or 1
+                    config.get("pinglian_request_interval", 2) or 2
                 ),
                 get_data_func=self.get_data,
                 save_data_func=self.save_data,
@@ -242,7 +243,7 @@ class SearchApi(OwnerDelegator):
                 5, int(config.get("juying_result_limit", 5) or 5)
             ),
             pinglian_result_limit=min(
-                20, int(config.get("pinglian_result_limit", 20) or 20)
+                10, int(config.get("pinglian_result_limit", 10) or 10)
             ),
             search_source_order=[source],
             search_cache_enabled=False,
@@ -472,13 +473,7 @@ class SearchApi(OwnerDelegator):
             value = item.get("size")
             if not isinstance(value, (int, float)) or value <= 0:
                 return value or 0
-            units = ("B", "KB", "MB", "GB", "TB")
-            number = float(value)
-            unit = 0
-            while number >= 1024 and unit < len(units) - 1:
-                number /= 1024
-                unit += 1
-            return f"{number:.2f}{units[unit]}"
+            return StringUtils.format_size(int(value))
 
         def display_tags(item: Dict[str, Any]) -> List[str]:
             values = [item.get("tags") or []]
@@ -492,6 +487,7 @@ class SearchApi(OwnerDelegator):
             )
 
             tags: List[str] = []
+            seen_tags = set()
 
             def append_tag(value: Any) -> None:
                 if isinstance(value, dict):
@@ -514,8 +510,10 @@ class SearchApi(OwnerDelegator):
                     if isinstance(parsed, (dict, list, tuple, set)):
                         append_tag(parsed)
                         return
-                if text not in tags:
-                    tags.append(text)
+                if text in seen_tags:
+                    return
+                seen_tags.add(text)
+                tags.append(text)
 
             for value in values:
                 append_tag(value)
@@ -608,13 +606,19 @@ class SearchApi(OwnerDelegator):
                 item.get("resource_type") or item.get("pan_type") or "unknown"
             ).strip().lower() or "unknown"
             groups.setdefault(resource_type, []).append(item)
+        target = max(1, int(limit or 20))
+        offsets = {resource_type: 0 for resource_type in groups}
         balanced = []
-        while groups and len(balanced) < max(1, int(limit or 20)):
+        while groups and len(balanced) < target:
             for resource_type in list(groups):
                 rows = groups[resource_type]
-                balanced.append(rows.pop(0))
-                if not rows:
+                offset = offsets[resource_type]
+                balanced.append(rows[offset])
+                offset += 1
+                offsets[resource_type] = offset
+                if offset >= len(rows):
                     groups.pop(resource_type)
-                if len(balanced) >= max(1, int(limit or 20)):
+                    offsets.pop(resource_type, None)
+                if len(balanced) >= target:
                     break
         return balanced

@@ -2,6 +2,7 @@
 
 import copy
 import datetime
+import heapq
 import re
 import time
 from collections import Counter
@@ -9,14 +10,17 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
 import pytz
-from app.core.cache import TTLCache
 from app.core.config import settings
 from app.core.metainfo import MetaInfo
+from app.db import SessionFactory
+from app.db.models.subscribe import Subscribe
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.schemas.types import MediaType
+from app.utils.string import StringUtils
 
 from ...core import CloudDriveCapability, OwnerDelegator
+from ...utils.cache import create_platform_ttl_cache
 
 
 class PlatformIntegrationService(OwnerDelegator):
@@ -30,13 +34,15 @@ class PlatformIntegrationService(OwnerDelegator):
 
     def __init__(self, owner):
         super().__init__(owner)
-        self._overview_cache = TTLCache(
-            region="cloudsubscribe:platform_overview",
+        self._overview_cache = create_platform_ttl_cache(
+            "platform:overview",
+            owner,
             maxsize=4,
             ttl=int(self._OVERVIEW_TTL_SECONDS),
         )
-        self._agent_resource_cache = TTLCache(
-            region="cloudsubscribe:agent_resources",
+        self._agent_resource_cache = create_platform_ttl_cache(
+            "platform:agent_resources",
+            owner,
             maxsize=256,
             ttl=30 * 60,
         )
@@ -50,9 +56,11 @@ class PlatformIntegrationService(OwnerDelegator):
                 str(value or "")
             )
         links = []
+        seen = set()
         for candidate in candidates:
             link = str(candidate or "").strip().rstrip(",，。;；)")
-            if link and link not in links:
+            if link and link not in seen:
+                seen.add(link)
                 links.append(link)
         return links[:50]
 
@@ -77,19 +85,30 @@ class PlatformIntegrationService(OwnerDelegator):
             result["recent_history"] = list(cached.get("recent_history") or [])[:limit]
             return result
 
-        history = [
-            dict(record)
-            for record in (self.get_data("history") or [])
-            if isinstance(record, dict)
-        ]
-        history.sort(key=lambda item: str(item.get("time") or ""), reverse=True)
+        history_count = 0
+        recent_heap = []
         today = datetime.datetime.now(pytz.timezone(settings.TZ)).strftime("%Y-%m-%d")
-        total = len(history)
-        success = sum(record.get("status") == "成功" for record in history)
-        failed = sum(record.get("status") == "失败" for record in history)
-        transferred_today = sum(
-            str(record.get("time") or "").startswith(today) for record in history
-        )
+        success = 0
+        failed = 0
+        transferred_today = 0
+        for index, raw_record in enumerate(self.get_data("history") or []):
+            if not isinstance(raw_record, dict):
+                continue
+            record = dict(raw_record)
+            history_count += 1
+            status = record.get("status")
+            success += status == "成功"
+            failed += status == "失败"
+            record_time = str(record.get("time") or "")
+            transferred_today += record_time.startswith(today)
+            heap_entry = (record_time, index, record)
+            if len(recent_heap) < 20:
+                heapq.heappush(recent_heap, heap_entry)
+            elif heap_entry > recent_heap[0]:
+                heapq.heapreplace(recent_heap, heap_entry)
+        recent_history = [
+            entry[2] for entry in sorted(recent_heap, reverse=True)
+        ]
         tasks = self._serialize_runtime_tasks()
         provider = self._cloud_drive
         overview = {
@@ -100,13 +119,13 @@ class PlatformIntegrationService(OwnerDelegator):
                 "tasks": tasks,
             },
             "stats": [
-                {"title": "总转存", "value": total, "color": "primary", "icon": "mdi-cloud-upload-outline"},
+                {"title": "总转存", "value": history_count, "color": "primary", "icon": "mdi-cloud-upload-outline"},
                 {"title": "今日转存", "value": transferred_today, "color": "info", "icon": "mdi-calendar-today"},
                 {"title": "成功", "value": success, "color": "success", "icon": "mdi-check-circle-outline"},
                 {"title": "失败", "value": failed, "color": "error", "icon": "mdi-alert-circle-outline"},
             ],
-            "history_count": total,
-            "recent_history": history[:20],
+            "history_count": history_count,
+            "recent_history": recent_history,
             "cache": self._cache_stats(),
             "provider": {
                 "key": provider.key if provider else "",
@@ -118,7 +137,7 @@ class PlatformIntegrationService(OwnerDelegator):
         }
         self._overview_cache["overview"] = copy.deepcopy(overview)
         result = copy.deepcopy(overview)
-        result["recent_history"] = history[:limit]
+        result["recent_history"] = recent_history[:limit]
         return result
 
     def clear_platform_cache(self) -> Dict[str, int]:
@@ -360,23 +379,6 @@ class PlatformIntegrationService(OwnerDelegator):
             reasons.append(f"更新时间 {resource.get('update_time')}")
         return reasons or ["已通过订阅规则筛选"]
 
-    @staticmethod
-    def _resource_summary_size(value: Any) -> int:
-        if isinstance(value, (int, float)):
-            return max(0, int(value))
-        match = re.search(
-            r"([\d.]+)\s*(B|KB|MB|GB|TB)",
-            str(value or ""),
-            re.IGNORECASE,
-        )
-        if not match:
-            return 0
-        unit = match.group(2).upper()
-        return int(
-            float(match.group(1))
-            * 1024 ** ("B", "KB", "MB", "GB", "TB").index(unit)
-        )
-
     def search_platform_resources(
             self,
             session_id: str,
@@ -476,6 +478,15 @@ class PlatformIntegrationService(OwnerDelegator):
         candidates = []
         cached_resources = {}
         bound_subscribe_id = int(getattr(subscribe, "id", 0) or 0) or None
+        available_count = 0
+        transferable_count = 0
+        unlock_count = 0
+        official_count = 0
+        free_count = 0
+        total_size = 0
+        latest_update_time = ""
+        source_counts: Counter = Counter()
+        resource_type_counts: Counter = Counter()
         for index, resource in enumerate(resources):
             candidate_id = f"r{index + 1:03d}"
             item = dict(resource)
@@ -488,7 +499,7 @@ class PlatformIntegrationService(OwnerDelegator):
                         and item.get("slug")
                 )
             )
-            candidates.append({
+            candidate = {
                 "candidate_id": candidate_id,
                 "title": str(item.get("title") or "未知资源"),
                 "source": str(item.get("source") or "unknown"),
@@ -509,7 +520,21 @@ class PlatformIntegrationService(OwnerDelegator):
                 "available": available,
                 "transferable": bool(bound_subscribe_id and available),
                 "recommendation_reasons": self._candidate_reason(item, index),
-            })
+            }
+            candidates.append(candidate)
+            available_count += available
+            transferable_count += candidate["transferable"]
+            unlock_count += candidate["need_unlock"]
+            official_count += candidate["is_official"]
+            free_count += not candidate["need_unlock"]
+            total_size += max(
+                0, int(StringUtils.num_filesize(candidate["size"]) or 0)
+            )
+            latest_update_time = max(
+                latest_update_time, str(candidate.get("update_time") or "")
+            )
+            source_counts[candidate["source"]] += 1
+            resource_type_counts[candidate["resource_type"]] += 1
 
         search_id = uuid4().hex[:12]
         media = {
@@ -525,29 +550,18 @@ class PlatformIntegrationService(OwnerDelegator):
             "media": media,
             "resources": cached_resources,
         }
-        available = [item for item in candidates if item["available"]]
-        transferable = [item for item in candidates if item["transferable"]]
-        total_size = sum(
-            self._resource_summary_size(item.get("size"))
-            for item in candidates
-        )
         summary = {
             "total": len(candidates),
-            "available": len(available),
-            "transferable": len(transferable),
-            "need_unlock": sum(item["need_unlock"] for item in candidates),
-            "official": sum(item["is_official"] for item in candidates),
-            "free": sum(not item["need_unlock"] for item in candidates),
+            "available": available_count,
+            "transferable": transferable_count,
+            "need_unlock": unlock_count,
+            "official": official_count,
+            "free": free_count,
             "total_size_bytes": total_size,
             "average_size_bytes": total_size // len(candidates) if candidates else 0,
-            "latest_update_time": max(
-                (str(item.get("update_time") or "") for item in candidates),
-                default="",
-            ),
-            "by_source": dict(Counter(item["source"] for item in candidates)),
-            "by_resource_type": dict(
-                Counter(item["resource_type"] for item in candidates)
-            ),
+            "latest_update_time": latest_update_time,
+            "by_source": dict(source_counts),
+            "by_resource_type": dict(resource_type_counts),
         }
         logger.info(
             f"智能体资源搜索完成：{media['title']}"
@@ -649,22 +663,17 @@ class PlatformIntegrationService(OwnerDelegator):
                     "pending": len(self._subscribe_search_pending),
                     "active": len(self._subscribe_search_active),
                 }
-        external_calls = sum(
-            int(metric.get("external_calls") or 0)
-            for metric in search_metrics.values()
-        )
-        external_elapsed_ms = sum(
-            int(metric.get("external_elapsed_ms") or 0)
-            for metric in search_metrics.values()
-        )
-        positive_hits = sum(
-            int(metric.get("positive_cache_hits") or 0)
-            for metric in search_metrics.values()
-        )
-        negative_hits = sum(
-            int(metric.get("negative_cache_hits") or 0)
-            for metric in search_metrics.values()
-        )
+        external_calls = 0
+        external_elapsed_ms = 0
+        positive_hits = 0
+        negative_hits = 0
+        for metric in search_metrics.values():
+            external_calls += int(metric.get("external_calls") or 0)
+            external_elapsed_ms += int(
+                metric.get("external_elapsed_ms") or 0
+            )
+            positive_hits += int(metric.get("positive_cache_hits") or 0)
+            negative_hits += int(metric.get("negative_cache_hits") or 0)
         run_elapsed_ms = (
             int(max(0.0, now - self._sync_run_started_at) * 1000)
             if self._sync_running and self._sync_run_started_at else 0
@@ -754,17 +763,25 @@ class PlatformIntegrationService(OwnerDelegator):
                     context, "cloudsubscribe_sync", result
                 )
             requested_ids = sorted(value for value in normalized_ids if value > 0)
-            existing_ids = {
-                int(item.id) for item in (SubscribeOper().list() or [])
-                if int(getattr(item, "id", 0) or 0) in requested_ids
-            }
-            missing_ids = [value for value in requested_ids if value not in existing_ids]
-            if not requested_ids or missing_ids:
-                message = (
-                    f"订阅不存在：{', '.join(map(str, missing_ids))}"
-                    if missing_ids else "请提供有效的订阅 ID"
+            if not requested_ids:
+                result = {"success": False, "message": "请提供有效的订阅 ID"}
+                return False, self._set_workflow_output(
+                    context, "cloudsubscribe_sync", result
                 )
-                result = {"success": False, "message": message}
+            with SessionFactory() as db:
+                existing_ids = {
+                    int(item.id)
+                    for item in db.query(Subscribe).filter(
+                        Subscribe.id.in_(requested_ids)
+                    ).all()
+                    if getattr(item, "id", None) is not None
+                }
+            missing_ids = [value for value in requested_ids if value not in existing_ids]
+            if missing_ids:
+                result = {
+                    "success": False,
+                    "message": f"订阅不存在：{', '.join(map(str, missing_ids))}",
+                }
                 return False, self._set_workflow_output(
                     context, "cloudsubscribe_sync", result
                 )

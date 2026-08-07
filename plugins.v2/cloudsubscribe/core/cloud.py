@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
 from threading import BoundedSemaphore, local
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, ClassVar, Dict, FrozenSet, Iterable, Iterator, Mapping, Optional, Protocol, \
+    runtime_checkable
 
 
 class CloudDriveCapability(str, Enum):
@@ -74,20 +75,27 @@ class CloudFile(Mapping[str, Any]):
     md5: str = ""
     playback_values: Mapping[str, str] = field(default_factory=dict)
     native: Any = field(default=None, repr=False, compare=False)
+    _MAPPING_KEYS: ClassVar[tuple[str, ...]] = (
+        "id", "name", "is_dir", "size", "sha1", "md5",
+    )
 
     def __getitem__(self, key: str) -> Any:
-        values = {
-            "id": self.id,
-            "name": self.name,
-            "is_dir": self.is_directory,
-            "size": self.size,
-            "sha1": self.sha1,
-            "md5": self.md5,
-        }
-        return values[key]
+        if key == "id":
+            return self.id
+        if key == "name":
+            return self.name
+        if key == "is_dir":
+            return self.is_directory
+        if key == "size":
+            return self.size
+        if key == "sha1":
+            return self.sha1
+        if key == "md5":
+            return self.md5
+        raise KeyError(key)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(("id", "name", "is_dir", "size", "sha1", "md5"))
+        return iter(self._MAPPING_KEYS)
 
     def __len__(self) -> int:
         return 6
@@ -385,8 +393,12 @@ class _ProviderServiceProxy:
     def __init__(self, service: Any, gate: _ProviderIoGate):
         self._service = service
         self._gate = gate
+        self._method_cache: Dict[str, Callable[..., Any]] = {}
 
     def __getattr__(self, name: str) -> Any:
+        cached = self._method_cache.get(name)
+        if cached is not None:
+            return cached
         value = getattr(self._service, name)
         if name.startswith("_") or not callable(value):
             return value
@@ -395,6 +407,7 @@ class _ProviderServiceProxy:
         def guarded(*args: Any, **kwargs: Any) -> Any:
             return self._gate.call(value, *args, **kwargs)
 
+        self._method_cache[name] = guarded
         return guarded
 
 

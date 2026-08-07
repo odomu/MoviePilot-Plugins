@@ -19,10 +19,13 @@ from .security import HDHiveSecurityProtocol
 from ...http_client import (
     CURL_CFFI_AVAILABLE,
     RequestGate,
+    RequestGateCancelled,
+    RequestGateCooldown,
     gated_idempotent_request,
     normalize_proxies,
     requests,
 )
+from ....utils.cache import create_platform_ttl_cache
 
 
 class HDHiveWebError(RuntimeError):
@@ -49,7 +52,9 @@ class HDHiveClient:
     _UNLOCK_STATE_LOCK = threading.RLock()
     _UNLOCK_HISTORIES: Dict[str, deque] = {}
     _UNLOCK_LOCKS: Dict[str, threading.RLock] = {}
+    _UNLOCK_READY_ATS: Dict[str, float] = {}
     _RISK_COOLDOWNS: Dict[str, tuple] = {}
+    _RISK_COOLDOWN_CACHE_TTL = 10 * 60
     _LOGIN_CHUNK_RE = re.compile(
         r"static/chunks/app/\(auth\)/login/page-[^\\\"']+\.js"
     )
@@ -77,6 +82,7 @@ class HDHiveClient:
             request_interval: float = 5.0,
             unlocks_per_minute: int = 2,
             timeout: int = 30,
+            should_stop: Optional[Callable[[], bool]] = None,
     ):
         if not CURL_CFFI_AVAILABLE:
             raise HDHiveWebError(
@@ -87,15 +93,19 @@ class HDHiveClient:
         self._password = str(password or "")
         self._proxies = normalize_proxies(proxy)
         self._timeout = max(5, min(int(timeout or 30), 120))
+        self._should_stop = should_stop
         self._unlocks_per_minute = max(
             1, min(int(unlocks_per_minute or 2), 3)
-        )
-        self._first_unlock_ready_at = (
-                time.monotonic() + random.uniform(3.0, 8.0)
         )
         self._session_key = hashlib.sha256(
             f"{self.BASE_URL}\0{self._username}".encode("utf-8")
         ).hexdigest()
+        self._risk_cooldown_cache = create_platform_ttl_cache(
+            "hdhive:web:risk_cooldown",
+            self._session_key,
+            maxsize=1,
+            ttl=self._RISK_COOLDOWN_CACHE_TTL,
+        )
         self._session = requests.Session(impersonate="chrome")
         self._user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -115,8 +125,9 @@ class HDHiveClient:
         self._security_expires_at = 0.0
         self._bind_secret = ""
         self._clock_offset_ms = 0
-        self._request_gate = RequestGate(
+        self._request_gate = RequestGate.shared(
             "HDHive WebAPI",
+            self._session_key,
             request_interval=request_interval,
             minimum_interval=2.0,
             risk_cooldown_seconds=self._RISK_COOLDOWN_SECONDS,
@@ -134,6 +145,19 @@ class HDHiveClient:
     @property
     def cache_namespace(self) -> str:
         return self._session_key[:12]
+
+    @property
+    def cooldown_remaining(self) -> float:
+        """返回账户风险冷却与请求门控冷却中的较长剩余时间。"""
+        shared_remaining, _ = self._shared_risk_cooldown()
+        return max(shared_remaining, self._request_gate.cooldown_remaining)
+
+    def _stop_requested(self) -> bool:
+        try:
+            return bool(self._should_stop and self._should_stop())
+        except Exception as error:
+            logger.warning(f"读取 HDHive 停止状态失败：{error}")
+            return False
 
     def matches_config(
             self, username: str, password: str, proxy: Any,
@@ -167,6 +191,20 @@ class HDHiveClient:
         """安全读取响应正文，供资源协议层使用。"""
         return HDHiveClient._response_text(response)
 
+    @classmethod
+    def _body_cooldown_seconds(cls, response) -> int:
+        """从 429 文本中提取站点给出的中文冷却秒数。"""
+        if int(getattr(response, "status_code", 0) or 0) != 429:
+            return 0
+        text = cls._response_text(response)[:4096]
+        match = re.search(r"(?:冷却|重试|限制)[^0-9]{0,24}(\d+)\s*秒", text)
+        if not match:
+            return 0
+        try:
+            return max(1, min(int(match.group(1)), 10 * 60))
+        except (TypeError, ValueError):
+            return 0
+
     def activate_risk_cooldown(
             self, reason: str, seconds: Optional[int] = None
     ) -> None:
@@ -185,7 +223,8 @@ class HDHiveClient:
         self._remember_risk_cooldown(cooldown_seconds, status=0)
 
     def _remember_risk_cooldown(self, seconds: float, status: int) -> None:
-        cooldown_until = time.monotonic() + max(0.0, float(seconds or 0.0))
+        duration = max(0.0, float(seconds or 0.0))
+        cooldown_until = time.monotonic() + duration
         with self._UNLOCK_STATE_LOCK:
             current_until, _ = self._RISK_COOLDOWNS.get(
                 self._session_key, (0.0, 0)
@@ -195,16 +234,46 @@ class HDHiveClient:
                     cooldown_until,
                     int(status or 0),
                 )
+        if duration > 0:
+            try:
+                current = self._risk_cooldown_cache.get("state") or {}
+                current_until = float(current.get("until") or 0)
+                wall_until = time.time() + duration
+                if wall_until >= current_until:
+                    ttl = max(
+                        1,
+                        min(
+                            int(duration + 0.999),
+                            self._RISK_COOLDOWN_CACHE_TTL,
+                        ),
+                    )
+                    self._risk_cooldown_cache.set(
+                        "state",
+                        {"until": wall_until, "status": int(status or 0)},
+                        ttl=ttl,
+                    )
+            except Exception as error:
+                logger.debug(f"HDHive 风控冷却持久化失败：{error}")
 
     def _shared_risk_cooldown(self) -> tuple:
+        wall_remaining = 0.0
+        wall_status = 0
+        try:
+            persisted = self._risk_cooldown_cache.get("state") or {}
+            wall_remaining = float(persisted.get("until") or 0) - time.time()
+            wall_status = int(persisted.get("status") or 0)
+        except Exception as error:
+            logger.debug(f"HDHive 风控冷却读取失败：{error}")
         with self._UNLOCK_STATE_LOCK:
             cooldown_until, status = self._RISK_COOLDOWNS.get(
                 self._session_key, (0.0, 0)
             )
             remaining = cooldown_until - time.monotonic()
-            if remaining <= 0:
+            if remaining <= 0 and wall_remaining <= 0:
                 self._RISK_COOLDOWNS.pop(self._session_key, None)
                 return 0.0, 0
+            if wall_remaining > remaining:
+                return wall_remaining, wall_status
             return remaining, int(status or 0)
 
     @staticmethod
@@ -258,6 +327,13 @@ class HDHiveClient:
                 headers=request_headers,
                 **kwargs,
             )
+            body_cooldown = self._body_cooldown_seconds(response)
+            if body_cooldown > self._request_gate.cooldown_remaining:
+                self._request_gate.activate_cooldown(
+                    body_cooldown,
+                    status=429,
+                    reason="HTTP 429 风控",
+                )
             cooldown_status = self._request_gate.cooldown_status
             if cooldown_status in {403, 429}:
                 self._remember_risk_cooldown(
@@ -384,7 +460,7 @@ class HDHiveClient:
         if response.status_code >= 400:
             raise HDHiveWebError(
                 f"HDHive 网页请求失败（HTTP {response.status_code}）",
-                code="request_failed",
+                code=("rate_limited" if response.status_code == 429 else "request_failed"),
                 status_code=response.status_code,
             )
         return response
@@ -497,6 +573,17 @@ class HDHiveClient:
                 + random.uniform(1.0, 4.0)
         )
         while True:
+            if self._stop_requested():
+                raise HDHiveWebError(
+                    "HDHive 解锁等待已停止", code="stopped"
+                )
+            cooldown_remaining = self.cooldown_remaining
+            if cooldown_remaining > 0:
+                raise HDHiveWebError(
+                    "HDHive WebAPI 处于风控冷却期，跳过解锁"
+                    f"（剩余 {int(cooldown_remaining + 0.999)} 秒）",
+                    code="rate_limited",
+                )
             with self._UNLOCK_STATE_LOCK:
                 history = self._UNLOCK_HISTORIES.setdefault(
                     self._session_key, deque()
@@ -507,7 +594,11 @@ class HDHiveClient:
                         and now - history[0] >= self._UNLOCK_WINDOW_SECONDS
                 ):
                     history.popleft()
-                wait_seconds = max(self._first_unlock_ready_at - now, 0.0)
+                ready_at = self._UNLOCK_READY_ATS.get(self._session_key)
+                if ready_at is None:
+                    ready_at = now + random.uniform(3.0, 8.0)
+                    self._UNLOCK_READY_ATS[self._session_key] = ready_at
+                wait_seconds = max(ready_at - now, 0.0)
                 if history:
                     wait_seconds = max(
                         wait_seconds,
@@ -523,7 +614,23 @@ class HDHiveClient:
             logger.debug(
                 f"HDHive 解锁接口按节奏等待 {wait_seconds:.1f} 秒"
             )
-            time.sleep(wait_seconds)
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                if self._stop_requested():
+                    raise HDHiveWebError(
+                        "HDHive 解锁等待已停止", code="stopped"
+                    )
+                cooldown_remaining = self.cooldown_remaining
+                if cooldown_remaining > 0:
+                    raise HDHiveWebError(
+                        "HDHive WebAPI 处于风控冷却期，跳过解锁"
+                        f"（剩余 {int(cooldown_remaining + 0.999)} 秒）",
+                        code="rate_limited",
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(remaining, 0.25))
 
     def _record_unlock_attempt(self) -> None:
         with self._UNLOCK_STATE_LOCK:
@@ -628,28 +735,35 @@ class HDHiveClient:
                 status_code=response.status_code,
             )
         if response.status_code == 401 and retry:
-            try:
-                error_payload = response.json()
-            except ValueError:
-                error_payload = {}
-            error_code = str(
-                error_payload.get("code") or error_payload.get("error_code") or ""
-            )
-            if error_code in self._SECURITY_RETRY_CODES:
-                self._ensure_security_session(force=True)
-                return self._signed_request(
-                    method, path, body, headers, retry=False
-                )
-            if error_code == "stale_ts":
-                self._sync_security_time()
-                return self._signed_request(
-                    method, path, body, headers, retry=False
-                )
-            if error_code == "replay":
+            error_code = self._security_error_code(response)
+            if self._prepare_security_retry(error_code):
                 return self._signed_request(
                     method, path, body, headers, retry=False
                 )
         return response
+
+    @staticmethod
+    def _security_error_code(response) -> str:
+        if int(getattr(response, "status_code", 0) or 0) != 401:
+            return ""
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {}
+        if not isinstance(error_payload, dict):
+            return ""
+        return str(
+            error_payload.get("code") or error_payload.get("error_code") or ""
+        )
+
+    def _prepare_security_retry(self, error_code: str) -> bool:
+        if error_code in self._SECURITY_RETRY_CODES:
+            self._ensure_security_session(force=True)
+            return True
+        if error_code == "stale_ts":
+            self._sync_security_time()
+            return True
+        return error_code == "replay"
 
     def signed_request(
             self,
@@ -665,6 +779,75 @@ class HDHiveClient:
                 method, path, body=body, headers=headers
             )
             return response_handler(response) if response_handler else response
+
+    def signed_unlock_request(
+            self,
+            method: str,
+            path: str,
+            resource_page_path: str,
+            body: bytes = b"",
+            headers: Optional[Dict[str, str]] = None,
+            page_headers: Optional[Dict[str, str]] = None,
+            response_handler: Optional[Callable] = None,
+    ):
+        """在同一账户锁内先刷新资源页上下文，再发送解锁请求。
+
+        HDHive 会通过资源页响应轮换页面会话 Cookie；若页面 GET 与解锁
+        POST 被不同请求插入，后一个页面上下文会使前一个解锁被判定为过期。
+        """
+        try:
+            with self._unlock_lock():
+                self._wait_for_unlock_slot()
+                with self._lock:
+                    # 登录或握手可能产生额外请求，必须在刷新资源页之前完成。
+                    self._ensure_security_session()
+
+                    def request_once():
+                        with self._request_gate.immediate_sequence(
+                                request_count=2,
+                                cancel_check=self._stop_requested,
+                                fail_on_cooldown=True,
+                        ):
+                            self._authenticated_request(
+                                "GET",
+                                resource_page_path,
+                                headers=page_headers or {},
+                            )
+                            return self._signed_request_once(
+                                method,
+                                path,
+                                body=body,
+                                headers=headers,
+                                retry=False,
+                            )
+
+                    response = request_once()
+                    error_code = self._security_error_code(response)
+                    if self._prepare_security_retry(error_code):
+                        response = request_once()
+                    if not response_handler:
+                        return response
+                    try:
+                        return response_handler(response)
+                    except HDHiveWebError as error:
+                        if error.code != "page_expired":
+                            raise
+                        # 页面上下文过期通常意味着安全 Cookie 已轮换；重建一次
+                        # 会话后重新执行“资源页 GET + 解锁 POST”原子序列。
+                        self._ensure_security_session(force=True)
+                        retry_response = request_once()
+                        return response_handler(retry_response)
+        except RequestGateCooldown as error:
+            raise HDHiveWebError(
+                "HDHive WebAPI 处于风控冷却期，跳过解锁"
+                f"（剩余 {int(error.remaining + 0.999)} 秒）",
+                code="rate_limited",
+                status_code=error.status,
+            ) from error
+        except RequestGateCancelled as error:
+            raise HDHiveWebError(
+                "HDHive 解锁等待已停止", code="stopped"
+            ) from error
 
     def get_account_info(self) -> Dict[str, Any]:
         """通过已签名的用户接口读取 HDHive 可用积分。"""

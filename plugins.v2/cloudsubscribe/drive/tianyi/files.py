@@ -4,6 +4,13 @@ import json
 import time
 from pathlib import PurePosixPath
 
+from app.core.cache import TTLCache
+
+from ..common import (
+    create_directory_cache,
+    create_directory_path_cache,
+    resolve_directory_path,
+)
 from ...core.cloud import CloudFile, DirectoryListing, DirectoryLookup
 from ...core.transfer import HttpFileDownloadService
 
@@ -12,6 +19,15 @@ class TianyiFileService:
     def __init__(self, client):
         self.client = client
         self._items_by_id: dict[str, CloudFile] = {}
+        self._directory_path_cache = create_directory_path_cache(
+            "tianyi", client, "-11"
+        )
+        self._directory_cache: TTLCache = create_directory_cache(
+            "tianyi", client
+        )
+
+    def _invalidate_directory_cache(self) -> None:
+        self._directory_cache.clear()
 
     def _remember(self, item: CloudFile) -> CloudFile:
         if item.id:
@@ -46,38 +62,36 @@ class TianyiFileService:
         return url, headers
 
     def resolve_directory(self, path: str, create: bool = False) -> DirectoryLookup:
-        if str(path or "/") in ("", "/"):
-            return DirectoryLookup(True, "-11")
-        current = "-11"
-        for part in str(path).strip("/").split("/"):
-            found = next((f for f in self.list_directory(current).files
-                          if f.is_directory and f.name == part), None)
-            if not found and create:
-                data = self.client.request(
-                    "POST", "https://cloud.189.cn/api/open/file/createFolder.action",
-                    data={"parentFolderId": current, "folderName": part},
-                )
-                result = data.get("data") if isinstance(data.get("data"), dict) else data
-                folder_id = str(
-                    result.get("id") or result.get("folderId")
-                    or result.get("fileId") or ""
-                )
-                if folder_id:
-                    found = self._remember(
-                        CloudFile(folder_id, part, True, native=result)
-                    )
-                else:
-                    found = next(
-                        (f for f in self.list_directory(current).files
-                         if f.is_directory and f.name == part),
-                        None,
-                    )
-            if not found:
-                return DirectoryLookup(True, None)
-            current = found.id
-        return DirectoryLookup(True, current)
+        return resolve_directory_path(
+            path,
+            root_directory_id="-11",
+            path_cache=self._directory_path_cache,
+            list_children=lambda directory_id: self.list_directory(directory_id).files,
+            create_child=self._create_folder,
+            create=create,
+            provider_name="天翼",
+        )
+
+    def _create_folder(self, name: str, parent_id: str) -> CloudFile | None:
+        data = self.client.request(
+            "POST", "https://cloud.189.cn/api/open/file/createFolder.action",
+            data={"parentFolderId": parent_id, "folderName": name},
+        )
+        self._invalidate_directory_cache()
+        result = data.get("data") if isinstance(data.get("data"), dict) else data
+        folder_id = str(
+            result.get("id") or result.get("folderId")
+            or result.get("fileId") or ""
+        )
+        if not folder_id:
+            return None
+        return self._remember(CloudFile(folder_id, name, True, native=result))
 
     def list_directory(self, directory_id: str) -> DirectoryListing:
+        directory_id = str(directory_id or "-11")
+        cached = self._directory_cache.get(directory_id)
+        if cached is not None:
+            return cached
         result, page = [], 1
         while True:
             data = self.client.request("GET", "https://cloud.189.cn/api/open/file/listFiles.action",
@@ -95,7 +109,9 @@ class TianyiFileService:
             if len(result) >= int(info.get("count") or 0):
                 break
             page += 1
-        return DirectoryListing(True, tuple(result))
+        listing = DirectoryListing(True, tuple(result))
+        self._directory_cache.set(directory_id, listing)
+        return listing
 
     def list_directories(self, path: str):
         lookup = self.resolve_directory(path)
@@ -149,7 +165,11 @@ class TianyiFileService:
             else {"fileId": item.id, "destFileName": target_name}
         )
         self.client.request("POST", url, data=data)
-        return self._find_with_retry(path, target_name) is not None
+        self._invalidate_directory_cache()
+        success = self._find_with_retry(path, target_name) is not None
+        if success and item.is_directory:
+            self._directory_path_cache.clear()
+        return success
 
     def _batch_task(self, task_type: str, item: CloudFile, target_id: str = "") -> None:
         created = self.client.request(
@@ -190,6 +210,9 @@ class TianyiFileService:
         if not lookup.directory_id:
             return None
         self._batch_task("MOVE", item, lookup.directory_id)
+        self._invalidate_directory_cache()
+        if item.is_directory:
+            self._directory_path_cache.clear()
         if target_name and target_name != item.name:
             moved = CloudFile(
                 item.id, item.name, item.is_directory, item.size,
@@ -204,5 +227,8 @@ class TianyiFileService:
         if not item:
             return False
         self._batch_task("DELETE", item)
+        self._invalidate_directory_cache()
         self._items_by_id.pop(item.id, None)
+        if item.is_directory:
+            self._directory_path_cache.clear()
         return True

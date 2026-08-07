@@ -33,6 +33,18 @@ class MediaScraper:
     def _has_image(directory: Path, stem: str) -> bool:
         return any(directory.glob(f"{stem}.*"))
 
+    def _cached_image_checker(self):
+        """在一次刮削批次内缓存目录图片探测结果。"""
+        image_cache = {}
+
+        def has_image(directory: Path, stem: str) -> bool:
+            key = (directory, stem)
+            if key not in image_cache:
+                image_cache[key] = self._has_image(directory, stem)
+            return image_cache[key]
+
+        return has_image
+
     @staticmethod
     def _download_missing(path: Path, url: str) -> bool:
         if path.exists() or not url:
@@ -55,17 +67,86 @@ class MediaScraper:
             if temp_path and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
 
+    def filter_missing_items(
+            self, items: Iterable[Dict], mediainfo: MediaInfo
+    ) -> list[Dict]:
+        """在请求 TMDB 前筛出仍缺少目标元数据的媒体文件。"""
+        normalized = [dict(item) for item in (items or []) if item.get("media_path")]
+        if not normalized or not mediainfo or not getattr(mediainfo, "tmdb_id", None):
+            return []
+        has_image = self._cached_image_checker()
+
+        if mediainfo.type == MediaType.MOVIE:
+            result = []
+            for item in normalized:
+                media_path = Path(item["media_path"])
+                missing_nfo = self._nfo_enabled and not media_path.with_suffix(".nfo").exists()
+                missing_image = self._image_enabled and (
+                        not has_image(media_path.parent, "poster")
+                        or not has_image(media_path.parent, "fanart")
+                )
+                if missing_nfo or missing_image:
+                    result.append(item)
+            return result
+
+        selected = []
+        selected_ids = set()
+        parsed = []
+        for item in normalized:
+            media_path = Path(item["media_path"])
+            meta = MetaInfoPath(media_path)
+            season = int(item.get("season") or meta.begin_season or 1)
+            episode = int(item.get("episode") or meta.begin_episode or 0)
+            parsed.append((item, media_path, season, episode))
+
+        show_dir = parsed[0][1].parent.parent
+        shared_missing = self._nfo_enabled and not (show_dir / "tvshow.nfo").exists()
+        shared_missing = shared_missing or self._image_enabled and (
+                not has_image(show_dir, "poster")
+                or not has_image(show_dir, "fanart")
+        )
+        seasons_checked = set()
+        for item, media_path, season, episode in parsed:
+            missing = False
+            if season not in seasons_checked:
+                seasons_checked.add(season)
+                poster_stem = (
+                    "season-specials-poster" if season == 0
+                    else f"season{season:02d}-poster"
+                )
+                missing = self._nfo_enabled and not (
+                        media_path.parent / "season.nfo"
+                ).exists()
+                missing = missing or self._image_enabled and not has_image(
+                    show_dir, poster_stem
+                )
+            if episode:
+                missing = missing or self._nfo_enabled and not media_path.with_suffix(
+                    ".nfo"
+                ).exists()
+                missing = missing or self._image_enabled and not has_image(
+                    media_path.parent, f"{media_path.stem}-thumb"
+                )
+            if shared_missing or missing:
+                item_id = id(item)
+                if item_id not in selected_ids:
+                    selected_ids.add(item_id)
+                    selected.append(item)
+                shared_missing = False
+        return selected
+
     def _scrape_movie(self, media_path: Path, mediainfo: MediaInfo) -> int:
         media_path.parent.mkdir(parents=True, exist_ok=True)
         meta = MetaInfoPath(media_path)
+        has_image = self._cached_image_checker()
         created = 0
         if self._nfo_enabled and not media_path.with_suffix(".nfo").exists():
             nfo = self._scraper.get_metadata_nfo(meta, mediainfo)
             if nfo:
                 created += self._write_missing(media_path.with_suffix(".nfo"), nfo)
         if self._image_enabled and (
-                not self._has_image(media_path.parent, "poster")
-                or not self._has_image(media_path.parent, "fanart")
+                not has_image(media_path.parent, "poster")
+                or not has_image(media_path.parent, "fanart")
         ):
             for image_name, url in self._scraper.get_metadata_img(mediainfo).items():
                 lower_name = image_name.lower()
@@ -91,6 +172,8 @@ class MediaScraper:
             return 0
         created = 0
         show_dir = normalized[0][0].parent.parent
+        has_image = self._cached_image_checker()
+
         show_dir.mkdir(parents=True, exist_ok=True)
         sample_meta = normalized[0][3]
         if self._nfo_enabled and not (show_dir / "tvshow.nfo").exists():
@@ -98,8 +181,8 @@ class MediaScraper:
             if nfo:
                 created += self._write_missing(show_dir / "tvshow.nfo", nfo)
         if self._image_enabled and (
-                not self._has_image(show_dir, "poster")
-                or not self._has_image(show_dir, "fanart")
+                not has_image(show_dir, "poster")
+                or not has_image(show_dir, "fanart")
         ):
             for image_name, url in self._scraper.get_metadata_img(mediainfo).items():
                 lower_name = image_name.lower()
@@ -117,7 +200,7 @@ class MediaScraper:
                 if nfo:
                     created += self._write_missing(season_dir / "season.nfo", nfo)
             poster_stem = "season-specials-poster" if season == 0 else f"season{season:02d}-poster"
-            if self._image_enabled and not self._has_image(show_dir, poster_stem):
+            if self._image_enabled and not has_image(show_dir, poster_stem):
                 for image_name, url in self._scraper.get_metadata_img(mediainfo, season=season).items():
                     created += self._download_missing(show_dir / image_name, url)
 
@@ -131,7 +214,7 @@ class MediaScraper:
                 if nfo:
                     created += self._write_missing(media_path.with_suffix(".nfo"), nfo)
             thumb_stem = f"{media_path.stem}-thumb"
-            if self._image_enabled and not self._has_image(media_path.parent, thumb_stem):
+            if self._image_enabled and not has_image(media_path.parent, thumb_stem):
                 for image_name, url in self._scraper.get_metadata_img(
                         mediainfo, season=season, episode=episode
                 ).items():

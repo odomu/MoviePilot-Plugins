@@ -3,7 +3,6 @@
 import datetime
 from typing import Any, Dict, List, Optional, Set
 
-from app.core.metainfo import MetaInfo
 from app.db import SessionFactory
 from app.log import logger
 from app.schemas import MediaInfo
@@ -28,6 +27,7 @@ class UpgradeService(OwnerDelegator):
             exclude_ids: Set[int],
             target_episodes: Optional[Set[int]] = None,
             manual_upgrade: bool = False,
+            manual_resources: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         """
         洗版模式专用转存逻辑（独立于普通转存）
@@ -54,23 +54,8 @@ class UpgradeService(OwnerDelegator):
                 self._search_handler.reset_sub_spent_points(sub_key)
             logger.debug(f"开始洗版：{subscribe.name} S{season:02d}")
 
-            # 识别媒体信息
-            meta = MetaInfo(subscribe.name)
-            meta.year = subscribe.year
-            meta.begin_season = season
-            meta.type = MediaType.TV
-
-            mediainfo: MediaInfo = self._recognize_media_once(
-                (
-                    "subscribe", MediaType.TV.value, subscribe.tmdbid,
-                    subscribe.doubanid, subscribe.name, subscribe.year,
-                    season, True,
-                ),
-                meta=meta,
-                mtype=MediaType.TV,
-                tmdbid=subscribe.tmdbid,
-                doubanid=subscribe.doubanid,
-                cache=True,
+            mediainfo: MediaInfo = self._subscribe_mediainfo(
+                subscribe, MediaType.TV
             )
             if not mediainfo:
                 logger.warning(f"【洗版转存】无法识别媒体信息 {subscribe.name}")
@@ -206,10 +191,11 @@ class UpgradeService(OwnerDelegator):
                         if episode in unreleased_episodes
                     ]
                     if not_aired:
+                        not_aired_set = set(not_aired)
                         episodes_to_search = [
                             episode
                             for episode in episodes_to_search
-                            if episode not in set(not_aired)
+                            if episode not in not_aired_set
                         ]
                         logger.debug(
                             f"{upgrade_log_prefix} 跳过 {len(not_aired)} 集未播出"
@@ -236,14 +222,21 @@ class UpgradeService(OwnerDelegator):
             logger.debug(f"{upgrade_log_prefix} 待搜索 {len(episodes_to_search)} 集：{episodes_to_search}")
 
             # 搜索并转存匹配资源
-            enabled_sources = self._search_handler.get_enabled_sources()
+            enabled_sources = (
+                ["manual"]
+                if manual_resources
+                else self._search_handler.get_enabled_sources()
+            )
             if not enabled_sources:
                 logger.warning(f"{upgrade_log_prefix} 没有可用的搜索源")
                 return transferred_count
 
             self._set_upgrade_phase(subscribe, "搜索候选资源", 40)
-            prefetched_results = {}
-            if self._search_handler.source_concurrency_enabled:
+            prefetched_results = (
+                {"manual": [dict(resource) for resource in manual_resources]}
+                if manual_resources else {}
+            )
+            if not manual_resources:
                 prefetched_results = self._search_handler.search_sources(
                     sources=enabled_sources,
                     mediainfo=mediainfo,
@@ -253,11 +246,14 @@ class UpgradeService(OwnerDelegator):
                     target_episode_air_dates=target_episode_air_dates,
                     subscribe=subscribe,
                 )
+            resource_batches = self._build_transfer_resource_batches(
+                enabled_sources, prefetched_results
+            )
             new_priority = dict(existing_ep_pri)
             upgrade_downloaded = 0
             upgrade_episodes = set()  # 记录已升级的集号，用于更新 note
 
-            for source_index, source in enumerate(enabled_sources):
+            for source, candidate_resources, is_cross_batch in resource_batches:
                 if self._stop_requested():
                     break
                 if not episodes_to_search:
@@ -266,27 +262,12 @@ class UpgradeService(OwnerDelegator):
                     logger.info(f"{upgrade_log_prefix} 已达单次同步上限 {self._max_transfer_per_sync}")
                     break
 
-                logger.debug(f"{upgrade_log_prefix} 使用 {source.upper()} 搜索")
+                logger.debug(
+                    f"{upgrade_log_prefix} 使用 {source.upper()} 处理"
+                    f"{'跨盘' if is_cross_batch else '目标网盘'}候选"
+                )
 
-                p115_results = prefetched_results.get(source)
-                if p115_results is None:
-                    p115_results = self._search_handler.search_single_source(
-                        source=source, mediainfo=mediainfo,
-                        media_type=MediaType.TV, season=season,
-                        target_episodes=episodes_to_search,
-                        target_episode_air_dates=target_episode_air_dates,
-                        subscribe=subscribe,
-                    )
-
-                if not p115_results:
-                    remaining = enabled_sources[source_index + 1:]
-                    if remaining:
-                        logger.debug(f"{upgrade_log_prefix} {source.upper()} 无结果，继续下一来源")
-                    else:
-                        logger.debug(f"{upgrade_log_prefix} {source.upper()} 无结果，搜索来源已用尽")
-                    continue
-
-                for resource_index, resource in enumerate(p115_results):
+                for resource_index, resource in enumerate(candidate_resources):
                     if self._stop_requested():
                         break
                     if not episodes_to_search:
@@ -296,6 +277,7 @@ class UpgradeService(OwnerDelegator):
 
                     share_url = resource.get("url", "")
                     resource_title = resource.get("title", "")
+                    pending_episodes = tuple(episodes_to_search)
 
                     # HDHive 解锁
                     if (resource.get("need_unlock") or resource.get("need_access")) and not share_url:
@@ -307,7 +289,8 @@ class UpgradeService(OwnerDelegator):
                                 mediainfo,
                                 subscribe,
                                 season,
-                                episodes_to_search[:],
+                                pending_episodes,
+                                require_media_match=is_cross_batch,
                             ) if preview_files else {}
                             preview_candidates = [
                                 (episode, file_item, score)
@@ -332,7 +315,7 @@ class UpgradeService(OwnerDelegator):
                                     )
                                     continue
                     share_url = self._resolve_candidate_resource_url(
-                        p115_results,
+                        candidate_resources,
                         resource_index,
                         resource,
                         self._search_handler._search_label(
@@ -373,6 +356,7 @@ class UpgradeService(OwnerDelegator):
                             set(episodes_to_search)
                             & self._resource_preview_episodes(resource, season)
                         ) or sorted(episodes_to_search)
+                        target_episode_set = set(target_episodes)
                         upgrade_baseline = {}
                         worthwhile = False
                         for episode in target_episodes:
@@ -432,7 +416,7 @@ class UpgradeService(OwnerDelegator):
                         ))
                         episodes_to_search = [
                             episode for episode in episodes_to_search
-                            if episode not in set(target_episodes)
+                            if episode not in target_episode_set
                         ]
                         continue
 
@@ -453,9 +437,10 @@ class UpgradeService(OwnerDelegator):
                         mediainfo,
                         subscribe,
                         season,
-                        episodes_to_search[:],
+                        pending_episodes,
+                        require_media_match=is_cross_batch,
                     )
-                    for episode in episodes_to_search[:]:
+                    for episode in pending_episodes:
                         matched_file, cand_pri = matched_files.get(
                             episode, (None, 0)
                         )
@@ -547,6 +532,12 @@ class UpgradeService(OwnerDelegator):
                             "upgrade_old_size": int(
                                 baseline.get(episode, {}).get("file_size") or 0
                             ),
+                            "subtitle_files": self._companion_subtitle_files(
+                                share_files,
+                                matched_file,
+                                season=season,
+                                episode=episode,
+                            ),
                         })
 
                     if not matched_items:
@@ -605,9 +596,6 @@ class UpgradeService(OwnerDelegator):
                             upgrade_episodes.add(episode)
                             new_priority[str(episode)] = new_score
 
-                            if episode in episodes_to_search:
-                                episodes_to_search.remove(episode)
-
                             if pending_key:
                                 history_item["finalize_key"] = pending_key
                                 history_item["status"] = (
@@ -623,6 +611,12 @@ class UpgradeService(OwnerDelegator):
                                 f" {old_score}→{new_score}（{file_name}）"
                             )
 
+                    if batch_success_episodes:
+                        completed_episode_set = set(batch_success_episodes)
+                        episodes_to_search = [
+                            episode for episode in episodes_to_search
+                            if episode not in completed_episode_set
+                        ]
                     self._append_tv_transfer_detail(
                         transfer_details, mediainfo, season, batch_detail_episodes,
                         notification_kind="upgrade",
@@ -708,22 +702,7 @@ class UpgradeService(OwnerDelegator):
         from app.db.subscribe_oper import SubscribeOper
 
         season = int(subscribe.season or 1)
-        meta = MetaInfo(subscribe.name)
-        meta.year = subscribe.year
-        meta.begin_season = season
-        meta.type = MediaType.TV
-        mediainfo = self._recognize_media_once(
-            (
-                "subscribe", MediaType.TV.value, subscribe.tmdbid,
-                subscribe.doubanid, subscribe.name, subscribe.year,
-                season, True,
-            ),
-            meta=meta,
-            mtype=MediaType.TV,
-            tmdbid=subscribe.tmdbid,
-            doubanid=subscribe.doubanid,
-            cache=True,
-        )
+        mediainfo = self._subscribe_mediainfo(subscribe, MediaType.TV)
         if not mediainfo:
             logger.warning(f"洗版评分刷新失败：无法识别 {subscribe.name}")
             return 0
@@ -764,21 +743,8 @@ class UpgradeService(OwnerDelegator):
         for subscribe in subscribes:
             try:
                 season = int(subscribe.season or 1)
-                meta = MetaInfo(subscribe.name)
-                meta.year = subscribe.year
-                meta.begin_season = season
-                meta.type = MediaType.TV
-                mediainfo = self._recognize_media_once(
-                    (
-                        "subscribe", MediaType.TV.value, subscribe.tmdbid,
-                        subscribe.doubanid, subscribe.name, subscribe.year,
-                        season, True,
-                    ),
-                    meta=meta,
-                    mtype=MediaType.TV,
-                    tmdbid=subscribe.tmdbid,
-                    doubanid=subscribe.doubanid,
-                    cache=True,
+                mediainfo = self._subscribe_mediainfo(
+                    subscribe, MediaType.TV
                 )
                 if not mediainfo:
                     continue

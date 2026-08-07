@@ -70,7 +70,7 @@ export function createDian115Groups(options = {}) {
         },
         {
             tab: "dian115",
-            title: "Dian115 搜索与风控",
+            title: "搜索与风控",
             icon: "mdi-shield-search",
             hint: "登录和资源接口共用请求限速；详情结果另有短期内存缓存。",
             fields: [
@@ -80,7 +80,7 @@ export function createDian115Groups(options = {}) {
                     type: "number",
                     min: 1,
                     max: 20,
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "dian115_unlocks_per_minute",
@@ -90,7 +90,7 @@ export function createDian115Groups(options = {}) {
                     min: 1,
                     max: 10,
                     suffix: "次",
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "dian115_request_interval",
@@ -101,7 +101,7 @@ export function createDian115Groups(options = {}) {
                     max: 10,
                     step: 0.2,
                     suffix: "秒",
-                    cols: 6,
+                    cols: 4,
                 },
             ],
         },

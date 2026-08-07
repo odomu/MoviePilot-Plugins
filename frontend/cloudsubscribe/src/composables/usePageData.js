@@ -21,6 +21,15 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
     );
     const stats = computed(() => {
         const today = new Date().toISOString().slice(0, 10);
+        let todayCount = 0;
+        let successCount = 0;
+        let failedCount = 0;
+        for (const item of history.value) {
+            const time = String(item?.time || "");
+            if (time.startsWith(today)) todayCount += 1;
+            if (item?.status === "成功") successCount += 1;
+            if (item?.status === "失败") failedCount += 1;
+        }
         return [
             {
                 title: "总转存",
@@ -30,21 +39,19 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
             },
             {
                 title: "今日转存",
-                value: history.value.filter((item) =>
-                    String(item.time || "").startsWith(today),
-                ).length,
+                value: todayCount,
                 color: "info",
                 icon: "mdi-calendar-today",
             },
             {
                 title: "成功",
-                value: history.value.filter((item) => item.status === "成功").length,
+                value: successCount,
                 color: "success",
                 icon: "mdi-check-circle-outline",
             },
             {
                 title: "失败",
-                value: history.value.filter((item) => item.status === "失败").length,
+                value: failedCount,
                 color: "error",
                 icon: "mdi-alert-circle-outline",
             },
