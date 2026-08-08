@@ -10,11 +10,14 @@ import re
 import time
 import uuid
 from urllib.parse import urlencode
+from xml.etree import ElementTree
 
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from app.utils.string import StringUtils
+
+from ..common import DriveRateLimiter
 
 
 class TianyiApiError(RuntimeError):
@@ -39,6 +42,9 @@ class TianyiClient:
         self.refresh_token = str(refresh_token or "").strip()
         self.session_key = str(session_key or "").strip()
         self.on_token_refresh = on_token_refresh
+        self.rate_limiter = DriveRateLimiter.shared(
+            "tianyi", self.session_key or self.access_token, min_interval=0.5
+        )
         self.session = requests.Session()
         self.session.headers.update({"Referer": "https://cloud.189.cn/",
                                      "User-Agent": "Mozilla/5.0"})
@@ -50,22 +56,75 @@ class TianyiClient:
 
     @staticmethod
     def _response_data(response: requests.Response) -> dict:
-        response.raise_for_status()
-        data = response.json()
+        http_error = None
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as error:
+            http_error = error
+        try:
+            data = response.json()
+        except ValueError:
+            try:
+                root = ElementTree.fromstring(response.text)
+            except ElementTree.ParseError as error:
+                raise TianyiApiError("天翼云盘返回了无法识别的响应") from error
+
+            def xml_value(element):
+                children = list(element)
+                if not children:
+                    return str(element.text or "").strip()
+                result = {}
+                for child in children:
+                    key = child.tag.rsplit("}", 1)[-1]
+                    value = xml_value(child)
+                    if key not in result:
+                        result[key] = value
+                    elif isinstance(result[key], list):
+                        result[key].append(value)
+                    else:
+                        result[key] = [result[key], value]
+                return result
+
+            data = xml_value(root)
+        if not isinstance(data, dict):
+            raise TianyiApiError("天翼云盘返回了无效响应")
         error_code = data.get("errorCode")
         result_code = data.get("res_code")
         has_error = error_code not in (None, "", 0, "0", "SUCCESS")
         if result_code not in (None, "", 0, "0", "SUCCESS"):
             has_error = True
-        if has_error:
+        if http_error or has_error:
+            code = str(data.get("code") or error_code or result_code or "")
+            known_messages = {
+                "ShareAuditNotPass": "天翼分享未通过审核或已被屏蔽",
+                "ShareNotFound": "天翼分享不存在或已失效",
+                "ShareNotFoundFlatDir": "天翼分享目录不存在",
+            }
             raise TianyiApiError(
-                data.get("errorMsg") or data.get("res_message") or str(data)
+                known_messages.get(code)
+                or data.get("message")
+                or data.get("errorMsg")
+                or data.get("res_message")
+                or str(data)
             )
         return data
 
     def _raw_request(self, method: str, url: str, **kwargs) -> dict:
-        response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+        response = self.rate_limiter.call(
+            self.session.request,
+            method,
+            url,
+            timeout=self.timeout,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
+            **kwargs,
+        )
         return self._response_data(response)
+
+    def public_request(self, method: str, url: str, **kwargs) -> dict:
+        """请求无需登录的公开分享接口。"""
+        headers = {"Accept": "application/json;charset=UTF-8"}
+        headers.update(dict(kwargs.pop("headers", {}) or {}))
+        return self._raw_request(method, url, headers=headers, **kwargs)
 
     def request(self, method: str, url: str, **kwargs):
         if url.startswith(self.WEB_URL):
@@ -76,7 +135,8 @@ class TianyiClient:
         return self._raw_request(method, url, **kwargs)
 
     def _get_login_form(self) -> dict:
-        response = self.session.get(
+        response = self.rate_limiter.call(
+            self.session.get,
             f"{self.WEB_URL}/api/portal/unifyLoginForPC.action",
             params={
                 "appId": self.APP_ID,
@@ -85,6 +145,7 @@ class TianyiClient:
                 "timeStamp": int(time.time() * 1000),
             },
             timeout=self.timeout,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
         )
         response.raise_for_status()
         html = response.text

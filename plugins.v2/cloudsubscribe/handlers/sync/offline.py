@@ -731,7 +731,7 @@ class OfflineTaskService(OwnerDelegator):
                 if not target_file:
                     ready_at = float(item.get("download_completed_at") or created_at)
                     if now - ready_at >= self._FILE_FINALIZE_TIMEOUT:
-                        reason = "网盘文件已保存但24小时内仍无法在转存路径定位"
+                        reason = "网盘文件已保存但30分钟内仍无法在转存路径定位"
                         self._mark_offline_history_status(pending_key, "失败", reason)
                         pending.pop(pending_key, None)
                         failed += 1
@@ -892,7 +892,7 @@ class OfflineTaskService(OwnerDelegator):
 
                 ready_at = float(item.get("download_completed_at") or created_at)
                 if now - ready_at >= self._FILE_FINALIZE_TIMEOUT:
-                    reason = "文件已下载但24小时内仍无法生成 STRM"
+                    reason = "文件已下载但30分钟内仍无法生成 STRM"
                     self._mark_offline_history_status(pending_key, "失败", reason)
                     pending.pop(pending_key, None)
                     failed += 1

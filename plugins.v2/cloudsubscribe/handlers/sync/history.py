@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import unicodedata
 from app.chain.mediaserver import MediaServerChain
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
@@ -22,6 +23,7 @@ from app.schemas.types import MediaType
 from sqlalchemy import func, or_
 
 from ...core import CloudDriveCapability, CloudFile, OwnerDelegator
+from ...search.types import normalize_resource_type, resource_type_from_url
 
 
 class HistoryService(OwnerDelegator):
@@ -847,6 +849,94 @@ class HistoryService(OwnerDelegator):
             amount /= 1024
         return "-"
 
+    @staticmethod
+    def _history_page_fields(record: Dict[str, Any]) -> Dict[str, str]:
+        """生成历史页面所需的稳定标识、名称和可点击链接。"""
+        media_type = str(record.get("type") or "未知类型")
+        tmdb_id = str(record.get("tmdb_id") or "").strip()
+        if tmdb_id:
+            group_key = f"tmdb:{media_type}:{tmdb_id}"
+        else:
+            title_key = " ".join(
+                unicodedata.normalize(
+                    "NFKC", str(record.get("title") or "")
+                ).casefold().split()
+            )
+            year = (
+                str(record.get("year") or "").strip()
+                if media_type == "电影" else ""
+            )
+            group_key = f"legacy:{media_type}:{title_key}:{year}"
+
+        file_name = str(
+            record.get("file_name") or record.get("source_file_name") or ""
+        ).strip() or "-"
+        extension = Path(file_name).suffix.removeprefix(".").upper() or "-"
+        if media_type == "电影":
+            display_name = str(record.get("title") or "").strip()
+            if not display_name:
+                display_name = Path(file_name).stem or "-"
+        else:
+            try:
+                season = max(0, int(record.get("season") or 0))
+            except (TypeError, ValueError):
+                season = 0
+            target_episodes = record.get("target_episodes")
+            values = (
+                target_episodes
+                if isinstance(target_episodes, (list, tuple, set))
+                else re.findall(r"\d+", str(target_episodes or ""))
+            )
+            episodes = set()
+            for value in values:
+                try:
+                    episode = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if episode > 0:
+                    episodes.add(episode)
+            ordered = sorted(episodes)
+            season_label = f"S{season:02d}"
+            if len(ordered) > 1:
+                display_name = (
+                    f"{season_label}E{ordered[0]:02d}-E{ordered[-1]:02d}"
+                )
+            else:
+                try:
+                    episode = ordered[0] if ordered else int(
+                        record.get("episode") or 0
+                    )
+                except (TypeError, ValueError):
+                    episode = 0
+                display_name = (
+                    f"{season_label}E{episode:02d}"
+                    if episode > 0 else season_label
+                )
+
+        source = str(record.get("source") or "").strip().casefold()
+        source_url = str(
+            record.get("source_url") or record.get("media_page_url") or ""
+        ).strip()
+        has_source_link = (
+                source not in {"manual", "手动添加", "手动资源"}
+                and bool(re.match(r"^https?://", source_url, re.IGNORECASE))
+        )
+        source_link = source_url if has_source_link else ""
+        share_url = str(record.get("share_url") or "").strip()
+        resource_link = (
+            share_url
+            if re.match(r"^(?:https?|ed2k|magnet):", share_url, re.IGNORECASE)
+            else ""
+        )
+        return {
+            "history_group_key": group_key,
+            "display_name": display_name,
+            "display_file_name": file_name,
+            "file_extension": extension,
+            "source_link": source_link,
+            "resource_link": resource_link,
+        }
+
     @classmethod
     def _history_retry_state(cls, record: Dict[str, Any]) -> Tuple[bool, str]:
         status = str(record.get("status") or "")
@@ -881,6 +971,14 @@ class HistoryService(OwnerDelegator):
         prepared = []
         for source in records or []:
             record = copy.deepcopy(source)
+            record["resource_type"] = (
+                    normalize_resource_type(
+                        record.get("resource_type") or record.get("pan_type") or ""
+                    )
+                    or resource_type_from_url(record.get("share_url"))
+                    or "unknown"
+            )
+            record.update(cls._history_page_fields(record))
             is_cross = str(record.get("transfer_mode") or "") == "cross"
             record["is_cross_transfer"] = is_cross
             record["task_types"] = cls._history_task_types(record)

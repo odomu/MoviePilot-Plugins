@@ -257,6 +257,7 @@ class Dian115SearchService(OwnerDelegator):
             target_episodes: Optional[List[int]] = None,
             subscribe: Any = None,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         tmdb_id = mediainfo.tmdb_id or getattr(subscribe, "tmdbid", None)
         search_label = self._search_label(mediainfo, media_type, season)
@@ -320,10 +321,16 @@ class Dian115SearchService(OwnerDelegator):
                     inaccessible_skipped += 1
                     continue
                 candidates.append(candidate)
+                if test_mode and len(candidates) >= max(
+                        1, int(result_limit or self._dian115_candidate_limit)
+                ):
+                    break
 
             before_limit_count = len(candidates)
             if test_mode:
-                candidates = candidates[:100]
+                candidates = candidates[
+                    :max(1, int(result_limit or self._dian115_candidate_limit))
+                ]
             else:
                 candidates = self._prefilter_resource_order(
                     candidates,

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 from app.log import logger
 
+from ..common import DRIVE_RETRY_EXCEPTIONS
 from ...core.cloud import ShareLinkStatus
 from ...core.delegation import OwnerDelegator
 
@@ -106,7 +107,6 @@ class ShareService(OwnerDelegator):
 
         try:
             # 使用 share_snap 接口检查分享状态
-            self.rate_limiter.wait()
             payload = {
                 "share_code": share_code,
                 "receive_code": receive_code or "",
@@ -114,7 +114,11 @@ class ShareService(OwnerDelegator):
                 "limit": 1,  # 只获取1条记录，用于验证
                 "offset": 0,
             }
-            resp = self.client.share_snap(payload, **self._ios_request_kwargs(app=False))
+            resp = self._rate_limited_call(
+                self.client.share_snap,
+                payload,
+                **self._ios_request_kwargs(app=False),
+            )
 
             # 检查响应状态
             state = resp.get("state")
@@ -250,6 +254,39 @@ class ShareService(OwnerDelegator):
             self._share_file_cache[cache_key] = copy.deepcopy(files)
         return files
 
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> List[dict]:
+        """列出分享中的当前目录，并向预览接口保留真实异常。"""
+        if not P115_AVAILABLE:
+            raise RuntimeError("p115client 未安装")
+        info = self.extract_share_info(share_url)
+        share_code = info.get("share_code")
+        receive_code = info.get("receive_code")
+        if not share_code or not receive_code:
+            raise ValueError("无效的 115 分享链接或缺少提取码")
+        rows = self.rate_limiter.call(
+            lambda: list(share_iterdir(
+                self.client or None,
+                share_code=share_code,
+                receive_code=receive_code,
+                cid=int(parent_id or 0),
+                app="web",
+                cooldown=self.rate_limiter.min_interval,
+                max_workers=0,
+            ))
+        )
+        return [
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "size": int(item.get("size") or 0),
+                "is_dir": bool(item.get("is_dir")),
+                "sha1": str(item.get("sha1") or ""),
+            }
+            for item in rows
+        ]
+
     def _list_share_files_recursive(
             self,
             share_code: str,
@@ -266,18 +303,19 @@ class ShareService(OwnerDelegator):
 
         files = []
         try:
-            # 速率限制
-            self.rate_limiter.wait()
-
-            iterator = share_iterdir(
-                self.client,
-                share_code=share_code,
-                receive_code=receive_code,
-                cid=cid,
-                app="web",
+            rows = self.rate_limiter.call(
+                lambda: list(share_iterdir(
+                    self.client,
+                    share_code=share_code,
+                    receive_code=receive_code,
+                    cid=cid,
+                    app="web",
+                    cooldown=self.rate_limiter.min_interval,
+                    max_workers=0,
+                ))
             )
 
-            for item in iterator:
+            for item in rows:
                 file_info = {
                     "id": str(item.get("id", "")),
                     "name": item.get("name", ""),
@@ -659,9 +697,11 @@ class ShareService(OwnerDelegator):
         last_error = None
         for attempt in range(max_retries + 1):
             try:
-                self.rate_limiter.wait()
-                resp = self.client.share_receive(
+                resp = self._rate_limited_call(
+                    self.client.share_receive,
                     payload,
+                    retry_exceptions=DRIVE_RETRY_EXCEPTIONS,
+                    max_retries=0,
                     **self._ios_request_kwargs(app=False),
                 )
 
@@ -687,7 +727,7 @@ class ShareService(OwnerDelegator):
                     # 检查是否是可重试的错误（如限流）
                     if error_code in (990001, 990002, 990009):  # 常见的限流错误码
                         if attempt < max_retries:
-                            wait_time = (attempt + 1) * 2  # 递增等待时间
+                            wait_time = min(30.0, 1.0 * (2 ** attempt))
                             logger.warning(f"遇到限流，{wait_time}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
                             time.sleep(wait_time)
                             continue
@@ -695,15 +735,18 @@ class ShareService(OwnerDelegator):
                     logger.error(f"转存失败: {error_msg} (错误码: {error_code})")
                     return False
 
-            except Exception as e:
+            except DRIVE_RETRY_EXCEPTIONS as e:
                 last_error = e
                 if attempt < max_retries:
-                    wait_time = (attempt + 1) * 1.5
+                    wait_time = min(30.0, 0.75 * (2 ** attempt))
                     logger.warning(f"转存异常: {e}, {wait_time:.1f}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
                     time.sleep(wait_time)
                 else:
                     logger.error(f"转存过程中发生异常: {e}")
                     return False
+            except Exception as e:
+                logger.error(f"转存过程中发生不可重试异常: {e}")
+                return False
 
         return False
 

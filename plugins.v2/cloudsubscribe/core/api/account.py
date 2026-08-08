@@ -169,7 +169,6 @@ class AccountApi(OwnerDelegator):
                     proxy=settings.PROXY,
                     request_timeout=10,
                     request_interval=self._juying_request_interval,
-                    unlocks_per_minute=self._juying_unlocks_per_minute,
                     get_data_func=self.get_data,
                     save_data_func=self.save_data,
                 )

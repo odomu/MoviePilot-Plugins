@@ -20,7 +20,7 @@ class ConfigApi(OwnerDelegator):
     _AGENT_INT_RANGES = {"search_cache_ttl_minutes": (1, 1440), "search_concurrency": (1, 5),
                          "subscription_concurrency": (1, 5), "pansou_result_limit": (1, 100),
                          "hdhive_candidate_limit": (1, 20), "hdhive_unlocks_per_minute": (1, 3),
-                         "dian115_unlocks_per_minute": (1, 10), "juying_unlocks_per_minute": (1, 12)}
+                         "dian115_unlocks_per_minute": (1, 10)}
 
     def _queue_pending_config(self, payload: Dict[str, Any]) -> None:
         """保存运行期间最后一次配置，等待同步任务结束后应用。"""

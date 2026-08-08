@@ -195,6 +195,29 @@ class GuangyaShareService:
             logger.warning(f"读取光鸭分享文件失败：{error}")
             return []
 
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> list:
+        """列出分享中的当前目录，并向预览接口保留真实异常。"""
+        if self._offline.is_offline_url(share_url):
+            return self.list_share_files(share_url)
+        _, token = self._share_access(share_url)
+        result = []
+        page = 1
+        while True:
+            response = self._share_files(
+                token, str(parent_id or ""), page, self.page_size
+            )
+            if not self.client.is_success(response):
+                raise RuntimeError(
+                    response.get("msg") or response.get("error") or "读取光鸭分享目录失败"
+                )
+            items = list_data(self.client, response)
+            result.extend(dict(item) for raw in items if (item := cloud_file(raw)))
+            if len(items) < self.page_size:
+                return result
+            page += 1
+
     def _restore_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str
     ) -> bool:

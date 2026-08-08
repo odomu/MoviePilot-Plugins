@@ -197,14 +197,9 @@ class ButailingClient:
             selected = None
             for keyword in normalized_keywords:
                 rows = self._search_rows(keyword)
-                if test_mode:
-                    selected = next(
-                        (row for row in rows if row.get("doub_id")), None
-                    )
-                else:
-                    selected = self._select_row(
-                        rows, titles, year, media_type, season, douban_id
-                    )
+                selected = self._select_row(
+                    rows, titles, year, media_type, season, douban_id
+                )
                 if selected:
                     break
             if not selected:

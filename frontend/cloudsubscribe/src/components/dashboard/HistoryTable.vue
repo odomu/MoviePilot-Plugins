@@ -227,7 +227,10 @@
     >
       <template #item.media="{ item }">
         <div class="media-cell">
-          <span class="media-title font-weight-medium">
+          <span
+              class="media-title font-weight-medium"
+              :title="item.title + (item.year ? ` (${item.year})` : '')"
+          >
             {{ item.title }}<span v-if="item.year"> ({{ item.year }})</span>
           </span>
           <v-btn
@@ -241,11 +244,8 @@
               @click.stop="openMediaDetail(item)"
           />
         </div>
-        <div class="text-caption text-medium-emphasis">
-          {{
-            item.type
-          }}<span v-if="item.season_label"> · {{ item.season_label }}</span> ·
-          {{ item.records.length }} 条记录
+        <div class="media-meta text-caption text-medium-emphasis">
+          {{ item.type }} · {{ item.records.length }} 条记录
           <span> · {{ formatSize(item.total_size) }}</span>
         </div>
       </template>
@@ -283,23 +283,20 @@
           >
             多渠道
           </v-chip>
-          <div v-else class="source-summary-links">
-          <template v-for="source in item.source_items" :key="source.value">
-            <a
-                v-if="source.url"
-                :href="source.url"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="source-link"
-                @click.stop
-            >
-              {{ sourceLabel(source.value) }}
-              <v-icon icon="mdi-open-in-new" size="x-small"/>
-            </a>
-            <span v-else>{{ sourceLabel(source.value) }}</span>
-          </template>
-          </div>
+          <span v-else>{{ sourceLabel(item.source_items[0]?.value) }}</span>
         </div>
+      </template>
+
+      <template #item.resource_links="{ item }">
+        <v-chip
+            v-if="item.resource_link_count"
+            prepend-icon="mdi-link-variant"
+            variant="tonal"
+            size="x-small"
+        >
+          {{ item.resource_link_count }} 个
+        </v-chip>
+        <span v-else class="text-medium-emphasis">-</span>
       </template>
 
       <template #item.summary="{ item }">
@@ -359,9 +356,11 @@
             <v-table density="compact" class="detail-table">
               <thead>
               <tr>
-                <th>文件 / 剧集</th>
-                <th>资源类型</th>
+                <th>名称</th>
+                <th>类型</th>
+                <th>格式</th>
                 <th>来源</th>
+                <th>资源</th>
                 <th>大小</th>
                 <th>状态</th>
                 <th>时间</th>
@@ -375,9 +374,12 @@
               >
                 <td>
                   <div class="d-flex align-center ga-1">
-                      <span v-if="record.type !== '电影'" class="episode-label">
-                        {{ episodeLabel(record) }}
-                      </span>
+                    <span
+                        class="record-name"
+                        :title="record.display_name || '-'"
+                    >
+                      {{ record.display_name || "-" }}
+                    </span>
                     <v-chip
                         v-if="record.upgrade"
                         size="x-small"
@@ -401,8 +403,12 @@
                       </v-tooltip>
                     </v-chip>
                   </div>
-                  <div class="text-caption text-medium-emphasis file-name">
-                    {{ record.file_name || "-" }}
+                  <div
+                      v-if="record.type !== '电影'"
+                      class="record-file-name text-caption text-medium-emphasis"
+                      :title="record.display_file_name || '-'"
+                  >
+                    {{ record.display_file_name || "-" }}
                   </div>
                 </td>
                 <td>
@@ -415,18 +421,39 @@
                   </v-chip>
                 </td>
                 <td>
+                  <v-chip size="x-small" variant="tonal">
+                    {{ record.file_extension || "-" }}
+                  </v-chip>
+                </td>
+                <td>
                   <a
-                      v-if="sourceLink(record)"
-                      :href="sourceLink(record)"
+                      v-if="record.source_link"
+                      :href="record.source_link"
                       target="_blank"
                       rel="noopener noreferrer"
                       class="source-link"
+                      title="打开来源详情页"
                       @click.stop
                   >
                     {{ sourceLabel(record.source) }}
                     <v-icon icon="mdi-open-in-new" size="x-small"/>
                   </a>
                   <span v-else>{{ sourceLabel(record.source) }}</span>
+                </td>
+                <td>
+                  <a
+                      v-if="record.resource_link"
+                      :href="record.resource_link"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="source-link"
+                      title="打开资源链接"
+                      @click.stop
+                  >
+                    打开
+                    <v-icon icon="mdi-open-in-new" size="x-small"/>
+                  </a>
+                  <span v-else>-</span>
                 </td>
                 <td class="text-no-wrap">
                   {{ formatSize(record.file_size) }}
@@ -632,8 +659,11 @@
                   class="history-mobile-record"
               >
                 <div class="history-mobile-record-head">
-                  <span v-if="record.type !== '电影'" class="episode-label">
-                    {{ episodeLabel(record) }}
+                  <span
+                      class="record-name"
+                      :title="record.display_name || '-'"
+                  >
+                    {{ record.display_name || "-" }}
                   </span>
                   <v-chip
                       v-if="record.upgrade"
@@ -698,24 +728,40 @@
                     />
                   </div>
                 </div>
-                <div class="history-mobile-file text-caption">
-                  {{ record.file_name || "-" }}
+                <div
+                    v-if="record.type !== '电影'"
+                    class="history-mobile-file text-caption text-medium-emphasis"
+                    :title="record.display_file_name || '-'"
+                >
+                  {{ record.display_file_name || "-" }}
                 </div>
                 <div class="history-mobile-record-footer">
                   <div
                       class="history-mobile-record-meta text-caption text-medium-emphasis"
                   >
                     <span>{{ resourceTypeLabel(resourceType(record)) }}</span>
+                    <span>{{ record.file_extension || "-" }}</span>
                     <a
-                        v-if="sourceLink(record)"
-                        :href="sourceLink(record)"
+                        v-if="record.source_link"
+                        :href="record.source_link"
                         target="_blank"
                         rel="noopener noreferrer"
                         class="source-link"
+                        title="打开来源详情页"
                         @click.stop
-                    >{{ sourceLabel(record.source) }}</a
+                    >来源：{{ sourceLabel(record.source) }}</a
                     >
-                    <span v-else>{{ sourceLabel(record.source) }}</span>
+                    <span v-else>来源：{{ sourceLabel(record.source) }}</span>
+                    <a
+                        v-if="record.resource_link"
+                        :href="record.resource_link"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="source-link"
+                        title="打开资源链接"
+                        @click.stop
+                    >资源链接</a
+                    >
                     <span>{{ formatSize(record.file_size) }}</span>
                   </div>
                   <span
@@ -782,6 +828,12 @@ const mobilePageSize = 10;
 const sourceNames = {
   hdhive: "HDHive",
   pansou: "PanSou",
+  dian115: "Dian115",
+  juying: "聚影",
+  seedhub: "SeedHub",
+  butailing: "不太灵",
+  pinglian: "盘链",
+  online_docs: "在线文档",
   manual: "手动添加",
   unknown: "未知",
 };
@@ -797,13 +849,14 @@ const pageSizes = [
   {value: -1, title: "全部"},
 ];
 const headers = [
-  {title: "媒体", key: "media", sortable: false, width: "26%"},
-  {title: "类型", key: "resource_types", sortable: false, width: "14%"},
-  {title: "来源", key: "sources", sortable: false, width: "12%"},
-  {title: "汇总", key: "summary", sortable: false, width: "18%"},
-  {title: "时间", key: "latest_time", width: 140},
-  {title: "", key: "actions", sortable: false, width: 104},
-  {title: "", key: "data-table-expand", width: 48},
+  {title: "媒体", key: "media", sortable: false, width: "25%"},
+  {title: "类型", key: "resource_types", sortable: false, width: "8%"},
+  {title: "来源", key: "sources", sortable: false, width: "10%"},
+  {title: "资源", key: "resource_links", sortable: false, width: "8%"},
+  {title: "汇总", key: "summary", sortable: false, width: "17%"},
+  {title: "时间", key: "latest_time", width: 172},
+  {title: "", key: "actions", sortable: false, width: 112},
+  {title: "", key: "data-table-expand", width: 44},
 ];
 
 const resourceTypeOptions = computed(() =>
@@ -869,9 +922,9 @@ const groupedItems = computed(() => {
   const groups = new Map();
   for (const record of filteredRecords.value) {
     const mediaType = record.type || "未知类型";
-    const groupKey = record.tmdb_id
-        ? `tmdb:${mediaType}:${record.tmdb_id}`
-        : `legacy:${mediaType}:${record.title || ""}:${record.year || ""}`;
+    const groupKey = String(
+        record.history_group_key || record.time || record.file_name || groups.size,
+    );
     if (!groups.has(groupKey)) {
       groups.set(groupKey, {
         group_key: groupKey,
@@ -910,15 +963,12 @@ const groupedItems = computed(() => {
             group.records.map((record) => normalizeSource(record.source)),
         ),
         seasons: historySeasons(group.records),
-        season_label: formatSeasonLabel(historySeasons(group.records)),
         source_items: uniqueOptions(
             group.records.map((record) => normalizeSource(record.source)),
-        ).map((value) => {
-          const record = group.records.find(
-              (item) => normalizeSource(item.source) === value && sourceLink(item),
-          );
-          return {value, url: record ? sourceLink(record) : ""};
-        }),
+        ).map((value) => ({value})),
+        resource_link_count: uniqueOptions(
+            group.records.map((record) => record.resource_link),
+        ).length,
         notification_record:
             [...group.records]
                 .filter(canNotifyRecord)
@@ -1013,11 +1063,6 @@ function historySeasons(records) {
   ].sort((left, right) => left - right);
 }
 
-function formatSeasonLabel(seasons) {
-  if (!seasons.length) return "";
-  return seasons.map((season) => `S${pad(season)}`).join("、");
-}
-
 function normalizeSource(value) {
   const normalized =
       String(value || "unknown")
@@ -1035,14 +1080,10 @@ function sourceLabel(value) {
 
 function resourceType(item) {
   if (typeof item === "string") return item.trim().toLowerCase();
-  const configured = String(item.resource_type || "")
+  const configured = String(item?.resource_type || "")
       .trim()
       .toLowerCase();
-  if (configured) return configured;
-  const link = String(item.share_url || "").toLowerCase();
-  if (link.startsWith("ed2k://")) return "ed2k";
-  if (link.startsWith("magnet:?")) return "magnet";
-  return "115";
+  return configured || "unknown";
 }
 
 function resourceTypeLabel(value) {
@@ -1057,6 +1098,7 @@ function resourceTypeLabel(value) {
     aliyun: "阿里云盘",
     ed2k: "ED2K",
     magnet: "Magnet",
+    unknown: "未知",
   }[normalized] || normalized.toUpperCase();
 }
 
@@ -1067,11 +1109,6 @@ function resourceTypeColor(value) {
       : normalized === "magnet"
           ? "purple"
           : "info";
-}
-
-function sourceLink(item) {
-  const link = String(item.source_url || "").trim();
-  return /^https?:\/\//i.test(link) ? link : "";
 }
 
 function mediaDetailLink(item) {
@@ -1130,26 +1167,6 @@ function recordKey(record, index) {
     record.episode,
     index,
   ].join(":");
-}
-
-function episodeLabel(record) {
-  const season = `S${pad(record.season)}`;
-  const targetEpisodes = Array.isArray(record.target_episodes)
-      ? record.target_episodes
-      : String(record.target_episodes || "")
-          .split(/[^0-9]+/)
-          .filter(Boolean);
-  const episodes = [
-    ...new Set(
-        targetEpisodes
-            .map((value) => Number(value))
-            .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  ].sort((left, right) => left - right);
-  if (episodes.length > 1)
-    return `${season}E${pad(episodes[0])}-E${pad(episodes[episodes.length - 1])}`;
-  const episode = episodes[0] || Number(record.episode || 0);
-  return episode > 0 ? `${season}E${pad(episode)}` : season;
 }
 
 function historyRetryKey(record) {
@@ -1404,10 +1421,14 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
 .summary-counts {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
+  overflow: hidden;
   gap: 5px;
   font-size: 0.75rem;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .summary-actions,
@@ -1446,16 +1467,10 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
 .source-summary {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 4px;
   min-width: 0;
-}
-
-.source-summary-links {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 4px 8px;
-  min-width: 0;
+  white-space: nowrap;
 }
 
 .mixed-resource-types {
@@ -1499,9 +1514,51 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
   color: rgb(var(--v-theme-on-surface-variant));
 }
 
+.detail-table :deep(th:first-child),
 .detail-table :deep(td:first-child) {
-  width: 28%;
+  width: 14%;
   min-width: 0;
+}
+
+.detail-table :deep(th:nth-child(2)),
+.detail-table :deep(td:nth-child(2)) {
+  width: 10%;
+}
+
+.detail-table :deep(th:nth-child(3)),
+.detail-table :deep(td:nth-child(3)) {
+  width: 8%;
+}
+
+.detail-table :deep(th:nth-child(4)),
+.detail-table :deep(td:nth-child(4)) {
+  width: 12%;
+}
+
+.detail-table :deep(th:nth-child(5)),
+.detail-table :deep(td:nth-child(5)) {
+  width: 10%;
+}
+
+.detail-table :deep(th:nth-child(6)),
+.detail-table :deep(td:nth-child(6)) {
+  width: 10%;
+}
+
+.detail-table :deep(th:nth-child(7)),
+.detail-table :deep(td:nth-child(7)) {
+  width: 9%;
+}
+
+.detail-table :deep(th:nth-child(8)),
+.detail-table :deep(td:nth-child(8)) {
+  width: 140px;
+}
+
+.detail-table :deep(td:not(:first-child)) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .action-column {
@@ -1523,16 +1580,22 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
   display: inline-block;
   min-width: 0;
   line-height: 1.35;
-  white-space: normal;
+  white-space: nowrap;
 }
 
-.episode-label {
+.record-name {
+  min-width: 0;
+  overflow: hidden;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.file-name {
-  max-width: 260px;
-  overflow-wrap: anywhere;
+.record-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .media-cell {
@@ -1544,7 +1607,15 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
 
 .media-title {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .media-link {
@@ -1713,9 +1784,12 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
 }
 
 .history-mobile-file {
+  min-width: 0;
   margin-top: 2px;
+  overflow: hidden;
   line-height: 1.35;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .history-mobile-pagination {

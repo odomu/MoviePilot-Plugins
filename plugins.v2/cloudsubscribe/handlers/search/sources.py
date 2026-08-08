@@ -7,6 +7,7 @@ from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
 from ...core import OwnerDelegator
+from ...search.types import RESOURCE_TYPE_ORDER
 from ...utils import parse_magnet_metadata
 
 
@@ -27,6 +28,7 @@ class PanSouSearchService(OwnerDelegator):
             media_type: MediaType,
             season: Optional[int] = None,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict]:
         """
         PanSou 搜索的通用逻辑
@@ -42,15 +44,22 @@ class PanSouSearchService(OwnerDelegator):
         ).strip()
         if title_en:
             titles.append(title_en)
+        effective_limit = (
+            max(1, int(result_limit or self._pansou_result_limit))
+            if test_mode else self._pansou_result_limit
+        )
         search_results = self._pansou_client.search(
             keyword=keyword,
-            cloud_types=[] if test_mode else [
+            cloud_types=[
                 "aliyun" if value == "alipan" else value
-                for value in self._resource_type_order_config
+                for value in (
+                    RESOURCE_TYPE_ORDER
+                    if test_mode else self._resource_type_order_config
+                )
             ],
             channels=[] if test_mode else self._pansou_channels,
             plugins=[] if test_mode else self._pansou_plugins,
-            limit=100 if test_mode else self._pansou_result_limit,
+            limit=effective_limit,
             expected_titles=titles,
             expected_year=getattr(mediainfo, "year", None),
             filter_config={} if test_mode else self._pansou_filter,
@@ -76,14 +85,30 @@ class PanSouSearchService(OwnerDelegator):
             return []
 
         results = search_results.get("results", {})
-        candidates = [
-            item
-            for group in results.values()
-            if isinstance(group, list)
-            for item in group
-            if test_mode
-               or self._pansou_resource_type(item) in self._resource_type_order_config
-        ]
+        groups = [group for group in results.values() if isinstance(group, list)]
+        if test_mode:
+            candidates = []
+            offsets = [0] * len(groups)
+            while groups and len(candidates) < effective_limit:
+                for index in range(len(groups) - 1, -1, -1):
+                    group = groups[index]
+                    offset = offsets[index]
+                    if offset >= len(group):
+                        groups.pop(index)
+                        offsets.pop(index)
+                        continue
+                    candidates.append(group[offset])
+                    offsets[index] += 1
+                    if len(candidates) >= effective_limit:
+                        break
+        else:
+            candidates = [
+                item
+                for group in groups
+                for item in group
+                if self._pansou_resource_type(item)
+                   in self._resource_type_order_config
+            ]
         magnet_results = [
             item for item in candidates if self._pansou_resource_type(item) == "magnet"
         ]
@@ -140,6 +165,7 @@ class PanSouSearchService(OwnerDelegator):
             self,
             mediainfo: MediaInfo,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict]:
         """
         仅使用 PanSou 搜索电影资源
@@ -153,7 +179,8 @@ class PanSouSearchService(OwnerDelegator):
 
         keyword = f"{mediainfo.title} {mediainfo.year or ''}".strip()
         results = self._pansou_search(
-            keyword, mediainfo, MediaType.MOVIE, test_mode=test_mode
+            keyword, mediainfo, MediaType.MOVIE, test_mode=test_mode,
+            result_limit=result_limit,
         )
         return results
 
@@ -162,6 +189,7 @@ class PanSouSearchService(OwnerDelegator):
             mediainfo: MediaInfo,
             season: int,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict]:
         """
         仅使用 PanSou 搜索电视剧资源
@@ -177,6 +205,7 @@ class PanSouSearchService(OwnerDelegator):
         season_number = max(1, int(season or 1))
         keyword = str(mediainfo.title or "").strip()
         results = self._pansou_search(
-            keyword, mediainfo, MediaType.TV, season_number, test_mode=test_mode
+            keyword, mediainfo, MediaType.TV, season_number,
+            test_mode=test_mode, result_limit=result_limit,
         )
         return results

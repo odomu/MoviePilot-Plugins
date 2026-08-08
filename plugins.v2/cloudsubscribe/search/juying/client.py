@@ -7,11 +7,11 @@ from typing import Any, Callable, Dict, Optional
 from app.log import logger
 
 from ..http_client import (
-    AccountActionGate,
     RequestGate,
     gated_idempotent_request,
     gated_request,
     normalize_proxies,
+    request_error_summary,
     requests,
 )
 
@@ -47,20 +47,20 @@ class JuyingClient:
             proxy: Any = None,
             request_timeout: int = 30,
             request_interval: float = 1.0,
-            unlocks_per_minute: int = 8,
             get_data_func: Optional[Callable] = None,
             save_data_func: Optional[Callable] = None,
+            cache_namespace: str = "",
     ):
         self.base_url = str(base_url or self.BASE_URL).rstrip("/")
         self.username = str(username or "").strip()
         self.password = str(password or "")
         self._proxies = normalize_proxies(proxy)
         self._request_timeout = max(5, min(int(request_timeout or 30), 60))
-        self._session = requests.Session(impersonate="chrome")
-        self._session.headers.update(self._HEADERS)
+        self._session = self._create_session()
         self._token = ""
         self._get_data_func = get_data_func
         self._save_data_func = save_data_func
+        self.cache_namespace = str(cache_namespace or "").strip()
         self._lock = threading.RLock()
         self._circuit_open_until = 0.0
         self._request_gate = RequestGate.shared(
@@ -69,13 +69,34 @@ class JuyingClient:
             request_interval=request_interval,
             minimum_interval=1,
         )
-        self._access_gate = AccountActionGate.shared(
-            "聚影解锁接口",
-            f"juying:{self.username.casefold()}",
-            max_actions=unlocks_per_minute,
-            maximum_actions=12,
-        )
         self._restore_token()
+
+    @property
+    def _timeout(self) -> tuple[int, int]:
+        return min(15, self._request_timeout), self._request_timeout
+
+    @classmethod
+    def _create_session(cls):
+        session = requests.Session(impersonate="chrome")
+        session.headers.update(cls._HEADERS)
+        return session
+
+    def _session_request(self, *args, **kwargs):
+        return self._session.request(*args, **kwargs)
+
+    def _reset_transport(self, error: BaseException, attempt: int) -> None:
+        cookies = self._session.cookies.get_dict()
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = self._create_session()
+        for name, value in cookies.items():
+            self._session.cookies.set(name, value)
+        logger.debug(
+            f"聚影连接异常后重建 HTTP 会话："
+            f"{type(error).__name__}，重试={attempt}"
+        )
 
     def _restore_token(self) -> None:
         if not self._get_data_func:
@@ -148,29 +169,42 @@ class JuyingClient:
                 self._restore_token()
                 if self._token:
                     return
-            csrf_response = gated_idempotent_request(
-                self._request_gate,
-                self._session.request,
-                "GET",
-                f"{self.base_url}/api/csrf/",
-                retry_connection_errors=False,
-                proxies=self._proxies,
-                timeout=(8, self._request_timeout),
-            )
+            try:
+                csrf_response = gated_idempotent_request(
+                    self._request_gate,
+                    self._session_request,
+                    "GET",
+                    f"{self.base_url}/api/csrf/",
+                    on_retry=self._reset_transport,
+                    proxies=self._proxies,
+                    timeout=self._timeout,
+                )
+            except requests.exceptions.RequestException as error:
+                raise JuyingError(
+                    f"聚影登录初始化失败：{request_error_summary(error)}",
+                    "juying_login_failed",
+                ) from error
             if csrf_response.status_code != 200:
                 raise JuyingError(
                     f"聚影 CSRF 初始化失败（HTTP {csrf_response.status_code}）",
                     "juying_login_failed",
                 )
-            response = gated_request(
-                self._request_gate,
-                self._session.post,
-                f"{self.base_url}/api/app/login/",
-                json={"username": self.username, "password": self.password},
-                headers=self._csrf_headers(),
-                proxies=self._proxies,
-                timeout=(8, self._request_timeout),
-            )
+            try:
+                response = gated_request(
+                    self._request_gate,
+                    self._session_request,
+                    "POST",
+                    f"{self.base_url}/api/app/login/",
+                    json={"username": self.username, "password": self.password},
+                    headers=self._csrf_headers(),
+                    proxies=self._proxies,
+                    timeout=self._timeout,
+                )
+            except requests.exceptions.RequestException as error:
+                raise JuyingError(
+                    f"聚影登录失败：{request_error_summary(error)}",
+                    "juying_login_failed",
+                ) from error
             if response.status_code != 200 or not self._json_response(response):
                 raise JuyingError(
                     f"聚影登录失败（HTTP {response.status_code}）",
@@ -205,22 +239,20 @@ class JuyingClient:
             def request():
                 return gated_idempotent_request(
                     self._request_gate,
-                    self._session.request,
+                    self._session_request,
                     method,
                     f"{self.base_url}{path}",
-                    retry_connection_errors=False,
+                    on_retry=self._reset_transport,
                     headers=headers,
                     proxies=self._proxies,
-                    timeout=(8, self._request_timeout),
+                    timeout=self._timeout,
                     **kwargs,
                 )
 
-            response = (
-                self._access_gate.run(request) if protected_access else request()
-            )
+            response = request()
         except requests.exceptions.RequestException as error:
             raise JuyingError(
-                f"聚影请求失败：{type(error).__name__}",
+                f"聚影请求失败：{request_error_summary(error)}",
                 "juying_request_failed",
             ) from error
 

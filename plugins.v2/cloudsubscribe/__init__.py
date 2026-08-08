@@ -59,10 +59,10 @@ from .search.hdhive import (
     HDHiveTokenStore, HDHiveTokenStoreError,
 )
 from .search.juying import JuyingClient
+from .search.online_docs import OnlineDocumentClient
 from .search.pansou import PanSouClient
 from .search.pinglian import PinglianClient
 from .search.seedhub import SeedHubClient
-from .search.online_docs import OnlineDocumentClient
 
 _COMPONENT_TYPES = (
     PageApi,
@@ -95,7 +95,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -242,7 +242,6 @@ class CloudSubscribe(_PluginBase):
     _juying_password: str = ""
     _juying_result_limit: int = 5
     _juying_request_interval: float = 1.0
-    _juying_unlocks_per_minute: int = 8
     _pinglian_enabled: bool = False
     _pinglian_username: str = ""
     _pinglian_password: str = ""
@@ -735,9 +734,6 @@ class CloudSubscribe(_PluginBase):
             self._juying_request_interval = max(
                 0.5, min(float(config.get("juying_request_interval", 1) or 1), 10.0)
             )
-            self._juying_unlocks_per_minute = max(
-                1, min(int(config.get("juying_unlocks_per_minute", 8) or 8), 12)
-            )
             self._pinglian_enabled = "pinglian" in selected_sources
             self._pinglian_username = str(
                 config.get("pinglian_username", "") or ""
@@ -1134,7 +1130,6 @@ class CloudSubscribe(_PluginBase):
                 password=self._juying_password,
                 proxy=proxy,
                 request_interval=self._juying_request_interval,
-                unlocks_per_minute=self._juying_unlocks_per_minute,
                 get_data_func=self.get_data,
                 save_data_func=self.save_data,
             )
@@ -1687,7 +1682,6 @@ class CloudSubscribe(_PluginBase):
             "juying_password": self._juying_password,
             "juying_result_limit": self._juying_result_limit,
             "juying_request_interval": self._juying_request_interval,
-            "juying_unlocks_per_minute": self._juying_unlocks_per_minute,
             "pinglian_username": self._pinglian_username,
             "pinglian_password": self._pinglian_password,
             "pinglian_result_limit": self._pinglian_result_limit,

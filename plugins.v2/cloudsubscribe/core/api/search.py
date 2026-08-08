@@ -2,7 +2,6 @@
 
 import ast
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -14,14 +13,21 @@ from app.schemas.types import MediaType
 from app.utils.string import StringUtils
 
 from .. import OwnerDelegator
+from ..cloud import CloudDriveCapability
 from ..config import UIConfig
-
-_SEARCH_TEST_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="CloudSubscribe-SearchTest")
-_SEARCH_TEST_TIMEOUT_SECONDS = 30
+from ...search.types import (
+    PREVIEW_PROVIDER_KEYS,
+    PREVIEW_RESOURCE_TYPES,
+    RESOURCE_TYPE_PRIORITY,
+    SUPPORTED_RESOURCE_TYPES,
+    normalize_resource_type,
+    resource_type_name,
+)
+from ...utils import parse_magnet_metadata
 
 
 class SearchApi(OwnerDelegator):
-    _SEARCH_TEST_RESULT_LIMIT = 20
+    _SEARCH_TEST_DISPLAY_LIMIT = 10
     _SEARCH_TEST_CONFIG_FIELDS = {
         "pansou": frozenset({
             "pansou_url", "pansou_username", "pansou_password",
@@ -47,7 +53,7 @@ class SearchApi(OwnerDelegator):
         "juying": frozenset({
             "juying_base_url",
             "juying_username", "juying_password", "juying_result_limit",
-            "juying_request_interval", "juying_unlocks_per_minute",
+            "juying_request_interval",
         }),
         "seedhub": frozenset({"seedhub_result_limit"}),
         "butailing": frozenset({"butailing_result_limit"}),
@@ -59,6 +65,163 @@ class SearchApi(OwnerDelegator):
             "online_docs", "online_docs_urls", "online_docs_resource_types"
         }),
     }
+
+    @staticmethod
+    def _preview_error_message(error: Exception) -> str:
+        """优先返回第三方异常携带的结构化错误信息。"""
+        for value in reversed(getattr(error, "args", ())):
+            if not isinstance(value, dict):
+                continue
+            message = value.get("message") or value.get("msg") or value.get("error")
+            if message:
+                return str(message)
+        return str(error) or error.__class__.__name__
+
+    @staticmethod
+    def _preview_file(item: Any) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            item = getattr(item, "__dict__", {}) or {}
+        name = next((str(item.get(key) or "").strip() for key in
+                     ("name", "file_name", "filename", "fileName")
+                     if item.get(key)), "")
+        size = next((item.get(key) for key in
+                     ("size", "file_size", "fileSize")
+                     if item.get(key) is not None), 0)
+        is_dir = bool(item.get("is_dir") or item.get("is_folder")
+                      or item.get("isDirectory") or item.get("type") == "folder")
+        file_id = next((str(item.get(key) or "").strip() for key in
+                        ("id", "file_id", "fileId", "fid", "cid")
+                        if item.get(key) is not None), "")
+        return {
+            "id": file_id,
+            "name": name or "未命名文件",
+            "size": size or 0,
+            "is_dir": is_dir,
+            "can_enter": bool(is_dir and file_id),
+        }
+
+    def api_vue_preview_search_resource(self, payload: Dict[str, Any]) -> dict:
+        """只读获取测试资源的文件列表。"""
+        payload = dict(payload or {})
+        source = str(payload.get("source") or "").strip().lower()
+        juying_resource_id = str(
+            payload.get("juying_resource_id") or ""
+        ).strip()
+        resource_type = normalize_resource_type(payload.get("resource_type"))
+        url = str(payload.get("url") or "").strip()
+        parent_id = str(payload.get("parent_id") or "").strip()
+        pending_juying = source == "juying" and bool(juying_resource_id)
+        if (not url and not pending_juying) or len(url) > 8192:
+            return {"success": False, "message": "资源链接无效"}
+        if pending_juying and (
+                len(juying_resource_id) > 32
+                or not juying_resource_id.isdigit()
+        ):
+            return {"success": False, "message": "聚影资源标识无效"}
+        if len(parent_id) > 256:
+            return {"success": False, "message": "目录标识无效"}
+        try:
+            if pending_juying and not url:
+                if parent_id:
+                    return {"success": False, "message": "聚影资源链接已失效，请重新预览"}
+                handler = self._build_test_search_handler(
+                    "juying",
+                    self._test_search_config("juying", payload.get("config")),
+                )
+                try:
+                    resolved = handler.resolve_juying_resource(juying_resource_id)
+                finally:
+                    handler.close(release_cache=False)
+                url = str(resolved.get("url") or "").strip()
+                resource_type = normalize_resource_type(
+                    resolved.get("resource_type")
+                )
+                if not url:
+                    raise RuntimeError("聚影资源链接为空")
+            if resource_type == "magnet":
+                if parent_id:
+                    return {"success": False, "message": "磁力链接不支持目录导航"}
+                metadata = parse_magnet_metadata(url, fetch_info=True, timeout=12)
+                files = [
+                    {"name": str(entry.get("path") or entry.get("name") or "未命名文件"),
+                     "size": int(entry.get("size") or 0), "is_dir": False}
+                    for entry in (metadata.get("torrent_file_entries") or [])
+                ]
+                if not files:
+                    raise RuntimeError("暂未获取到该磁力链接的 torrent 元数据")
+                return {
+                    "success": True,
+                    "message": f"读取到 {len(files)} 个文件",
+                    "data": {
+                        "items": files, "count": len(files),
+                        "provider_name": "",
+                        "resource_type": "magnet",
+                        "resource_type_name": resource_type_name("magnet"),
+                        "share_url": url,
+                        "parent_id": "",
+                        "info_hash": metadata.get("info_hash"),
+                        "display_name": metadata.get("display_name"),
+                        "size": metadata.get("size") or 0
+                    }
+                }
+
+            provider_key = PREVIEW_PROVIDER_KEYS.get(resource_type)
+            if not provider_key or not self._cloud_drive_registry:
+                return {"success": False, "message": "当前资源类型暂不支持内容预览"}
+            provider = self._cloud_drive_registry.get(provider_key)
+            if not provider or not provider.supports(CloudDriveCapability.SHARE_TRANSFER):
+                return {"success": False, "message": "对应网盘未配置或不支持分享预览"}
+            service = provider.require(CloudDriveCapability.SHARE_TRANSFER)
+            raw_files = service.list_share_directory(url, parent_id=parent_id) or []
+            files = [self._preview_file(item) for item in raw_files][:500]
+            return {
+                "success": True,
+                "message": f"读取到 {len(files)} 个项目",
+                "data": {
+                    "items": files, "count": len(files),
+                    "provider_name": provider.name,
+                    "resource_type": resource_type,
+                    "resource_type_name": resource_type_name(
+                        resource_type, provider.name
+                    ),
+                    "share_url": url,
+                    "parent_id": parent_id,
+                }
+            }
+        except Exception as error:
+            message = self._preview_error_message(error)
+            logger.warning(f"测试资源预览失败：{resource_type} - {message}")
+            return {"success": False, "message": f"预览失败：{message}"}
+
+    def api_vue_unlock_search_resource(self, payload: Dict[str, Any]) -> dict:
+        payload = dict(payload or {})
+        source = str(payload.get("source") or "").strip().lower()
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        try:
+            points = max(0, int(item.get("unlock_points") or 0))
+            if points <= 0:
+                return {"success": False, "message": "该资源不需要积分解锁"}
+            handler = self._build_test_search_handler(source, self._test_search_config(source, payload.get("config")))
+            try:
+                if source == "hdhive":
+                    url = handler.unlock_hdhive_resource(
+                        str(item.get("slug") or item.get("id") or ""), points,
+                        str(item.get("resource_type") or ""), str(item.get("media_page_url") or ""),
+                    )
+                elif source == "dian115":
+                    url = handler.unlock_dian115_resource(
+                        int(item.get("share_id") or 0), int(item.get("resource_id") or 0), points,
+                    )
+                else:
+                    return {"success": False, "message": "当前搜索源不支持积分解锁"}
+            finally:
+                handler.close(release_cache=False)
+            if not url:
+                return {"success": False, "message": "资源解锁失败"}
+            return {"success": True, "message": "资源已解锁", "data": {"url": url}}
+        except Exception as error:
+            logger.warning(f"测试资源解锁失败：{source} - {error}")
+            return {"success": False, "message": f"解锁失败：{error}"}
 
     def _test_search_config(
             self, source: str, overrides: Any
@@ -194,11 +357,9 @@ class SearchApi(OwnerDelegator):
                 request_interval=float(
                     config.get("juying_request_interval", 1) or 1
                 ),
-                unlocks_per_minute=int(
-                    config.get("juying_unlocks_per_minute", 8) or 8
-                ),
                 get_data_func=self.get_data,
                 save_data_func=self.save_data,
+                cache_namespace="test-preview",
             )
         pinglian_client = None
         online_docs_client = OnlineDocumentClient(
@@ -256,28 +417,28 @@ class SearchApi(OwnerDelegator):
             pansou_filter_exclude=config.get("pansou_filter_exclude") or [],
             resource_type_order=resource_type_order,
             pansou_concurrency=config.get("pansou_concurrency") or None,
-            pansou_result_limit=min(
-                10, int(config.get("pansou_result_limit", 10) or 10)
+            pansou_result_limit=int(
+                config.get("pansou_result_limit", 10) or 10
             ),
             pansou_refresh=False,
             pansou_timeout=pansou_timeout,
-            seedhub_result_limit=min(
-                5, int(config.get("seedhub_result_limit", 20) or 20)
+            seedhub_result_limit=int(
+                config.get("seedhub_result_limit", 20) or 20
             ),
-            butailing_result_limit=min(
-                10, int(config.get("butailing_result_limit", 20) or 20)
+            butailing_result_limit=int(
+                config.get("butailing_result_limit", 20) or 20
             ),
-            juying_result_limit=min(
-                5, int(config.get("juying_result_limit", 5) or 5)
+            juying_result_limit=int(
+                config.get("juying_result_limit", 5) or 5
             ),
-            pinglian_result_limit=min(
-                10, int(config.get("pinglian_result_limit", 10) or 10)
+            pinglian_result_limit=int(
+                config.get("pinglian_result_limit", 20) or 20
             ),
             search_source_order=[source],
             search_cache_enabled=False,
             search_concurrency=1,
-            hdhive_candidate_limit=min(
-                4, int(config.get("hdhive_candidate_limit", 4) or 4)
+            hdhive_candidate_limit=int(
+                config.get("hdhive_candidate_limit", 4) or 4
             ),
             hdhive_request_interval=float(
                 config.get("hdhive_request_interval", 5) or 5
@@ -285,8 +446,8 @@ class SearchApi(OwnerDelegator):
             hdhive_unlocks_per_minute=int(
                 config.get("hdhive_unlocks_per_minute", 2) or 2
             ),
-            dian115_candidate_limit=min(
-                4, int(config.get("dian115_candidate_limit", 4) or 4)
+            dian115_candidate_limit=int(
+                config.get("dian115_candidate_limit", 4) or 4
             ),
             dian115_request_interval=float(
                 config.get("dian115_request_interval", 1) or 1
@@ -412,23 +573,21 @@ class SearchApi(OwnerDelegator):
         mediainfo.original_title = original_title
 
         test_started = time.monotonic()
-        test_timeout = (
-            120 if source == "dian115" else _SEARCH_TEST_TIMEOUT_SECONDS
-        )
-        test_deadline = test_started + test_timeout
 
         def run_test() -> list:
             handler = None
             try:
                 handler = self._build_test_search_handler(
-                    source, config, deadline=test_deadline
+                    source, config
                 )
-                return handler.test_source(
+                source_result_limit = handler.test_source_result_limit(source)
+                results = handler.test_source(
                     source=source,
                     mediainfo=mediainfo,
                     media_type=media_type,
                     season=season,
                 )
+                return results, source_result_limit
             finally:
                 if handler:
                     try:
@@ -444,22 +603,7 @@ class SearchApi(OwnerDelegator):
                 f"[{source.upper()}] 开始只读渠道测试："
                 f"TMDB ID={tmdb_id}，类型={media_type_value}"
             )
-            future = _SEARCH_TEST_EXECUTOR.submit(run_test)
-            results = future.result(timeout=test_timeout)
-        except FutureTimeoutError:
-            future.cancel()
-            logger.warning(
-                f"[{title}{f' S{season:02d}' if season else ''}]"
-                f"[{source.upper()}] 渠道测试超过 "
-                f"{test_timeout} 秒，已提前返回"
-            )
-            return {
-                "success": False,
-                "message": (
-                    f"{source_names[source]} 测试超过 "
-                    f"{test_timeout} 秒，请检查渠道服务或代理状态"
-                ),
-            }
+            results, source_result_limit = run_test()
         except Exception as error:
             logger.warning(
                 f"[{title}{f' S{season:02d}' if season else ''}]"
@@ -468,10 +612,27 @@ class SearchApi(OwnerDelegator):
             return {
                 "success": False,
                 "message": f"{source_names[source]} 测试失败：{error}",
+                "data": {
+                    "source": source,
+                    "elapsed_seconds": round(time.monotonic() - test_started, 2),
+                },
             }
-        total_result_count = len(results or [])
+        supported_results = []
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            resource_type = normalize_resource_type(
+                result.get("resource_type") or result.get("pan_type") or ""
+            )
+            if resource_type not in SUPPORTED_RESOURCE_TYPES:
+                continue
+            if result.get("resource_type") != resource_type:
+                result = {**result, "resource_type": resource_type}
+            supported_results.append(result)
+        results = supported_results
+        total_result_count = len(results)
         results = self._balanced_test_results(
-            results, self._SEARCH_TEST_RESULT_LIMIT
+            results, self._SEARCH_TEST_DISPLAY_LIMIT
         )
         displayed_result_count = len(results or [])
         logger.debug(
@@ -481,20 +642,6 @@ class SearchApi(OwnerDelegator):
             f"耗时={time.monotonic() - test_started:.2f}s"
         )
 
-        resource_type_names = {
-            "115": "115",
-            "123": "123云盘",
-            "ed2k": "ED2K",
-            "magnet": "Magnet",
-            "quark": "夸克",
-            "guangya": "光鸭",
-            "aliyun": "阿里云盘",
-            "alipan": "阿里云盘",
-            "ali": "阿里云盘",
-            "xunlei": "迅雷云盘",
-            "189": "天翼云盘",
-            "123pan": "123云盘",
-        }
         items = []
         resource_type_counts: Dict[str, int] = {}
 
@@ -551,7 +698,7 @@ class SearchApi(OwnerDelegator):
                 append_tag(value)
             return tags
 
-        for item in (results or [])[:100]:
+        for item in (results or [])[:self._SEARCH_TEST_DISPLAY_LIMIT]:
             source_url = ""
             for value in (item.get("source_url"), item.get("media_page_url")):
                 candidate = str(value or "").strip()
@@ -574,7 +721,7 @@ class SearchApi(OwnerDelegator):
                     str(item.get("source") or source), source_names[source]
                 ),
                 "resource_type": resource_type,
-                "resource_type_name": resource_type_names.get(
+                "resource_type_name": resource_type_name(
                     resource_type, resource_type.upper() or "未知"
                 ),
                 "size": display_size(item),
@@ -582,11 +729,23 @@ class SearchApi(OwnerDelegator):
                 "tags": display_tags(item),
                 "description": str(item.get("description") or "").strip(),
                 "source_url": source_url,
+                "url": str(
+                    item.get("url") or item.get("share_url")
+                    or ""
+                ).strip(),
+                "slug": str(item.get("slug") or "").strip(),
+                "share_id": item.get("share_id") or item.get("id") or 0,
+                "resource_id": item.get("resource_id") or 0,
+                "media_page_url": str(item.get("media_page_url") or "").strip(),
                 "unlock_points": unlock_points,
                 "need_unlock": bool(item.get("need_unlock")),
                 "need_access": bool(item.get("need_access")),
                 "is_unlocked": bool(item.get("is_unlocked")),
                 "is_free": bool(item.get("is_free")),
+                "juying_resource_id": str(
+                    item.get("juying_resource_id") or ""
+                ).strip(),
+                "can_preview": resource_type in PREVIEW_RESOURCE_TYPES,
             })
             resource_type_counts[resource_type] = (
                     resource_type_counts.get(resource_type, 0) + 1
@@ -604,27 +763,22 @@ class SearchApi(OwnerDelegator):
                 ),
                 "count": total_result_count,
                 "displayed_count": displayed_result_count,
+                "result_limit": source_result_limit,
+                "display_limit": self._SEARCH_TEST_DISPLAY_LIMIT,
+                "elapsed_seconds": round(time.monotonic() - test_started, 2),
                 "items": items,
                 "resource_types": [
                     {
                         "value": resource_type,
-                        "title": resource_type_names.get(
-                            resource_type,
-                            resource_type.upper() or "未知",
+                        "title": resource_type_name(
+                            resource_type, resource_type.upper() or "未知"
                         ),
                         "count": count,
                     }
                     for resource_type, count in sorted(
                         resource_type_counts.items(),
                         key=lambda pair: (
-                            {
-                                "115": 0,
-                                "123": 1,
-                                "quark": 2,
-                                "guangya": 3,
-                                "ed2k": 4,
-                                "magnet": 5,
-                            }.get(pair[0], 99),
+                            RESOURCE_TYPE_PRIORITY.get(pair[0], 99),
                             pair[0],
                         ),
                     )

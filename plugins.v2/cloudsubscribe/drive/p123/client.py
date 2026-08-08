@@ -5,9 +5,10 @@ from __future__ import annotations
 from threading import RLock
 from typing import Any, Dict, Optional
 
+import requests
 from app.log import logger
 
-from ..common import format_size, safe_int
+from ..common import DriveRateLimiter, format_size, safe_int
 
 try:
     from p123client import P123Client, check_response
@@ -33,6 +34,8 @@ def is_success(response: Any) -> bool:
 class P123ClientManager:
     """使用扫码取得的 Token 按需创建 123 客户端。"""
 
+    _login_rate_limiter = DriveRateLimiter(min_interval=0.8)
+
     def __init__(
             self,
             token: str = "",
@@ -42,6 +45,9 @@ class P123ClientManager:
         self.timeout = max(5, min(int(timeout or 30), 300))
         self._client: Optional[Any] = None
         self._lock = RLock()
+        self.rate_limiter = DriveRateLimiter.shared(
+            "p123", self.token, min_interval=0.5
+        )
 
     def _create_client(self):
         return P123Client.init(
@@ -67,14 +73,20 @@ class P123ClientManager:
         def wrapped(*args, **kwargs):
             kwargs.setdefault("timeout", self.timeout)
             method = getattr(self._get_client(), name)
-            try:
-                response = method(*args, **kwargs)
-            except TypeError as error:
-                if "timeout" not in str(error) or "timeout" not in kwargs:
-                    raise
-                kwargs.pop("timeout", None)
-                response = method(*args, **kwargs)
-            return response
+
+            def invoke():
+                try:
+                    return method(*args, **kwargs)
+                except TypeError as error:
+                    if "timeout" not in str(error) or "timeout" not in kwargs:
+                        raise
+                    kwargs.pop("timeout", None)
+                    return method(*args, **kwargs)
+
+            return self.rate_limiter.call(
+                invoke,
+                retry_exceptions=(requests.Timeout, requests.ConnectionError),
+            )
 
         return wrapped
 
@@ -82,7 +94,11 @@ class P123ClientManager:
         """使用 p123client 创建 123 App 扫码登录会话。"""
         if not P123_AVAILABLE:
             raise RuntimeError("p123client 未安装")
-        response = P123Client.login_qrcode_generate(timeout=self.timeout)
+        response = self._login_rate_limiter.call(
+            P123Client.login_qrcode_generate,
+            timeout=self.timeout,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
+        )
         check_response(response)
         data = response.get("data") or {}
         uni_id = str(data.get("uniID") or "").strip()
@@ -107,7 +123,12 @@ class P123ClientManager:
         uni_id = str(kwargs.get("uni_id") or kwargs.get("uniID") or "").strip()
         if not uni_id:
             raise ValueError("缺少 123 网盘扫码会话参数")
-        response = P123Client.login_qrcode_result(uni_id, timeout=self.timeout)
+        response = self._login_rate_limiter.call(
+            P123Client.login_qrcode_result,
+            uni_id,
+            timeout=self.timeout,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
+        )
         if not isinstance(response, dict):
             raise RuntimeError("123网盘扫码状态响应格式无效")
         data = response.get("data") or {}

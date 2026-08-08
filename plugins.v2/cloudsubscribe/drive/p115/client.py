@@ -14,10 +14,9 @@ from app.log import logger
 
 from .files import P115FileService
 from .offline import OfflineDownloadService
-from .rate_limiter import RateLimiter
 from .share import ShareService
 from .upload import P115UploadService
-from ..common import create_directory_path_cache
+from ..common import DriveRateLimiter, create_directory_path_cache
 from ...core import get_component, resolve_component
 from ...utils import DEFAULT_METADATA_URL_TEMPLATE
 from ...utils.cache import create_platform_ttl_cache
@@ -116,6 +115,7 @@ class P115ClientManager:
     DEFAULT_PATH_CACHE_TTL = 3600  # 路径缓存过期时间（秒）
     DEFAULT_MAX_RETRIES = 3  # 最大重试次数
     DEFAULT_JITTER_RATIO = 0.3  # 请求间隔随机抖动比例（±30%）
+    _login_rate_limiter = DriveRateLimiter(min_interval=0.8)
     SHARE_TRANSFER_PAGE_SIZE = 115  # 分享接收接口单页文件数
     OFFLINE_TASK_CACHE_TTL = 600  # 115 离线任务接口最短刷新间隔（秒）
 
@@ -152,7 +152,7 @@ class P115ClientManager:
         if not PAVAILABLE:
             raise RuntimeError("p115client 未安装")
         final_client_type = cls.normalize_qrcode_client_type(client_type)
-        response = P115Client.login_qrcode_token()
+        response = cls._login_rate_limiter.call(P115Client.login_qrcode_token)
         check_response(response)
         data = response.get("data") or {}
         uid = str(data.get("uid") or "")
@@ -193,11 +193,10 @@ class P115ClientManager:
         if not uid or not qrcode_time or not sign:
             raise ValueError("二维码登录参数不完整")
         final_client_type = cls.normalize_qrcode_client_type(client_type)
-        response = P115Client.login_qrcode_scan_status({
-            "uid": uid,
-            "time": qrcode_time,
-            "sign": sign,
-        })
+        response = cls._login_rate_limiter.call(
+            P115Client.login_qrcode_scan_status,
+            {"uid": uid, "time": qrcode_time, "sign": sign},
+        )
         check_response(response)
         status_code = (response.get("data") or {}).get("status")
         if status_code == 0 or status_code is None:
@@ -211,7 +210,11 @@ class P115ClientManager:
         if status_code != 2:
             return {"status": "unknown", "message": f"未知二维码状态：{status_code}"}
 
-        result = P115Client.login_qrcode_scan_result(uid, app=final_client_type)
+        result = cls._login_rate_limiter.call(
+            P115Client.login_qrcode_scan_result,
+            uid,
+            app=final_client_type,
+        )
         check_response(result)
         cookie_data = (result.get("data") or {}).get("cookie")
         if not isinstance(cookie_data, dict):
@@ -267,7 +270,9 @@ class P115ClientManager:
 
         # 速率限制
         _min_interval = min_interval if min_interval is not None else self.DEFAULT_MIN_INTERVAL
-        self.rate_limiter = RateLimiter(min_interval=_min_interval)
+        self.rate_limiter = DriveRateLimiter.shared(
+            "p115", cookies, min_interval=_min_interval
+        )
 
         # 路径缓存（带 TTL）
         _path_cache_ttl = path_cache_ttl if path_cache_ttl is not None else self.DEFAULT_PATH_CACHE_TTL
@@ -358,8 +363,7 @@ class P115ClientManager:
         :param func: 要调用的函数
         :return: 函数返回值
         """
-        self.rate_limiter.wait()
-        return func(*args, **kwargs)
+        return self.rate_limiter.call(func, *args, **kwargs)
 
     def close(self) -> None:
         pass
@@ -425,8 +429,7 @@ class P115ClientManager:
             return False
 
         try:
-            self.rate_limiter.wait()
-            user_info = self.client.user_my_info()
+            user_info = self._rate_limited_call(self.client.user_my_info)
             if user_info.get("state"):
                 data = user_info.get("data") or {}
                 vip_data = data.get("vip") or {}
@@ -469,8 +472,7 @@ class P115ClientManager:
                 return copy.deepcopy(cached)
 
             try:
-                self.rate_limiter.wait()
-                user_response = self.client.user_my_info()
+                user_response = self._rate_limited_call(self.client.user_my_info)
                 check_response(user_response)
                 user_data = user_response.get("data") or {}
                 vip_data = user_data.get("vip") or {}
@@ -478,8 +480,9 @@ class P115ClientManager:
 
                 space_data = {}
                 try:
-                    self.rate_limiter.wait()
-                    space_response = self.client.fs_index_info(payload=0)
+                    space_response = self._rate_limited_call(
+                        self.client.fs_index_info, payload=0
+                    )
                     check_response(space_response)
                     space_data = (
                             (space_response.get("data") or {}).get("space_info") or {}

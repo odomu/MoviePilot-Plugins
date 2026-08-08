@@ -262,7 +262,8 @@ class QuarkUploadService:
                         bucket, obj_key, query,
                     ),
                 )
-                response = requests.put(
+                response = self.client.rate_limiter.call(
+                    requests.put,
                     target_url,
                     params={"partNumber": part_number, "uploadId": upload_id},
                     headers={
@@ -317,7 +318,8 @@ class QuarkUploadService:
                 signed_headers, bucket, obj_key, f"uploadId={upload_id}",
             ),
         )
-        response = requests.post(
+        response = self.client.rate_limiter.call(
+            requests.post,
             self._build_oss_url(pre_data),
             params={"uploadId": upload_id},
             headers={
@@ -329,5 +331,6 @@ class QuarkUploadService:
             },
             data=body,
             timeout=max(getattr(self.client, "_timeout", 30), 120),
+            max_retries=0,
         )
         response.raise_for_status()

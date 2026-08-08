@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterable, Optional
 import requests
 from app.log import logger
 
-from ..common import format_size, safe_int
+from ..common import DriveRateLimiter, format_size, safe_int
 
 
 def _find_number(data: Any, keys: Iterable[str]) -> int:
@@ -50,6 +50,9 @@ class GuangyaClient:
         self.device_id = str(device_id or uuid.uuid4().hex).replace("-", "").strip()
         self._on_token_refresh = on_token_refresh
         self._timeout = max(5, int(timeout or 30))
+        self.rate_limiter = DriveRateLimiter.shared(
+            "guangya", self.access_token or self.device_id, min_interval=0.5
+        )
         self._session = requests.Session()
 
     def close(self) -> None:
@@ -120,8 +123,11 @@ class GuangyaClient:
             headers["authorization"] = f"Bearer {self.access_token}"
             headers["accessToken"] = self.access_token
         try:
-            response = self._session.request(
-                method.upper(), url, headers=headers, json=json_data, timeout=self._timeout
+            response = self.rate_limiter.call(
+                self._session.request,
+                method.upper(), url,
+                headers=headers, json=json_data, timeout=self._timeout,
+                retry_exceptions=(requests.Timeout, requests.ConnectionError),
             )
             if response.status_code == 401 and authenticated and retry_auth and self.refresh_token_value:
                 if self.refresh_access_token():

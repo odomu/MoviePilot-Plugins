@@ -167,6 +167,16 @@
                 />
               </v-col>
             </v-row>
+            <v-alert
+                v-if="testError"
+                type="error"
+                variant="tonal"
+                density="compact"
+                class="source-test-error mt-3"
+            >
+              {{ testError }}
+              <span v-if="testElapsed != null">（耗时 {{ formatElapsed(testElapsed) }}）</span>
+            </v-alert>
             <div
                 v-if="tmdbSearched && !testSubmitted"
                 class="source-test-tmdb mt-3"
@@ -241,33 +251,27 @@
                 </v-alert>
               </div>
             </div>
-            <v-alert
-                v-if="testError"
-                type="error"
-                variant="tonal"
-                density="compact"
-                class="mt-3"
-            >
-              {{ testError }}
-            </v-alert>
             <div v-if="testSubmitted" class="source-test-result">
               <div class="source-test-summary">
                 <div class="source-test-summary__line">
                   <span class="source-test-summary__context">
-                    {{ testChannelSummary }} · {{ testResult.media }}
+                    {{ testResult.media || "搜索结果" }}
                   </span>
                   <span>
-                    共 <strong>{{ testResult.count || 0 }}</strong> 个搜索结果
+                    本次获取 <strong>{{ testResult.count || 0 }}</strong> 个搜索结果
                   </span>
                   <span>
                     当前展示
                     <strong>{{ testResult.displayed_count ?? (testResult.items || []).length }}</strong>
                     个
                   </span>
+                  <span v-if="testResult.elapsed_seconds != null">
+                    耗时 <strong>{{ formatElapsed(testResult.elapsed_seconds) }}</strong>
+                  </span>
                 </div>
               </div>
               <div class="source-test-notice text-medium-emphasis mb-3">
-                测试结果可能受渠道测试展示上限限制数量，正式搜索仍按配置的候选上限执行
+                搜索测试固定最多获取并展示 {{ testResult.display_limit }} 个候选，不受正式搜索候选上限配置影响
               </div>
               <v-tabs
                   v-if="testResourceTabs.length > 1"
@@ -354,6 +358,34 @@
                         >
                           {{ tag }}
                         </v-chip>
+                        <div class="source-test-item-actions">
+                          <v-btn
+                              v-if="canPreviewResource(item)"
+                              icon="mdi-eye-outline"
+                              size="x-small"
+                              variant="text"
+                              title="预览资源内容"
+                              :loading="previewingUrl === previewResourceKey(item)"
+                              @click="previewResource(item)"
+                          />
+                          <v-btn
+                              v-if="item.url"
+                              icon="mdi-content-copy"
+                              size="x-small"
+                              variant="text"
+                              title="复制资源链接"
+                              @click="copyText(item.url, '资源链接')"
+                          />
+                          <v-btn
+                              v-if="item.need_unlock"
+                              icon="mdi-lock-open-outline"
+                              size="x-small"
+                              variant="text"
+                              color="warning"
+                              :title="`确认消耗 ${Number(item.unlock_points || 0)} 积分解锁`"
+                              @click="confirmUnlock(item)"
+                          />
+                        </div>
                       </div>
                     </div>
                   </v-list-item>
@@ -382,6 +414,115 @@
             </v-btn>
           </v-card-actions>
         </v-form>
+      </v-card>
+    </v-dialog>
+    <v-dialog v-model="previewVisible" max-width="720">
+      <v-card class="source-preview-card">
+        <v-card-title class="d-flex align-center ga-2">
+          <v-icon icon="mdi-file-tree-outline" color="primary"/>
+          <span>资源内容预览</span>
+          <v-spacer/>
+          <a
+              v-if="previewMeta.share_url"
+              class="source-preview-header-link text-caption"
+              :href="previewMeta.share_url"
+              target="_blank"
+              rel="noopener noreferrer"
+              :title="previewMeta.share_url"
+          >
+            {{ previewMeta.share_url }}
+          </a>
+          <v-btn
+              v-if="previewMeta.share_url"
+              icon="mdi-content-copy"
+              size="small"
+              variant="text"
+              title="复制网盘链接"
+              @click="copyText(previewMeta.share_url, '网盘链接')"
+          />
+          <v-btn icon="mdi-close" size="small" variant="text" title="关闭" @click="previewVisible = false"/>
+        </v-card-title>
+        <v-card-text class="source-preview-body">
+          <div
+              v-if="previewMeta.display_name || previewMeta.info_hash || previewMeta.size || previewMeta.provider_name || previewMeta.share_url"
+              class="source-preview-meta text-caption text-medium-emphasis">
+            <span v-if="previewMeta.provider_name">网盘: {{ previewMeta.provider_name }}</span>
+            <span v-if="previewMeta.resource_type_name">类型: {{ previewMeta.resource_type_name }}</span>
+            <span v-if="previewMeta.display_name" class="source-preview-meta__title">标题: {{
+                previewMeta.display_name
+              }}</span>
+            <span v-if="previewMeta.info_hash">Info Hash: {{ previewMeta.info_hash }}</span>
+            <span v-if="previewMeta.size">总大小: {{ formatPreviewSize(previewMeta.size) }}</span>
+            <span>当前层项目数: {{ previewItems.length }}</span>
+          </div>
+          <div v-if="previewBreadcrumbs.length > 1" class="source-preview-breadcrumbs">
+            <template v-for="(breadcrumb, index) in previewBreadcrumbs" :key="`${breadcrumb.id}-${index}`">
+              <v-icon v-if="index" icon="mdi-chevron-right" size="small"/>
+              <v-btn size="small" variant="text" :disabled="previewLoading || index === previewBreadcrumbs.length - 1"
+                     @click="openPreviewBreadcrumb(index)">
+                {{ breadcrumb.name }}
+              </v-btn>
+            </template>
+          </div>
+          <div v-if="previewLoading" class="source-preview-loading">
+            <v-progress-circular indeterminate color="primary" size="44" width="4"/>
+          </div>
+          <v-alert v-if="previewError" type="error" variant="tonal" density="compact" class="my-3">
+            {{ previewError }}
+          </v-alert>
+          <div v-else-if="!previewLoading && previewItems.length" class="source-preview-list-scroll">
+            <v-list density="compact" lines="one" class="source-preview-list">
+              <template v-for="(file, index) in previewItems" :key="`${file.name}-${index}`">
+                <v-list-item class="source-preview-file" :class="{'source-preview-file--directory': file.can_enter}"
+                             @click="file.can_enter && openPreviewFolder(file)">
+                  <template #prepend>
+                    <v-icon :icon="previewFileIcon(file)"/>
+                  </template>
+                  <v-list-item-title class="source-preview-file-name" :title="file.name">
+                    <span v-if="file.is_dir" class="source-preview-file-stem">{{ file.name }}</span>
+                    <template v-else><span class="source-preview-file-stem">{{ previewFileStem(file.name) }}</span><span
+                        class="source-preview-file-extension">{{ previewFileExtension(file.name) }}</span></template>
+                  </v-list-item-title>
+                  <template #append>
+                <span v-if="formatPreviewSize(file.size)"
+                      class="source-preview-file-size text-caption text-medium-emphasis">
+                  {{ formatPreviewSize(file.size) }}
+                </span>
+                    <v-icon v-if="file.can_enter" icon="mdi-chevron-right" size="small" class="ml-2"/>
+                  </template>
+                </v-list-item>
+                <v-divider v-if="index < previewItems.length - 1"/>
+              </template>
+            </v-list>
+          </div>
+          <v-alert v-else-if="!previewLoading && !previewError" type="info" variant="tonal" density="compact">
+            当前目录为空
+          </v-alert>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+    <v-dialog v-model="unlockVisible" max-width="440" :persistent="unlocking">
+      <v-card>
+        <v-card-title class="d-flex align-center ga-2">
+          <v-icon icon="mdi-lock-open-outline" color="warning"/>
+          解锁资源
+        </v-card-title>
+        <v-card-text>
+          <p class="mb-3">确认消耗 {{ Number(unlockItem?.unlock_points || 0) }} 积分解锁此资源？</p>
+          <div class="text-body-2 text-medium-emphasis text-truncate" :title="unlockItem?.title || ''">
+            {{ unlockItem?.title || "未命名资源" }}
+          </div>
+          <v-alert v-if="unlockError" type="error" variant="tonal" density="compact" class="mt-4">
+            {{ unlockError }}
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer/>
+          <v-btn variant="text" :disabled="unlocking" @click="unlockVisible = false">取消</v-btn>
+          <v-btn color="warning" variant="flat" prepend-icon="mdi-lock-open-outline" :loading="unlocking"
+                 @click="unlockResource">确认解锁
+          </v-btn>
+        </v-card-actions>
       </v-card>
     </v-dialog>
     <v-snackbar
@@ -462,10 +603,27 @@ const qrVisible = ref(false),
     sourceTestVisible = ref(false),
     testSubmitted = ref(false),
     testError = ref(""),
+    testElapsed = ref(null),
+    previewVisible = ref(false),
+    previewingUrl = ref(""),
+    previewLoading = ref(false),
+    previewError = ref(""),
+    previewItems = ref([]),
+    previewMeta = ref({}),
+    previewBreadcrumbs = ref([]),
+    previewResourceType = ref(""),
+    previewShareUrl = ref(""),
+    previewSource = ref(""),
+    previewJuyingResourceId = ref(""),
+    unlockVisible = ref(false),
+    unlockItem = ref(null),
+    unlocking = ref(false),
+    unlockError = ref(""),
     message = ref(""),
     messageType = ref("success"),
     messageVisible = ref(false);
 let hdhiveOauthWindow = null;
+let previewRequestId = 0;
 const options = reactive({
   subscribes: [],
   mediaservers: [],
@@ -503,9 +661,6 @@ const filteredTestItems = computed(() => {
   return items.filter(
       (item) => item.resource_type === activeTestResourceType.value,
   );
-});
-const testChannelSummary = computed(() => {
-  return testResult.value?.source_name || "搜索渠道";
 });
 const sourceNames = {
   pansou: "PanSou",
@@ -558,7 +713,6 @@ const sourceTestConfigKeys = {
     "juying_password",
     "juying_result_limit",
     "juying_request_interval",
-    "juying_unlocks_per_minute",
   ],
   seedhub: ["seedhub_result_limit"],
   butailing: ["butailing_result_limit"],
@@ -640,7 +794,7 @@ function notify(text, type = "success") {
   messageVisible.value = true;
 }
 
-async function copyText(value) {
+async function copyText(value, label = "Webhook URL") {
   const text = String(value || "");
   if (!text) return;
   try {
@@ -665,9 +819,179 @@ async function copyText(value) {
       document.body.removeChild(input);
       if (!copied) throw new Error("浏览器拒绝访问剪贴板");
     }
-    notify("Webhook URL 已复制");
+    notify(`${label}已复制`);
   } catch (error) {
     notify(`复制失败：${error.message || error}`, "error");
+  }
+}
+
+function formatPreviewSize(value) {
+  const size = Number(value || 0);
+  if (!Number.isFinite(size) || size <= 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+  return `${(size / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function formatElapsed(value) {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) ? `${seconds.toFixed(2)} 秒` : "未知";
+}
+
+function previewFileIcon(file) {
+  if (file?.is_dir) return "mdi-folder-outline";
+  const name = String(file?.name || "").toLowerCase();
+  if (/\.(mkv|mp4|avi|ts|m2ts|mov|wmv|webm)$/.test(name)) return "mdi-filmstrip";
+  if (/\.(srt|ass|ssa|sup|vtt)$/.test(name)) return "mdi-subtitles-outline";
+  if (/\.(zip|rar|7z|tar|gz)$/.test(name)) return "mdi-archive-outline";
+  return "mdi-file-outline";
+}
+
+function previewFileExtension(value) {
+  const name = String(value || "未命名文件");
+  const extensionMatch = name.match(/(\.[^./\\\s]{1,12})$/);
+  return extensionMatch ? extensionMatch[1] : "";
+}
+
+function previewFileStem(value) {
+  const name = String(value || "未命名文件");
+  const extension = previewFileExtension(name);
+  const slash = Math.max(name.lastIndexOf("/"), name.lastIndexOf("\\"));
+  const basename = slash >= 0 ? name.slice(slash + 1) : name;
+  return extension ? basename.slice(0, -extension.length) : basename;
+}
+
+function canPreviewResource(item) {
+  const source = String(item?.source || "").toLowerCase();
+  return Boolean(
+      item?.can_preview && (
+          item?.url || (source === "juying" && item?.juying_resource_id)
+      ),
+  );
+}
+
+function previewResourceKey(item) {
+  const source = String(item?.source || "").toLowerCase();
+  const resourceId = String(item?.juying_resource_id || "");
+  return source === "juying" && resourceId
+      ? `${source}:${resourceId}`
+      : String(item?.url || "");
+}
+
+async function previewResource(item) {
+  if (!canPreviewResource(item)) return;
+  const shareUrl = String(item.url || "");
+  const requestId = ++previewRequestId;
+  previewingUrl.value = previewResourceKey(item);
+  previewVisible.value = true;
+  previewLoading.value = false;
+  previewError.value = "";
+  previewItems.value = [];
+  previewResourceType.value = String(item.resource_type || "").toLowerCase();
+  previewShareUrl.value = shareUrl;
+  previewSource.value = String(item.source || "").toLowerCase();
+  previewJuyingResourceId.value = String(item.juying_resource_id || "");
+  previewMeta.value = {
+    provider_name: "",
+    resource_type_name: String(
+        item.resource_type_name || item.resource_type || "",
+    ),
+    share_url: previewShareUrl.value,
+  };
+  const breadcrumbs = [{id: "", name: "根目录"}];
+  previewBreadcrumbs.value = breadcrumbs;
+  await loadPreviewDirectory("", breadcrumbs, requestId);
+  if (requestId === previewRequestId) previewingUrl.value = "";
+}
+
+async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++previewRequestId) {
+  const pendingJuying = previewSource.value === "juying" && previewJuyingResourceId.value;
+  if (!previewShareUrl.value && !pendingJuying) return;
+  const resourceType = previewResourceType.value;
+  const shareUrl = previewShareUrl.value;
+  previewLoading.value = true;
+  previewError.value = "";
+  try {
+    const response = unwrapResponse(await api.post("plugin/CloudSubscribe/search/preview", {
+      resource_type: resourceType,
+      url: shareUrl,
+      parent_id: parentId || "",
+      source: previewSource.value,
+      juying_resource_id: previewJuyingResourceId.value,
+      config: pendingJuying ? sourceTestConfig("juying") : undefined,
+    }));
+    if (requestId !== previewRequestId || !previewVisible.value) return;
+    if (response.success === false) throw new Error(response.message || "资源预览失败");
+    const data = response.data?.data || response.data || {};
+    if (data.resource_type) {
+      previewResourceType.value = String(data.resource_type).toLowerCase();
+    }
+    if (data.share_url) previewShareUrl.value = String(data.share_url);
+    previewItems.value = Array.isArray(data.items) ? data.items : [];
+    previewMeta.value = {
+      provider_name: String(data.provider_name || ""),
+      resource_type_name: String(data.resource_type_name || ""),
+      display_name: String(data.display_name || ""),
+      info_hash: String(data.info_hash || ""),
+      size: Number(data.size || 0),
+      share_url: String(data.share_url || shareUrl),
+    };
+    previewBreadcrumbs.value = breadcrumbs;
+  } catch (error) {
+    if (requestId !== previewRequestId || !previewVisible.value) return;
+    previewItems.value = [];
+    previewError.value = error?.response?.data?.message || error.message || String(error);
+  } finally {
+    if (requestId === previewRequestId) previewLoading.value = false;
+  }
+}
+
+function openPreviewFolder(file) {
+  if (!file?.can_enter || previewLoading.value) return;
+  loadPreviewDirectory(String(file.id || ""), [
+    ...previewBreadcrumbs.value,
+    {id: String(file.id || ""), name: String(file.name || "未命名目录")},
+  ]);
+}
+
+function openPreviewBreadcrumb(index) {
+  const breadcrumb = previewBreadcrumbs.value[index];
+  if (!breadcrumb || previewLoading.value) return;
+  loadPreviewDirectory(
+      String(breadcrumb.id || ""),
+      previewBreadcrumbs.value.slice(0, index + 1),
+  );
+}
+
+function confirmUnlock(item) {
+  unlockItem.value = item || null;
+  unlockError.value = "";
+  unlockVisible.value = Boolean(item);
+}
+
+async function unlockResource() {
+  const item = unlockItem.value;
+  if (!item || unlocking.value) return;
+  unlocking.value = true;
+  unlockError.value = "";
+  try {
+    const response = unwrapResponse(await api.post("plugin/CloudSubscribe/search/unlock", {
+      source: item.source || sourceTest.source,
+      item,
+      config: sourceTestConfig(item.source || sourceTest.source),
+    }));
+    if (response.success === false) throw new Error(response.message || "解锁失败");
+    const data = response.data?.data || response.data || {};
+    if (!data.url) throw new Error(response.message || "解锁失败");
+    item.url = data.url;
+    item.need_unlock = false;
+    item.is_unlocked = true;
+    unlockVisible.value = false;
+    notify("资源已解锁，现在可以预览或复制");
+  } catch (error) {
+    unlockError.value = error?.response?.data?.message || error.message || String(error);
+  } finally {
+    unlocking.value = false;
   }
 }
 
@@ -923,6 +1247,7 @@ function openSourceTest(source) {
   testResult.value = {};
   testSubmitted.value = false;
   testError.value = "";
+  testElapsed.value = null;
   sourceTestVisible.value = true;
 }
 
@@ -963,6 +1288,7 @@ async function testSource(candidate) {
   testingSource.value = sourceTest.source;
   selectedTmdbId.value = Number(candidate.tmdb_id || 0);
   testError.value = "";
+  testElapsed.value = null;
   testSubmitted.value = false;
   messageVisible.value = false;
   try {
@@ -979,14 +1305,18 @@ async function testSource(candidate) {
         }),
     );
     if (response.success === false) {
+      testElapsed.value = response.data?.elapsed_seconds ?? null;
       throw new Error(response.message || "搜索渠道测试失败");
     }
     testResult.value = response.data?.data || response.data || {};
+    testElapsed.value = testResult.value.elapsed_seconds ?? null;
     activeTestResourceType.value = "all";
     testSubmitted.value = true;
     notify(response.message || "搜索渠道测试完成");
   } catch (e) {
     const status = Number(e?.response?.status || 0);
+    const errorData = e?.response?.data?.data || e?.response?.data || {};
+    testElapsed.value = errorData.elapsed_seconds ?? testElapsed.value;
     testError.value =
         status === 502
         ? `${sourceNames[sourceTest.source] || "搜索渠道"} 测试请求被网关中断（HTTP 502），请检查渠道服务状态及反向代理超时`
@@ -1008,9 +1338,28 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  previewRequestId += 1;
   window.removeEventListener("message", handleHdhiveOAuthMessage);
   if (hdhiveOauthWindow && !hdhiveOauthWindow.closed) hdhiveOauthWindow.close();
 });
+
+watch(
+    previewVisible,
+    (visible) => {
+      if (visible) return;
+      previewRequestId += 1;
+      previewingUrl.value = "";
+      previewLoading.value = false;
+      previewError.value = "";
+      previewItems.value = [];
+      previewMeta.value = {};
+      previewBreadcrumbs.value = [];
+      previewResourceType.value = "";
+      previewShareUrl.value = "";
+      previewSource.value = "";
+      previewJuyingResourceId.value = "";
+    },
+);
 
 watch(
     () => props.initialConfig,
@@ -1199,6 +1548,10 @@ watch(
   flex: 0 0 auto;
 }
 
+.source-test-error {
+  flex: 0 0 auto;
+}
+
 .source-test-tmdb {
   min-height: 0;
   flex: 1 1 auto;
@@ -1286,6 +1639,10 @@ watch(
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 
+.source-test-tabs :deep(.v-btn__content) {
+  text-transform: none;
+}
+
 .source-test-result-list {
   padding: 0;
 }
@@ -1305,6 +1662,8 @@ watch(
 .source-test-item-content {
   width: 100%;
   min-width: 0;
+  position: relative;
+  padding-right: 82px;
 }
 
 .source-test-item-title {
@@ -1318,11 +1677,141 @@ watch(
   display: flex;
   min-width: 0;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
+  overflow: hidden;
   padding-top: 4px;
   padding-bottom: 2px;
   line-height: 1.4;
+}
+
+.source-test-item-meta > :deep(.v-chip),
+.source-test-item-meta > span {
+  flex: 0 0 auto;
+}
+
+.source-test-item-actions {
+  position: absolute;
+  top: 22px;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.source-preview-card {
+  max-height: min(78vh, 720px);
+}
+
+.source-preview-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.source-preview-loading {
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.source-preview-list-scroll {
+  min-height: 0;
+  max-height: min(58vh, 520px);
+  overflow-y: auto;
+}
+
+.source-preview-list {
+  font-size: 0.86rem;
+}
+
+.source-preview-list :deep(.v-list-item-title) {
+  font-size: 0.86rem;
+  line-height: 1.35rem;
+}
+
+.source-preview-meta {
+  padding-bottom: 8px;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
+.source-preview-meta > span {
+  margin-right: 16px;
+}
+
+.source-preview-meta__title {
+  white-space: normal;
+}
+
+.source-preview-header-link {
+  display: block;
+  max-width: min(44%, 320px);
+  min-width: 0;
+  overflow: hidden;
+  color: rgb(var(--v-theme-primary));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-preview-breadcrumbs {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  overflow-x: auto;
+  padding-bottom: 6px;
+  white-space: nowrap;
+}
+
+.source-preview-file--directory {
+  cursor: pointer;
+}
+
+.source-preview-file--directory:hover {
+  background: rgba(var(--v-theme-primary), 0.06);
+}
+
+.source-preview-file :deep(.v-list-item__prepend) {
+  width: 36px;
+  min-width: 36px;
+}
+
+.source-preview-file :deep(.v-list-item__content) {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.source-preview-file-name {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-start;
+  min-width: 0;
+  overflow: hidden;
+  direction: ltr;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.source-preview-file-stem {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: ltr;
+  text-align: left;
+}
+
+.source-preview-file-extension {
+  flex: 0 0 auto;
+}
+
+.source-preview-file-size {
+  width: 76px;
+  flex: 0 0 76px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .config-window {

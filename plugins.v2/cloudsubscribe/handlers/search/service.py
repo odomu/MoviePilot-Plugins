@@ -25,6 +25,7 @@ from .sources import PanSouSearchService
 from ...core import get_component, resolve_component
 from ...search.juying import JuyingResourceService
 from ...search.matching import positive_ints, unique_texts
+from ...search.types import SUPPORTED_RESOURCE_TYPES, normalize_resource_type
 from ...utils.cache import create_platform_ttl_cache
 
 _COMPONENT_TYPES = (
@@ -242,7 +243,7 @@ class SearchHandler:
             value for value in unique_texts(
                 self._resource_type_order_config, str.lower
             )
-            if value in JuyingResourceService.SUPPORTED_RESOURCE_TYPES
+            if value in SUPPORTED_RESOURCE_TYPES
         ]
         self._search_source_order = search_source_order or []
         self._search_cache_enabled = bool(search_cache_enabled)
@@ -753,10 +754,9 @@ class SearchHandler:
     @staticmethod
     def _resource_type(resource: Dict[str, Any]) -> str:
         """读取内部规范化类型；pan_type 仅用于尚未规范化的外部来源。"""
-        value = str(
-            resource.get("resource_type") or resource.get("pan_type") or ""
-        ).strip().lower()
-        return "alipan" if value == "aliyun" else value
+        return normalize_resource_type(
+            resource.get("resource_type") or resource.get("pan_type")
+        )
 
     @classmethod
     def _resource_availability_order(cls, resource: Dict[str, Any]) -> int:

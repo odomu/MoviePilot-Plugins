@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 import requests
 from app.log import logger
 
-from ..common import format_size, safe_int
+from ..common import DriveRateLimiter, format_size, safe_int
 
 
 def _format_expire_date(value: Any) -> str:
@@ -59,6 +59,7 @@ def _member_profile(member: Dict[str, Any]) -> Dict[str, Any]:
 
 class QuarkClient:
     BASE_URL = "https://drive-pc.quark.cn/1/clouddrive"
+    SHARE_PAGE_BASE_URL = "https://drive-h.quark.cn/1/clouddrive"
     SHARE_BASE_URL = "https://drive.quark.cn/1/clouddrive"
     PAN_CLOUDDRIVE_URL = "https://pan.quark.cn/1/clouddrive"
     ACCOUNT_URL = "https://pan.quark.cn/account"
@@ -75,6 +76,7 @@ class QuarkClient:
         "accept": "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9",
     }
+    _login_rate_limiter = DriveRateLimiter(min_interval=0.8)
 
     def __init__(
             self,
@@ -85,12 +87,19 @@ class QuarkClient:
         self._cookie = str(cookie or "").strip()
         self._on_cookie_refresh = on_cookie_refresh
         self._timeout = max(5, int(timeout or 30))
+        self.rate_limiter = DriveRateLimiter.shared(
+            "quark", self._cookie, min_interval=0.5
+        )
         self._session = requests.Session()
         self._session.headers.update(self.DEFAULT_HEADERS)
 
     @property
     def cookie(self) -> str:
         return self._cookie
+
+    @property
+    def request_timeout(self) -> int:
+        return self._timeout
 
     def close(self) -> None:
         self._session.close()
@@ -163,19 +172,25 @@ class QuarkClient:
             json_data: Optional[Dict[str, Any]] = None,
             base_url: Optional[str] = None,
             request_headers: Optional[Dict[str, str]] = None,
+            request_timeout: Any = None,
     ) -> Dict[str, Any]:
         url = f"{(base_url or self.BASE_URL).rstrip('/')}/{endpoint.lstrip('/')}"
         try:
             headers = self._headers(request_headers)
             if method.upper() == "GET":
                 headers.pop("content-type", None)
-            response = self._session.request(
+            response = self.rate_limiter.call(
+                self._session.request,
                 method.upper(),
                 url,
                 params=self._params(params),
                 json=json_data,
                 headers=headers,
-                timeout=self._timeout,
+                timeout=(
+                    request_timeout
+                    if request_timeout is not None else self._timeout
+                ),
+                retry_exceptions=(requests.Timeout, requests.ConnectionError),
             )
             self._refresh_cookie(response)
             if response.status_code >= 400:
@@ -205,11 +220,13 @@ class QuarkClient:
     @classmethod
     def create_qrcode_login(cls, client_type: str = "") -> Dict[str, Any]:
         session = requests.Session()
-        response = session.get(
+        response = cls._login_rate_limiter.call(
+            session.get,
             f"{cls.QR_LOGIN_URL}/getTokenForQrcodeLogin",
             params={"client_id": "532", "v": "1.2", "request_id": str(uuid.uuid4())},
             headers=cls.DEFAULT_HEADERS,
             timeout=30,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
         )
         response.raise_for_status()
         payload = response.json()
@@ -231,7 +248,8 @@ class QuarkClient:
         if not token:
             raise ValueError("缺少夸克二维码令牌")
         session = requests.Session()
-        response = session.get(
+        response = cls._login_rate_limiter.call(
+            session.get,
             f"{cls.QR_LOGIN_URL}/getServiceTicketByQrcodeToken",
             params={
                 "client_id": "532",
@@ -241,6 +259,7 @@ class QuarkClient:
             },
             headers=cls.DEFAULT_HEADERS,
             timeout=30,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
         )
         if response.status_code != 200:
             return {"status": "waiting", "message": "等待扫码"}
@@ -249,11 +268,13 @@ class QuarkClient:
         message = str(payload.get("message") or "")
         ticket = (payload.get("data") or {}).get("members", {}).get("service_ticket")
         if status == 2000000 and ticket:
-            account_response = session.get(
+            account_response = cls._login_rate_limiter.call(
+                session.get,
                 f"{cls.ACCOUNT_URL}/info",
                 params={"st": ticket, "lw": "scan"},
                 headers=cls.DEFAULT_HEADERS,
                 timeout=30,
+                retry_exceptions=(requests.Timeout, requests.ConnectionError),
             )
             account_response.raise_for_status()
             cookies = "; ".join(
@@ -274,11 +295,13 @@ class QuarkClient:
         try:
             headers = self._headers()
             headers.pop("content-type", None)
-            response = self._session.get(
+            response = self.rate_limiter.call(
+                self._session.get,
                 f"{self.ACCOUNT_URL}/info",
                 params={"fr": "pc", "platform": "pc"},
                 headers=headers,
                 timeout=self._timeout,
+                retry_exceptions=(requests.Timeout, requests.ConnectionError),
             )
             self._refresh_cookie(response)
             if response.status_code >= 400 or "text/html" in response.headers.get("content-type", ""):

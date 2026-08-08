@@ -82,15 +82,17 @@ class OfflineDownloadService(OwnerDelegator):
             refresh_revision = self._offline_task_cache_revision
 
         try:
-            self.rate_limiter.wait()
-            tasks = [
-                self._format_offline_task(task)
-                for task in clouddownload_iter(
+            rows = self.rate_limiter.call(
+                lambda: list(clouddownload_iter(
                     self.client,
                     cooldown=2,
                     type="web",
                     **self._ios_request_kwargs(app=False),
-                )
+                ))
+            )
+            tasks = [
+                self._format_offline_task(task)
+                for task in rows
             ]
             tasks = tasks[:self._OFFLINE_TASK_CACHE_LIMIT]
         except Exception as error:
@@ -181,8 +183,8 @@ class OfflineDownloadService(OwnerDelegator):
                     return dict(self._offline_quota_cache)
             self._offline_quota_refreshing = True
         try:
-            self.rate_limiter.wait()
-            response = self.client.clouddownload_quota_info_open(
+            response = self._rate_limited_call(
+                self.client.clouddownload_quota_info_open,
                 **self._ios_request_kwargs(app=False)
             )
             check_response(response)
@@ -210,8 +212,8 @@ class OfflineDownloadService(OwnerDelegator):
         normalized_hash = str(task_id or "").strip().lower()
         if not normalized_hash:
             raise ValueError("离线任务 info_hash 不能为空")
-        self.rate_limiter.wait()
-        response = self.client.clouddownload_task_del(
+        response = self._rate_limited_call(
+            self.client.clouddownload_task_del,
             {
                 "hash[0]": normalized_hash,
                 "flag": 1 if delete_source_file else 0,
@@ -242,8 +244,8 @@ class OfflineDownloadService(OwnerDelegator):
             raise ValueError("请选择需要删除的离线任务")
         payload = {f"hash[{index}]": value for index, value in enumerate(hashes)}
         payload["flag"] = 1 if delete_source_file else 0
-        self.rate_limiter.wait()
-        response = self.client.clouddownload_task_del(
+        response = self._rate_limited_call(
+            self.client.clouddownload_task_del,
             payload, **self._ios_request_kwargs(app=False)
         )
         check_response(response)
@@ -265,8 +267,8 @@ class OfflineDownloadService(OwnerDelegator):
         normalized_hash = str(task_id or "").strip().lower()
         if not normalized_hash:
             raise ValueError("离线任务 info_hash 不能为空")
-        self.rate_limiter.wait()
-        response = self.client.clouddownload_task_restart(
+        response = self._rate_limited_call(
+            self.client.clouddownload_task_restart,
             normalized_hash,
             **self._ios_request_kwargs(app=False),
         )
@@ -387,8 +389,8 @@ class OfflineDownloadService(OwnerDelegator):
             }
             payload["wp_path_id"] = parent_id
             try:
-                self.rate_limiter.wait()
-                resp = self.client.clouddownload_task_add_urls(
+                resp = self._rate_limited_call(
+                    self.client.clouddownload_task_add_urls,
                     payload,
                     **self._ios_request_kwargs(app=False),
                 )

@@ -128,6 +128,20 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "使用页面输入测试单个搜索渠道",
             },
             {
+                "path": "/search/preview",
+                "endpoint": self.api_vue_preview_search_resource,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "只读预览搜索资源文件列表",
+            },
+            {
+                "path": "/search/unlock",
+                "endpoint": self.api_vue_unlock_search_resource,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "确认后解锁测试资源",
+            },
+            {
                 "path": "/config/save",
                 "endpoint": self.api_vue_save_config,
                 "methods": ["POST"],

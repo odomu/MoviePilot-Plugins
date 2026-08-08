@@ -82,6 +82,7 @@ class PageApi(OwnerDelegator):
         if isinstance(cached, dict):
             return copy.deepcopy(cached)
         from ...search.pansou import PanSouClient
+        from ...search.types import PANSOU_RESOURCE_TYPES, resource_type_name
 
         providers = (
             self._cloud_drive_registry.available()
@@ -152,10 +153,10 @@ class PageApi(OwnerDelegator):
             "channels": [],
             "cloud_types": [
                 {
-                    "title": PanSouClient.TYPE_NAMES.get(value, value),
+                    "title": resource_type_name(value, value),
                     "value": value,
                 }
-                for value in PanSouClient.SUPPORTED_CLOUD_TYPES
+                for value in PANSOU_RESOURCE_TYPES
             ],
         }
         pansou_url = str(getattr(self, "_pansou_url", "") or "").strip()

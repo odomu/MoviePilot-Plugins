@@ -69,13 +69,16 @@ class P123ShareService:
         stack = [(0, 0)]
         while stack:
             parent_id, depth = stack.pop()
-            for item in share_iterdir(
+            items = self.client.rate_limiter.call(
+                lambda: list(share_iterdir(
                     share_key=str(info.get("share_key") or ""),
                     share_pwd=str(info.get("share_pwd") or ""),
                     payload=parent_id,
                     max_depth=1,
                     keep_raw=True,
-            ):
+                ))
+            )
+            for item in items:
                 yield item
                 if item.get("is_dir") and (max_depth < 0 or depth + 1 < max_depth):
                     stack.append((int(item["id"]), depth + 1))
@@ -123,6 +126,32 @@ class P123ShareService:
         except Exception as error:
             logger.warning(f"读取123分享文件失败：{error}")
             return []
+
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> list:
+        """列出分享中的当前目录，并向预览接口保留真实异常。"""
+        info = self.extract_share_info(share_url)
+        if not info:
+            raise ValueError("无效的 123 分享链接")
+        if not P123_AVAILABLE or share_iterdir is None:
+            raise RuntimeError("p123client 未安装")
+        directory_id = int(parent_id or 0)
+        rows = self.client.rate_limiter.call(
+            lambda: list(share_iterdir(
+                share_key=str(info.get("share_key") or ""),
+                share_pwd=str(info.get("share_pwd") or ""),
+                payload=directory_id,
+                max_depth=1,
+                keep_raw=True,
+            ))
+        )
+        result = []
+        for raw in rows:
+            item = cloud_file(raw)
+            if item:
+                result.append(dict(item))
+        return result
 
     def _resolve_items(
             self, share_url: str, file_ids: Iterable[str]

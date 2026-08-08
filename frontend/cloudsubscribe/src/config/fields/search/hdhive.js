@@ -19,7 +19,7 @@ export function createHdhiveGroups(options = {}) {
                 {
                     key: "hdhive_base_url",
                     label: "服务地址",
-                    ols: 12,
+                    cols: 12,
                 },
                 {
                     key: "hdhive_query_mode",

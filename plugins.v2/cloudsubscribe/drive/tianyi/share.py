@@ -7,7 +7,7 @@ import re
 import time
 from threading import RLock
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from app.log import logger
 
@@ -32,13 +32,22 @@ class TianyiShareService:
     @staticmethod
     def extract_share_info(share_url: str) -> dict[str, str]:
         value = str(share_url or "").strip()
-        match = re.search(r"cloud\.189\.cn/(?:t/|web/share\?code=)([A-Za-z0-9]+)", value, re.I)
+        decoded = unquote(value)
+        match = re.search(
+            r"cloud\.189\.cn/(?:t/|web/share\?code=)([A-Za-z0-9]+)",
+            decoded,
+            re.I,
+        )
         if not match:
             return {}
-        query = parse_qs(urlsplit(value).query)
+        query = parse_qs(urlsplit(decoded).query)
         access_code = str((query.get("pwd") or query.get("accessCode") or [""])[0]).strip()
         if not access_code:
-            code_match = re.search(r"(?:访问码|提取码|密码|pwd)\s*[：:=]?\s*([^\s&#]+)", value, re.I)
+            code_match = re.search(
+                r"(?:访问码|提取码|密码|pwd)\s*[：:=]?\s*([A-Za-z0-9]{4,8})",
+                decoded,
+                re.I,
+            )
             access_code = code_match.group(1) if code_match else ""
         return {"share_code": match.group(1), "access_code": access_code}
 
@@ -51,12 +60,30 @@ class TianyiShareService:
             cached = self._share_info_cache.get(cache_key)
         if isinstance(cached, dict):
             return dict(cached)
-        result = self.client.request(
+        result = self.client.public_request(
             "GET", "https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action",
             params={"shareCode": parsed["share_code"]},
         )
         data = result.get("data") if isinstance(result.get("data"), dict) else result
         info = {**parsed, **data}
+        requires_code = str(info.get("needAccessCode") or "").lower() in {
+            "1", "true", "yes"
+        }
+        if requires_code and not parsed["access_code"]:
+            raise ValueError("天翼分享需要访问码")
+        if not info.get("shareId"):
+            access = self.client.public_request(
+                "GET", "https://cloud.189.cn/api/open/share/checkAccessCode.action",
+                params={
+                    "shareCode": parsed["share_code"],
+                    "accessCode": parsed["access_code"],
+                },
+            )
+            if access.get("success") is False:
+                raise ValueError("天翼分享访问码错误")
+            info.update(access)
+        if not info.get("shareId"):
+            raise ValueError("天翼分享未返回分享 ID")
         with self._share_cache_lock:
             self._share_info_cache.set(cache_key, info)
         return dict(info)
@@ -81,11 +108,11 @@ class TianyiShareService:
     def _list_directory(
             self, info: dict[str, Any], folder_id: str = "-11"
     ) -> tuple[list[dict], list[dict]]:
-        result = self.client.request(
+        result = self.client.public_request(
             "GET", "https://cloud.189.cn/api/open/share/listShareDir.action",
             params={
                 "shareId": info["shareId"],
-                "fileId": folder_id,
+                "fileId": folder_id or info.get("fileId") or "-11",
                 "isFolder": "true",
                 "orderBy": "lastOpTime",
                 "descending": "true",
@@ -104,7 +131,7 @@ class TianyiShareService:
             share_id = str(info.get("shareId") or "")
             cached: dict[str, dict[str, Any]] = {}
             files = []
-            stack = ["-11"]
+            stack = [str(info.get("fileId") or "-11")]
             while stack:
                 file_list, folder_list = self._list_directory(info, stack.pop())
                 stack.extend(str(item.get("id") or item.get("fileId") or "") for item in folder_list)
@@ -127,6 +154,32 @@ class TianyiShareService:
         except Exception as error:
             logger.warning(f"读取天翼分享文件失败：{error}")
             return []
+
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> list:
+        """列出分享中的当前目录，并向预览接口保留真实异常。"""
+        info = self._share_info(share_url)
+        file_list, folder_list = self._list_directory(
+            info, str(parent_id or info.get("fileId") or "-11")
+        )
+        result = []
+        for raw, is_dir in (
+                *((item, True) for item in folder_list),
+                *((item, False) for item in file_list),
+        ):
+            file_id = str(raw.get("id") or raw.get("fileId") or "")
+            name = str(raw.get("name") or raw.get("fileName") or "")
+            if not file_id or not name:
+                continue
+            result.append({
+                "id": file_id,
+                "name": name,
+                "is_dir": is_dir,
+                "size": 0 if is_dir else int(raw.get("size") or raw.get("fileSize") or 0),
+                "md5": str(raw.get("md5") or ""),
+            })
+        return result
 
     def _save(self, share_url: str, file_ids: list[str], save_path: str) -> bool:
         info = self._share_info(share_url)

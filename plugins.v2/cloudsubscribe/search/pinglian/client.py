@@ -15,10 +15,16 @@ from ..http_client import (
     gated_idempotent_request,
     gated_request,
     normalize_proxies,
+    request_error_summary,
     requests,
 )
 from ..matching import extract_year, title_matches, unique_texts
-from ..types import TYPE_ALIASES as COMMON_TYPE_ALIASES, TYPE_HOSTS as COMMON_TYPE_HOSTS
+from ..types import (
+    RESOURCE_TYPE_ORDER,
+    SUPPORTED_RESOURCE_TYPES,
+    normalize_resource_type,
+    resource_type_from_url,
+)
 
 
 class PinglianError(RuntimeError):
@@ -110,8 +116,6 @@ class PinglianClient:
     BASE_URL = "https://pinglian.lol"
     _SESSION_DATA_KEY = "pinglian_auth_session"
     _LOGIN_LOCK = threading.RLock()
-    _TYPE_ALIASES = COMMON_TYPE_ALIASES
-    _TYPE_HOSTS = COMMON_TYPE_HOSTS
     _HEADERS = {
         "Accept": "application/json, text/plain, */*",
         "X-Requested-With": "XMLHttpRequest",
@@ -137,8 +141,7 @@ class PinglianClient:
         self.password = str(password or "")
         self._proxies = normalize_proxies(proxy)
         self._request_timeout = max(5, min(int(request_timeout or 30), 120))
-        self._session = requests.Session(impersonate="chrome")
-        self._session.headers.update(self._HEADERS)
+        self._session = self._create_session()
         self._request_gate = RequestGate.shared(
             "盘链",
             f"{self.base_url}|{self.username.casefold()}|{self._proxies}",
@@ -149,6 +152,33 @@ class PinglianClient:
         self._lock = threading.RLock()
         self._authenticated = False
         self._restore_session()
+
+    @property
+    def _timeout(self) -> tuple[int, int]:
+        return min(15, self._request_timeout), self._request_timeout
+
+    @classmethod
+    def _create_session(cls):
+        session = requests.Session(impersonate="chrome")
+        session.headers.update(cls._HEADERS)
+        return session
+
+    def _session_request(self, *args, **kwargs):
+        return self._session.request(*args, **kwargs)
+
+    def _reset_transport(self, error: BaseException, attempt: int) -> None:
+        cookies = self._session.cookies.get_dict()
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = self._create_session()
+        for name, value in cookies.items():
+            self._session.cookies.set(name, value)
+        logger.debug(
+            f"盘链连接异常后重建 HTTP 会话："
+            f"{type(error).__name__}，重试={attempt}"
+        )
 
     @property
     def is_configured(self) -> bool:
@@ -213,9 +243,30 @@ class PinglianClient:
             if force:
                 self._clear_session()
             try:
+                login_page = gated_idempotent_request(
+                    self._request_gate,
+                    self._session_request,
+                    "GET",
+                    f"{self.base_url}/pages/login.php",
+                    on_retry=self._reset_transport,
+                    headers={
+                        "Accept": (
+                            "text/html,application/xhtml+xml,application/xml;"
+                            "q=0.9,*/*;q=0.8"
+                        ),
+                    },
+                    proxies=self._proxies,
+                    timeout=self._timeout,
+                )
+                if login_page.status_code != 200:
+                    raise PinglianError(
+                        f"盘链登录页初始化失败（HTTP {login_page.status_code}）",
+                        "pinglian_login_failed",
+                    )
                 response = gated_request(
                     self._request_gate,
-                    self._session.post,
+                    self._session_request,
+                    "POST",
                     f"{self.base_url}/api/login.php",
                     data={
                         "username": self.username,
@@ -227,11 +278,12 @@ class PinglianClient:
                         "Referer": f"{self.base_url}/pages/login.php",
                     },
                     proxies=self._proxies,
-                    timeout=(8, self._request_timeout),
+                    timeout=self._timeout,
                 )
             except requests.exceptions.RequestException as error:
                 raise PinglianError(
-                    f"盘链登录失败：{type(error).__name__}", "pinglian_login_failed"
+                    f"盘链登录失败：{request_error_summary(error)}",
+                    "pinglian_login_failed",
                 ) from error
             if response.status_code != 200 or not self._is_json(response):
                 raise PinglianError(
@@ -255,22 +307,24 @@ class PinglianClient:
     def _request(self, method: str, path: str, retry_auth: bool = True, **kwargs):
         self._login()
         headers = dict(kwargs.pop("headers", {}) or {})
-        headers.setdefault("Referer", f"{self.base_url}/")
+        headers.setdefault("Origin", self.base_url)
+        headers.setdefault("Referer", f"{self.base_url}/all-videos.php")
         try:
             response = gated_idempotent_request(
                 self._request_gate,
-                self._session.request,
+                self._session_request,
                 method,
                 f"{self.base_url}{path}",
-                retry_connection_errors=False,
+                on_retry=self._reset_transport,
                 headers=headers,
                 proxies=self._proxies,
-                timeout=(8, self._request_timeout),
+                timeout=self._timeout,
                 **kwargs,
             )
         except requests.exceptions.RequestException as error:
             raise PinglianError(
-                f"盘链请求失败：{type(error).__name__}", "pinglian_request_failed"
+                f"盘链请求失败：{request_error_summary(error)}",
+                "pinglian_request_failed",
             ) from error
         auth_failed = response.status_code == 401
         payload = None
@@ -359,18 +413,6 @@ class PinglianClient:
         )
 
     @staticmethod
-    def _host_matches(host: str, domains: Iterable[str]) -> bool:
-        return any(host == domain or host.endswith(f".{domain}") for domain in domains)
-
-    @classmethod
-    def _target_type(cls, target: str) -> str:
-        host = str(urlparse(target).hostname or "").casefold()
-        for resource_type, domains in cls._TYPE_HOSTS.items():
-            if cls._host_matches(host, domains):
-                return resource_type
-        return ""
-
-    @staticmethod
     def _append_password(resource_type: str, target: str, password: str) -> str:
         password = str(password or "").strip()
         if not password:
@@ -403,7 +445,7 @@ class PinglianClient:
             target = html.unescape(target).replace(r"\/", "/")
         if not target:
             raise PinglianError("盘链资源令牌未返回跳转链接", "pinglian_empty_link")
-        actual_type = self._target_type(target)
+        actual_type = resource_type_from_url(target)
         if actual_type != expected_type:
             raise PinglianError("盘链资源跳转类型异常", "pinglian_invalid_link")
         return target
@@ -444,11 +486,11 @@ class PinglianClient:
         if not titles:
             return []
         allowed = (
-            list(self._TYPE_HOSTS)
+            list(RESOURCE_TYPE_ORDER)
             if test_mode
             else list(dict.fromkeys(
-                str(value).strip().casefold() for value in resource_type_order
-                if str(value).strip().casefold() in self._TYPE_HOSTS
+                normalize_resource_type(value) for value in resource_type_order
+                if normalize_resource_type(value) in SUPPORTED_RESOURCE_TYPES
             ))
         )
         if not allowed:
@@ -466,30 +508,17 @@ class PinglianClient:
             selected_keyword = ""
             for keyword in titles:
                 payload = self.request_json(
-                    "/api/search_suggestions.php", params={"q": keyword}
+                    "/api/get_videos.php", params={"wd": keyword, "pg": 1}
                 )
-                rows = payload.get("data") if payload.get("success") else []
+                rows = payload.get("list") or []
                 rows = rows if isinstance(rows, list) else []
                 logger.debug(
-                    f"{prefix} suggestions：关键词={keyword}，条目={len(rows)}"
+                    f"{prefix} get_videos：关键词={keyword}，条目={len(rows)}"
                 )
                 video = (
                     self._first_video(rows) if test_mode
                     else self._select_video(rows, titles, expected_year)
                 )
-                if not video:
-                    payload = self.request_json(
-                        "/api/get_videos.php", params={"wd": keyword, "pg": 1}
-                    )
-                    rows = payload.get("list") or []
-                    rows = rows if isinstance(rows, list) else []
-                    logger.debug(
-                        f"{prefix} get_videos：关键词={keyword}，条目={len(rows)}"
-                    )
-                    video = (
-                        self._first_video(rows) if test_mode
-                        else self._select_video(rows, titles, expected_year)
-                    )
                 if video:
                     selected_keyword = keyword
                     break
@@ -512,20 +541,31 @@ class PinglianClient:
             candidates = []
             raw_link_count = 0
             type_counts: Dict[str, int] = {}
-            for group in groups.values():
+            for group_key, group in groups.items():
                 for row in (group.get("links") or []) if isinstance(group, dict) else []:
                     raw_link_count += 1
                     if not isinstance(row, dict):
                         continue
-                    resource_type = self._TYPE_ALIASES.get(
-                        str(row.get("type") or "").strip().casefold(), ""
+                    direct_target = str(row.get("url") or "").strip()
+                    raw_type = (
+                            row.get("type") or group_key
+                            or (group.get("name") if isinstance(group, dict) else "")
                     )
+                    resource_type = normalize_resource_type(raw_type)
+                    if not resource_type and direct_target:
+                        resource_type = resource_type_from_url(direct_target)
                     token = str(row.get("token") or "").strip()
                     if resource_type:
                         type_counts[resource_type] = type_counts.get(resource_type, 0) + 1
-                    if resource_type not in type_order or (not token and not test_mode):
+                    if (
+                            resource_type not in type_order
+                            or (not direct_target and not token)
+                    ):
                         continue
-                    candidates.append((type_order[resource_type], row, resource_type, token))
+                    candidates.append((
+                        type_order[resource_type], row, resource_type,
+                        direct_target, token,
+                    ))
 
             logger.debug(
                 f"{prefix} search_pan_links：分组={len(groups)}，"
@@ -560,18 +600,29 @@ class PinglianClient:
                             offsets.pop(resource_type, None)
             results = []
             seen = set()
+            direct_count = 0
             resolved_count = 0
             resolve_failed_count = 0
-            for _, row, resource_type, token in candidates:
+            for _, row, resource_type, direct_target, token in candidates:
                 if len(results) >= limit_value:
                     break
-                key = (resource_type, str(row.get("title") or "").strip(), token)
+                key = (
+                    resource_type,
+                    str(row.get("title") or "").strip(),
+                    direct_target or token,
+                )
                 if key in seen:
                     continue
                 seen.add(key)
                 source_url = f"{self.base_url}/pages/video.php?id={vod_id}"
-                target = ""
-                if not test_mode:
+                target = direct_target
+                if target:
+                    if resource_type_from_url(target) != resource_type:
+                        resolve_failed_count += 1
+                        logger.debug(f"{prefix} 跳过类型不匹配的直链")
+                        continue
+                    direct_count += 1
+                else:
                     try:
                         target = self._resolve_token(token, resource_type)
                         resolved_count += 1
@@ -579,9 +630,9 @@ class PinglianClient:
                         resolve_failed_count += 1
                         logger.debug(f"{prefix} 跳过不可用资源：{error.code}")
                         continue
-                    target = self._append_password(
-                        resource_type, target, row.get("password")
-                    )
+                target = self._append_password(
+                    resource_type, target, row.get("password")
+                )
                 results.append({
                     "title": str(row.get("title") or "盘链资源").strip(),
                     "description": str(row.get("source") or "").strip(),
@@ -595,8 +646,8 @@ class PinglianClient:
                     "pinglian_resource_id": str(row.get("id") or ""),
                 })
             logger.debug(
-                f"{prefix} 返回完成：测试候选={len(results)}，"
-                f"链接解析成功={resolved_count}，解析失败={resolve_failed_count}"
+                f"{prefix} 返回完成：结果={len(results)}，直链={direct_count}，"
+                f"token回退={resolved_count}，跳过={resolve_failed_count}"
             )
             return results
 

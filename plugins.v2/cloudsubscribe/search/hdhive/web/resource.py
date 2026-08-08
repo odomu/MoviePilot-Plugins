@@ -377,6 +377,7 @@ class HDHiveResourceService:
             self,
             tmdb_id: int,
             media_type: str,
+            candidate_limit: int = 20,
             log_prefix: str = "[HDHIVE]",
     ) -> List[Dict[str, Any]]:
         """只读取资源页原始候选，不访问详情、不套预算或订阅规则。"""
@@ -385,7 +386,7 @@ class HDHiveResourceService:
             media_type=media_type,
             include_paid=True,
             resource_types=list(HDHIVE_RESOURCE_TYPES),
-            candidate_limit=None,
+            candidate_limit=max(1, int(candidate_limit or 20)),
             log_prefix=log_prefix,
         )
 

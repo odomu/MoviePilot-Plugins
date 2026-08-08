@@ -99,13 +99,18 @@ def _fetch_torrent_metadata(
         torrent = Torrent.read_stream(io.BytesIO(payload), validate=True)
         if str(torrent.infohash or "").upper() != info_hash:
             raise ValueError("torrent 元数据 Info Hash 不匹配")
-        filepaths = [str(file) for file in torrent.files]
+        file_entries = [
+            {"path": str(file), "size": int(getattr(file, "size", 0) or 0)}
+            for file in torrent.files
+        ]
+        filepaths = [entry["path"] for entry in file_entries]
         if not filepaths and torrent.name:
             filepaths = [str(torrent.name)]
         metadata = {
             "display_name": str(torrent.name or "").strip(),
             "size": int(torrent.size or 0),
             "torrent_files": filepaths,
+            "torrent_file_entries": file_entries,
             "metadata_source": "itorrents",
         }
     except (OSError, httpx.HTTPError, TorfError, ValueError):
@@ -135,6 +140,7 @@ def parse_magnet_metadata(
             return {}
 
     torrent_files = []
+    torrent_file_entries = []
     metadata_source = "uri" if magnet.dn else ""
     if fetch_info and not magnet.dn:
         fetched = _fetch_torrent_metadata(
@@ -146,6 +152,7 @@ def parse_magnet_metadata(
             magnet.dn = fetched["display_name"]
             magnet.xl = fetched["size"] or None
             torrent_files = fetched["torrent_files"]
+            torrent_file_entries = fetched.get("torrent_file_entries") or []
             metadata_source = fetched["metadata_source"]
 
     provider_text = str(provider_text or "").strip()
@@ -164,6 +171,7 @@ def parse_magnet_metadata(
         "webseeds": [str(value) for value in magnet.ws],
         "keywords": list(magnet.kt or []),
         "torrent_files": torrent_files,
+        "torrent_file_entries": torrent_file_entries,
         "metadata_available": bool(magnet.dn or torrent_files),
         "provider_metadata_available": bool(provider_text),
         "metadata_source": metadata_source,

@@ -47,7 +47,8 @@ class QuarkShareService:
                 "passcode": password,
                 "support_visit_limit_private_share": True,
             },
-            base_url=self.client.BASE_URL,
+            base_url=self.client.SHARE_PAGE_BASE_URL,
+            request_timeout=(2, self.client.request_timeout),
         )
 
     def _get_share_files(
@@ -69,7 +70,8 @@ class QuarkShareService:
                 "_fetch_total": "1",
                 "_sort": "file_type:asc,file_name:asc",
             },
-            base_url=self.client.BASE_URL,
+            base_url=self.client.SHARE_PAGE_BASE_URL,
+            request_timeout=(2, self.client.request_timeout),
         )
 
     def _save_shared_files(
@@ -196,6 +198,28 @@ class QuarkShareService:
         except Exception as error:
             logger.warning(f"读取夸克分享文件失败：{error}")
             return []
+
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> list:
+        """列出分享中的当前目录，预览调用方需要保留目录节点和错误。"""
+        info, token = self._share_access(share_url)
+        result = []
+        page = 1
+        directory_id = str(parent_id or "0")
+        while True:
+            response = self._get_share_files(
+                info["share_id"], token, directory_id, page, self.page_size
+            )
+            if not self.client.is_success(response):
+                raise RuntimeError(
+                    response.get("message") or response.get("msg") or "读取夸克分享目录失败"
+                )
+            items = list_data(self.client, response)
+            result.extend(dict(item) for raw in items if (item := cloud_file(raw)))
+            if len(items) < self.page_size:
+                return result
+            page += 1
 
     def _save_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str

@@ -147,6 +147,7 @@ class HDHiveSearchService(OwnerDelegator):
             target_episode_air_dates: Optional[Dict[int, str]] = None,
             subscribe: Any = None,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> Optional[List[Dict]]:
         """
         使用 HDHive 搜索资源
@@ -174,6 +175,7 @@ class HDHiveSearchService(OwnerDelegator):
                 target_episode_air_dates=target_episode_air_dates,
                 subscribe=subscribe,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         return self._search_hdhive_api(
             mediainfo,
@@ -182,6 +184,7 @@ class HDHiveSearchService(OwnerDelegator):
             season=season,
             subscribe=subscribe,
             test_mode=test_mode,
+            result_limit=result_limit,
         )
 
     def _search_hdhive_web(
@@ -194,6 +197,7 @@ class HDHiveSearchService(OwnerDelegator):
             target_episode_air_dates: Optional[Dict[int, str]] = None,
             subscribe: Any = None,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> Optional[List[Dict]]:
         """
         使用 WebAPI 模式查询 HDHive 资源。
@@ -216,6 +220,7 @@ class HDHiveSearchService(OwnerDelegator):
                 results = resources.search_test_resources(
                     tmdb_id=int(tmdb_id),
                     media_type=hdhive_media_type,
+                    candidate_limit=result_limit or self._hdhive_candidate_limit,
                     log_prefix=search_prefix,
                 )
             else:
@@ -298,6 +303,7 @@ class HDHiveSearchService(OwnerDelegator):
             self, mediainfo: MediaInfo, hdhive_media_type: str,
             tmdb_id: Optional[int] = None, season: Optional[int] = None,
             subscribe: Any = None, test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> Optional[List[Dict]]:
         """
         使用 API 模式查询 HDHive 资源
@@ -358,7 +364,9 @@ class HDHiveSearchService(OwnerDelegator):
                         ),
                         need_unlock=not is_free,
                     ))
-                    if len(raw_candidates) >= 80:
+                    if len(raw_candidates) >= max(
+                            1, int(result_limit or self._hdhive_candidate_limit)
+                    ):
                         break
                 logger.debug(
                     f"{search_prefix} API 查询完成：站点资源={len(data.get('data') or [])}，"

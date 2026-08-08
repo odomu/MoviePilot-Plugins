@@ -13,6 +13,8 @@ from ...core import OwnerDelegator
 class SourceDispatchService(OwnerDelegator):
     """把来源选择和结果准备从搜索主协调器中隔离出来。"""
 
+    _TEST_RESULT_LIMIT = 10
+
     def _run_source_search(
             self,
             source: str,
@@ -23,6 +25,7 @@ class SourceDispatchService(OwnerDelegator):
             target_episode_air_dates: Optional[Dict[int, str]] = None,
             subscribe: Any = None,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> Optional[List[Dict]]:
         if source == "hdhive":
             return self._search_hdhive(
@@ -33,6 +36,7 @@ class SourceDispatchService(OwnerDelegator):
                 target_episode_air_dates=target_episode_air_dates,
                 subscribe=subscribe,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         if source == "dian115":
             return self._search_dian115(
@@ -42,11 +46,17 @@ class SourceDispatchService(OwnerDelegator):
                 target_episodes=target_episodes,
                 subscribe=subscribe,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         if source == "pansou":
             if media_type == MediaType.MOVIE:
-                return self._search_pansou_movie(mediainfo, test_mode=test_mode)
-            return self._search_pansou_tv(mediainfo, season, test_mode=test_mode)
+                return self._search_pansou_movie(
+                    mediainfo, test_mode=test_mode, result_limit=result_limit
+                )
+            return self._search_pansou_tv(
+                mediainfo, season, test_mode=test_mode,
+                result_limit=result_limit,
+            )
         if source == "seedhub":
             return self._search_seedhub(
                 mediainfo,
@@ -54,6 +64,7 @@ class SourceDispatchService(OwnerDelegator):
                 season,
                 raise_errors=test_mode,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         if source == "butailing":
             return self._search_butailing(
@@ -63,6 +74,7 @@ class SourceDispatchService(OwnerDelegator):
                 subscribe=subscribe,
                 raise_errors=test_mode,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         if source == "juying":
             return self._search_juying(
@@ -71,6 +83,7 @@ class SourceDispatchService(OwnerDelegator):
                 season,
                 raise_errors=test_mode,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         if source == "pinglian":
             return self._search_pinglian(
@@ -79,6 +92,7 @@ class SourceDispatchService(OwnerDelegator):
                 season,
                 raise_errors=test_mode,
                 test_mode=test_mode,
+                result_limit=result_limit,
             )
         if source == "online_docs":
             titles = []
@@ -93,7 +107,7 @@ class SourceDispatchService(OwnerDelegator):
             return self._online_docs_client.search(
                 keyword=titles[0] if titles else "",
                 alternative_titles=titles[1:],
-                limit=100 if test_mode else 20,
+                limit=result_limit if test_mode else 20,
                 test_mode=test_mode,
             )
         raise ValueError("不支持的搜索渠道")
@@ -125,6 +139,16 @@ class SourceDispatchService(OwnerDelegator):
             target_episodes=target_episodes,
         )
 
+    def test_source_result_limit(self, source: str) -> int:
+        """搜索测试固定返回 10 条，不读取正式搜索的候选上限配置。"""
+        return self._TEST_RESULT_LIMIT
+
+    def resolve_juying_resource(self, resource_id: str) -> Dict[str, Any]:
+        """兑换测试搜索选中的单条聚影资源。"""
+        if not self._juying_resources:
+            raise ValueError("聚影搜索客户端未配置")
+        return self._juying_resources.resolve_resource(resource_id)
+
     def test_source(
             self,
             source: str,
@@ -151,12 +175,14 @@ class SourceDispatchService(OwnerDelegator):
         }.get(source)
         if client:
             client.clear_cache()
+        source_result_limit = self.test_source_result_limit(source)
         results = self._run_source_search(
-            source, mediainfo, media_type, season, test_mode=True
+            source, mediainfo, media_type, season, test_mode=True,
+            result_limit=source_result_limit,
         ) or []
         for result in results:
             result.setdefault("source", source)
-        return list(results)
+        return list(results)[:source_result_limit]
 
     def search_single_source(
             self,

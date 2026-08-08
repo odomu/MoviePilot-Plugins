@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, Optional
 import requests
 from app.utils.string import StringUtils
 
+from ..common import DriveRateLimiter
+
 
 class AliPanClient:
     API = "https://api.aliyundrive.com"
@@ -28,6 +30,9 @@ class AliPanClient:
         self.drive_id = ""
         self.user_id = ""
         self._lock = RLock()
+        self.rate_limiter = DriveRateLimiter.shared(
+            "alipan", self.refresh_token or self.access_token, min_interval=0.5
+        )
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": (
@@ -169,7 +174,14 @@ class AliPanClient:
                 if self.access_token.lower().startswith("bearer ")
                 else f"Bearer {self.access_token}"
             )
-        response = self.session.request(method, url, headers=headers, **kwargs)
+        response = self.rate_limiter.call(
+            self.session.request,
+            method,
+            url,
+            headers=headers,
+            retry_exceptions=(requests.Timeout, requests.ConnectionError),
+            **kwargs,
+        )
         if authenticated and retry and response.status_code in (401, 403):
             self.refresh()
             return self.raw_request(
@@ -243,11 +255,13 @@ class AliPanClient:
                     else f"Bearer {self.access_token}"
                 )
             }
-            response = self.session.post(
+            response = self.rate_limiter.call(
+                self.session.post,
                 f"{self.API}/v2/user/get",
                 headers=headers,
                 json={},
                 timeout=self.timeout,
+                retry_exceptions=(requests.Timeout, requests.ConnectionError),
             )
             response.raise_for_status()
             data = response.json()

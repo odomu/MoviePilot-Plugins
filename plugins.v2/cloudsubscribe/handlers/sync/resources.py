@@ -11,6 +11,7 @@ from ...core import (
     CloudFile,
     OwnerDelegator,
 )
+from ...search.types import normalize_resource_type, resource_type_from_url
 from ...utils import MediaFileParser
 
 
@@ -39,21 +40,25 @@ class ResourceTransferService(OwnerDelegator):
             resource: Dict[str, Any], share_url: str
     ) -> Dict[str, Any]:
         source = str(resource.get("source") or "unknown").strip().lower()
-        resource_type = str(
+        resource_type = normalize_resource_type(
             resource.get("resource_type") or resource.get("pan_type") or ""
-        ).strip().lower()
+        )
         if not resource_type:
-            resource_type = (
-                "ed2k"
-                if str(share_url).lower().startswith("ed2k://")
-                else "115"
-            )
+            resource_type = resource_type_from_url(share_url) or "unknown"
         points = resource.get("unlock_points")
         try:
             points = int(points) if points is not None else None
         except (TypeError, ValueError):
             points = None
-        source_url = str(resource.get("source_url") or "").strip()
+        source_url = ""
+        if source != "manual":
+            for value in (
+                    resource.get("source_url"), resource.get("media_page_url")
+            ):
+                candidate = str(value or "").strip()
+                if candidate.lower().startswith(("http://", "https://")):
+                    source_url = candidate
+                    break
         result = {
             "resource_type": resource_type,
             "source": source,

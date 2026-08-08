@@ -360,7 +360,6 @@ class SyncApi(OwnerDelegator):
                 "title": f"手动添加 {index}",
                 "resource_type": resource_type,
                 "source": "manual",
-                "source_url": link,
                 "unlock_points": 0,
                 **(
                     {"magnet_metadata": magnet_info["metadata"]}

@@ -170,6 +170,10 @@ class ShareTransferOperations(Protocol):
 
     def list_share_files(self, share_url: str, **kwargs: Any) -> list: ...
 
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> list: ...
+
     def transfer_share(self, share_url: str, save_path: str) -> bool: ...
 
     def transfer_file(

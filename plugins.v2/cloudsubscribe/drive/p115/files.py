@@ -114,7 +114,7 @@ class P115FileQuery:
         client = getattr(self.manager, "client", None)
         if not client or not pickcode:
             raise RuntimeError("115 文件缺少 pickcode 或客户端未登录")
-        value = client.download_url(pickcode)
+        value = self.manager.rate_limiter.call(client.download_url, pickcode)
         return str(value or ""), dict(getattr(value, "headers", None) or {})
 
 
@@ -178,8 +178,8 @@ class P115FileService(OwnerDelegator):
 
     def _iter_directory(self, cid: Any):
         """按页读取一个115目录，并让工具层处理字段标准化和响应校验。"""
-        self.rate_limiter.wait()
-        return iterdir(
+        return self.rate_limiter.call(
+            iterdir,
             self.client,
             cid=cid,
             page_size=self.DIRECTORY_PAGE_SIZE,
@@ -188,6 +188,7 @@ class P115FileService(OwnerDelegator):
             app="web",
             cooldown=self.rate_limiter.min_interval,
             max_workers=0,
+            max_retries=0,
             **self._ios_request_kwargs(app=False),
         )
 
@@ -203,8 +204,8 @@ class P115FileService(OwnerDelegator):
     def _rename_items(self, pairs: List[Tuple[Any, str]]) -> Set[str]:
         if not pairs:
             return set()
-        self.rate_limiter.wait()
-        renamed = update_name(
+        renamed = self._rate_limited_call(
+            update_name,
             self.client,
             pairs,
             batch_size=self.MUTATION_BATCH_SIZE,
@@ -217,8 +218,8 @@ class P115FileService(OwnerDelegator):
         normalized = [str(file_id) for file_id in file_ids if file_id not in (None, "")]
         if not normalized:
             return
-        self.rate_limiter.wait()
-        batch_move(
+        self._rate_limited_call(
+            batch_move,
             self.client,
             normalized,
             pid=target_pid,
@@ -233,8 +234,8 @@ class P115FileService(OwnerDelegator):
         ))
         if not normalized:
             return set()
-        self.rate_limiter.wait()
-        batch_delete(
+        self._rate_limited_call(
+            batch_delete,
             self.client,
             normalized,
             batch_size=self.MUTATION_BATCH_SIZE,
@@ -294,8 +295,8 @@ class P115FileService(OwnerDelegator):
                 return True, -1
 
             try:
-                self.rate_limiter.wait()
-                parent_id = makedir(
+                parent_id = self._rate_limited_call(
+                    makedir,
                     self.client,
                     part,
                     pid=parent_id,

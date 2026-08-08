@@ -137,6 +137,27 @@ class AliPanShareService:
             logger.warning(f"读取阿里云盘分享文件失败：{error}")
             return []
 
+    def list_share_directory(
+            self, share_url: str, parent_id: str = ""
+    ) -> list:
+        """列出分享中的当前目录，并向预览接口保留真实异常。"""
+        info = self._prepare(share_url)
+        result = []
+        for raw in self._list(info, str(parent_id or "root")):
+            file_id = str(raw.get("file_id") or "")
+            name = str(raw.get("name") or "")
+            if not file_id or not name:
+                continue
+            is_dir = raw.get("type") == "folder"
+            result.append({
+                "id": file_id,
+                "name": name,
+                "is_dir": is_dir,
+                "size": 0 if is_dir else int(raw.get("size") or 0),
+                "sha1": str(raw.get("content_hash") or ""),
+            })
+        return result
+
     def transfer_file(
             self, share_url: str, file_id: str, save_path: str,
             target_name: str, **kwargs,

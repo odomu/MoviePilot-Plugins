@@ -92,8 +92,10 @@ class AliPanUploadService:
                         upload_url = str((refreshed[0] if refreshed else {}).get(
                             "upload_url"
                         ) or "")
-                    response = self.client.session.put(
-                        upload_url, data=payload,
+                    response = self.client.rate_limiter.call(
+                        self.client.session.put,
+                        upload_url,
+                        data=payload,
                         headers={"Content-Type": "application/octet-stream"},
                         timeout=self.client.timeout,
                     )

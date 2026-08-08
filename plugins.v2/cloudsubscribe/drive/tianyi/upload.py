@@ -99,8 +99,13 @@ class TianyiUploadService:
                         if "=" in value:
                             key, header_value = value.split("=", 1)
                             headers[key] = header_value
-                    response = self.client.session.put(str(part.get("requestURL") or ""), data=chunk,
-                                                       headers=headers, timeout=self.client.timeout)
+                    response = self.client.rate_limiter.call(
+                        self.client.session.put,
+                        str(part.get("requestURL") or ""),
+                        data=chunk,
+                        headers=headers,
+                        timeout=self.client.timeout,
+                    )
                     response.raise_for_status()
                     if progress_callback:
                         uploaded = min(source.stat().st_size, index * self.SLICE_SIZE)

@@ -91,6 +91,7 @@ class ExternalResourceSearchService(OwnerDelegator):
             season: Optional[int],
             raise_errors: bool = False,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         label = self._search_label(mediainfo, media_type, season)
         prefix = f"[{label}][SEEDHUB]"
@@ -106,7 +107,10 @@ class ExternalResourceSearchService(OwnerDelegator):
                 expected_year=getattr(mediainfo, "year", None),
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
-                limit=80 if test_mode else self._seedhub_result_limit,
+                limit=(
+                    result_limit or self._seedhub_result_limit
+                    if test_mode else self._seedhub_result_limit
+                ),
                 test_mode=test_mode,
             )
         except SeedHubError as error:
@@ -126,6 +130,7 @@ class ExternalResourceSearchService(OwnerDelegator):
             subscribe: Any = None,
             raise_errors: bool = False,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         label = self._search_label(mediainfo, media_type, season)
         prefix = f"[{label}][BUTAILING]"
@@ -144,7 +149,10 @@ class ExternalResourceSearchService(OwnerDelegator):
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
                 douban_id=douban_id,
-                limit=80 if test_mode else self._butailing_result_limit,
+                limit=(
+                    result_limit or self._butailing_result_limit
+                    if test_mode else self._butailing_result_limit
+                ),
                 test_mode=test_mode,
             )
         except ButailingError as error:
@@ -163,6 +171,7 @@ class ExternalResourceSearchService(OwnerDelegator):
             season: Optional[int],
             raise_errors: bool = False,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         label = self._search_label(mediainfo, media_type, season)
         prefix = f"[{label}][JUYING]"
@@ -178,7 +187,10 @@ class ExternalResourceSearchService(OwnerDelegator):
                 tmdb_id=getattr(mediainfo, "tmdb_id", None),
                 season=season,
                 resource_type_order=self._juying_resource_types,
-                limit=80 if test_mode else self._juying_result_limit,
+                limit=(
+                    result_limit or self._juying_result_limit
+                    if test_mode else self._juying_result_limit
+                ),
                 test_mode=test_mode,
             )
         except JuyingError as error:
@@ -197,6 +209,7 @@ class ExternalResourceSearchService(OwnerDelegator):
             season: Optional[int],
             raise_errors: bool = False,
             test_mode: bool = False,
+            result_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         label = self._search_label(mediainfo, media_type, season)
         prefix = f"[{label}][PINGLIAN]"
@@ -214,7 +227,10 @@ class ExternalResourceSearchService(OwnerDelegator):
                 alternative_titles=titles[1:],
                 year=getattr(mediainfo, "year", None),
                 resource_type_order=self._resource_type_order_config,
-                limit=80 if test_mode else self._pinglian_result_limit,
+                limit=(
+                    result_limit or self._pinglian_result_limit
+                    if test_mode else self._pinglian_result_limit
+                ),
                 test_mode=test_mode,
             )
         except PinglianError as error:

@@ -3,16 +3,20 @@
 import base64
 import json
 import re
-import unicodedata
 import uuid
 import zlib
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import unicodedata
 from app.log import logger
 
 from ..http_client import normalize_proxies, requests
-from ..types import TYPE_HOSTS
+from ..types import (
+    SUPPORTED_RESOURCE_TYPES,
+    normalize_resource_type,
+    resource_type_from_url,
+)
 
 _DOC_HOSTS = {"kdocs.cn", "www.kdocs.cn", "docs.qq.com", "docs.weixin.qq.com"}
 _URL_RE = re.compile(
@@ -26,19 +30,6 @@ _QQ_CALLBACK_RE = re.compile(
 _KDOCS_ID_RE = re.compile(r"/(?:l|view)/([^/?#]+)", re.IGNORECASE)
 _QQ_ID_RE = re.compile(r"/(?:doc|sheet|s)/([^/?#]+)", re.IGNORECASE)
 _CONTEXT_WINDOW = 8000
-
-
-def _resource_type(url: str) -> str:
-    lowered = str(url or "").casefold()
-    if lowered.startswith("magnet:?"):
-        return "magnet"
-    if lowered.startswith("ed2k://"):
-        return "ed2k"
-    host = (urlparse(url).hostname or "").lower()
-    for resource_type, domains in TYPE_HOSTS.items():
-        if host in domains or any(host.endswith("." + domain) for domain in domains):
-            return resource_type
-    return ""
 
 
 def is_online_document_url(url: str) -> bool:
@@ -447,7 +438,7 @@ def _extract_links(text: str, sheet_names: List[str]) -> List[Dict[str, Any]]:
     seen = set()
     for matched in _URL_RE.finditer(str(text or "")):
         url = matched.group(0).rstrip(".,;，。；）)]}&")
-        resource_type = _resource_type(url)
+        resource_type = resource_type_from_url(url)
         if not resource_type or url.casefold() in seen:
             continue
         seen.add(url.casefold())
@@ -517,9 +508,8 @@ class OnlineDocumentClient:
             normalized.append({
                 "url": url,
                 "resource_types": list(dict.fromkeys(
-                    str(kind).strip().lower() for kind in resource_types
-                    if str(kind).strip().lower() in TYPE_HOSTS
-                    or str(kind).strip().lower() in {"magnet", "ed2k"}
+                    normalize_resource_type(kind) for kind in resource_types
+                    if normalize_resource_type(kind) in SUPPORTED_RESOURCE_TYPES
                 )),
             })
         return normalized

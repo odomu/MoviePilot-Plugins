@@ -96,7 +96,6 @@ class UIConfig:
             "juying_password": "",
             "juying_result_limit": 5,
             "juying_request_interval": 1.0,
-            "juying_unlocks_per_minute": 8,
             "pinglian_username": "",
             "pinglian_password": "",
             "pinglian_result_limit": 20,

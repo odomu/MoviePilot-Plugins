@@ -1,4 +1,4 @@
-"""SeedHub Magnet 搜索客户端。"""
+"""SeedHub 网盘与 Magnet 搜索客户端。"""
 
 from .client import SeedHubClient, SeedHubError
 

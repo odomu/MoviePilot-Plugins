@@ -9,6 +9,13 @@ from app.log import logger
 
 from .client import JuyingClient, JuyingError
 from ..matching import extract_season, extract_year, normalize_title, title_matches
+from ..types import (
+    RESOURCE_TYPE_ORDER,
+    SUPPORTED_RESOURCE_TYPES,
+    TYPE_HOSTS,
+    resource_type_from_text,
+    resource_type_from_url,
+)
 from ...utils.cache import (
     create_platform_ttl_cache,
     normalize_platform_cache_key,
@@ -19,28 +26,18 @@ class JuyingResourceService:
     """使用认证客户端查询资源，不管理登录会话。"""
 
     _MAX_RESOURCE_PAGES = 10
-    SUPPORTED_RESOURCE_TYPE_ORDER = (
-        "115", "123", "quark", "guangya", "alipan", "ed2k", "magnet"
-    )
-    SUPPORTED_RESOURCE_TYPES = frozenset(SUPPORTED_RESOURCE_TYPE_ORDER)
-    _TYPE_ALIASES = {
-        "115": "115",
-        "115pan": "115",
-        "123": "123",
-        "123pan": "123",
-        "quark": "quark",
-        "guangya": "guangya",
-        "alipan": "alipan",
-        "aliyun": "alipan",
-        "magnet": "magnet",
-        "magnetlink": "magnet",
-        "ed2k": "ed2k",
-    }
 
     def __init__(self, client: JuyingClient):
         self._client = client
         self._lock = threading.RLock()
-        cache_identity = f"{getattr(client, 'base_url', '')}|{id(client)}"
+        cache_namespace = str(
+            getattr(client, "cache_namespace", "") or ""
+        ).strip()
+        cache_identity = (
+            f"{cache_namespace or f'instance:{id(client)}'}|"
+            f"{getattr(client, 'base_url', '')}|"
+            f"{str(getattr(client, 'username', '') or '').strip().casefold()}"
+        )
         self._search_cache = create_platform_ttl_cache(
             "juying:search", cache_identity, maxsize=128, ttl=15 * 60
         )
@@ -87,8 +84,7 @@ class JuyingResourceService:
         return best[2] if best is not None else None
 
     def _find_movie(self, title: str, alternative_titles: List[str], year: str,
-                    media_type: str, tmdb_id: Optional[int],
-                    test_mode: bool = False):
+                    media_type: str, tmdb_id: Optional[int]):
         titles = list(dict.fromkeys(str(value).strip() for value in [title, *alternative_titles]
                                     if str(value or "").strip()))
         attempted = set()
@@ -106,8 +102,6 @@ class JuyingResourceService:
                     row for row in (payload.get("results") or [])
                     if isinstance(row, dict)
                 ]
-                if test_mode and rows:
-                    return rows[0]
                 selected = self._select_movie(
                     rows,
                     titles, year, media_type, tmdb_id,
@@ -137,12 +131,11 @@ class JuyingResourceService:
                 break
         return resources
 
-    @classmethod
-    def _resource_type(cls, row: Dict[str, Any]) -> str:
-        actual = str(row.get("resource_type") or "").strip().casefold()
-        mapped = cls._TYPE_ALIASES.get(actual)
-        if mapped:
-            return mapped
+    @staticmethod
+    def _resource_type(row: Dict[str, Any]) -> str:
+        actual = resource_type_from_text(row.get("resource_type"))
+        if actual:
+            return actual
         marker = " ".join(
             str(row.get(key) or "").strip().casefold()
             for key in (
@@ -152,19 +145,7 @@ class JuyingResourceService:
             )
             if str(row.get(key) or "").strip()
         )
-        if "magnet:?" in marker or "磁力" in marker:
-            return "magnet"
-        if "ed2k://" in marker or "电驴" in marker:
-            return "ed2k"
-        if "pan.quark.cn" in marker or "夸克" in marker or "quark" in marker:
-            return "quark"
-        if "guangyapan.com" in marker or "光鸭" in marker or "guangya" in marker:
-            return "guangya"
-        if "123云盘" in marker or "123网盘" in marker or "123pan" in marker:
-            return "123"
-        if "115.com" in marker or "115网盘" in marker:
-            return "115"
-        return ""
+        return resource_type_from_text(marker)
 
     @staticmethod
     def _resource_size(value: Any) -> Any:
@@ -177,10 +158,12 @@ class JuyingResourceService:
                              media_type: str, tmdb_id: Optional[int], season: Optional[int],
                              force: bool = False,
                              filter_season: bool = True,
-                             test_mode: bool = False) -> List[Dict[str, Any]]:
+                             test_mode: bool = False,
+                             result_limit: Optional[int] = None) -> List[Dict[str, Any]]:
         cache_key = (media_type, tmdb_id or 0, normalize_title(title),
                      tuple(normalize_title(item) for item in alternative_titles), year,
-                     season or 0, bool(filter_season), bool(test_mode))
+                     season or 0, bool(filter_season), bool(test_mode),
+                     int(result_limit or 0))
         cache_key = normalize_platform_cache_key(cache_key)
         if not force:
             cached = self._search_cache.get(cache_key)
@@ -189,7 +172,6 @@ class JuyingResourceService:
                 return [dict(item) for item in cached]
         movie = self._find_movie(
             title, alternative_titles, year, media_type, tmdb_id,
-            test_mode=test_mode,
         )
         if not movie:
             self._search_cache.set(cache_key, [])
@@ -201,7 +183,8 @@ class JuyingResourceService:
         source_url = f"{self._client.base_url}/movie/{movie_id}"
         context = {"title": title, "alternative_titles": alternative_titles, "year": year,
                    "media_type": media_type, "tmdb_id": tmdb_id, "season": season,
-                   "filter_season": filter_season, "test_mode": test_mode}
+                   "filter_season": filter_season, "test_mode": test_mode,
+                   "result_limit": result_limit}
         public_rows = []
         for row in self._load_resources(movie_id):
             resource_type = self._resource_type(row)
@@ -241,35 +224,13 @@ class JuyingResourceService:
         return dict(cached) if isinstance(cached, dict) else None
 
     @staticmethod
-    def _host_matches(host: str, domains: Iterable[str]) -> bool:
-        return any(host == domain or host.endswith(f".{domain}") for domain in domains)
-
-    @classmethod
-    def _target_type(cls, target: str) -> str:
-        lowered = target.casefold()
-        if lowered.startswith("magnet:?"):
-            return "magnet"
-        if lowered.startswith("ed2k://"):
-            return "ed2k"
-        parsed = urlparse(target)
-        host = str(parsed.hostname or "").casefold()
-        if parsed.scheme != "https" or not host:
-            return ""
-        if cls._host_matches(host, {"115.com", "115cdn.com"}):
-            return "115"
-        if cls._host_matches(host, {"123pan.com", "123684.com", "123865.com"}):
-            return "123"
-        if cls._host_matches(host, {"quark.cn"}):
-            return "quark"
-        if cls._host_matches(host, {"guangyapan.com"}):
-            return "guangya"
-        if cls._host_matches(host, {"alipan.com", "aliyundrive.com"}):
-            return "alipan"
-        return ""
-
-    @classmethod
-    def _validate_target(cls, resource_type: str, target: str) -> None:
-        if resource_type not in cls.SUPPORTED_RESOURCE_TYPES or cls._target_type(target) != resource_type:
+    def _validate_target(resource_type: str, target: str) -> None:
+        scheme = str(urlparse(target).scheme or "").casefold()
+        if (
+                resource_type not in SUPPORTED_RESOURCE_TYPES
+                or resource_type_from_url(target) != resource_type
+                or (resource_type in TYPE_HOSTS and scheme != "https")
+        ):
             raise JuyingError("聚影返回的资源链接格式异常", "juying_invalid_link")
 
     @staticmethod
@@ -336,7 +297,7 @@ class JuyingResourceService:
         target = str(payload.get("target") or "").strip()
         if not target:
             raise JuyingError("聚影资源链接为空", "juying_empty_link")
-        resource_type = self._target_type(target)
+        resource_type = resource_type_from_url(target)
         self._validate_target(resource_type, target)
         access_code = str(payload.get("access_code") or "").strip()
         target = self._append_access_code(resource_type, target, access_code)
@@ -344,18 +305,23 @@ class JuyingResourceService:
                 "access_mode": str(payload.get("access_mode") or ""),
                 "expires_in": self._safe_int(payload.get("expires_in"))}
 
+    def resolve_resource(self, resource_id: str) -> Dict[str, Any]:
+        """按测试搜索返回的资源 ID 兑换一次实际链接。"""
+        with self._lock:
+            return self._resolve_resource(str(resource_id or "").strip())
+
     def search(self, title: str, alternative_titles: Iterable[str], year: object,
                media_type: str, tmdb_id: Optional[int], season: Optional[int],
                resource_type_order: Iterable[str], limit: int = 5,
                test_mode: bool = False) -> List[Dict[str, Any]]:
         normalized_limit = max(1, min(int(limit or 5), 80))
         allowed_order = (
-            list(self.SUPPORTED_RESOURCE_TYPE_ORDER)
+            list(RESOURCE_TYPE_ORDER)
             if test_mode
             else list(dict.fromkeys(
                 str(value).strip().casefold()
                 for value in resource_type_order
-                if str(value).strip().casefold() in self.SUPPORTED_RESOURCE_TYPES
+                if str(value).strip().casefold() in SUPPORTED_RESOURCE_TYPES
             ))
         )
         if not allowed_order:
@@ -366,7 +332,8 @@ class JuyingResourceService:
                                              extract_year(year), "tv" if media_type == "tv" else "movie",
                                              tmdb_id, season,
                                              filter_season=not test_mode,
-                                             test_mode=test_mode)
+                                             test_mode=test_mode,
+                                             result_limit=normalized_limit)
             order_map = {value: index for index, value in enumerate(allowed_order)}
             fallback_order = len(allowed_order)
             rows.sort(
@@ -374,19 +341,23 @@ class JuyingResourceService:
                     item["resource_type"], fallback_order
                 )
             )
+            rows = [
+                row for row in rows
+                if row["resource_type"] in allowed_order
+                   and (test_mode or row["link_exposed"])
+            ][:normalized_limit]
             results = []
             for row in rows:
-                if row["resource_type"] not in allowed_order:
-                    continue
                 if test_mode:
-                    results.append({**row, "url": "", "pan_type": row["resource_type"],
-                                    "source": "juying", "source_service": "juying",
-                                    "source_url": row["source_url"],
-                                    "juying_resource_id": row["resource_id"]})
-                    if len(results) >= normalized_limit:
-                        break
-                    continue
-                if not row["link_exposed"]:
+                    results.append({
+                        **row,
+                        "url": "",
+                        "pan_type": row["resource_type"],
+                        "source": "juying",
+                        "source_service": "juying",
+                        "source_url": row["source_url"],
+                        "juying_resource_id": row["resource_id"],
+                    })
                     continue
                 try:
                     resolved = self._resolve_resource(row["resource_id"])
@@ -405,8 +376,6 @@ class JuyingResourceService:
                                 "source": "juying", "source_service": "juying",
                                 "source_url": row["source_url"],
                                 "juying_resource_id": row["resource_id"]})
-                if len(results) >= normalized_limit:
-                    break
             return results
 
     def clear_cache(self) -> Dict[str, int]:

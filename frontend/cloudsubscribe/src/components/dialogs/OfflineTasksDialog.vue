@@ -96,7 +96,7 @@
           />
         </v-sheet>
         <div class="text-caption text-medium-emphasis mb-3">
-          最近检查：{{ updatedText }} · 已下载文件最多等待系统处理24小时
+          最近检查：{{ updatedText }} · 已下载文件最多等待系统处理30分钟
         </div>
 
         <v-alert

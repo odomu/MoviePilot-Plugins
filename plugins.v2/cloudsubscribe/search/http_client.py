@@ -58,6 +58,12 @@ except ImportError:
         "Dian115 不可用，请安装 curl_cffi 后重启 MoviePilot"
     )
 
+TRANSIENT_REQUEST_EXCEPTIONS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.SSLError,
+)
+
 
 def normalize_proxies(proxy: Any) -> Optional[Dict[str, str]]:
     """统一字符串、requests 字典和 server 代理配置。"""
@@ -80,37 +86,65 @@ def normalize_proxies(proxy: Any) -> Optional[Dict[str, str]]:
 
 
 def gated_request(
-        gate: "RequestGate", requester: Callable, *args, **kwargs
+        gate: "RequestGate", requester: Callable, *args,
+        retry_exceptions: tuple[type[BaseException], ...] = (),
+        max_retries: int = 0,
+        initial_delay: float = 0.5,
+        backoff_factor: float = 2.0,
+        on_retry: Optional[Callable[[BaseException, int], None]] = None,
+        **kwargs,
 ):
-    """通过共享门控执行任意 requests/Session 请求，隐藏闭包样板。"""
-    return gate.run(partial(requester, *args, **kwargs))
+    """通过共享门控执行请求，并对指定瞬态异常做指数退避。"""
+    exceptions = retry_exceptions
+    retries = max(0, min(int(max_retries or 0), 3))
+    delay = max(0.1, min(float(initial_delay or 0.5), 10.0))
+    factor = max(1.0, min(float(backoff_factor or 2.0), 4.0))
+    for attempt in range(retries + 1):
+        try:
+            return gate.run(partial(requester, *args, **kwargs))
+        except exceptions as error:
+            if attempt >= retries:
+                raise
+            logger.debug(
+                f"{gate.name} 请求异常：{request_error_summary(error)}，"
+                f"{delay:.2f} 秒后第 {attempt + 1} 次重试"
+            )
+            if on_retry:
+                on_retry(error, attempt + 1)
+            time.sleep(delay)
+            delay = min(delay * factor, 30.0)
 
 
 def gated_idempotent_request(
         gate: "RequestGate", requester: Callable, method: str, *args,
         retry_delay: float = 0.75,
         retry_connection_errors: bool = True,
+        on_retry: Optional[Callable[[BaseException, int], None]] = None,
         **kwargs,
 ):
-    """幂等请求遇到暂态连接异常时短暂重试一次。"""
+    """幂等请求仅对连接类异常执行指数退避重试。"""
     normalized_method = str(method or "").strip().upper()
-    attempts = (
-        2
-        if retry_connection_errors and normalized_method in {"GET", "HEAD"}
-        else 1
+    should_retry = retry_connection_errors and normalized_method in {"GET", "HEAD"}
+    return gated_request(
+        gate, requester, normalized_method, *args,
+        retry_exceptions=TRANSIENT_REQUEST_EXCEPTIONS if should_retry else (),
+        max_retries=2 if should_retry else 0,
+        initial_delay=max(0.1, float(retry_delay or 0.75)),
+        backoff_factor=2.0,
+        on_retry=on_retry,
+        **kwargs,
     )
-    for attempt in range(attempts):
-        try:
-            return gated_request(
-                gate, requester, normalized_method, *args, **kwargs
-            )
-        except requests.exceptions.RequestException:
-            if attempt + 1 >= attempts:
-                raise
-            logger.debug(
-                f"{gate.name} 连接异常，{retry_delay:.2f} 秒后重试一次"
-            )
-            time.sleep(max(0.0, float(retry_delay)))
+
+
+def request_error_summary(error: BaseException) -> str:
+    """返回不包含请求地址和凭据的网络异常摘要。"""
+    name = type(error).__name__
+    code = getattr(error, "code", 0)
+    try:
+        code_value = int(code or 0)
+    except (TypeError, ValueError):
+        code_value = 0
+    return f"{name} (curl {code_value})" if code_value else name
 
 
 class RequestGateCancelled(RuntimeError):

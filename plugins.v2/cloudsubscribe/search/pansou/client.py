@@ -13,6 +13,7 @@ import unicodedata
 from app.log import logger
 
 from ..http_client import RequestGate, gated_request, normalize_proxies, requests
+from ..types import PANSOU_RESOURCE_TYPES, resource_type_name
 
 
 class PanSouClient:
@@ -21,27 +22,6 @@ class PanSouClient:
     MAX_RAW_RESULTS = 100
     _SESSION_DATA_KEY = "pansou_auth_session"
     _LOGIN_LOCK = threading.RLock()
-    SUPPORTED_CLOUD_TYPES = (
-        "aliyun", "quark", "guangya", "tianyi", "uc", "mobile",
-        "115", "pikpak", "xunlei", "123", "magnet", "ed2k",
-    )
-
-    # 网盘类型中文名映射
-    TYPE_NAMES = {
-        "aliyun": "阿里云盘",
-        "quark": "夸克网盘",
-        "guangya": "光鸭网盘",
-        "tianyi": "天翼云盘",
-        "uc": "UC网盘",
-        "mobile": "移动云盘",
-        "115": "115网盘",
-        "pikpak": "PikPak",
-        "xunlei": "迅雷云盘",
-        "123": "123云盘",
-        "magnet": "磁力链接",
-        "ed2k": "电驴链接"
-    }
-
     @staticmethod
     def _sanitize_json_strings(value: Any) -> Any:
         if isinstance(value, str):
@@ -406,7 +386,7 @@ class PanSouClient:
         effective_cloud_types = list(dict.fromkeys(
             str(item).strip().lower()
             for item in requested_cloud_types
-            if str(item).strip().lower() in self.SUPPORTED_CLOUD_TYPES
+            if str(item).strip().lower() in PANSOU_RESOURCE_TYPES
         ))
 
         try:
@@ -515,8 +495,11 @@ class PanSouClient:
             # 按网盘类型分组
             grouped_results = {}
             allowed_types = set(effective_cloud_types)
+            accepted_count = 0
 
             for item in results_list:
+                if test_mode and accepted_count >= limit:
+                    break
                 item_title = re.sub(r'<[^>]+>', '', item.get("title", ""))
                 links = item.get("links", [])
                 update_time = item.get("datetime", "")
@@ -526,6 +509,8 @@ class PanSouClient:
                 tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
 
                 for link in links:
+                    if test_mode and accepted_count >= limit:
+                        break
                     title = re.sub(
                         r'<[^>]+>', '', str(link.get("work_title") or item_title)
                     ).strip()
@@ -551,7 +536,7 @@ class PanSouClient:
                     pan_type = link.get("type", "unknown")
                     if allowed_types and str(pan_type).strip().lower() not in allowed_types:
                         continue
-                    type_display = self.TYPE_NAMES.get(pan_type, pan_type)
+                    type_display = resource_type_name(pan_type, pan_type)
 
                     if type_display not in grouped_results:
                         grouped_results[type_display] = []
@@ -593,6 +578,7 @@ class PanSouClient:
                         link_item["password"] = pwd
 
                     grouped_results[type_display].append(link_item)
+                    accepted_count += 1
 
             # 按时间倒序排序
             for pan_type in grouped_results:

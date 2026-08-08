@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
+from hashlib import sha256
 from pathlib import PurePosixPath
+from random import uniform
+from threading import Lock, RLock
 from typing import Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional, Sequence
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - requests is a platform dependency
+    requests = None
 
 from app.core.cache import TTLCache
 from app.log import logger
@@ -13,6 +21,93 @@ from app.utils.string import StringUtils
 
 from ..core.cloud import CloudFile, DirectoryListing, DirectoryLookup
 from ..utils.cache import create_platform_ttl_cache
+
+if requests is not None:
+    DRIVE_RETRY_EXCEPTIONS = (
+        TimeoutError,
+        ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
+    )
+else:
+    DRIVE_RETRY_EXCEPTIONS = (TimeoutError, ConnectionError)
+
+
+class DriveRateLimiter:
+    """网盘客户端共享的串行请求门控，避免同一账号突发请求触发风控。"""
+
+    _shared: dict[tuple[str, str, float, float], "DriveRateLimiter"] = {}
+    _shared_lock = RLock()
+
+    def __init__(self, min_interval: float = 0.5, jitter_ratio: float = 0.2):
+        self.min_interval = max(0.0, min(float(min_interval or 0.5), 60.0))
+        self.jitter_ratio = max(0.0, min(float(jitter_ratio or 0.0), 0.5))
+        self._last_request = 0.0
+        self._lock = Lock()
+
+    @classmethod
+    def shared(
+            cls, provider: str, identity: Any, *, min_interval: float = 0.5,
+            jitter_ratio: float = 0.2,
+    ) -> "DriveRateLimiter":
+        identity_key = sha256(
+            str(identity or "").encode("utf-8")
+        ).hexdigest()[:16]
+        key = (
+            str(provider or "drive").strip().lower(),
+            identity_key,
+            round(float(min_interval or 0.5), 3),
+            round(float(jitter_ratio or 0.0), 3),
+        )
+        with cls._shared_lock:
+            limiter = cls._shared.get(key)
+            if limiter is None:
+                limiter = cls(
+                    min_interval=min_interval,
+                    jitter_ratio=jitter_ratio,
+                )
+                cls._shared[key] = limiter
+            return limiter
+
+    def _before_request(self) -> None:
+        with self._lock:
+            elapsed = time.monotonic() - self._last_request
+            jitter = self.min_interval * self.jitter_ratio
+            interval = self.min_interval + uniform(-jitter, jitter)
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+            self._last_request = time.monotonic()
+
+    def call(
+            self,
+            func: Callable,
+            *args,
+            retry_exceptions: tuple[type[BaseException], ...] = None,
+            max_retries: int = 2,
+            initial_delay: float = 0.5,
+            backoff_factor: float = 2.0,
+            **kwargs,
+    ):
+        """限流执行请求，并仅对调用方指定的瞬态异常指数退避重试。"""
+        if retry_exceptions is None:
+            retry_exceptions = DRIVE_RETRY_EXCEPTIONS
+        retries = max(0, min(int(max_retries or 0), 5))
+        delay = max(0.1, min(float(initial_delay or 0.5), 30.0))
+        factor = max(1.0, min(float(backoff_factor or 2.0), 4.0))
+        for attempt in range(retries + 1):
+            self._before_request()
+            try:
+                return func(*args, **kwargs)
+            except retry_exceptions as error:
+                if attempt >= retries:
+                    raise
+                name = getattr(func, "__name__", type(func).__name__)
+                logger.debug(
+                    f"网盘请求 {name} 失败：{error}，"
+                    f"{delay:.2f} 秒后第 {attempt + 1} 次重试"
+                )
+                time.sleep(delay)
+                delay = min(delay * factor, 60.0)
 
 
 def safe_int(value: Any) -> int:

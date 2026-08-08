@@ -50,8 +50,8 @@ class P115UploadService(OwnerDelegator):
                 handle.seek(start)
                 return handle.read(end - start + 1)
 
-        self.rate_limiter.wait()
-        response = self.client.upload_file_init(
+        response = self._rate_limited_call(
+            self.client.upload_file_init,
             target_name,
             checksum.upper(),
             int(size),
@@ -89,26 +89,29 @@ class P115UploadService(OwnerDelegator):
         upload_name = str(target_name or source.name).strip()
         checksum = str(file_sha1 or "").strip().upper() or self._file_sha1(source)
         try:
-            self.rate_limiter.wait()
             file_size = source.stat().st_size
             if progress_callback:
                 with source.open("rb") as file:
-                    response = self.client.upload_file(
+                    response = self._rate_limited_call(
+                        self.client.upload_file,
                         _ProgressReader(file, file_size, progress_callback),
                         pid=int(lookup.directory_id or 0),
                         filename=upload_name,
                         filesha1=checksum,
                         filesize=file_size,
                         partsize=-1,
+                        max_retries=0,
                     )
             else:
-                response = self.client.upload_file(
+                response = self._rate_limited_call(
+                    self.client.upload_file,
                     source,
                     pid=int(lookup.directory_id or 0),
                     filename=upload_name,
                     filesha1=checksum,
                     filesize=file_size,
                     partsize=-1,
+                    max_retries=0,
                 )
             check_response(response)
             self._target_file_cache.clear()
@@ -162,8 +165,8 @@ class P115UploadService(OwnerDelegator):
                 progress_callback(uploaded, file_size)
 
         try:
-            self.rate_limiter.wait()
-            init_response = self.client.upload_file_init(
+            init_response = self._rate_limited_call(
+                self.client.upload_file_init,
                 filename=target_name,
                 filesize=file_size,
                 filesha1=checksum.upper(),
@@ -180,7 +183,8 @@ class P115UploadService(OwnerDelegator):
                 return "rapid"
 
             reader.seek(0)
-            response = self.client.upload_file(
+            response = self._rate_limited_call(
+                self.client.upload_file,
                 reader,
                 pid=int(lookup.directory_id or 0),
                 filename=target_name,
@@ -188,6 +192,7 @@ class P115UploadService(OwnerDelegator):
                 filesize=file_size,
                 partsize=-1,
                 reporthook=report,
+                max_retries=0,
             )
             check_response(response)
             self._target_file_cache.clear()

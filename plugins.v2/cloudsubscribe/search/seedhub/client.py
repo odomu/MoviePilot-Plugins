@@ -1,4 +1,4 @@
-"""SeedHub Magnet 搜索客户端。"""
+"""SeedHub 网盘与 Magnet 搜索客户端。"""
 
 import base64
 import html
@@ -6,11 +6,13 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 from ..http_client import RequestGate, gated_request, normalize_proxies, requests
 from ..matching import extract_season, extract_year, title_matches, unique_texts
+from ..types import resource_type_from_url
 from ...utils.cache import (
     create_platform_ttl_cache,
     normalize_platform_cache_key,
@@ -21,8 +23,55 @@ class SeedHubError(RuntimeError):
     """SeedHub 请求或页面解析失败。"""
 
 
+class _SeedHubLinkParser(HTMLParser):
+    """提取详情页网盘中转项与中转页真实直链。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.pan_entries: List[Dict[str, str]] = []
+        self.direct_links: List[str] = []
+        self._pan_list_depth = 0
+        self._current: Optional[Dict[str, str]] = None
+        self._current_text: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attributes = dict(attrs)
+        classes = set(str(attributes.get("class") or "").split())
+        if tag == "ul":
+            if self._pan_list_depth:
+                self._pan_list_depth += 1
+            elif "pan-links" in classes:
+                self._pan_list_depth = 1
+        if tag != "a":
+            return
+        href = html.unescape(str(attributes.get("href") or "")).strip()
+        if "direct-pan" in classes and href:
+            self.direct_links.append(href)
+        if self._pan_list_depth and "redirect_to=pan_id_" in href:
+            self._current = {
+                "href": href,
+                "title": html.unescape(str(attributes.get("title") or "")).strip(),
+                "host": str(attributes.get("data-link") or "").strip().lower(),
+            }
+            self._current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            self._current_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._current is not None:
+            item = dict(self._current)
+            item["title"] = item["title"] or " ".join(self._current_text).strip()
+            self.pan_entries.append(item)
+            self._current = None
+            self._current_text = []
+        if tag == "ul" and self._pan_list_depth:
+            self._pan_list_depth -= 1
+
+
 class SeedHubClient:
-    """搜索作品页并解析其中的 Magnet 链接。"""
+    """搜索作品页并解析其中的网盘或 Magnet 链接。"""
 
     _HEADERS = {
         "User-Agent": (
@@ -315,12 +364,20 @@ class SeedHubClient:
             anchor = str(matched.group("a") or "")
             title_match = re.search(r'title="([^"]*)"', anchor, re.IGNORECASE)
             entries.append({
+                "kind": "magnet",
                 "seed_id": seed_id,
                 "title": self._clean_text(title_match.group(1) if title_match else ""),
                 "size": self._clean_text(matched.group("size")),
                 "updated_at": self._clean_text(matched.group("updated")),
             })
         return entries
+
+    @staticmethod
+    def _parse_pan_entries(text: str) -> List[Dict[str, str]]:
+        parser = _SeedHubLinkParser()
+        parser.feed(text or "")
+        parser.close()
+        return parser.pan_entries
 
     def _resolve_magnet(self, seed_id: str) -> str:
         with self._cache_lock:
@@ -345,6 +402,36 @@ class SeedHubClient:
             self._magnet_cache.set(seed_id, magnet)
         return magnet
 
+    def _resolve_pan_link(self, entry: Dict[str, str]) -> tuple[str, str]:
+        href = str(entry.get("href") or "").strip()
+        if not href:
+            return "", ""
+        host_hint = str(entry.get("host") or "").strip()
+        if host_hint and not resource_type_from_url(f"https://{host_hint}"):
+            return "", ""
+        cache_key = f"pan:{href}"
+        with self._cache_lock:
+            cached = self._magnet_cache.get(cache_key)
+        if cached:
+            url = str(cached)
+            return url, resource_type_from_url(url)
+        parser = _SeedHubLinkParser()
+        parser.feed(self._get_text(urljoin(f"{self.base_url}/", href)))
+        parser.close()
+        url = next((str(value).strip() for value in parser.direct_links if value), "")
+        resource_type = resource_type_from_url(url)
+        if not resource_type:
+            return "", ""
+        with self._cache_lock:
+            self._magnet_cache.set(cache_key, url)
+        return url, resource_type
+
+    def _resolve_entry(self, item: Dict[str, str]) -> tuple[str, str]:
+        if item.get("kind") == "pan":
+            return self._resolve_pan_link(item)
+        magnet = self._resolve_magnet(str(item.get("seed_id") or ""))
+        return magnet, "magnet" if magnet else ""
+
     def _resolve_entries(
             self, movie_id: str, entries: List[Dict[str, str]], limit: int
     ) -> List[Dict[str, Any]]:
@@ -357,30 +444,31 @@ class SeedHubClient:
             for offset in range(0, len(entries), self._resolve_concurrency):
                 batch = entries[offset:offset + self._resolve_concurrency]
                 futures = [
-                    (item, executor.submit(self._resolve_magnet, item["seed_id"]))
+                    (item, executor.submit(self._resolve_entry, item))
                     for item in batch
                 ]
                 for item, future in futures:
                     try:
-                        magnet = future.result()
+                        url, resource_type = future.result()
                     except SeedHubError:
                         continue
-                    key = magnet.casefold()
-                    if not magnet or key in seen:
+                    key = url.casefold()
+                    if not url or not resource_type or key in seen:
                         continue
                     seen.add(key)
-                    title = item.get("title") or f"SeedHub 资源 #{item['seed_id']}"
+                    identity = item.get("seed_id") or item.get("href") or ""
+                    title = item.get("title") or f"SeedHub 资源 {identity}"
                     results.append({
-                        "url": magnet,
+                        "url": url,
                         "title": title,
                         "size": item.get("size") or 0,
                         "update_time": item.get("updated_at") or "",
-                        "resource_type": "magnet",
-                        "pan_type": "magnet",
+                        "resource_type": resource_type,
+                        "pan_type": resource_type,
                         "source": "seedhub",
                         "source_service": "seedhub",
                         "source_url": f"{self.base_url}/movies/{movie_id}/",
-                        "seed_id": item["seed_id"],
+                        "seed_id": item.get("seed_id") or "",
                     })
                     if len(results) >= limit:
                         break
@@ -434,9 +522,9 @@ class SeedHubClient:
                 return []
 
             movie_id = selected["movie_id"]
-            entries = self._parse_entries(
-                self._get_text(f"{self.base_url}/movies/{movie_id}/")
-            )
+            detail_text = self._get_text(f"{self.base_url}/movies/{movie_id}/")
+            entries = self._parse_entries(detail_text)
+            entries.extend({"kind": "pan", **item} for item in self._parse_pan_entries(detail_text))
             if not test_mode and media_type == "tv" and season:
                 matching_entries = [
                     item for item in entries
@@ -454,7 +542,7 @@ class SeedHubClient:
         with self._cache_lock:
             counts = {
                 "search": len(list(self._search_cache.items())),
-                "magnet": len(list(self._magnet_cache.items())),
+                "links": len(list(self._magnet_cache.items())),
             }
             self._search_cache.clear()
             self._magnet_cache.clear()
