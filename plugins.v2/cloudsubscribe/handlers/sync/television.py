@@ -86,7 +86,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
             missing_episodes: List[int] = []
             target_episode_air_dates: Dict[int, str] = {}
             calendar_entry: Optional[Dict[str, Any]] = None
-            # 收集阶段已读取平台订阅日历；这里复用结果，避免重复查询 TMDB。
+            # 收集阶段已读取 TMDB 季网页；这里复用结果，避免重复请求网页。
             if expected_episodes and mediainfo.tmdb_id and not manual_resources:
                 preparation = getattr(
                     subscribe, "_cloudsubscribe_preparation", {}
@@ -120,7 +120,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                         boundary_text = ""
                         if boundary:
                             boundary_text = (
-                                f"，TMDB 仅返回至 E{boundary - 1:02d}，"
+                                f"，TMDB 网页仅返回至 E{boundary - 1:02d}，"
                                 f"按 E{boundary:02d} 未播边界过滤"
                                 if boundary_reason == "unknown_tail"
                                 else f"，按 E{boundary:02d} 未播边界过滤"
@@ -134,7 +134,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                 else:
                     logger.info(
                         f"{mediainfo.title_year} S{season:02d} "
-                        "平台日历未返回剧集信息，跳过播出过滤"
+                        "TMDB 季网页未返回剧集信息，跳过播出过滤"
                     )
             # 1. 先读取 Emby 实际剧集，不混入订阅 note。
             self._set_task_phase(subscribe, "检查媒体库内容", 30)

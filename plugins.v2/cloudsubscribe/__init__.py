@@ -95,7 +95,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -1799,6 +1799,13 @@ class CloudSubscribe(_PluginBase):
                     if stop_event:
                         stop_event.set()
         self._restore_subscribe_search_takeover()
+        try:
+            components = self.__dict__.get("_plugin_components", {})
+            search_api = components.get(SearchApi)
+            if search_api:
+                search_api.close()
+        except Exception as error:
+            logger.debug(f"关闭搜索测试连接失败：{error}")
         try:
             components = self.__dict__.get("_plugin_components", {})
             media_library_api = components.get(MediaLibraryApi)

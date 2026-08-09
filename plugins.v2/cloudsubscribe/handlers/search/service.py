@@ -68,6 +68,8 @@ class SearchHandler:
             juying_client=None,
             pinglian_client=None,
             online_docs_client=None,
+            hdhive_web_client=None,
+            hdhive_web_client_owned: bool = True,
             pansou_enabled: bool = False,
             hdhive_enabled: bool = False,
             dian115_enabled: bool = False,
@@ -154,7 +156,10 @@ class SearchHandler:
         if self._hdhive_query_mode not in {"api", "web"}:
             self._hdhive_query_mode = "web"
         self._hdhive_auto_unlock = hdhive_auto_unlock
-        self._hdhive_web_client = None
+        self._hdhive_web_client = hdhive_web_client
+        self._hdhive_web_client_owned = bool(
+            hdhive_web_client is None or hdhive_web_client_owned
+        )
         self._hdhive_web_resources = None
         self._hdhive_web_lock = threading.RLock()
         self._hdhive_unlock_operation_lock = threading.Lock()

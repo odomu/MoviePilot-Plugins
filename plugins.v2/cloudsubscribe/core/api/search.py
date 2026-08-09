@@ -1,6 +1,8 @@
 """搜索源测试与 TMDB 候选查询 API。"""
 
 import ast
+import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -15,12 +17,14 @@ from app.utils.string import StringUtils
 from .. import OwnerDelegator
 from ..cloud import CloudDriveCapability
 from ..config import UIConfig
+from ...search.hdhive import HDHIVE_DETAIL_RESOURCE_TYPES
 from ...search.types import (
     PREVIEW_PROVIDER_KEYS,
     PREVIEW_RESOURCE_TYPES,
     RESOURCE_TYPE_PRIORITY,
     SUPPORTED_RESOURCE_TYPES,
     normalize_resource_type,
+    resource_type_from_url,
     resource_type_name,
 )
 from ...utils import parse_magnet_metadata
@@ -28,6 +32,7 @@ from ...utils import parse_magnet_metadata
 
 class SearchApi(OwnerDelegator):
     _SEARCH_TEST_DISPLAY_LIMIT = 10
+    _TEST_HDHIVE_CLIENT_LIMIT = 4
     _SEARCH_TEST_CONFIG_FIELDS = {
         "pansou": frozenset({
             "pansou_url", "pansou_username", "pansou_password",
@@ -66,6 +71,64 @@ class SearchApi(OwnerDelegator):
         }),
     }
 
+    def __init__(self, owner):
+        super().__init__(owner)
+        object.__setattr__(self, "_test_hdhive_clients_lock", threading.RLock())
+        object.__setattr__(self, "_test_hdhive_clients", [])
+
+    def close(self) -> None:
+        """释放测试接口复用的 HDHive 认证连接。"""
+        with self._test_hdhive_clients_lock:
+            clients = list(self._test_hdhive_clients)
+            self._test_hdhive_clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception as error:
+                logger.debug(f"关闭 HDHive 测试认证连接失败：{error}")
+
+    def _get_test_hdhive_web_client(
+            self,
+            config: Dict[str, Any],
+            proxy: Any,
+    ) -> tuple:
+        """按账号和网络配置复用测试连接及内存安全会话。"""
+        from ...search.hdhive import HDHiveClient
+
+        username = str(config.get("hdhive_username") or "")
+        password = str(config.get("hdhive_password") or "")
+        request_interval = float(
+            config.get("hdhive_request_interval", 5) or 5
+        )
+        unlocks_per_minute = int(
+            config.get("hdhive_unlocks_per_minute", 2) or 2
+        )
+        with self._test_hdhive_clients_lock:
+            for client in self._test_hdhive_clients:
+                if client.matches_config(
+                        username,
+                        password,
+                        proxy,
+                        request_interval,
+                        unlocks_per_minute,
+                ):
+                    return client, False
+            client = HDHiveClient(
+                username=username,
+                password=password,
+                proxy=proxy,
+                request_interval=request_interval,
+                unlocks_per_minute=unlocks_per_minute,
+            )
+            if len(self._test_hdhive_clients) >= self._TEST_HDHIVE_CLIENT_LIMIT:
+                logger.debug(
+                    "HDHive 测试连接配置超过缓存上限，本次使用临时认证连接"
+                )
+                return client, True
+            self._test_hdhive_clients.append(client)
+            logger.debug("HDHive 测试接口已建立可复用认证连接")
+            return client, False
+
     @staticmethod
     def _preview_error_message(error: Exception) -> str:
         """优先返回第三方异常携带的结构化错误信息。"""
@@ -82,7 +145,7 @@ class SearchApi(OwnerDelegator):
         if not isinstance(item, dict):
             item = getattr(item, "__dict__", {}) or {}
         name = next((str(item.get(key) or "").strip() for key in
-                     ("name", "file_name", "filename", "fileName")
+                     ("name", "path", "file_name", "filename", "fileName")
                      if item.get(key)), "")
         size = next((item.get(key) for key in
                      ("size", "file_size", "fileSize")
@@ -109,9 +172,20 @@ class SearchApi(OwnerDelegator):
         ).strip()
         resource_type = normalize_resource_type(payload.get("resource_type"))
         url = str(payload.get("url") or "").strip()
+        slug = str(payload.get("slug") or "").strip()
+        is_unlocked = bool(payload.get("is_unlocked"))
         parent_id = str(payload.get("parent_id") or "").strip()
         pending_juying = source == "juying" and bool(juying_resource_id)
-        if (not url and not pending_juying) or len(url) > 8192:
+        valid_hdhive_url = bool(
+            url and "\\" not in url
+            and resource_type_from_url(url) == resource_type
+        )
+        pending_hdhive = (
+                source == "hdhive"
+                and bool(slug)
+                and (not url or (is_unlocked and not valid_hdhive_url))
+        )
+        if (not url and not pending_juying and not pending_hdhive) or len(url) > 8192:
             return {"success": False, "message": "资源链接无效"}
         if pending_juying and (
                 len(juying_resource_id) > 32
@@ -120,7 +194,87 @@ class SearchApi(OwnerDelegator):
             return {"success": False, "message": "聚影资源标识无效"}
         if len(parent_id) > 256:
             return {"success": False, "message": "目录标识无效"}
+        if pending_hdhive and (
+                resource_type not in HDHIVE_DETAIL_RESOURCE_TYPES
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", slug)
+        ):
+            return {"success": False, "message": "HDHive 资源标识或类型无效"}
         try:
+            if pending_hdhive:
+                url = ""
+                if parent_id:
+                    return {
+                        "success": False,
+                        "message": "HDHive file-list 不支持目录导航",
+                    }
+                handler = self._build_test_search_handler(
+                    "hdhive",
+                    self._test_search_config("hdhive", payload.get("config")),
+                )
+                try:
+                    if is_unlocked:
+                        url = handler.unlock_hdhive_resource(
+                            slug=slug,
+                            unlock_points=0,
+                            resource_type=resource_type,
+                            is_unlocked=True,
+                            target_season=payload.get("target_season"),
+                            target_episodes=payload.get("target_episodes"),
+                            supports_file_preview=payload.get(
+                                "supports_file_preview"
+                            ),
+                            detail_path=str(payload.get("detail_path") or ""),
+                            search_label="测试已解锁预览",
+                        )
+                    else:
+                        preview = handler.preview_hdhive_resource(
+                            slug=slug,
+                            resource_type=resource_type,
+                            target_season=payload.get("target_season"),
+                            target_episodes=payload.get("target_episodes"),
+                            supports_file_preview=payload.get(
+                                "supports_file_preview"
+                            ),
+                            detail_path=str(payload.get("detail_path") or ""),
+                            search_label="测试只读预览",
+                        )
+                finally:
+                    handler.close(release_cache=False)
+                if is_unlocked:
+                    url = str(url or "").strip()
+                    if not url:
+                        raise RuntimeError("HDHive 已解锁资源页未解析到分享链接")
+                else:
+                    files = [
+                        {
+                            **self._preview_file(item),
+                            "can_enter": False,
+                        }
+                        for item in (preview.get("files") or [])
+                    ][:500]
+                    return {
+                        "success": True,
+                        "message": f"只读预览到 {len(files)} 个项目，未执行解锁",
+                        "data": {
+                            "items": files,
+                            "count": len(files),
+                            "provider_name": "HDHive",
+                            "resource_type": resource_type,
+                            "resource_type_name": resource_type_name(
+                                resource_type, resource_type.upper()
+                            ),
+                            "share_url": "",
+                            "parent_id": "",
+                            "preview_episodes": preview.get("preview_episodes") or {},
+                            "covers_target": preview.get("covers_target"),
+                            "resource_validate_status": preview.get(
+                                "resource_validate_status"
+                            ) or "",
+                            "resource_validate_message": preview.get(
+                                "resource_validate_message"
+                            ) or "",
+                        },
+                    }
             if pending_juying and not url:
                 if parent_id:
                     return {"success": False, "message": "聚影资源链接已失效，请重新预览"}
@@ -165,6 +319,9 @@ class SearchApi(OwnerDelegator):
                     }
                 }
 
+            if "\\" in url or resource_type_from_url(url) != resource_type:
+                return {"success": False, "message": "资源链接格式或类型无效"}
+
             provider_key = PREVIEW_PROVIDER_KEYS.get(resource_type)
             if not provider_key or not self._cloud_drive_registry:
                 return {"success": False, "message": "当前资源类型暂不支持内容预览"}
@@ -199,14 +356,45 @@ class SearchApi(OwnerDelegator):
         item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
         try:
             points = max(0, int(item.get("unlock_points") or 0))
-            if points <= 0:
+            free_hdhive_access = (
+                    source == "hdhive"
+                    and points == 0
+                    and bool(item.get("need_access"))
+                    and bool(item.get("is_free") or item.get("is_unlocked"))
+            )
+            zero_point_hdhive_unlock = (
+                    source == "hdhive"
+                    and points == 0
+                    and bool(item.get("need_unlock"))
+                    and bool(item.get("is_free"))
+            )
+            if points <= 0 and not (
+                    free_hdhive_access or zero_point_hdhive_unlock
+            ):
                 return {"success": False, "message": "该资源不需要积分解锁"}
-            handler = self._build_test_search_handler(source, self._test_search_config(source, payload.get("config")))
+            slug = str(item.get("slug") or item.get("id") or "").strip()
+            resource_type = normalize_resource_type(item.get("resource_type"))
+            if source == "hdhive" and (
+                    not slug or resource_type not in HDHIVE_DETAIL_RESOURCE_TYPES
+            ):
+                return {"success": False, "message": "HDHive 资源标识或类型无效"}
+            handler = self._build_test_search_handler(
+                source,
+                self._test_search_config(source, payload.get("config")),
+                confirmed_hdhive_unlock_points=(
+                    points if source == "hdhive" else 0
+                ),
+            )
             try:
                 if source == "hdhive":
                     url = handler.unlock_hdhive_resource(
-                        str(item.get("slug") or item.get("id") or ""), points,
-                        str(item.get("resource_type") or ""), str(item.get("media_page_url") or ""),
+                        slug, points, resource_type,
+                        str(item.get("media_page_url") or ""),
+                        is_unlocked=bool(item.get("is_unlocked")),
+                        target_season=item.get("target_season"),
+                        target_episodes=item.get("target_episodes"),
+                        supports_file_preview=item.get("supports_file_preview"),
+                        detail_path=str(item.get("detail_path") or ""),
                     )
                 elif source == "dian115":
                     url = handler.unlock_dian115_resource(
@@ -217,8 +405,10 @@ class SearchApi(OwnerDelegator):
             finally:
                 handler.close(release_cache=False)
             if not url:
-                return {"success": False, "message": "资源解锁失败"}
-            return {"success": True, "message": "资源已解锁", "data": {"url": url}}
+                message = "资源链接获取失败" if free_hdhive_access else "资源解锁失败"
+                return {"success": False, "message": message}
+            message = "资源链接已获取" if free_hdhive_access else "资源已解锁"
+            return {"success": True, "message": message, "data": {"url": url}}
         except Exception as error:
             logger.warning(f"测试资源解锁失败：{source} - {error}")
             return {"success": False, "message": f"解锁失败：{error}"}
@@ -242,6 +432,7 @@ class SearchApi(OwnerDelegator):
             source: str,
             config: Dict[str, Any],
             deadline: Optional[float] = None,
+            confirmed_hdhive_unlock_points: int = 0,
     ):
         """使用当前表单配置创建隔离搜索器，不修改已保存配置或运行中服务。"""
         from ...handlers.search import SearchHandler
@@ -321,6 +512,18 @@ class SearchApi(OwnerDelegator):
         elif source == "pinglian":
             require("pinglian_username", "pinglian_password")
 
+        hdhive_web_client = None
+        hdhive_web_client_owned = True
+        if (
+                source == "hdhive"
+                and hdhive_query_mode == "web"
+                and deadline is None
+        ):
+            (
+                hdhive_web_client,
+                hdhive_web_client_owned,
+            ) = self._get_test_hdhive_web_client(config, proxy)
+
         pansou_client = None
         pansou_timeout = 20
         if source == "pansou":
@@ -380,6 +583,9 @@ class SearchApi(OwnerDelegator):
                 get_data_func=self.get_data,
                 save_data_func=self.save_data,
             )
+        confirmed_hdhive_unlock_points = max(
+            0, int(confirmed_hdhive_unlock_points or 0)
+        )
         handler = SearchHandler(
             pansou_client=pansou_client,
             hdhive_client=hdhive_client,
@@ -395,13 +601,15 @@ class SearchApi(OwnerDelegator):
             juying_enabled=source == "juying",
             pinglian_enabled=source == "pinglian",
             online_docs_client=online_docs_client,
+            hdhive_web_client=hdhive_web_client,
+            hdhive_web_client_owned=hdhive_web_client_owned,
             hdhive_username=str(config.get("hdhive_username") or ""),
             hdhive_password=str(config.get("hdhive_password") or ""),
             hdhive_query_mode=hdhive_query_mode,
             # HDHive 测试使用独立只读路径；显式关闭自动解锁能力。
             hdhive_auto_unlock=False,
-            hdhive_max_unlock_points=0,
-            hdhive_max_points_per_sub=0,
+            hdhive_max_unlock_points=confirmed_hdhive_unlock_points,
+            hdhive_max_points_per_sub=confirmed_hdhive_unlock_points,
             dian115_email=str(config.get("dian115_email") or ""),
             dian115_password=str(config.get("dian115_password") or ""),
             # 测试搜索不进入同步链；收费候选仅展示，不会消耗积分。
@@ -742,6 +950,9 @@ class SearchApi(OwnerDelegator):
                 "need_access": bool(item.get("need_access")),
                 "is_unlocked": bool(item.get("is_unlocked")),
                 "is_free": bool(item.get("is_free")),
+                "target_season": item.get("target_season"),
+                "target_episodes": item.get("target_episodes") or [],
+                "preview_episodes": item.get("preview_episodes") or {},
                 "juying_resource_id": str(
                     item.get("juying_resource_id") or ""
                 ).strip(),

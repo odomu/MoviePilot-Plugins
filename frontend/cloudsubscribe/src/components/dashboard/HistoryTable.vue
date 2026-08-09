@@ -740,7 +740,6 @@
                       class="history-mobile-record-meta text-caption text-medium-emphasis"
                   >
                     <span>{{ resourceTypeLabel(resourceType(record)) }}</span>
-                    <span>{{ record.file_extension || "-" }}</span>
                     <a
                         v-if="record.source_link"
                         :href="record.source_link"
@@ -749,9 +748,9 @@
                         class="source-link"
                         title="打开来源详情页"
                         @click.stop
-                    >来源：{{ sourceLabel(record.source) }}</a
+                    >{{ sourceLabel(record.source) }}</a
                     >
-                    <span v-else>来源：{{ sourceLabel(record.source) }}</span>
+                    <span v-else>{{ sourceLabel(record.source) }}</span>
                     <a
                         v-if="record.resource_link"
                         :href="record.resource_link"
@@ -759,8 +758,11 @@
                         rel="noopener noreferrer"
                         class="source-link"
                         title="打开资源链接"
+                        aria-label="打开资源链接"
                         @click.stop
-                    >资源链接</a
+                    >
+                      <v-icon icon="mdi-link-variant" size="x-small"/>
+                    </a
                     >
                     <span>{{ formatSize(record.file_size) }}</span>
                   </div>

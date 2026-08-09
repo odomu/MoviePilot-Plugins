@@ -243,13 +243,18 @@ class RequestGate:
             return self._cooldown_status if self._cooldown_until > time.monotonic() else 0
 
     def run(self, request: Callable):
-        """在同一把门锁内执行请求，确保所有接口共用限速。"""
+        """按串行配置执行请求；非串行模式只锁定限速槽分配。"""
+        queued_at = time.monotonic()
         if not self._serial_requests:
             self._reserve_request_slot()
-            response = request()
-            with self._lock:
-                self._apply_cooldown(response)
-            return response
+            requested_at = time.monotonic()
+            try:
+                response = request()
+                with self._lock:
+                    self._apply_cooldown(response)
+                return response
+            finally:
+                self._log_timing(queued_at, requested_at)
         with self._lock:
             self._wait_for_slot_locked(
                 cancel_check=getattr(
@@ -259,7 +264,23 @@ class RequestGate:
                     self._sequence_local, "fail_on_cooldown", False
                 )),
             )
-            return self._run_request_locked(request)
+            requested_at = time.monotonic()
+            try:
+                return self._run_request_locked(request)
+            finally:
+                self._log_timing(queued_at, requested_at)
+
+    def _log_timing(self, queued_at: float, requested_at: float) -> None:
+        """拆分门控排队与网络耗时，便于定位渠道慢请求。"""
+        completed_at = time.monotonic()
+        queue_seconds = max(0.0, requested_at - queued_at)
+        request_seconds = max(0.0, completed_at - requested_at)
+        if queue_seconds < 0.1 and request_seconds < 0.5:
+            return
+        logger.debug(
+            f"{self._name} 请求阶段耗时：排队={queue_seconds:.2f}s，"
+            f"网络={request_seconds:.2f}s"
+        )
 
     def _run_request_locked(self, request: Callable):
         self._record_request_locked()
@@ -277,7 +298,7 @@ class RequestGate:
             cancel_check: Optional[Callable[[], bool]] = None,
             fail_on_cooldown: bool = False,
     ):
-        """串行执行强关联请求，但每次请求仍遵守最低间隔。"""
+        """串行执行强关联请求，跳过链内普通间隔但保留窗口限流。"""
         with self._lock:
             previous_cancel = getattr(
                 self._sequence_local, "cancel_check", None
@@ -285,6 +306,14 @@ class RequestGate:
             previous_fail = bool(getattr(
                 self._sequence_local, "fail_on_cooldown", False
             ))
+            previous_skip = bool(getattr(
+                self._sequence_local, "skip_interval", False
+            ))
+            if previous_skip:
+                # 外层协议链已经独占门控；嵌套链只让真实请求逐次计数，
+                # 避免登录刷新或验证码重试重复预留窗口容量。
+                yield
+                return
             self._wait_for_slot_locked(
                 required_slots=request_count,
                 cancel_check=cancel_check,
@@ -292,11 +321,13 @@ class RequestGate:
             )
             self._sequence_local.cancel_check = cancel_check
             self._sequence_local.fail_on_cooldown = fail_on_cooldown
+            self._sequence_local.skip_interval = True
             try:
                 yield
             finally:
                 self._sequence_local.cancel_check = previous_cancel
                 self._sequence_local.fail_on_cooldown = previous_fail
+                self._sequence_local.skip_interval = previous_skip
 
     def _reserve_request_slot(self) -> None:
         with self._lock:
@@ -333,13 +364,13 @@ class RequestGate:
         cooldown_wait = max(self._cooldown_until - now, 0.0)
         if fail_on_cooldown and cooldown_wait > 0:
             raise RequestGateCooldown(cooldown_wait, self._cooldown_status)
-        wait_seconds = max(
-            cooldown_wait,
-            window_wait,
-            self._request_interval * random.uniform(1.0, 1.25)
-            - (now - self._last_request_at),
-            0.0,
-        )
+        interval_wait = 0.0
+        if not getattr(self._sequence_local, "skip_interval", False):
+            interval_wait = (
+                    self._request_interval * random.uniform(1.0, 1.25)
+                    - (now - self._last_request_at)
+            )
+        wait_seconds = max(cooldown_wait, window_wait, interval_wait, 0.0)
         deadline = time.monotonic() + wait_seconds
         while wait_seconds > 0:
             if cancel_check and cancel_check():

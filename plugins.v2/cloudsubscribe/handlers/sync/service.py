@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import List, Dict, Any, Set, Optional, Callable, Tuple, Mapping
 
@@ -22,6 +23,7 @@ from app.log import logger
 from app.modules.filemanager import FileManagerModule
 from app.modules.filemanager.transhandler import TransHandler
 from app.schemas.types import MediaType, NotificationType
+from app.utils.http import RequestUtils
 
 from .baseline import UpgradeBaselineService
 from .history import HistoryService
@@ -61,6 +63,85 @@ _COMPONENT_TYPES = (
     UpgradeService,
     PtUpgradeService,
 )
+
+
+class _TmdbSeasonPageParser(HTMLParser):
+    """解析 TMDB 季页面中服务端渲染的剧集卡片。"""
+
+    def __init__(self, season: int):
+        super().__init__(convert_charrefs=True)
+        self.season = int(season)
+        self.episodes: Dict[int, str] = {}
+        self._card_depth = 0
+        self._card_episode = 0
+        self._episode_depth = 0
+        self._date_depth = 0
+        self._text: List[str] = []
+        self._field = ""
+
+    @staticmethod
+    def _classes(attrs) -> Set[str]:
+        return set(str(dict(attrs).get("class") or "").split())
+
+    def _finish_card(self) -> None:
+        if self._card_episode > 0 and self._text:
+            raw = "".join(self._text).strip()
+            match = re.search(r"(\d{4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})", raw)
+            if match:
+                self.episodes[self._card_episode] = (
+                    f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+                )
+        self._card_episode = 0
+        self._text = []
+        self._field = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        classes = self._classes(attrs)
+        if tag == "div" and "card" in classes:
+            if self._card_depth:
+                self._finish_card()
+            self._card_depth = 1
+            url = str(attrs_dict.get("data-url") or "")
+            match = re.search(r"/season/(\d+)/episode/(\d+)", url)
+            self._card_episode = int(match.group(2)) if match and int(match.group(1)) == self.season else 0
+            return
+        if not self._card_depth:
+            return
+        if tag == "div":
+            self._card_depth += 1
+        if tag in {"span", "div"} and "episode_number" in classes:
+            self._episode_depth = self._card_depth
+            self._field = "episode"
+            self._text = []
+        elif tag in {"span", "div"} and "date" in classes:
+            self._date_depth = self._card_depth
+            self._field = "date"
+            self._text = []
+
+    def handle_endtag(self, tag):
+        if not self._card_depth:
+            return
+        if self._field == "episode" and self._card_depth == self._episode_depth:
+            try:
+                self._card_episode = int("".join(self._text).strip())
+            except ValueError:
+                self._card_episode = 0
+            self._field = ""
+        elif self._field == "date" and self._card_depth == self._date_depth:
+            self._field = ""
+        if tag == "div":
+            self._card_depth -= 1
+            if not self._card_depth:
+                self._finish_card()
+
+    def handle_data(self, data):
+        if self._field in {"episode", "date"}:
+            self._text.append(data)
+
+    def close(self):
+        super().close()
+        self._finish_card()
 
 
 class SyncHandler:
@@ -525,12 +606,39 @@ class SyncHandler:
                 self._subscribe_defer_cache.delete(cache_key)
         return None
 
+    def _tmdb_season_web_episodes(self, tmdb_id: int, season: int) -> Dict[int, str]:
+        """读取 TMDB 季网页的真实卡片，绕过 API/平台缓存的滞后。"""
+        url = f"https://www.themoviedb.org/tv/{int(tmdb_id)}/season/{int(season)}"
+        response = RequestUtils(
+            timeout=20,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/136.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+        ).get_res(url=url)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if not response or status != 200:
+            logger.debug(
+                f"TMDB 季网页请求失败：S{season:02d}，HTTP {status or '-'}"
+            )
+            return {}
+        parser = _TmdbSeasonPageParser(season)
+        parser.feed(str(getattr(response, "text", "") or ""))
+        parser.close()
+        logger.debug(
+            f"TMDB 季网页解析完成：TV {tmdb_id} S{season:02d}，"
+            f"获取 {len(parser.episodes)} 集，最大集数 E{max(parser.episodes, default=0):02d}"
+        )
+        return parser.episodes
+
     def get_tv_subscribe_calendar(
             self,
             subscribe: Any,
             tmdb_id: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """复用平台订阅日历缓存，返回当前订阅目标集的播出状态。"""
+        """读取 TMDB 季网页并缓存当前订阅目标集的播出状态。"""
         if str(getattr(subscribe, "type", "") or "") != MediaType.TV.value:
             return None
         tmdb_id = int(tmdb_id or getattr(subscribe, "tmdbid", 0) or 0)
@@ -547,32 +655,32 @@ class SyncHandler:
         checked_on = today.isoformat()
         with self._subscribe_defer_lock:
             entry = self._subscribe_calendar_cache.get(cache_key)
-            if entry and entry.get("checked_on") == checked_on:
+            if (
+                    entry
+                    and entry.get("checked_on") == checked_on
+                    and entry.get("source") == "tmdb_web"
+            ):
                 return dict(entry)
             if entry:
                 self._subscribe_calendar_cache.delete(cache_key)
 
         try:
-            from app.chain.tmdb import TmdbChain
-
-            query_kwargs = {
-                "tmdbid": tmdb_id,
-                "season": season,
-            }
-            episode_group = str(
-                getattr(subscribe, "episode_group", "") or ""
-            ).strip()
-            if episode_group:
-                query_kwargs["episode_group"] = episode_group
-            episodes = self._timed_sync_call(
-                "tmdb_episodes",
-                TmdbChain().tmdb_episodes,
-                **query_kwargs,
+            web_air_dates = self._timed_sync_call(
+                "tmdb_season_web",
+                self._tmdb_season_web_episodes,
+                tmdb_id,
+                season,
             )
         except Exception as error:
             logger.warning(
                 f"{getattr(subscribe, 'name', '')} S{season:02d} "
-                f"读取平台订阅日历失败：{error}"
+                f"读取 TMDB 季网页失败：{error}"
+            )
+            return None
+        if not web_air_dates:
+            logger.warning(
+                f"{getattr(subscribe, 'name', '')} S{season:02d} "
+                "TMDB 季网页未解析到剧集播出日期，跳过播出过滤"
             )
             return None
 
@@ -581,12 +689,12 @@ class SyncHandler:
         season_aired_episodes: Set[int] = set()
         known_air_dates: Dict[int, str] = {}
         aired_episodes: Set[int] = set()
-        for episode in episodes or []:
+        for episode_number, raw_air_date in web_air_dates.items():
             try:
-                episode_number = int(getattr(episode, "episode_number", 0) or 0)
+                episode_number = int(episode_number)
             except (TypeError, ValueError):
                 continue
-            air_date = self._calendar_date(getattr(episode, "air_date", None))
+            air_date = self._calendar_date(raw_air_date)
             if episode_number <= 0 or not air_date:
                 continue
             season_known_air_dates[episode_number] = air_date.isoformat()
@@ -644,6 +752,7 @@ class SyncHandler:
         next_air_date = min(future_air_dates.values(), default=None)
         defer_until = next_air_date if all_targets_future else None
         entry = {
+            "source": "tmdb_web",
             "checked_on": checked_on,
             "known_air_dates": known_air_dates,
             "aired_episodes": sorted(aired_episodes),

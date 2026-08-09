@@ -130,6 +130,11 @@ class PointBudgetLedger:
             return 0
         return len(list(self._unlocked_cache.items()))
 
+    def discard_cached_url(self, identity: Any) -> None:
+        """移除单个无效链接，避免格式错误的历史值反复命中。"""
+        if self._unlocked_cache is not None:
+            self._unlocked_cache.pop(str(identity), None)
+
     def clear_cached_urls(self) -> int:
         count = self.cached_url_count()
         if self._unlocked_cache is not None:

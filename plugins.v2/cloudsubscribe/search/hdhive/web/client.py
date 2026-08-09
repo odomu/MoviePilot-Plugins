@@ -9,12 +9,14 @@ import re
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urljoin
 
 from app.log import logger
 
+from .captcha import HDHiveCaptchaError, HDHiveCaptchaSolver
 from .security import HDHiveSecurityProtocol
 from ...http_client import (
     CURL_CFFI_AVAILABLE,
@@ -61,6 +63,17 @@ class HDHiveClient:
     _LOGIN_ACTION_RE = re.compile(
         r"createServerReference\)\(\"([0-9a-f]{40,64})\".{0,200}?\"login\"",
         re.S,
+    )
+    _RESOURCE_PAGE_CHUNK_RE = re.compile(
+        r"static/chunks/app/\(no-layout\)/resource/[^\"']+/page-[A-Za-z0-9]+\.js"
+    )
+    _UNLOCK_ACTION_RE = re.compile(
+        r"createServerReference\)\(\"([0-9a-f]{40,64})\""
+        r".{0,240}?\"unlockResource\"",
+        re.S,
+    )
+    _HONEYPOT_TOKEN_RE = re.compile(
+        r'"honeypotToken"\s*:\s*("(?:\\.|[^"\\])*")'
     )
     _BIND_SECRET_RE = re.compile(
         r'[\\"]bindSecret[\\"]\s*:\s*[\\"]([^\\"]+)', re.I
@@ -121,6 +134,7 @@ class HDHiveClient:
         self._authenticated = False
         self._login_action = ""
         self._login_action_expires_at = 0.0
+        self._unlock_actions: Dict[str, str] = {}
         self._security = HDHiveSecurityProtocol()
         self._security_expires_at = 0.0
         self._bind_secret = ""
@@ -133,9 +147,13 @@ class HDHiveClient:
             risk_cooldown_seconds=self._RISK_COOLDOWN_SECONDS,
             server_error_cooldown_seconds=self._SERVER_ERROR_COOLDOWN_SECONDS,
             challenge_detector=self._is_challenge_response,
+            # 普通页面请求只串行领取限速槽，不在网络 I/O 期间占用账号门锁。
+            # 登录、验证码和解锁仍由客户端锁及 immediate_sequence 独占。
+            serial_requests=False,
             max_requests_per_window=self._MAX_REQUESTS_PER_MINUTE,
             request_window_seconds=60.0,
         )
+        self._captcha = HDHiveCaptchaSolver(self._raw_request)
         self._load_cookies()
 
     @property
@@ -353,6 +371,16 @@ class HDHiveClient:
             return False
         return bool(cookies.get("token") and cookies.get("refresh_token"))
 
+    @contextmanager
+    def related_requests(self, request_count: int):
+        """连续执行协议链，并固定客户端锁先于门控锁以避免反向等待。"""
+        with self._lock:
+            with self._request_gate.immediate_sequence(
+                    request_count=request_count,
+                    cancel_check=self._stop_requested,
+            ):
+                yield
+
     def _login_action_id(self, force: bool = False) -> str:
         now = time.monotonic()
         if not force and self._login_action and self._login_action_expires_at > now:
@@ -434,26 +462,68 @@ class HDHiveClient:
             self._security_expires_at = 0.0
         self._save_cookies()
 
+    def _login_with_sequence(self) -> None:
+        """连续完成登录页、JS 模块和登录 Action。"""
+        with self.related_requests(3):
+            self._login()
+
     def _ensure_authenticated(self) -> None:
         if self._authenticated and self._has_login_cookie():
             return
         if self._has_login_cookie():
             self._authenticated = True
             return
-        self._login()
+        self._login_with_sequence()
 
     def _authenticated_request(
-            self, method: str, path: str, retry_login: bool = True, **kwargs
+            self,
+            method: str,
+            path: str,
+            retry_login: bool = True,
+            retry_captcha: bool = True,
+            **kwargs,
     ):
         self._ensure_authenticated()
         response = self._raw_request(method, path, **kwargs)
+        if self._captcha.is_challenge_response(response):
+            logger.debug(
+                f"HDHive 请求命中验证码挑战：{method} {str(path).split('?', 1)[0]}"
+            )
+            if not retry_captcha:
+                raise HDHiveWebError(
+                    "HDHive 验证通过后仍返回安全验证页",
+                    code="captcha_retry_failed",
+                )
+            with self.related_requests(4):
+                try:
+                    clearance_seconds = self._captcha.solve(response, path)
+                except HDHiveCaptchaError as error:
+                    logger.debug(
+                        f"HDHive 验证码处理失败：code={error.code}，原因={error}"
+                    )
+                    raise HDHiveWebError(str(error), code=error.code) from error
+                self._save_cookies()
+                logger.info(
+                    "HDHive 动态验证码验证通过"
+                    + (
+                        f"，有效期 {clearance_seconds} 秒"
+                        if clearance_seconds > 0 else ""
+                    )
+                )
+                return self._authenticated_request(
+                    method,
+                    path,
+                    retry_login=retry_login,
+                    retry_captcha=False,
+                    **kwargs,
+                )
         redirected_to_login = "/login" in str(getattr(response, "url", ""))
         if retry_login and (
                 response.status_code in {401, 403} or redirected_to_login
         ):
             self._authenticated = False
             self._session.cookies.clear()
-            self._login()
+            self._login_with_sequence()
             return self._authenticated_request(
                 method, path, retry_login=False, **kwargs
             )
@@ -486,6 +556,7 @@ class HDHiveClient:
                 and self._security_expires_at - 60 > time.time()
         ):
             return
+        started = time.monotonic()
         client_public_key = self._security.begin_handshake()
         fingerprint = hashlib.sha256(
             f"{self._user_agent}|{self._languages}".encode("utf-8")
@@ -530,6 +601,10 @@ class HDHiveClient:
                 str(data.get("cid") or ""), server_public_key
             )
             self._security_expires_at = float(data.get("expires_at") or 0)
+            logger.debug(
+                "HDHive 安全会话握手完成："
+                f"耗时={time.monotonic() - started:.2f}s"
+            )
         except (TypeError, ValueError) as error:
             raise HDHiveWebError(
                 f"HDHive 安全握手参数无效：{error}", code="handshake_invalid"
@@ -720,12 +795,18 @@ class HDHiveClient:
                     if isinstance(error_value, dict)
                     else payload.get("message") if isinstance(payload, dict) else ""
                 ).strip()
+                risk_message = any(marker in message for marker in (
+                    "高频", "人机验证", "安全验证", "访问频繁", "操作频繁",
+                ))
+                if risk_message:
+                    self.activate_risk_cooldown("受保护接口要求人机验证")
                 raise HDHiveWebError(
                     f"HDHive 受保护接口请求失败："
                     f"{message or f'HTTP {response.status_code}'}",
                     code=(
                         "rate_limited"
-                        if response.status_code == 429 else "request_failed"
+                        if response.status_code == 429 or risk_message
+                        else "request_failed"
                     ),
                     status_code=response.status_code,
                 )
@@ -780,63 +861,116 @@ class HDHiveClient:
             )
             return response_handler(response) if response_handler else response
 
-    def signed_unlock_request(
+    @classmethod
+    def _resource_action_context(cls, response) -> tuple[str, str]:
+        """从详情页 RSC 数据中读取蜜罐字段值和页面 chunk。"""
+        text = cls._response_text(response)
+        normalized = text.replace(r'\"', '"')
+        token_match = cls._HONEYPOT_TOKEN_RE.search(normalized)
+        chunk_match = cls._RESOURCE_PAGE_CHUNK_RE.search(text)
+        if not token_match:
+            raise HDHiveWebError(
+                "HDHive 资源页未返回 honeypotToken 字段",
+                code="action_proof_missing",
+            )
+        if not chunk_match:
+            raise HDHiveWebError(
+                "HDHive 资源页未返回解锁客户端模块",
+                code="schema_changed",
+            )
+        try:
+            token = str(json.loads(token_match.group(1)) or "")
+        except (TypeError, ValueError) as error:
+            raise HDHiveWebError(
+                "HDHive honeypotToken 字段格式异常",
+                code="action_proof_invalid",
+            ) from error
+        logger.debug(
+            "HDHive 资源页 Action 上下文就绪："
+            f"honeypot长度={len(token)}，"
+            f"chunk={chunk_match.group(0).rsplit('/', 1)[-1]}"
+        )
+        return token, chunk_match.group(0)
+
+    def _unlock_action_id(self, chunk: str) -> str:
+        action_id = self._unlock_actions.get(chunk)
+        if action_id:
+            return action_id
+        response = self._authenticated_request("GET", f"/_next/{chunk}")
+        match = self._UNLOCK_ACTION_RE.search(self._response_text(response))
+        if not match:
+            raise HDHiveWebError(
+                "HDHive 解锁 Server Action 未找到",
+                code="schema_changed",
+            )
+        action_id = match.group(1)
+        self._unlock_actions = {chunk: action_id}
+        logger.debug("HDHive 解锁 Server Action 已解析")
+        return action_id
+
+    def web_unlock_request(
             self,
-            method: str,
-            path: str,
             resource_page_path: str,
-            body: bytes = b"",
-            headers: Optional[Dict[str, str]] = None,
+            slug: str,
             page_headers: Optional[Dict[str, str]] = None,
             response_handler: Optional[Callable] = None,
     ):
-        """在同一账户锁内先刷新资源页上下文，再发送解锁请求。
-
-        HDHive 会通过资源页响应轮换页面会话 Cookie；若页面 GET 与解锁
-        POST 被不同请求插入，后一个页面上下文会使前一个解锁被判定为过期。
-        """
+        """严格按网页的详情页 + unlockResource Server Action 顺序解锁。"""
         try:
             with self._unlock_lock():
-                self._wait_for_unlock_slot()
                 with self._lock:
-                    # 登录或握手可能产生额外请求，必须在刷新资源页之前完成。
-                    self._ensure_security_session()
-
-                    def request_once():
+                    self._wait_for_unlock_slot()
+                    started = time.monotonic()
+                    posted = False
+                    try:
+                        # 页面发布新 chunk 时会额外读取一次模块，始终按上限预留。
                         with self._request_gate.immediate_sequence(
-                                request_count=2,
+                                request_count=3,
                                 cancel_check=self._stop_requested,
                                 fail_on_cooldown=True,
                         ):
-                            self._authenticated_request(
+                            page_response = self._authenticated_request(
                                 "GET",
                                 resource_page_path,
                                 headers=page_headers or {},
                             )
-                            return self._signed_request_once(
-                                method,
-                                path,
-                                body=body,
-                                headers=headers,
-                                retry=False,
+                            honeypot_token, chunk = self._resource_action_context(
+                                page_response
                             )
-
-                    response = request_once()
-                    error_code = self._security_error_code(response)
-                    if self._prepare_security_retry(error_code):
-                        response = request_once()
-                    if not response_handler:
-                        return response
-                    try:
-                        return response_handler(response)
-                    except HDHiveWebError as error:
-                        if error.code != "page_expired":
-                            raise
-                        # 页面上下文过期通常意味着安全 Cookie 已轮换；重建一次
-                        # 会话后重新执行“资源页 GET + 解锁 POST”原子序列。
-                        self._ensure_security_session(force=True)
-                        retry_response = request_once()
-                        return response_handler(retry_response)
+                            action_id = self._unlock_action_id(chunk)
+                            posted = True
+                            response = self._authenticated_request(
+                                "POST",
+                                resource_page_path,
+                                headers={
+                                    "accept": "text/x-component",
+                                    "content-type": "text/plain;charset=UTF-8",
+                                    "next-action": action_id,
+                                    "next-url": resource_page_path,
+                                    "origin": self.BASE_URL,
+                                    "referer": (
+                                        f"{self.BASE_URL}{resource_page_path}"
+                                    ),
+                                    "sec-fetch-dest": "empty",
+                                    "sec-fetch-mode": "cors",
+                                    "sec-fetch-site": "same-origin",
+                                },
+                                data=json.dumps(
+                                    [slug, honeypot_token],
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            )
+                        logger.debug(
+                            "HDHive 网页解锁序列完成：详情页 HTTP "
+                            f"{getattr(page_response, 'status_code', 0)}，"
+                            f"Action HTTP {getattr(response, 'status_code', 0)}，"
+                            f"耗时 {(time.monotonic() - started):.2f}s"
+                        )
+                    finally:
+                        if posted:
+                            self._record_unlock_attempt()
+                    return response_handler(response) if response_handler else response
         except RequestGateCooldown as error:
             raise HDHiveWebError(
                 "HDHive WebAPI 处于风控冷却期，跳过解锁"

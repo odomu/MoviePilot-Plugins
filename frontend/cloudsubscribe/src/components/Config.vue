@@ -360,12 +360,25 @@
                         </v-chip>
                         <div class="source-test-item-actions">
                           <v-btn
+                              v-if="canAccessHdhiveResource(item)"
+                              icon="mdi-link-variant-plus"
+                              size="x-small"
+                              variant="text"
+                              title="获取资源链接"
+                              :loading="accessingResource === previewResourceKey(item)"
+                              :disabled="Boolean(previewingUrl) || Boolean(accessingResource)"
+                              @click="accessResource(item)"
+                          />
+                          <v-btn
                               v-if="canPreviewResource(item)"
                               icon="mdi-eye-outline"
                               size="x-small"
                               variant="text"
-                              title="预览资源内容"
+                              :title="String(item?.source || '').toLowerCase() === 'hdhive'
+                                ? (item?.is_unlocked ? '预览已解锁分享内容' : '只读预览资源内容')
+                                : '预览资源内容'"
                               :loading="previewingUrl === previewResourceKey(item)"
+                              :disabled="Boolean(previewingUrl) || Boolean(accessingResource)"
                               @click="previewResource(item)"
                           />
                           <v-btn
@@ -606,6 +619,7 @@ const qrVisible = ref(false),
     testElapsed = ref(null),
     previewVisible = ref(false),
     previewingUrl = ref(""),
+    accessingResource = ref(""),
     previewLoading = ref(false),
     previewError = ref(""),
     previewItems = ref([]),
@@ -615,6 +629,10 @@ const qrVisible = ref(false),
     previewShareUrl = ref(""),
     previewSource = ref(""),
     previewJuyingResourceId = ref(""),
+    previewHdhiveSlug = ref(""),
+    previewHdhiveUnlocked = ref(false),
+    previewTargetSeason = ref(null),
+    previewTargetEpisodes = ref([]),
     unlockVisible = ref(false),
     unlockItem = ref(null),
     unlocking = ref(false),
@@ -863,26 +881,78 @@ function previewFileStem(value) {
 
 function canPreviewResource(item) {
   const source = String(item?.source || "").toLowerCase();
+  const hdhivePreview = source === "hdhive" && Boolean(
+      item?.slug && item?.resource_type,
+  );
   return Boolean(
       item?.can_preview && (
-          item?.url || (source === "juying" && item?.juying_resource_id)
+          item?.url ||
+          (source === "juying" && item?.juying_resource_id) ||
+          hdhivePreview
       ),
+  );
+}
+
+function canAccessHdhiveResource(item) {
+  return Boolean(
+      String(item?.source || "").toLowerCase() === "hdhive" &&
+      item?.need_access &&
+      !item?.url &&
+      Number(item?.unlock_points || 0) === 0 &&
+      (item?.is_free || item?.is_unlocked),
   );
 }
 
 function previewResourceKey(item) {
   const source = String(item?.source || "").toLowerCase();
   const resourceId = String(item?.juying_resource_id || "");
-  return source === "juying" && resourceId
-      ? `${source}:${resourceId}`
-      : String(item?.url || "");
+  if (source === "juying" && resourceId) return `${source}:${resourceId}`;
+  return String(
+      item?.url ||
+      `${source}:${item?.resource_type || ""}:${item?.slug || item?.id || ""}`,
+  );
+}
+
+async function requestResourceUrl(item) {
+  const response = unwrapResponse(await api.post("plugin/CloudSubscribe/search/unlock", {
+    source: item.source || sourceTest.source,
+    item,
+    config: sourceTestConfig(item.source || sourceTest.source),
+  }));
+  if (response.success === false) throw new Error(response.message || "资源链接获取失败");
+  const data = response.data?.data || response.data || {};
+  if (!data.url) throw new Error(response.message || "资源链接获取失败");
+  item.url = data.url;
+  item.need_access = false;
+  item.need_unlock = false;
+  item.is_unlocked = true;
+  return response.message || "资源链接已获取";
+}
+
+async function accessResource(item) {
+  if (!canAccessHdhiveResource(item)) return;
+  const resourceKey = previewResourceKey(item);
+  if (accessingResource.value || previewingUrl.value) return;
+  accessingResource.value = resourceKey;
+  try {
+    const message = await requestResourceUrl(item);
+    notify(`${message}，现在可以预览或复制`);
+  } catch (error) {
+    notify(
+        error?.response?.data?.message || error.message || String(error),
+        "error",
+    );
+  } finally {
+    accessingResource.value = "";
+  }
 }
 
 async function previewResource(item) {
   if (!canPreviewResource(item)) return;
-  const shareUrl = String(item.url || "");
+  if (accessingResource.value || previewingUrl.value) return;
   const requestId = ++previewRequestId;
   previewingUrl.value = previewResourceKey(item);
+  const shareUrl = String(item.url || "");
   previewVisible.value = true;
   previewLoading.value = false;
   previewError.value = "";
@@ -891,6 +961,12 @@ async function previewResource(item) {
   previewShareUrl.value = shareUrl;
   previewSource.value = String(item.source || "").toLowerCase();
   previewJuyingResourceId.value = String(item.juying_resource_id || "");
+  previewHdhiveSlug.value = String(item.slug || "");
+  previewHdhiveUnlocked.value = Boolean(item.is_unlocked);
+  previewTargetSeason.value = item.target_season ?? null;
+  previewTargetEpisodes.value = Array.isArray(item.target_episodes)
+      ? [...item.target_episodes]
+      : [];
   previewMeta.value = {
     provider_name: "",
     resource_type_name: String(
@@ -901,12 +977,20 @@ async function previewResource(item) {
   const breadcrumbs = [{id: "", name: "根目录"}];
   previewBreadcrumbs.value = breadcrumbs;
   await loadPreviewDirectory("", breadcrumbs, requestId);
+  if (requestId === previewRequestId && previewShareUrl.value) {
+    item.url = previewShareUrl.value;
+    item.need_access = false;
+    item.need_unlock = false;
+    item.is_unlocked = true;
+  }
   if (requestId === previewRequestId) previewingUrl.value = "";
 }
 
 async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++previewRequestId) {
   const pendingJuying = previewSource.value === "juying" && previewJuyingResourceId.value;
-  if (!previewShareUrl.value && !pendingJuying) return;
+  const pendingHdhive = previewSource.value === "hdhive" &&
+      previewHdhiveSlug.value && !previewShareUrl.value;
+  if (!previewShareUrl.value && !pendingJuying && !pendingHdhive) return;
   const resourceType = previewResourceType.value;
   const shareUrl = previewShareUrl.value;
   previewLoading.value = true;
@@ -918,7 +1002,13 @@ async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++preview
       parent_id: parentId || "",
       source: previewSource.value,
       juying_resource_id: previewJuyingResourceId.value,
-      config: pendingJuying ? sourceTestConfig("juying") : undefined,
+      slug: previewHdhiveSlug.value,
+      is_unlocked: previewHdhiveUnlocked.value,
+      target_season: previewTargetSeason.value,
+      target_episodes: previewTargetEpisodes.value,
+      config: pendingJuying
+          ? sourceTestConfig("juying")
+          : pendingHdhive ? sourceTestConfig("hdhive") : undefined,
     }));
     if (requestId !== previewRequestId || !previewVisible.value) return;
     if (response.success === false) throw new Error(response.message || "资源预览失败");
@@ -974,25 +1064,18 @@ async function unlockResource() {
   if (!item || unlocking.value) return;
   unlocking.value = true;
   unlockError.value = "";
+  let shouldPreview = false;
   try {
-    const response = unwrapResponse(await api.post("plugin/CloudSubscribe/search/unlock", {
-      source: item.source || sourceTest.source,
-      item,
-      config: sourceTestConfig(item.source || sourceTest.source),
-    }));
-    if (response.success === false) throw new Error(response.message || "解锁失败");
-    const data = response.data?.data || response.data || {};
-    if (!data.url) throw new Error(response.message || "解锁失败");
-    item.url = data.url;
-    item.need_unlock = false;
-    item.is_unlocked = true;
+    const message = await requestResourceUrl(item);
     unlockVisible.value = false;
-    notify("资源已解锁，现在可以预览或复制");
+    shouldPreview = canPreviewResource(item);
+    notify(shouldPreview ? `${message}，正在打开预览` : `${message}，现在可以复制`);
   } catch (error) {
     unlockError.value = error?.response?.data?.message || error.message || String(error);
   } finally {
     unlocking.value = false;
   }
+  if (shouldPreview) await previewResource(item);
 }
 
 function testItemStatus(item) {
@@ -1358,6 +1441,10 @@ watch(
       previewShareUrl.value = "";
       previewSource.value = "";
       previewJuyingResourceId.value = "";
+      previewHdhiveSlug.value = "";
+      previewHdhiveUnlocked.value = false;
+      previewTargetSeason.value = null;
+      previewTargetEpisodes.value = [];
     },
 );
 

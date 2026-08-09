@@ -134,13 +134,40 @@ class ResourceTransferService(OwnerDelegator):
         slug = str(resource.get("slug") or "").strip()
         if not slug:
             return ""
+        source = str(resource.get("source") or "").strip().lower()
+        try:
+            target_season = max(1, int(resource.get("target_season") or 1))
+        except (TypeError, ValueError):
+            target_season = 1
+        target_episodes = set()
+        for value in resource.get("target_episodes") or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                target_episodes.add(episode)
+        remark_episodes = self._resource_preview_episodes(
+            resource, target_season
+        )
+        if (
+                source == "hdhive"
+                and target_episodes
+                and remark_episodes
+                and not (target_episodes & remark_episodes)
+        ):
+            prefix = f"{log_prefix} " if log_prefix else ""
+            logger.debug(
+                f"{prefix}HDHive remark 已明确不覆盖当前缺集，"
+                f"跳过详情预览与解锁：slug={slug}"
+            )
+            return ""
         try:
             unlock_points = int(resource.get("unlock_points") or 0)
         except (TypeError, ValueError):
             unlock_points = 0
         prefix = f"{log_prefix} " if log_prefix else ""
         resource_title = str(resource.get("title") or "").strip()
-        source = str(resource.get("source") or "").strip().lower()
         is_dian115 = source == "dian115"
         has_budget = (
             self._search_handler.has_dian115_unlock_budget(unlock_points)
@@ -178,6 +205,11 @@ class ResourceTransferService(OwnerDelegator):
                 resource.get("resource_type"),
                 media_page_url=media_page_url,
                 search_label=search_label,
+                is_unlocked=bool(resource.get("is_unlocked")),
+                target_season=resource.get("target_season"),
+                target_episodes=resource.get("target_episodes"),
+                supports_file_preview=resource.get("supports_file_preview"),
+                detail_path=str(resource.get("detail_path") or ""),
             )
         if self._stop_requested() or not unlocked:
             if not self._stop_requested():

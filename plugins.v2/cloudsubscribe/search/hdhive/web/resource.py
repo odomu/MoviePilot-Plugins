@@ -1,22 +1,31 @@
 """HDHive WebAPI 资源查询、详情解析与解锁。"""
 
 import copy
+import html
 import json
 import re
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from app.log import logger
 
 from .client import HDHiveClient, HDHiveWebError
 from ...matching import positive_ints, unique_texts
+from ...types import (
+    SUPPORTED_CLOUD_TYPES,
+    SUPPORTED_RESOURCE_TYPES,
+    normalize_resource_type,
+    resource_type_from_url,
+)
+from ....utils import MediaFileParser
 from ....utils.cache import create_platform_ttl_cache
 
-HDHIVE_DETAIL_RESOURCE_TYPES = frozenset({"115", "quark", "guangya", "ed2k"})
-HDHIVE_RESOURCE_TYPES = HDHIVE_DETAIL_RESOURCE_TYPES | {"magnet"}
+HDHIVE_RESOURCE_TYPES = frozenset(SUPPORTED_RESOURCE_TYPES)
+HDHIVE_DETAIL_RESOURCE_TYPES = HDHIVE_RESOURCE_TYPES - {"magnet"}
 
 
 class HDHiveResourceService:
@@ -25,7 +34,22 @@ class HDHiveResourceService:
     BASE_URL = "https://hdhive.com"
     _RESOURCE_CACHE_TTL = 5 * 60
     _RESOURCE_CACHE_LIMIT = 128
+    _RESOURCE_LOCKS = tuple(threading.Lock() for _ in range(64))
+    _PREVIEW_CACHE_TTL = 10 * 60
+    _PREVIEW_CACHE_LIMIT = 256
+    _ACCESSIBLE_URL_CACHE_TTL = 10 * 60
+    _ACCESSIBLE_URL_CACHE_LIMIT = 256
+    _ACCESSIBLE_URL_LOCKS = tuple(threading.Lock() for _ in range(64))
+    _PREVIEW_INTERVAL_SECONDS = 12.0
+    _PREVIEW_WINDOW_SECONDS = 60.0
+    _PREVIEWS_PER_WINDOW = 4
+    _PREVIEW_STATE_LOCK = threading.RLock()
+    _PREVIEW_HISTORIES: Dict[str, deque] = {}
+    _PREVIEW_LOCKS: Dict[str, threading.RLock] = {}
+    _PREVIEW_ACCOUNT_LOCKS: Dict[str, threading.Lock] = {}
+    _PREVIEW_LOCK_BUCKETS = 32
     _SCHEMA_FAILURE_TTL = 60
+    _PREVIEW_UNAVAILABLE_TTL = 15
     _TORRENTCLAW_CACHE_TTL = 30 * 60
     _TORRENTCLAW_CACHE_LIMIT = 128
     _TORRENTCLAW_REQUEST_INTERVAL = 60.0
@@ -45,6 +69,9 @@ class HDHiveResourceService:
         r"(?:\|(?:h|p)=[^|\r\n]+)*\|/",
         re.I,
     )
+    _EMBEDDED_ESCAPE_RE = re.compile(
+        r"\\+(u003a|u002f|u0026|u003d|u003f|u002b|/|[\"'])", re.I
+    )
 
     def __init__(
             self,
@@ -58,6 +85,7 @@ class HDHiveResourceService:
             torrentclaw_subtitle_languages or ["zh"]
         )
         session_key = client.cache_namespace
+        self._session_key = session_key
         self._resource_cache = create_platform_ttl_cache(
             "hdhive:web:rows",
             session_key,
@@ -70,13 +98,36 @@ class HDHiveResourceService:
             maxsize=self._RESOURCE_CACHE_LIMIT,
             ttl=self._SCHEMA_FAILURE_TTL,
         )
+        self._preview_cache = create_platform_ttl_cache(
+            "hdhive:web:file_preview",
+            session_key,
+            maxsize=self._PREVIEW_CACHE_LIMIT,
+            ttl=self._PREVIEW_CACHE_TTL,
+        )
+        self._preview_unavailable_cache = create_platform_ttl_cache(
+            "hdhive:web:preview_unavailable",
+            session_key,
+            maxsize=self._PREVIEW_CACHE_LIMIT,
+            ttl=self._PREVIEW_UNAVAILABLE_TTL,
+        )
+        self._preview_capability_cache = create_platform_ttl_cache(
+            "hdhive:web:preview_capability",
+            session_key,
+            maxsize=self._PREVIEW_CACHE_LIMIT,
+            ttl=self._PREVIEW_CACHE_TTL,
+        )
+        self._accessible_url_cache = create_platform_ttl_cache(
+            "hdhive:web:accessible_url",
+            session_key,
+            maxsize=self._ACCESSIBLE_URL_CACHE_LIMIT,
+            ttl=self._ACCESSIBLE_URL_CACHE_TTL,
+        )
         self._torrentclaw_cache = create_platform_ttl_cache(
             "hdhive:web:torrentclaw",
             session_key,
             maxsize=self._TORRENTCLAW_CACHE_LIMIT,
             ttl=self._TORRENTCLAW_CACHE_TTL,
         )
-        self._resource_locks = tuple(threading.Lock() for _ in range(32))
         self._lock = threading.RLock()
 
     def matches_config(
@@ -96,12 +147,513 @@ class HDHiveResourceService:
         with self._lock:
             counts = {
                 "resources": len(list(self._resource_cache.items())),
+                "previews": len(list(self._preview_cache.items())),
+                "accessible_urls": len(list(self._accessible_url_cache.items())),
                 "torrentclaw": len(list(self._torrentclaw_cache.items())),
             }
             self._resource_cache.clear()
             self._schema_failure_cache.clear()
+            self._preview_cache.clear()
+            self._preview_unavailable_cache.clear()
+            self._preview_capability_cache.clear()
+            self._accessible_url_cache.clear()
             self._torrentclaw_cache.clear()
             return counts
+
+    def _preview_lock(self, preview_key: str) -> threading.RLock:
+        """合并同一账号、同一资源的并发预览，不阻塞其他缓存命中。"""
+        bucket = hash(preview_key) % self._PREVIEW_LOCK_BUCKETS
+        lock_key = f"{self._client.cache_namespace}:{bucket}"
+        with self._PREVIEW_STATE_LOCK:
+            return self._PREVIEW_LOCKS.setdefault(lock_key, threading.RLock())
+
+    def _preview_account_lock(self) -> threading.Lock:
+        with self._PREVIEW_STATE_LOCK:
+            return self._PREVIEW_ACCOUNT_LOCKS.setdefault(
+                self._client.cache_namespace, threading.Lock()
+            )
+
+    def _wait_for_preview_slot(self, log_prefix: str) -> None:
+        """限制详情页 file-list 的账号级调用频率。"""
+        logged = False
+        while True:
+            if self._client.cooldown_remaining > 0:
+                raise HDHiveWebError(
+                    "HDHive WebAPI 处于风控冷却期，跳过文件预览",
+                    code="rate_limited",
+                )
+            with self._PREVIEW_STATE_LOCK:
+                history = self._PREVIEW_HISTORIES.setdefault(
+                    self._client.cache_namespace, deque()
+                )
+                now = time.monotonic()
+                while history and now - history[0] >= self._PREVIEW_WINDOW_SECONDS:
+                    history.popleft()
+                wait_seconds = 0.0
+                if history:
+                    wait_seconds = max(
+                        wait_seconds,
+                        self._PREVIEW_INTERVAL_SECONDS - (now - history[-1]),
+                    )
+                if len(history) >= self._PREVIEWS_PER_WINDOW:
+                    wait_seconds = max(
+                        wait_seconds,
+                        self._PREVIEW_WINDOW_SECONDS - (now - history[0]),
+                    )
+                if wait_seconds <= 0:
+                    history.append(now)
+                    return
+            if not logged:
+                logger.debug(
+                    f"{log_prefix} file-list 预览限频等待 {wait_seconds:.1f} 秒"
+                )
+                logged = True
+            time.sleep(min(wait_seconds, 0.25))
+
+    @staticmethod
+    def _preview_episodes_from_files(
+            files: List[Dict[str, Any]], target_season: Optional[int]
+    ) -> Dict[str, List[int]]:
+        episodes: Dict[str, set] = {}
+        fallback_season = max(1, int(target_season or 1))
+        for item in files or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("path") or item.get("name") or "").strip()
+            parsed = MediaFileParser.extract_season_episode(name)
+            if parsed:
+                episodes.setdefault(str(parsed[0]), set()).add(parsed[1])
+                continue
+            match = re.search(r"(?i)(?:^|[^A-Za-z0-9])EP?0*(\d{1,4})(?!\d)", name)
+            if not match:
+                match = re.search(r"第\s*(\d{1,4})\s*集", name)
+            if match:
+                episodes.setdefault(str(fallback_season), set()).add(
+                    int(match.group(1))
+                )
+        return {
+            season: sorted(values)
+            for season, values in episodes.items()
+            if values
+        }
+
+    def _load_file_preview(
+            self,
+            slug: str,
+            resource_type: str,
+            log_prefix: str,
+            detail_path: str = "",
+    ) -> Dict[str, Any]:
+        """限频读取并缓存 file-list，不访问详情页且绝不触发解锁。"""
+        preview_key = f"{resource_type}:{slug}"
+        preview = self._preview_cache.get(preview_key)
+        if isinstance(preview, dict):
+            logger.debug(f"{log_prefix} 命中 file-list 预览缓存：slug={slug}")
+            return copy.deepcopy(preview)
+        failure_key = f"preview:{preview_key}"
+        unavailable = self._preview_unavailable_cache.get(preview_key)
+        if unavailable:
+            raise HDHiveWebError(str(unavailable), code="preview_unavailable")
+        cached_failure = self._schema_failure_cache.get(failure_key)
+        if cached_failure:
+            raise HDHiveWebError(str(cached_failure), code="preview_invalid")
+        with self._preview_lock(preview_key):
+            preview = self._preview_cache.get(preview_key)
+            if isinstance(preview, dict):
+                return copy.deepcopy(preview)
+            unavailable = self._preview_unavailable_cache.get(preview_key)
+            if unavailable:
+                raise HDHiveWebError(
+                    str(unavailable), code="preview_unavailable"
+                )
+            cached_failure = self._schema_failure_cache.get(failure_key)
+            if cached_failure:
+                raise HDHiveWebError(str(cached_failure), code="preview_invalid")
+            account_lock = self._preview_account_lock()
+            if not account_lock.acquire(blocking=False):
+                raise HDHiveWebError(
+                    "HDHive 已有资源预览正在进行，请稍后再试",
+                    code="preview_busy",
+                )
+            try:
+                preview_started = time.monotonic()
+                self._wait_for_preview_slot(log_prefix)
+                requested_at = time.monotonic()
+                resolved_detail_path = self._resolve_detail_path(
+                    resource_type, slug, detail_path
+                )
+                response = self._client.signed_request(
+                    "GET",
+                    f"/api/customer/resources/{slug}/file-list",
+                    headers={
+                        "accept": "application/json",
+                        "referer": f"{self.BASE_URL}{resolved_detail_path}",
+                    },
+                )
+                logger.debug(
+                    f"{log_prefix} file-list 请求完成：slug={slug}，"
+                    f"限频等待={requested_at - preview_started:.2f}s，"
+                    f"请求链={time.monotonic() - requested_at:.2f}s"
+                )
+                try:
+                    payload = response.json()
+                except ValueError as error:
+                    self._schema_failure_cache.set(
+                        failure_key, "HDHive file-list 响应格式异常"
+                    )
+                    raise HDHiveWebError(
+                        "HDHive file-list 响应格式异常", code="preview_invalid"
+                    ) from error
+                preview = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(preview, dict):
+                    error_value = payload.get("error") if isinstance(payload, dict) else None
+                    message = str(
+                        payload.get("message")
+                        or (
+                            error_value.get("message")
+                            if isinstance(error_value, dict) else error_value
+                        )
+                        or ""
+                        if isinstance(payload, dict) else ""
+                    ).strip()
+                    business_failure = isinstance(payload, dict) and (
+                            payload.get("success") is False
+                            or bool(message)
+                            or isinstance(error_value, dict)
+                    )
+                    if business_failure:
+                        failure_message = "HDHive 暂时无法提供该资源文件列表"
+                        self._preview_unavailable_cache.set(
+                            preview_key, failure_message
+                        )
+                        logger.debug(
+                            f"{log_prefix} file-list 业务失败：slug={slug}，"
+                            f"原因={message or '站点未返回文件列表'}"
+                        )
+                        raise HDHiveWebError(
+                            failure_message, code="preview_unavailable"
+                        )
+                    failure_message = (
+                        f"HDHive file-list 缺少 data：{message}"
+                        if message else "HDHive file-list 缺少 data"
+                    )
+                    self._schema_failure_cache.set(failure_key, failure_message)
+                    raise HDHiveWebError(
+                        failure_message, code="preview_invalid"
+                    )
+                self._preview_cache.set(preview_key, copy.deepcopy(preview))
+                return copy.deepcopy(preview)
+            finally:
+                account_lock.release()
+
+    def preview_resource(
+            self,
+            slug: str,
+            resource_type: str,
+            target_season: Optional[int] = None,
+            target_episodes: Optional[List[int]] = None,
+            supports_file_preview: Optional[bool] = None,
+            detail_path: str = "",
+            log_prefix: str = "[HDHIVE]",
+    ) -> Dict[str, Any]:
+        """只读预览未解锁资源，返回文件和集数信息。"""
+        normalized_slug = str(slug or "").strip()
+        normalized_type = str(resource_type or "").strip().lower()
+        if (
+                not normalized_slug
+                or normalized_type not in HDHIVE_DETAIL_RESOURCE_TYPES
+        ):
+            raise HDHiveWebError(
+                "HDHive 资源标识或类型无效", code="invalid_resource"
+            )
+        can_preview = supports_file_preview
+        if can_preview is None:
+            can_preview = self._resolve_file_preview_capability(
+                normalized_slug, normalized_type, log_prefix, detail_path
+            )
+        if not can_preview:
+            raise HDHiveWebError(
+                f"HDHive {normalized_type.upper()} 资源不支持文件列表预览",
+                code="preview_unsupported",
+            )
+        preview = self._load_file_preview(
+            normalized_slug, normalized_type, log_prefix, detail_path
+        )
+        files = preview.get("files") or []
+        preview_episodes = self._preview_episodes_from_files(
+            files, target_season
+        )
+        targets = positive_ints(target_episodes)
+        available = positive_ints(preview_episodes.get(
+            str(max(1, int(target_season or 1)))
+        ))
+        return {
+            "files": copy.deepcopy(files),
+            "preview_episodes": preview_episodes,
+            "resource_validate_status": str(
+                preview.get("resource_validate_status") or ""
+            ),
+            "resource_validate_message": str(
+                preview.get("resource_validate_message") or ""
+            ),
+            "covers_target": bool(targets & available) if targets else None,
+        }
+
+    @classmethod
+    def _decode_embedded_text(cls, value: Any) -> str:
+        """还原 Next.js Flight/JSON 中可能重复编码的 URL 转义。"""
+        replacements = {
+            "u003a": ":",
+            "u002f": "/",
+            "u0026": "&",
+            "u003d": "=",
+            "u003f": "?",
+            "u002b": "+",
+            "/": "/",
+            '"': '"',
+            "'": "'",
+        }
+        text = str(value or "")
+        for _ in range(4):
+            decoded = html.unescape(unquote(text))
+            decoded = cls._EMBEDDED_ESCAPE_RE.sub(
+                lambda match: replacements[match.group(1).lower()], decoded
+            )
+            if decoded == text:
+                break
+            text = decoded
+        return text
+
+    @staticmethod
+    def _valid_share_url(value: str, resource_type: str) -> bool:
+        candidate = str(value or "").strip()
+        if not candidate or "\\" in candidate or any(
+                ord(character) < 32 for character in candidate
+        ):
+            return False
+        if resource_type == "ed2k":
+            return bool(HDHiveResourceService._ED2K_URL_RE.fullmatch(candidate))
+        try:
+            parsed = urlparse(candidate)
+            hostname = parsed.hostname
+        except ValueError:
+            return False
+        valid = (
+                parsed.scheme.lower() in {"http", "https"}
+                and bool(hostname)
+                and resource_type_from_url(candidate) == resource_type
+        )
+        if not valid or resource_type != "115":
+            return valid
+        share_code = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        receive_code = dict(parse_qsl(parsed.query)).get("password", "")
+        return bool(
+            re.fullmatch(r"[A-Za-z0-9]+", share_code)
+            and re.fullmatch(r"[A-Za-z0-9]{4}", receive_code)
+        )
+
+    @classmethod
+    def _normalize_share_url(
+            cls, value: Any, resource_type: str, access_code: Any = ""
+    ) -> str:
+        candidate = cls._decode_embedded_text(value).strip().rstrip("),.;]}")
+        if resource_type == "115" and candidate:
+            parsed = urlsplit(candidate)
+            query = parse_qsl(parsed.query, keep_blank_values=True)
+            embedded_code = next((
+                item for key, item in query
+                if key.lower() in {"password", "pwd", "receive_code"}
+            ), "")
+            code = cls._decode_embedded_text(
+                access_code or embedded_code
+            ).strip()
+            if re.fullmatch(r"[A-Za-z0-9]{4}", code):
+                query = [
+                    (key, item) for key, item in query
+                    if key.lower() not in {"password", "pwd", "receive_code"}
+                ]
+                query.append(("password", code))
+                candidate = urlunsplit(parsed._replace(query=urlencode(query)))
+        return candidate if cls._valid_share_url(candidate, resource_type) else ""
+
+    @classmethod
+    def _share_url_from_values(cls, values: Any, resource_type: str) -> str:
+        pending = [values]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                access_code = next((
+                    item for key, item in value.items()
+                    if str(key).replace("_", "").lower()
+                       in {"password", "pwd", "receivecode"}
+                ), "")
+                for item in value.values():
+                    if isinstance(item, (dict, list, tuple, set)):
+                        continue
+                    normalized = cls._normalize_share_url(
+                        item, resource_type, access_code
+                    )
+                    if normalized:
+                        return normalized
+                pending.extend(value.values())
+                continue
+            if isinstance(value, (list, tuple, set)):
+                pending.extend(value)
+                continue
+            text = cls._decode_embedded_text(value)
+            if resource_type == "ed2k":
+                match = cls._ED2K_URL_RE.search(text)
+                if match:
+                    normalized = cls._normalize_share_url(
+                        match.group(0), resource_type
+                    )
+                    if normalized:
+                        return normalized
+            for match in re.finditer(r"https?://[^\s\\\"'<>]+", text, re.I):
+                if match.end() < len(text) and text[match.end()] == "\\":
+                    continue
+                candidate = match.group(0).rstrip("),.;]}")
+                access_code = ""
+                if resource_type == "115":
+                    nearby = text[max(0, match.start() - 256):match.end() + 256]
+                    code_match = re.search(
+                        r'["\'](?:password|pwd|receive_?code)["\']\s*[:=]\s*'
+                        r'["\']([A-Za-z0-9]{4})["\']',
+                        nearby,
+                        re.I,
+                    )
+                    access_code = code_match.group(1) if code_match else ""
+                normalized = cls._normalize_share_url(
+                    candidate, resource_type, access_code
+                )
+                if normalized:
+                    return normalized
+        return ""
+
+    def _http_access_resource(
+            self,
+            slug: str,
+            resource_type: str,
+            listed_points: int,
+            is_unlocked: bool,
+            target_season: Optional[int],
+            target_episodes: Optional[List[int]],
+            supports_file_preview: Optional[bool],
+            detail_path: str,
+            log_prefix: str,
+    ) -> Dict[str, Any]:
+        """按 HDHive 页面真实流程预览并取得资源链接。"""
+        detail_path = self._resolve_detail_path(
+            resource_type, slug, detail_path
+        )
+        if is_unlocked:
+            access_key = f"{resource_type}:{slug}"
+            share_url = self._accessible_url_cache.get(access_key) or ""
+            if share_url and not self._valid_share_url(share_url, resource_type):
+                self._accessible_url_cache.delete(access_key)
+                share_url = ""
+            if share_url:
+                logger.debug(
+                    f"{log_prefix} 命中已解锁资源链接缓存：slug={slug}"
+                )
+                return {
+                    "url": share_url,
+                    "actual_points": 0,
+                    "preview_episodes": {},
+                    "is_unlocked": True,
+                }
+            lock_key = f"{self._session_key}:{access_key}"
+            access_lock = self._ACCESSIBLE_URL_LOCKS[
+                hash(lock_key) % len(self._ACCESSIBLE_URL_LOCKS)
+                ]
+            with access_lock:
+                share_url = self._accessible_url_cache.get(access_key) or ""
+                if share_url and not self._valid_share_url(share_url, resource_type):
+                    self._accessible_url_cache.delete(access_key)
+                    share_url = ""
+                if not share_url:
+                    page_started = time.monotonic()
+                    page_response = self._client.request(
+                        "GET",
+                        detail_path,
+                        headers={
+                            "accept": "text/html,application/xhtml+xml",
+                            "referer": f"{self.BASE_URL}/",
+                        },
+                    )
+                    page_text = getattr(page_response, "text", "") or ""
+                    parse_started = time.monotonic()
+                    share_url = self._share_url_from_values(
+                        page_text, resource_type
+                    )
+                    logger.debug(
+                        f"{log_prefix} 已解锁资源详情读取完成：slug={slug}，"
+                        f"请求={parse_started - page_started:.2f}s，"
+                        f"解析={time.monotonic() - parse_started:.3f}s"
+                    )
+                    if share_url:
+                        self._accessible_url_cache.set(access_key, share_url)
+                if not share_url:
+                    logger.warning(
+                        f"{log_prefix} 已解锁资源详情页未解析到链接：slug={slug}"
+                    )
+                return {
+                    "url": share_url,
+                    "actual_points": 0,
+                    "preview_episodes": {},
+                    "is_unlocked": bool(share_url),
+                }
+
+        can_preview = supports_file_preview
+        if can_preview is None:
+            can_preview = self._resolve_file_preview_capability(
+                slug, resource_type, log_prefix, detail_path
+            )
+        preview_episodes: Dict[str, List[int]] = {}
+        if can_preview:
+            preview = self._load_file_preview(
+                slug, resource_type, log_prefix, detail_path
+            )
+            files = preview.get("files") or []
+            preview_episodes = self._preview_episodes_from_files(files, target_season)
+            targets = positive_ints(target_episodes)
+            season_key = str(max(1, int(target_season or 1)))
+            available = positive_ints(preview_episodes.get(season_key))
+            if targets and (not available or not (targets & available)):
+                logger.debug(f"{log_prefix} file-list 未覆盖当前缺集，跳过资源：slug={slug}")
+                return {
+                    "url": "",
+                    "actual_points": 0,
+                    "preview_episodes": preview_episodes,
+                    "is_unlocked": False,
+                    "skip_reason": "target_not_covered",
+                }
+            if str(preview.get("resource_validate_status") or "").lower() == "invalid":
+                logger.debug(f"{log_prefix} file-list 标记资源失效，跳过资源：slug={slug}")
+                return {
+                    "url": "",
+                    "actual_points": 0,
+                    "preview_episodes": preview_episodes,
+                    "is_unlocked": False,
+                    "skip_reason": "resource_invalid",
+                }
+        else:
+            logger.debug(
+                f"{log_prefix} {resource_type.upper()} 不支持 file-list，"
+                f"已按资源卡片 remark 预筛结果继续：slug={slug}"
+            )
+        response = self._client.web_unlock_request(
+            detail_path,
+            slug,
+            page_headers={
+                "accept": "text/html,application/xhtml+xml",
+                "referer": f"{self.BASE_URL}/",
+            },
+            response_handler=lambda value: self._unlock_response(
+                value, listed_points, resource_type
+            ),
+        )
+        return {**response, "preview_episodes": preview_episodes, "is_unlocked": bool(response.get("url"))}
 
     @classmethod
     def _find_group_data(cls, value: Any) -> Optional[Dict[str, Any]]:
@@ -197,7 +749,10 @@ class HDHiveResourceService:
             if self._schema_failure_cache.get(cache_key):
                 logger.debug(f"{log_prefix} WebAPI 命中详情解析失败短缓存，跳过重复请求")
                 return []
-        cache_lock = self._resource_locks[hash(cache_key) % len(self._resource_locks)]
+        lock_key = f"{self._session_key}:{cache_key}"
+        cache_lock = self._RESOURCE_LOCKS[
+            hash(lock_key) % len(self._RESOURCE_LOCKS)
+            ]
         with cache_lock:
             if not force_refresh:
                 cached = self._resource_cache.get(cache_key)
@@ -214,31 +769,40 @@ class HDHiveResourceService:
                     )
                     return []
             try:
-                detail_path = self._client.request(
-                    "GET",
-                    f"/tmdb/{normalized_type}/{int(tmdb_id)}",
-                    headers={
-                        "accept": (
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                            "*/*;q=0.8"
-                        ),
-                        "cache-control": "no-cache",
-                        "referer": f"{self._client.BASE_URL}/",
-                    },
-                    response_handler=self._detail_path_from_response,
-                )
-                group_data = self._client.request(
-                    "GET",
-                    detail_path,
-                    headers={
-                        "accept": (
-                            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                            "*/*;q=0.8"
-                        ),
-                        "cache-control": "no-cache",
-                        "referer": f"{self._client.BASE_URL}/",
-                    },
-                    response_handler=self._group_data_from_response,
+                route_started = time.monotonic()
+                with self._client.related_requests(2):
+                    detail_path = self._client.request(
+                        "GET",
+                        f"/tmdb/{normalized_type}/{int(tmdb_id)}",
+                        headers={
+                            "accept": (
+                                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                                "*/*;q=0.8"
+                            ),
+                            "cache-control": "no-cache",
+                            "referer": f"{self._client.BASE_URL}/",
+                        },
+                        response_handler=self._detail_path_from_response,
+                    )
+                    detail_started = time.monotonic()
+                    group_data = self._client.request(
+                        "GET",
+                        detail_path,
+                        headers={
+                            "accept": (
+                                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                                "*/*;q=0.8"
+                            ),
+                            "cache-control": "no-cache",
+                            "referer": f"{self._client.BASE_URL}/",
+                        },
+                        response_handler=self._group_data_from_response,
+                    )
+                parsed_at = time.monotonic()
+                logger.debug(
+                    f"{log_prefix} WebAPI 页面阶段耗时："
+                    f"媒体页={detail_started - route_started:.2f}s，"
+                    f"资源页={parsed_at - detail_started:.2f}s"
                 )
             except HDHiveWebError as error:
                 if error.code == "schema_changed":
@@ -247,6 +811,10 @@ class HDHiveResourceService:
                     return []
                 raise
             rows = self._flatten_group_data(group_data)
+            logger.debug(
+                f"{log_prefix} WebAPI 分组解析耗时："
+                f"{time.monotonic() - parsed_at:.3f}s"
+            )
             if not group_data:
                 logger.debug(f"{log_prefix} WebAPI 详情页无资源分组，按正常空结果处理")
             self._resource_cache.set(cache_key, copy.deepcopy(rows))
@@ -429,6 +997,7 @@ class HDHiveResourceService:
         target_season_key = str(max(1, int(target_season or 1)))
         coverage_order = {}
         matched_rows = []
+        remark_filtered_count = 0
         for row in detail_rows:
             preview = row.get("preview_episodes") or {}
             if not target_episode_set or not preview:
@@ -438,6 +1007,7 @@ class HDHiveResourceService:
                     preview.get(target_season_key)
                 )
                 if not covered:
+                    remark_filtered_count += 1
                     continue
                 coverage = (
                     (0, -len(covered))
@@ -486,7 +1056,7 @@ class HDHiveResourceService:
             if not resource_type or not slug:
                 continue
             detail_path = HDHiveResourceService._resource_detail_path(
-                resource_type, slug
+                resource_type, slug, row.get("website")
             )
             update_time = self._resource_update_time(row)
             resource_time = HDHiveResourceService._resource_timestamp(update_time)
@@ -498,7 +1068,11 @@ class HDHiveResourceService:
                 continue
             points = HDHiveResourceService._unlock_points(row)
             is_unlocked = bool(row.get("is_unlocked"))
-            is_free = HDHiveResourceService._is_free_resource(row)
+            is_free = points == 0
+            share_url = (
+                self._share_url_from_values(row, resource_type)
+                if is_unlocked else ""
+            )
             common = {
                 "title": str(row.get("title") or f"HDHive {resource_type.upper()}资源"),
                 "description": str(row.get("remark") or ""),
@@ -513,21 +1087,31 @@ class HDHiveResourceService:
                 "listed_unlock_points": points,
                 "is_free": is_free,
                 "is_unlocked": is_unlocked,
+                "url": share_url,
                 "is_official": bool(row.get("is_official")),
                 "source_url": f"{self.BASE_URL}{detail_path}",
+                "detail_path": detail_path,
                 "media_page_url": media_page_url,
                 "target_season": int(target_season or 0),
                 "target_episodes": sorted(target_episode_set),
                 "preview_episodes": copy.deepcopy(
                     row.get("preview_episodes") or {}
                 ),
+                "supports_file_preview": self._file_preview_capability(row),
             }
-            if is_free:
+            if is_unlocked:
+                results.append({
+                    **common,
+                    "need_access": False,
+                    "need_unlock": False,
+                    "unlock_points": points,
+                })
+            elif is_free:
                 results.append({
                     **common,
                     "url": "",
-                    "need_access": True,
-                    "need_unlock": False,
+                    "need_access": False,
+                    "need_unlock": True,
                     "unlock_points": 0,
                 })
             elif include_paid:
@@ -573,7 +1157,8 @@ class HDHiveResourceService:
             accepted_groups.add(group)
         logger.debug(
             f"{log_prefix} WebAPI 候选整理完成：原始={len(rows)}，"
-            f"集数已识别={preview_count}，时间过滤={stale_count}，"
+            f"集数已识别={preview_count}，remark过滤={remark_filtered_count}，"
+            f"时间过滤={stale_count}，"
             f"资源页={len(accepted_groups)}，候选={len(results)}"
         )
         return results
@@ -584,54 +1169,51 @@ class HDHiveResourceService:
             unlock_points: int,
             resource_type: str,
             media_page_url: str = "",
+            is_unlocked: bool = False,
+            target_season: Optional[int] = None,
+            target_episodes: Optional[List[int]] = None,
+            supports_file_preview: Optional[bool] = None,
+            detail_path: str = "",
+            log_prefix: str = "[HDHIVE]",
     ) -> Dict[str, Any]:
-        """刷新资源页上下文后，通过签名解锁接口获取结构化分享链接。"""
+        """按详情页、file-list 预览和 Server Action 顺序获取链接。"""
         normalized_slug = str(slug or "").strip()
         normalized_type = str(resource_type or "").strip().lower()
         if not normalized_slug or normalized_type not in HDHIVE_DETAIL_RESOURCE_TYPES:
             raise HDHiveWebError("HDHive 资源标识或类型无效", code="invalid_resource")
         listed_points = max(0, int(unlock_points or 0))
-        endpoint = f"/api/customer/resources/{normalized_slug}/unlock"
-        detail_path = self._resource_detail_path(normalized_type, normalized_slug)
-        resource_url = f"{self.BASE_URL}{detail_path}"
-        referer = str(media_page_url or f"{self.BASE_URL}/").strip()
-        return self._client.signed_unlock_request(
-            "POST",
-            endpoint,
-            resource_page_path=detail_path,
-            body=b"",
-            headers={
-                "accept": "application/json",
-                "origin": self.BASE_URL,
-                "referer": resource_url,
-                "cache-control": "no-store",
-            },
-            page_headers={
-                "accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "*/*;q=0.8"
-                ),
-                "cache-control": "no-cache",
-                "referer": referer,
-            },
-            response_handler=lambda response: self._unlock_response(
-                response, listed_points, normalized_type
-            ),
+        return self._http_access_resource(
+            normalized_slug,
+            normalized_type,
+            listed_points,
+            bool(is_unlocked),
+            target_season,
+            target_episodes,
+            supports_file_preview,
+            detail_path,
+            log_prefix,
         )
 
     def _unlock_response(
             self, response, listed_points: int, normalized_type: str
     ) -> Dict[str, Any]:
         """在客户端串行锁内解析解锁结果并隔离页面上下文失败。"""
-        try:
-            payload = response.json()
-        except ValueError as error:
-            raise HDHiveWebError(
-                "HDHive 解锁响应格式异常", code="unlock_invalid_response"
-            ) from error
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        content_type = str(
+            getattr(response, "headers", {}).get("content-type") or ""
+        ).lower()
+        if "text/x-component" in content_type:
+            payload = self._server_action_payload(response)
+        else:
+            try:
+                payload = response.json()
+            except ValueError as error:
+                raise HDHiveWebError(
+                    "HDHive 解锁响应格式异常", code="unlock_invalid_response"
+                ) from error
         data = payload.get("data") if isinstance(payload, dict) else None
         if not (
-                response.status_code < 400
+                status_code < 400
                 and isinstance(payload, dict)
                 and payload.get("success")
                 and isinstance(data, dict)
@@ -649,26 +1231,45 @@ class HDHiveResourceService:
                 raise HDHiveWebError(
                     f"HDHive 资源页上下文刷新后仍已过期，停止本次解锁：{message}",
                     code="page_expired",
-                    status_code=response.status_code,
+                    status_code=status_code,
                 )
-            if response.status_code == 429:
+            if any(marker in message for marker in (
+                    "高频", "人机验证", "安全验证", "访问频繁", "操作频繁",
+            )):
+                self._client.activate_risk_cooldown(
+                    "网页解锁要求人机验证但未返回 challenge"
+                )
+                raise HDHiveWebError(
+                    f"HDHive 网页解锁要求人机验证但未返回可处理的 challenge：{message}",
+                    code="captcha_required",
+                    status_code=status_code,
+                )
+            if status_code == 429:
                 raise HDHiveWebError(
                     f"HDHive 获取资源触发 HTTP 429 风控：{message or '请求过于频繁'}",
                     code="rate_limited",
-                    status_code=response.status_code,
+                    status_code=status_code,
                 )
             raise HDHiveWebError(
-                f"HDHive 获取资源失败：{message or f'HTTP {response.status_code}'}",
+                f"HDHive 获取资源失败：{message or f'HTTP {status_code}'}",
                 code="unlock_failed",
-                status_code=response.status_code,
+                status_code=status_code,
             )
         value = str(data.get("full_url") or data.get("url") or "").strip()
         urls = (
             list(dict.fromkeys(
-                match.group(0) for match in self._ED2K_URL_RE.finditer(value)
+                candidate
+                for candidate in (
+                    match.group(0) for match in self._ED2K_URL_RE.finditer(value)
+                )
+                if self._valid_share_url(candidate, normalized_type)
             ))
             if normalized_type == "ed2k"
-            else ([value] if value else [])
+            else (
+                [value]
+                if self._valid_share_url(value, normalized_type)
+                else []
+            )
         )
         charged_points = 0 if data.get("already_owned") else listed_points
         if urls:
@@ -678,6 +1279,39 @@ class HDHiveResourceService:
             "actual_points": charged_points,
             "success": True,
         }
+
+    @classmethod
+    def _server_action_payload(cls, response) -> Dict[str, Any]:
+        """解析 Next.js Server Action 的 text/x-component 响应。"""
+        text = HDHiveClient.response_text(response)
+        for line in text.splitlines():
+            if not re.match(r"^[0-9a-f]+:\{", line, re.I):
+                continue
+            try:
+                value = json.loads(line.split(":", 1)[1])
+            except (json.JSONDecodeError, IndexError):
+                continue
+            pending = [value]
+            while pending:
+                current = pending.pop()
+                if isinstance(current, dict):
+                    action_response = current.get("response")
+                    if isinstance(action_response, dict):
+                        return action_response
+                    action_error = current.get("error")
+                    if isinstance(action_error, dict):
+                        return {
+                            "success": False,
+                            "error": action_error,
+                            "message": str(action_error.get("message") or ""),
+                        }
+                    pending.extend(current.values())
+                elif isinstance(current, list):
+                    pending.extend(current)
+        raise HDHiveWebError(
+            "HDHive 解锁 Server Action 响应格式异常",
+            code="unlock_invalid_response",
+        )
 
     @staticmethod
     def _normalize_languages(values: Any) -> List[str]:
@@ -841,8 +1475,67 @@ class HDHiveResourceService:
 
     @staticmethod
     def _resource_type(row: Dict[str, Any]) -> str:
-        website = str(row.get("website") or "").strip().lower()
+        website = normalize_resource_type(row.get("website") or "")
         return website if website in HDHIVE_RESOURCE_TYPES else ""
+
+    @staticmethod
+    def _file_preview_capability(
+            row: Optional[Dict[str, Any]] = None
+    ) -> Optional[bool]:
+        """读取站点显式能力字段；缺失时返回未知，不按网盘类型猜测。"""
+        if isinstance(row, dict):
+            for key in (
+                    "file_list_preview_enabled", "fileListPreviewEnabled",
+                    "supports_file_list", "supportsFileList",
+            ):
+                if key not in row or row.get(key) is None:
+                    continue
+                value = row.get(key)
+                if isinstance(value, str):
+                    return value.strip().lower() in {"1", "true", "yes", "on"}
+                return bool(value)
+        return None
+
+    def _resolve_file_preview_capability(
+            self, slug: str, resource_type: str, log_prefix: str,
+            detail_path: str = "",
+    ) -> bool:
+        """从资源详情页实际渲染参数确认 file-list 能力并短期缓存。"""
+        capability_key = f"{resource_type}:{slug}"
+        cached = self._preview_capability_cache.get(capability_key)
+        if isinstance(cached, bool):
+            return cached
+        detail_path = self._resolve_detail_path(
+            resource_type, slug, detail_path
+        )
+        response = self._client.request(
+            "GET",
+            detail_path,
+            headers={
+                "accept": "text/html,application/xhtml+xml",
+                "referer": f"{self.BASE_URL}/",
+            },
+        )
+        page_text = self._decode_embedded_text(
+            self._client.response_text(response)
+        )
+        matched = re.search(
+            r'["\']fileListPreviewEnabled["\']\s*:\s*(true|false)',
+            page_text,
+            re.I,
+        )
+        if not matched:
+            raise HDHiveWebError(
+                "HDHive 资源页未声明文件列表预览能力，已停止探测",
+                code="preview_capability_unknown",
+            )
+        supported = matched.group(1).lower() == "true"
+        self._preview_capability_cache.set(capability_key, supported)
+        logger.debug(
+            f"{log_prefix} 资源页 file-list 能力：slug={slug}，"
+            f"支持={supported}"
+        )
+        return supported
 
     @staticmethod
     def _unlock_points(row: Dict[str, Any]) -> int:
@@ -856,10 +1549,59 @@ class HDHiveResourceService:
         return str(row.get("slug") or "").strip()
 
     @staticmethod
-    def _resource_detail_path(resource_type: str, slug: str) -> str:
-        if resource_type == "ed2k":
-            return f"/resource/{slug}"
-        return f"/resource/{resource_type}/{slug}"
+    def _resource_detail_path(
+            resource_type: str, slug: str, route_type: Any = ""
+    ) -> str:
+        normalized_type = normalize_resource_type(resource_type)
+        normalized_slug = str(slug or "").strip()
+        if (
+                normalized_type not in HDHIVE_DETAIL_RESOURCE_TYPES
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", normalized_slug)
+        ):
+            raise HDHiveWebError(
+                "HDHive 资源类型或详情标识无效", code="invalid_resource"
+            )
+        segments = ["resource"]
+        if normalized_type in SUPPORTED_CLOUD_TYPES:
+            raw_route_type = str(route_type or normalized_type).strip().lower()
+            segments.append(
+                raw_route_type
+                if normalize_resource_type(raw_route_type) == normalized_type
+                else normalized_type
+            )
+        segments.append(normalized_slug)
+        return "/" + "/".join(segments)
+
+    @classmethod
+    def _resolve_detail_path(
+            cls, resource_type: str, slug: str, detail_path: str = ""
+    ) -> str:
+        """校验并复用卡片详情路径，旧候选缺失时再按资源类别推导。"""
+        normalized_type = normalize_resource_type(resource_type)
+        normalized_slug = str(slug or "").strip()
+        candidate = str(detail_path or "").strip()
+        if not candidate:
+            return cls._resource_detail_path(normalized_type, normalized_slug)
+        parsed = urlparse(urljoin(f"{cls.BASE_URL}/", candidate))
+        if parsed.scheme not in {"http", "https"} or parsed.hostname != "hdhive.com":
+            raise HDHiveWebError(
+                "HDHive 资源详情地址无效", code="invalid_resource"
+            )
+        parts = [part for part in parsed.path.split("/") if part]
+        expected_size = 3 if normalized_type in SUPPORTED_CLOUD_TYPES else 2
+        valid = (
+                normalized_type in HDHIVE_DETAIL_RESOURCE_TYPES
+                and len(parts) == expected_size
+                and parts[0] == "resource"
+                and parts[-1] == normalized_slug
+        )
+        if expected_size == 3:
+            valid = valid and normalize_resource_type(parts[1]) == normalized_type
+        if not valid:
+            raise HDHiveWebError(
+                "HDHive 资源详情地址与资源类型不匹配", code="invalid_resource"
+            )
+        return parsed.path
 
     @classmethod
     def _deduplicate(cls, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
