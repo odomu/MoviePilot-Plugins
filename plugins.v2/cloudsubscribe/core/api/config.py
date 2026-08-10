@@ -10,6 +10,7 @@ from .page import clear_ui_options_cache
 from .. import OwnerDelegator
 from ..config import UIConfig
 from ..services.runtime import sync_lock
+from ...search.http_client import build_proxy_url, validate_proxy_address
 
 
 class ConfigApi(OwnerDelegator):
@@ -21,6 +22,18 @@ class ConfigApi(OwnerDelegator):
                          "subscription_concurrency": (1, 5), "pansou_result_limit": (1, 100),
                          "hdhive_candidate_limit": (1, 20), "hdhive_unlocks_per_minute": (1, 3),
                          "dian115_unlocks_per_minute": (1, 10)}
+
+    @staticmethod
+    def _validate_search_proxy_config(payload: Dict[str, Any]) -> None:
+        """校验并规范化搜索渠道专用代理配置。"""
+        proxy = str(payload.get("search_proxy", "") or "").strip()
+        username = str(payload.get("search_proxy_username", "") or "").strip()
+        password = str(payload.get("search_proxy_password", "") or "")
+        normalized = validate_proxy_address(proxy)
+        build_proxy_url(normalized, username, password)
+        payload["search_proxy"] = normalized
+        payload["search_proxy_username"] = username
+        payload["search_proxy_password"] = password
 
     def _queue_pending_config(self, payload: Dict[str, Any]) -> None:
         """保存运行期间最后一次配置，等待同步任务结束后应用。"""
@@ -52,6 +65,7 @@ class ConfigApi(OwnerDelegator):
             payload = await request.json()
             if not isinstance(payload, dict):
                 return {"success": False, "message": "配置数据格式错误"}
+            self._validate_search_proxy_config(payload)
             self.update_config(payload)
             clear_ui_options_cache()
             clear_account_cache()

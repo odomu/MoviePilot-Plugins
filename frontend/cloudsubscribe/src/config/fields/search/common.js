@@ -48,6 +48,33 @@ export function createCommonSearchGroups(resourceTypeItems) {
     },
     {
       tab: "common",
+      title: "搜索代理",
+      icon: "mdi-lan-connect",
+      hint: "仅代理搜索渠道请求；测试使用 Cloudflare Trace 获取请求延迟、出口 IP、地区和节点。",
+      fields: [
+        {
+          key: "search_proxy",
+          label: "代理地址",
+          type: "proxy",
+          hint: "支持 http://、https://、socks5:// 和 host:port，留空则直连。",
+          placeholder: "http://127.0.0.1:7890",
+          cols: 12,
+        },
+        {
+          key: "search_proxy_username",
+          label: "代理用户名",
+          cols: 6,
+        },
+        {
+          key: "search_proxy_password",
+          label: "代理密码",
+          type: "password",
+          cols: 6,
+        },
+      ],
+    },
+    {
+      tab: "common",
       title: "搜索性能",
       icon: "mdi-speedometer",
       hint: "控制跨搜索源查询和本地缓存；115接口与积分解锁仍保持串行限速。",

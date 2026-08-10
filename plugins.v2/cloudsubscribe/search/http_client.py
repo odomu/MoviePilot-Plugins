@@ -8,6 +8,7 @@ from collections import deque
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from app.log import logger
 
@@ -64,22 +65,119 @@ TRANSIENT_REQUEST_EXCEPTIONS = (
     requests.exceptions.SSLError,
 )
 
+_PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks5", "socks5h"})
+
+
+def normalize_proxy_address(proxy: Any) -> str:
+    """规范化代理地址，兼容 host:port、IPv6 和带认证代理。"""
+    value = str(proxy or "").strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = f"http:{value}"
+    elif "://" not in value:
+        value = f"http://{value}"
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in _PROXY_SCHEMES or not parsed.hostname:
+            return ""
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        userinfo = ""
+        if parsed.username is not None:
+            userinfo = quote(unquote(parsed.username), safe="")
+            if parsed.password is not None:
+                userinfo += f":{quote(unquote(parsed.password), safe='')}"
+            userinfo += "@"
+        netloc = f"{userinfo}{host}"
+        if parsed.port is not None:
+            netloc += f":{parsed.port}"
+        return urlunsplit(
+            (parsed.scheme.lower(), netloc, parsed.path, parsed.query, parsed.fragment)
+        )
+    except (TypeError, ValueError):
+        return ""
+
+
+def validate_proxy_address(proxy: Any) -> str:
+    """校验并返回无路径的标准代理地址。"""
+    raw_value = str(proxy or "").strip()
+    if not raw_value:
+        return ""
+    value = normalize_proxy_address(raw_value)
+    if not value:
+        raise ValueError(
+            "代理地址无效，仅支持 http、https、socks4、socks5 或 socks5h"
+        )
+    parsed = urlsplit(value)
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("代理地址不能包含路径、查询参数或 fragment")
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def build_proxy_url(
+        proxy: Any, username: Any = "", password: Any = ""
+) -> str:
+    """将独立鉴权字段安全写入运行时代理 URL。"""
+    value = validate_proxy_address(proxy)
+    if not value:
+        if str(username or "").strip() or str(password or ""):
+            raise ValueError("填写代理鉴权信息前必须先填写代理地址")
+        return ""
+    normalized_username = str(username or "").strip()
+    normalized_password = str(password or "")
+    if normalized_password and not normalized_username:
+        raise ValueError("填写代理密码时必须同时填写代理用户名")
+    if not normalized_username:
+        return value
+    parsed = urlsplit(value)
+    server = urlsplit(proxy_server(value))
+    userinfo = quote(normalized_username, safe="")
+    if normalized_password:
+        userinfo += f":{quote(normalized_password, safe='')}"
+    return urlunsplit((parsed.scheme, f"{userinfo}@{server.netloc}", "", "", ""))
+
+
+def proxy_server(proxy: Any) -> str:
+    """返回浏览器代理需要的 server 地址，保留 IPv6 方括号。"""
+    value = normalize_proxy_address(proxy)
+    if not value:
+        return ""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in _PROXY_SCHEMES or not parsed.hostname:
+            return ""
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        server = f"{parsed.scheme}://{host}"
+        if parsed.port is not None:
+            server += f":{parsed.port}"
+        return server
+    except (TypeError, ValueError):
+        return ""
+
 
 def normalize_proxies(proxy: Any) -> Optional[Dict[str, str]]:
     """统一字符串、requests 字典和 server 代理配置。"""
     if not proxy:
         return None
     if isinstance(proxy, str):
-        value = proxy.strip()
+        value = normalize_proxy_address(proxy)
         return {"http": value, "https": value} if value else None
     if isinstance(proxy, dict):
         if proxy.get("server"):
-            value = str(proxy.get("server") or "").strip()
+            value = build_proxy_url(
+                proxy.get("server"),
+                proxy.get("username") or "",
+                proxy.get("password") or "",
+            )
             return {"http": value, "https": value} if value else None
         normalized = {
-            str(key): str(value).strip()
+            str(key): normalize_proxy_address(value)
             for key, value in proxy.items()
-            if str(value or "").strip()
+            if normalize_proxy_address(value)
         }
         return normalized or None
     return None

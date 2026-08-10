@@ -8,7 +8,6 @@ from threading import RLock
 from typing import Any, Dict, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from app.core.config import settings
 from app.log import logger
 from fastapi import Request
 
@@ -134,7 +133,7 @@ class AccountApi(OwnerDelegator):
                 client = HDHiveClient(
                     username=self._hdhive_username,
                     password=self._hdhive_password,
-                    proxy=settings.PROXY,
+                    proxy=self._search_proxy,
                     request_interval=self._hdhive_request_interval,
                     unlocks_per_minute=self._hdhive_unlocks_per_minute,
                     timeout=10,
@@ -149,7 +148,7 @@ class AccountApi(OwnerDelegator):
                 client = Dian115Client(
                     email=self._dian115_email,
                     password=self._dian115_password,
-                    proxy=settings.PROXY,
+                    proxy=self._search_proxy,
                     request_interval=self._dian115_request_interval,
                     unlocks_per_minute=self._dian115_unlocks_per_minute,
                     timeout=10,
@@ -166,7 +165,7 @@ class AccountApi(OwnerDelegator):
                 client = JuyingClient(
                     username=self._juying_username,
                     password=self._juying_password,
-                    proxy=settings.PROXY,
+                    proxy=self._search_proxy,
                     request_timeout=10,
                     request_interval=self._juying_request_interval,
                     get_data_func=self.get_data,
@@ -182,7 +181,7 @@ class AccountApi(OwnerDelegator):
                 client = PinglianClient(
                     username=self._pinglian_username,
                     password=self._pinglian_password,
-                    proxy=settings.PROXY,
+                    proxy=self._search_proxy,
                     request_timeout=min(self._pinglian_timeout, 30),
                     request_interval=self._pinglian_request_interval,
                     get_data_func=self.get_data,
@@ -346,7 +345,7 @@ class AccountApi(OwnerDelegator):
             client = HDHiveOpenAPIClient(
                 app_secret="",
                 client_id=client_id,
-                proxy=settings.PROXY,
+                proxy=self._search_proxy,
                 request_interval=self._hdhive_request_interval,
             )
             try:
@@ -416,7 +415,7 @@ class AccountApi(OwnerDelegator):
             client = HDHiveOpenAPIClient(
                 app_secret=app_secret,
                 client_id=client_id,
-                proxy=settings.PROXY,
+                proxy=self._search_proxy,
                 request_interval=self._hdhive_request_interval,
             )
             token_data = client.exchange_code(code, redirect_uri)

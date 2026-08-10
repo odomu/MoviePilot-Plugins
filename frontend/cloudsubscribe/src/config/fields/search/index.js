@@ -14,7 +14,7 @@ export function createSearchSection(resourceTypeItems, options = {}) {
     title: "搜索设置",
     icon: "mdi-magnify",
     subtabs: [
-      {value: "common", title: "通用", icon: "mdi-tune"},
+      {value: "common", title: "通用设置", icon: "mdi-tune"},
       {value: "pansou", title: "PanSou", icon: "mdi-magnify-scan"},
       {value: "hdhive", title: "HDHive", icon: "mdi-hexagon-multiple-outline",},
       {value: "dian115", title: "Dian115", icon: "mdi-cloud-search"},

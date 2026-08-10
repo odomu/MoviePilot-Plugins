@@ -103,6 +103,7 @@ class SearchHandler:
             juying_result_limit: int = 5,
             pinglian_result_limit: int = 20,
             search_source_order: Optional[List[str]] = None,
+            search_proxy: Any = None,
             search_cache_enabled: bool = True,
             search_cache_ttl_minutes: int = 30,
             search_concurrency: int = 2,
@@ -251,6 +252,7 @@ class SearchHandler:
             if value in SUPPORTED_RESOURCE_TYPES
         ]
         self._search_source_order = search_source_order or []
+        self._search_proxy = search_proxy
         self._search_cache_enabled = bool(search_cache_enabled)
         self._search_cache_ttl = max(60, int(search_cache_ttl_minutes or 30) * 60)
         self._search_concurrency = max(1, min(int(search_concurrency or 1), 5))

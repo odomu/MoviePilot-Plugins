@@ -10,7 +10,10 @@ from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import quote, unquote, urljoin, urlparse
 
-from ..http_client import RequestGate, gated_request, normalize_proxies, requests
+from ..http_client import (
+    RequestGate, gated_request, normalize_proxies, normalize_proxy_address,
+    proxy_server, requests,
+)
 from ..matching import extract_season, extract_year, title_matches, unique_texts
 from ..types import resource_type_from_url
 from ...utils.cache import (
@@ -132,14 +135,16 @@ class SeedHubClient:
     @staticmethod
     def _normalize_browser_proxy(proxy: Any) -> Optional[Dict[str, str]]:
         if isinstance(proxy, dict):
-            proxy = proxy.get("https") or proxy.get("http")
-        if not proxy:
+            proxy = (
+                    proxy.get("https") or proxy.get("http") or proxy.get("server")
+            )
+        value = normalize_proxy_address(proxy)
+        if not value:
             return None
-        parsed = urlparse(str(proxy))
+        parsed = urlparse(value)
         if not parsed.scheme or not parsed.hostname:
             return None
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        result = {"server": f"{parsed.scheme}://{parsed.hostname}:{port}"}
+        result = {"server": proxy_server(value)}
         if parsed.username:
             result["username"] = unquote(parsed.username)
         if parsed.password:

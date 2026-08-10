@@ -5,7 +5,6 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
-from app.core.config import settings
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
@@ -27,7 +26,7 @@ class Dian115SearchService(OwnerDelegator):
 
     def _get_dian115_resources(self) -> Dian115ResourceService:
         """复用唯一认证客户端，返回独立的资源服务。"""
-        proxy = settings.PROXY
+        proxy = self._search_proxy
         with self._dian115_client_lock:
             client = self._dian115_client
             if client is None or not client.matches_config(

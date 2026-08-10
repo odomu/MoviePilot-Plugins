@@ -62,10 +62,12 @@
                   :config="config"
                   :refreshing-account="refreshingAccount"
                   :testing-source="testingSource"
+                  :testing-proxy="testingProxy"
                   :hdhive-oauth-action="hdhiveOauthAction"
                   @scan="openQrCode"
                   @browse-directory="openDirectoryPicker"
                   @test-source="openSourceTest"
+                  @test-proxy="testSearchProxy"
                   @refresh-account="refreshAccount"
                   @hdhive-oauth-start="startHdhiveOAuth"
                   @hdhive-oauth-exchange="exchangeHdhiveOAuth"
@@ -607,6 +609,7 @@ const qrVisible = ref(false),
     refreshingAccount = ref(""),
     hdhiveOauthAction = ref(""),
     testingSource = ref(""),
+    testingProxy = ref(false),
     searchingTmdb = ref(false),
     tmdbSearched = ref(false),
     tmdbCandidates = ref([]),
@@ -810,6 +813,45 @@ function notify(text, type = "success") {
   message.value = text;
   messageType.value = type;
   messageVisible.value = true;
+}
+
+async function testSearchProxy() {
+  if (testingProxy.value) return;
+  const proxy = String(config.search_proxy || "").trim();
+  if (!proxy) {
+    notify("请先填写搜索渠道代理地址", "warning");
+    return;
+  }
+  testingProxy.value = true;
+  try {
+    const response = unwrapResponse(
+        await api.post("plugin/CloudSubscribe/search/proxy/test", {
+          proxy,
+          username: String(config.search_proxy_username || "").trim(),
+          password: String(config.search_proxy_password || ""),
+        }),
+    );
+    if (response.success === false) {
+      throw new Error(response.message || "代理测试失败");
+    }
+    const data = response.data?.data || response.data || {};
+    const details = [
+      Number.isFinite(Number(data.latency_ms))
+          ? `${Number(data.latency_ms)} ms`
+          : "",
+      data.ip ? `IP ${data.ip}` : "",
+      data.loc ? `地区 ${data.loc}` : "",
+      data.colo ? `节点 ${data.colo}` : "",
+    ].filter(Boolean);
+    notify(`代理连接成功${details.length ? `：${details.join(" · ")}` : ""}`);
+  } catch (error) {
+    notify(
+        error?.response?.data?.message || error.message || String(error),
+        "error",
+    );
+  } finally {
+    testingProxy.value = false;
+  }
 }
 
 async function copyText(value, label = "Webhook URL") {
@@ -1103,7 +1145,13 @@ function tmdbCandidateSubtitle(item) {
 }
 
 function sourceTestConfig(source) {
-  const keys = ["resource_type_order", ...(sourceTestConfigKeys[source] || [])];
+  const keys = [
+    "resource_type_order",
+    "search_proxy",
+    "search_proxy_username",
+    "search_proxy_password",
+    ...(sourceTestConfigKeys[source] || []),
+  ];
   return Object.fromEntries(
       keys
           .filter((key) => key in config && config[key] !== undefined)

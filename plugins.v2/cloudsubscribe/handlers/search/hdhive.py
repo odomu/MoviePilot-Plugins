@@ -5,7 +5,6 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from app.core.config import settings
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
@@ -99,7 +98,7 @@ class HDHiveSearchService(OwnerDelegator):
 
     def _get_hdhive_web_resources(self) -> HDHiveResourceService:
         """复用唯一认证客户端，返回独立的资源服务。"""
-        proxy = settings.PROXY
+        proxy = self._search_proxy
         with self._hdhive_web_lock:
             client = self._hdhive_web_client
             if client is None or not client.matches_config(

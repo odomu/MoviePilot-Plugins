@@ -1,13 +1,13 @@
 """搜索源测试与 TMDB 候选查询 API。"""
 
 import ast
+import ipaddress
 import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from app.core.config import settings
 from app.core.metainfo import MetaInfo
 from app.log import logger
 from app.schemas import MediaInfo
@@ -18,6 +18,13 @@ from .. import OwnerDelegator
 from ..cloud import CloudDriveCapability
 from ..config import UIConfig
 from ...search.hdhive import HDHIVE_DETAIL_RESOURCE_TYPES
+from ...search.http_client import (
+    build_proxy_url,
+    normalize_proxies,
+    request_error_summary,
+    requests,
+    validate_proxy_address,
+)
 from ...search.types import (
     PREVIEW_PROVIDER_KEYS,
     PREVIEW_RESOURCE_TYPES,
@@ -31,6 +38,7 @@ from ...utils import parse_magnet_metadata
 
 
 class SearchApi(OwnerDelegator):
+    _PROXY_TEST_URL = "https://www.cloudflare.com/cdn-cgi/trace"
     _SEARCH_TEST_DISPLAY_LIMIT = 10
     _TEST_HDHIVE_CLIENT_LIMIT = 4
     _SEARCH_TEST_CONFIG_FIELDS = {
@@ -86,6 +94,65 @@ class SearchApi(OwnerDelegator):
                 client.close()
             except Exception as error:
                 logger.debug(f"关闭 HDHive 测试认证连接失败：{error}")
+
+    def api_vue_test_search_proxy(self, payload: Dict[str, Any]) -> dict:
+        """通过 Cloudflare Trace 测试搜索代理出口和请求延迟。"""
+        payload = dict(payload or {})
+        response = None
+        try:
+            proxy_address = validate_proxy_address(payload.get("proxy"))
+            if not proxy_address:
+                raise ValueError("请先填写搜索渠道代理地址")
+            proxy = build_proxy_url(
+                proxy_address,
+                payload.get("username"),
+                payload.get("password"),
+            )
+            started = time.perf_counter()
+            response = requests.get(
+                self._PROXY_TEST_URL,
+                proxies=normalize_proxies(proxy),
+                timeout=15,
+                allow_redirects=True,
+                impersonate="chrome",
+            )
+            latency_ms = max(0, round((time.perf_counter() - started) * 1000))
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Cloudflare Trace 返回 HTTP {response.status_code}"
+                )
+            trace = {}
+            for line in str(response.text or "").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key:
+                    trace[key.strip().lower()] = value.strip()
+            ip_value = str(trace.get("ip") or "").strip()
+            try:
+                ipaddress.ip_address(ip_value)
+            except ValueError as error:
+                raise RuntimeError("Cloudflare Trace 未返回有效出口 IP") from error
+            location = str(trace.get("loc") or "").strip().upper()
+            colo = str(trace.get("colo") or "").strip().upper()
+            return {
+                "success": True,
+                "message": "代理连接成功",
+                "data": {
+                    "latency_ms": latency_ms,
+                    "ip": ip_value,
+                    "loc": location if re.fullmatch(r"[A-Z]{2}", location) else "",
+                    "colo": colo if re.fullmatch(r"[A-Z0-9-]{2,12}", colo) else "",
+                },
+            }
+        except requests.exceptions.RequestException as error:
+            return {
+                "success": False,
+                "message": f"代理测试失败：{request_error_summary(error)}",
+            }
+        except (ValueError, RuntimeError) as error:
+            return {"success": False, "message": f"代理测试失败：{error}"}
+        finally:
+            if response is not None:
+                response.close()
 
     def _get_test_hdhive_web_client(
             self,
@@ -420,7 +487,10 @@ class SearchApi(OwnerDelegator):
         base = dict(UIConfig.get_default_config())
         if isinstance(self._applied_config, dict):
             base.update(self._applied_config)
-        allowed = self._SEARCH_TEST_CONFIG_FIELDS[source] | {"resource_type_order"}
+        allowed = self._SEARCH_TEST_CONFIG_FIELDS[source] | {
+            "resource_type_order", "search_proxy", "search_proxy_username",
+            "search_proxy_password",
+        }
         if isinstance(overrides, dict):
             base.update({
                 key: value for key, value in overrides.items() if key in allowed
@@ -451,7 +521,11 @@ class SearchApi(OwnerDelegator):
                 return []
             return [value]
 
-        proxy = settings.PROXY
+        proxy = build_proxy_url(
+            config.get("search_proxy", ""),
+            config.get("search_proxy_username", ""),
+            config.get("search_proxy_password", ""),
+        )
         hdhive_query_mode = str(config.get("hdhive_query_mode") or "web")
         if hdhive_query_mode not in {"api", "web"}:
             hdhive_query_mode = "web"
@@ -643,6 +717,7 @@ class SearchApi(OwnerDelegator):
                 config.get("pinglian_result_limit", 20) or 20
             ),
             search_source_order=[source],
+            search_proxy=proxy,
             search_cache_enabled=False,
             search_concurrency=1,
             hdhive_candidate_limit=int(

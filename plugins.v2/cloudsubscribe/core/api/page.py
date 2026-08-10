@@ -164,7 +164,7 @@ class PageApi(OwnerDelegator):
             client = self._pansou_client or PanSouClient(
                 base_url=pansou_url,
                 auth_enabled=False,
-                proxy=settings.PROXY,
+                proxy=self._search_proxy,
                 search_timeout=5,
             )
             health = client.health(timeout=3)

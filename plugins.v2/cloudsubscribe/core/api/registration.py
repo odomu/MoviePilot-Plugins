@@ -128,6 +128,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "使用页面输入测试单个搜索渠道",
             },
             {
+                "path": "/search/proxy/test",
+                "endpoint": self.api_vue_test_search_proxy,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "通过Cloudflare Trace测试搜索代理",
+            },
+            {
                 "path": "/search/preview",
                 "endpoint": self.api_vue_preview_search_resource,
                 "methods": ["POST"],

@@ -389,7 +389,10 @@ class Dian115Client:
         parsed = urlparse(str(proxy))
         if not parsed.scheme or not parsed.hostname:
             return None
-        server = f"{parsed.scheme}://{parsed.hostname}"
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        server = f"{parsed.scheme}://{host}"
         if parsed.port:
             server += f":{parsed.port}"
         result = {"server": server}

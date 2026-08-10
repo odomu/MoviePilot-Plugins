@@ -58,6 +58,7 @@ from .search.hdhive import (
     HDHiveOpenAPIClient, HDHiveOpenAPIError,
     HDHiveTokenStore, HDHiveTokenStoreError,
 )
+from .search.http_client import build_proxy_url, validate_proxy_address
 from .search.juying import JuyingClient
 from .search.online_docs import OnlineDocumentClient
 from .search.pansou import PanSouClient
@@ -257,6 +258,10 @@ class CloudSubscribe(_PluginBase):
     _include_subscribes: List[int] = []
     # 搜索源优先级（按列表顺序），为空时使用已启用来源的默认顺序
     _search_source_order: List[str] = []
+    _search_proxy: Any = ""
+    _search_proxy_address: str = ""
+    _search_proxy_username: str = ""
+    _search_proxy_password: str = ""
     _search_cache_enabled: bool = True
     _search_cache_ttl_minutes: int = 30
     _search_concurrency: int = 2
@@ -639,6 +644,26 @@ class CloudSubscribe(_PluginBase):
                 if str(value).strip().lower() in source_names
             ))
             selected_sources = set(self._search_source_order)
+            raw_search_proxy = str(config.get("search_proxy", "") or "").strip()
+            self._search_proxy_username = str(
+                config.get("search_proxy_username", "") or ""
+            ).strip()
+            self._search_proxy_password = str(
+                config.get("search_proxy_password", "") or ""
+            )
+            try:
+                self._search_proxy_address = validate_proxy_address(
+                    raw_search_proxy
+                )
+                self._search_proxy = build_proxy_url(
+                    self._search_proxy_address,
+                    self._search_proxy_username,
+                    self._search_proxy_password,
+                )
+            except ValueError as error:
+                logger.error(f"搜索渠道代理配置无效，本次使用直连：{error}")
+                self._search_proxy_address = raw_search_proxy
+                self._search_proxy = ""
             self._pansou_enabled = "pansou" in selected_sources
             self._pansou_url = config.get("pansou_url", "https://so.252035.xyz/")
             self._hdhive_base_url = str(
@@ -1103,9 +1128,9 @@ class CloudSubscribe(_PluginBase):
         self._juying_client = None
         self._pinglian_client = None
         self._online_docs_client = None
-        proxy = settings.PROXY
+        proxy = self._search_proxy
         if proxy:
-            logger.info(f"使用PROXY: {proxy}")
+            logger.info("搜索渠道已启用统一请求代理")
 
         if self._pansou_enabled and self._pansou_url:
             self._pansou_client = PanSouClient(
@@ -1528,6 +1553,7 @@ class CloudSubscribe(_PluginBase):
             juying_result_limit=self._juying_result_limit,
             pinglian_result_limit=self._pinglian_result_limit,
             search_source_order=self._search_source_order,
+            search_proxy=self._search_proxy,
             search_cache_enabled=self._search_cache_enabled,
             search_cache_ttl_minutes=self._search_cache_ttl_minutes,
             search_concurrency=self._search_concurrency,
@@ -1712,6 +1738,9 @@ class CloudSubscribe(_PluginBase):
             "dian115_max_points_per_sub": self._dian115_max_points_per_sub,
             # 其他配置
             "search_source_order": self._search_source_order,
+            "search_proxy": self._search_proxy_address,
+            "search_proxy_username": self._search_proxy_username,
+            "search_proxy_password": self._search_proxy_password,
             "search_cache_enabled": self._search_cache_enabled,
             "search_cache_ttl_minutes": self._search_cache_ttl_minutes,
             "search_concurrency": self._search_concurrency,

@@ -304,6 +304,31 @@
                 </template>
               </v-text-field>
               <v-text-field
+                  v-else-if="field.type === 'proxy'"
+                  v-model="config[field.key]"
+                  :label="field.label"
+                  :hint="field.hint"
+                  :placeholder="field.placeholder"
+                  :persistent-hint="Boolean(field.hint)"
+                  clearable
+                  density="compact"
+                  variant="outlined"
+                  hide-details="auto"
+              >
+                <template #append-inner>
+                  <v-btn
+                      icon="mdi-lan-connect"
+                      variant="text"
+                      color="primary"
+                      size="small"
+                      title="测试代理连通性、延迟和出口"
+                      :loading="testingProxy"
+                      :disabled="testingProxy || !hasText(config[field.key])"
+                      @click="emit('test-proxy')"
+                  />
+                </template>
+              </v-text-field>
+              <v-text-field
                   v-else-if="field.type === 'number'"
                   v-model.number="config[field.key]"
                   :label="field.label"
@@ -363,12 +388,14 @@ const props = defineProps({
   config: {type: Object, required: true},
   refreshingAccount: {type: String, default: ""},
   testingSource: {type: String, default: ""},
+  testingProxy: {type: Boolean, default: false},
   hdhiveOauthAction: {type: String, default: ""},
 });
 const emit = defineEmits([
   "scan",
   "browse-directory",
   "test-source",
+  "test-proxy",
   "refresh-account",
   "hdhive-oauth-start",
   "hdhive-oauth-exchange",
