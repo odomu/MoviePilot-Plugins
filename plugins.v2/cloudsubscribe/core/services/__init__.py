@@ -1,5 +1,6 @@
 """插件业务服务。"""
 
+from .checkin import CheckinService
 from .platform import PlatformIntegrationService
 from .runtime import SyncRuntimeService, sync_lock
 from .scoring import SubscriptionScoringService
@@ -12,5 +13,6 @@ __all__ = [
     "SyncExecutionService",
     "SyncRuntimeService",
     "PlatformIntegrationService",
+    "CheckinService",
     "sync_lock",
 ]

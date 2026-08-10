@@ -29,6 +29,7 @@ from .core import (
 from .core.api import (
     AccountApi,
     ConfigApi,
+    CheckinApi,
     MoviePilotRegistration,
     HistoryApi,
     MediaLibraryApi,
@@ -41,6 +42,7 @@ from .core.api import (
 from .core.hook import PluginEventHandler, SubscriptionSearchHook
 from .core.services import (
     SubscriptionControlService,
+    CheckinService,
     PlatformIntegrationService,
     SubscriptionScoringService,
     SyncExecutionService,
@@ -70,6 +72,7 @@ _COMPONENT_TYPES = (
     AccountApi,
     SearchApi,
     ConfigApi,
+    CheckinApi,
     SyncApi,
     RuntimeApi,
     MediaLibraryApi,
@@ -83,6 +86,7 @@ _COMPONENT_TYPES = (
     SubscriptionControlService,
     SubscriptionSearchHook,
     PlatformIntegrationService,
+    CheckinService,
 )
 
 
@@ -96,7 +100,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -289,6 +293,11 @@ class CloudSubscribe(_PluginBase):
     _hdhive_auto_unlock: bool = False
     _hdhive_max_unlock_points: int = 50
     _hdhive_max_points_per_sub: int = 20
+    _hdhive_checkin_enabled: bool = False
+    _hdhive_checkin_mode: str = "normal"
+    _checkin_cron: str = "0 8 * * *"
+    _checkin_auto_retry: bool = True
+    _checkin_retry_count: int = 2
 
     _dian115_enabled: bool = False
     _dian115_email: str = ""
@@ -409,8 +418,6 @@ class CloudSubscribe(_PluginBase):
     _subscribe_search_queue_shutdown: Optional[ThreadEvent] = None
     _subscribe_search_coordinator_running: bool = False
     _subscribe_search_queue_revision: int = 0
-
-    # 仅校验 Cron 表达式格式，不限制任务间隔。
 
     @staticmethod
     def _cron_is_valid(cron_expr: str) -> bool:
@@ -805,6 +812,26 @@ class CloudSubscribe(_PluginBase):
             self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
             self._hdhive_username = config.get("hdhive_username", "")
             self._hdhive_password = config.get("hdhive_password", "")
+            self._hdhive_checkin_enabled = bool(
+                config.get("hdhive_checkin_enabled", False)
+            )
+            self._hdhive_checkin_mode = str(
+                config.get("hdhive_checkin_mode", "normal") or "normal"
+            ).strip().lower()
+            if self._hdhive_checkin_mode not in {"normal", "gambler"}:
+                self._hdhive_checkin_mode = "normal"
+            self._checkin_cron = str(
+                config.get("checkin_cron")
+                or config.get("hdhive_checkin_cron")
+                or "0 8 * * *"
+            ).strip()
+            self._checkin_auto_retry = bool(
+                config.get("checkin_auto_retry", True)
+            )
+            self._checkin_retry_count = max(
+                1,
+                min(10, int(config.get("checkin_retry_count", 2) or 2)),
+            )
             self._dian115_enabled = "dian115" in selected_sources
             self._dian115_email = str(config.get("dian115_email", "") or "").strip()
             self._dian115_password = str(config.get("dian115_password", "") or "")
@@ -1730,6 +1757,11 @@ class CloudSubscribe(_PluginBase):
             "hdhive_max_points_per_sub": self._hdhive_max_points_per_sub,
             "hdhive_username": self._hdhive_username,
             "hdhive_password": self._hdhive_password,
+            "hdhive_checkin_enabled": self._hdhive_checkin_enabled,
+            "hdhive_checkin_mode": self._hdhive_checkin_mode,
+            "checkin_cron": self._checkin_cron,
+            "checkin_auto_retry": self._checkin_auto_retry,
+            "checkin_retry_count": self._checkin_retry_count,
             # Dian115 配置
             "dian115_email": self._dian115_email,
             "dian115_password": self._dian115_password,

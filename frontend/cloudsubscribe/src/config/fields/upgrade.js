@@ -49,6 +49,7 @@ export function createUpgradeSection(options) {
             type: "select",
             items: options.subscribes,
             multiple: true,
+            searchable: true,
             hint: "所选电影或电视剧订阅参与网盘洗版。",
             cols: 12,
           },

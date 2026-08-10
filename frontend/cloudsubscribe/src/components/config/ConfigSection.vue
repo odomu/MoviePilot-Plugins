@@ -181,6 +181,22 @@
                   </v-btn>
                 </div>
               </div>
+              <CheckinTimeline
+                  v-else-if="field.type === 'checkin-timeline'"
+                  :api="api"
+                  :providers="field.providers"
+                  :config="config"
+                  @result="emit('checkin-result', $event)"
+              />
+              <VCronField
+                  v-else-if="field.type === 'cron'"
+                  v-model="config[field.key]"
+                  :label="field.label"
+                  :hint="field.hint"
+                  :placeholder="field.placeholder"
+                  :persistent-hint="Boolean(field.hint)"
+                  density="compact"
+              />
               <v-switch
                   v-else-if="field.type === 'switch'"
                   v-model="config[field.key]"
@@ -235,6 +251,24 @@
                   />
                 </div>
               </div>
+              <v-autocomplete
+                  v-else-if="field.type === 'select' && field.searchable"
+                  v-model="config[field.key]"
+                  v-model:search="selectSearch[field.key]"
+                  :label="field.label"
+                  :items="filteredSelectItems(field)"
+                  :multiple="field.multiple"
+                  :hint="field.hint"
+                  :persistent-hint="Boolean(field.hint)"
+                  :disabled="Boolean(field.disabled?.(config))"
+                  :no-filter="true"
+                  no-data-text="没有匹配的订阅"
+                  chips
+                  closable-chips
+                  density="compact"
+                  variant="outlined"
+                  hide-details="auto"
+              />
               <v-select
                   v-else-if="field.type === 'select'"
                   v-model="config[field.key]"
@@ -335,6 +369,7 @@
                   type="number"
                   :min="field.min"
                   :max="field.max"
+                  :suffix="field.suffix"
                   :hint="field.hint"
                   :placeholder="field.placeholder"
                   :clearable="field.clearable"
@@ -382,10 +417,12 @@
 <script setup>
 import {computed, ref} from "vue";
 import AccountInfo from "./AccountInfo.vue";
+import CheckinTimeline from "./CheckinTimeline.vue";
 
 const props = defineProps({
   section: {type: Object, required: true},
   config: {type: Object, required: true},
+  api: {type: [Object, Function], required: true},
   refreshingAccount: {type: String, default: ""},
   testingSource: {type: String, default: ""},
   testingProxy: {type: Boolean, default: false},
@@ -399,6 +436,7 @@ const emit = defineEmits([
   "refresh-account",
   "hdhive-oauth-start",
   "hdhive-oauth-exchange",
+  "checkin-result",
   "copy-text",
 ]);
 
@@ -457,6 +495,31 @@ function removeOnlineDocument(key, index) {
   documents.splice(index, 1);
 }
 const activeSubtab = ref(props.section.subtabs?.[0]?.value || "");
+const selectSearch = ref({});
+
+function normalizeSearchText(value) {
+  return String(value ?? "")
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .replace(/\s+/g, "");
+}
+
+function filteredSelectItems(field) {
+  const items = Array.isArray(field.items) ? field.items : [];
+  const keyword = normalizeSearchText(selectSearch.value[field.key]);
+  if (!keyword) return items;
+  const selected = new Set(
+      (Array.isArray(props.config[field.key])
+          ? props.config[field.key]
+          : [props.config[field.key]])
+          .filter((value) => value !== undefined && value !== null)
+          .map((value) => String(value)),
+  );
+  return items.filter((item) =>
+      selected.has(String(item?.value ?? "")) ||
+      normalizeSearchText(`${item?.title || ""} ${item?.value || ""}`).includes(keyword),
+  );
+}
 const availableGroups = computed(() =>
     props.section.groups.filter(
     (group) => !group.show || group.show(props.config),

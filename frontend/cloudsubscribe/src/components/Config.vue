@@ -60,6 +60,7 @@
               <ConfigSection
                   :section="section"
                   :config="config"
+                  :api="api"
                   :refreshing-account="refreshingAccount"
                   :testing-source="testingSource"
                   :testing-proxy="testingProxy"
@@ -71,6 +72,7 @@
                   @refresh-account="refreshAccount"
                   @hdhive-oauth-start="startHdhiveOAuth"
                   @hdhive-oauth-exchange="exchangeHdhiveOAuth"
+                  @checkin-result="handleCheckinResult"
                   @copy-text="copyText"
               />
             </section>
@@ -572,7 +574,6 @@ const QrCodeDialog = defineAsyncComponent(
 const CloudDirectoryDialog = defineAsyncComponent(
     () => import("./dialogs/CloudDirectoryDialog.vue"),
 );
-
 const props = defineProps({
   api: {type: [Object, Function], required: true},
   initialConfig: {type: Object, default: () => ({})},
@@ -1273,6 +1274,17 @@ async function save() {
   } finally {
     saving.value = false;
   }
+}
+
+function handleCheckinResult(result) {
+  const providerName = result?.providerName || "签到服务";
+  notify(
+      result?.message ||
+      (result?.success
+          ? `${providerName} 签到完成`
+          : `${providerName} 签到失败`),
+      result?.success ? "success" : "error",
+  );
 }
 
 function hdhiveOAuthPayload() {

@@ -38,7 +38,9 @@ export function createBasicSection(cloudDriveItems) {
                     },
                     {
                         key: "cron",
-                        label: "定时执行 Cron",
+                        label: "订阅执行周期",
+                        type: "cron",
+                        hint: "设置网盘订阅自动搜索的执行周期。",
                         placeholder: "30 2,10,18 * * *",
                         cols: 8,
                     },

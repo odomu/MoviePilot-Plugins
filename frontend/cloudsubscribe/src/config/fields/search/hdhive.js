@@ -101,7 +101,8 @@ export function createHdhiveGroups(options = {}) {
                     label: "HDHive 用户名",
                     cols: 4,
                     show: (config) =>
-                        config.hdhive_query_mode === "web",
+                        config.hdhive_query_mode === "web" ||
+                        config.hdhive_checkin_enabled,
                 },
                 {
                     key: "hdhive_password",
@@ -109,7 +110,8 @@ export function createHdhiveGroups(options = {}) {
                     type: "password",
                     cols: 4,
                     show: (config) =>
-                        config.hdhive_query_mode === "web",
+                        config.hdhive_query_mode === "web" ||
+                        config.hdhive_checkin_enabled,
                 },
                 {
                     key: "test_hdhive",

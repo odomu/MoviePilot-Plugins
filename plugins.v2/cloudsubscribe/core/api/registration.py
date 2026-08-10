@@ -7,12 +7,16 @@ import pytz
 from app.core.config import settings
 from app.log import logger
 from app.schemas.types import EventType
+from app.utils.timer import TimerUtils
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from .. import OwnerDelegator
 from ..agent import (
     CloudSubscribeCacheClearTool,
+    CloudSubscribeCheckinTool,
+    CloudSubscribeCheckinHistoryTool,
     CloudSubscribeConfigUpdateTool,
     CloudSubscribeLinksTool,
     CloudSubscribePerformanceTool,
@@ -98,6 +102,20 @@ class MoviePilotRegistration(OwnerDelegator):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "校验HDHive OAuth回调并换取用户Token",
+            },
+            {
+                "path": "/checkin/{provider}",
+                "endpoint": self.api_vue_checkin,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即执行提供方签到",
+            },
+            {
+                "path": "/checkin/{provider}/history",
+                "endpoint": self.api_vue_checkin_history,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取提供方签到历史",
             },
             {
                 "path": "/cloud/directories",
@@ -368,6 +386,8 @@ class MoviePilotRegistration(OwnerDelegator):
         return [
             CloudSubscribeStatusTool,
             CloudSubscribeSyncTool,
+            CloudSubscribeCheckinTool,
+            CloudSubscribeCheckinHistoryTool,
             CloudSubscribeLinksTool,
             CloudSubscribeResourceSearchTool,
             CloudSubscribeResourceSelectTool,
@@ -397,9 +417,30 @@ class MoviePilotRegistration(OwnerDelegator):
             {
                 "cmd": "/cloud_link",
                 "event": EventType.PluginAction,
-                "desc": "提交网盘链接：订阅ID 链接",
+                "desc": "提交网盘链接：订阅ID或媒体名称 链接",
                 "category": "网盘订阅",
                 "data": {"action": "cloudsubscribe_links"},
+            },
+            {
+                "cmd": "/cloud_link_select",
+                "event": EventType.PluginAction,
+                "desc": "选择链接识别出的 TMDB 媒体",
+                "category": "网盘订阅",
+                "data": {"action": "cloudsubscribe_link_select"},
+            },
+            {
+                "cmd": "/cloud_checkin",
+                "event": EventType.PluginAction,
+                "desc": "立即执行签到：渠道 模式",
+                "category": "网盘订阅",
+                "data": {"action": "cloudsubscribe_checkin"},
+            },
+            {
+                "cmd": "/cloud_checkin_history",
+                "event": EventType.PluginAction,
+                "desc": "列举签到详情：渠道 数量",
+                "category": "网盘订阅",
+                "data": {"action": "cloudsubscribe_checkin_history"},
             },
             {
                 "cmd": "/cloud_cache_clear",
@@ -455,6 +496,49 @@ class MoviePilotRegistration(OwnerDelegator):
             "func": self._install_subscribe_search_takeover,
             "kwargs": {}
         })
+
+        checkin_providers = [
+            provider
+            for provider in self.get_checkin_provider_specs()
+            if (
+                    bool(getattr(
+                        self, f"_{provider['key']}_checkin_enabled", False
+                    ))
+                    and all(
+                getattr(self, name, None)
+                for name in provider["credential_attrs"]
+            )
+            )
+        ]
+        if checkin_providers and self._cron_is_valid(self._checkin_cron):
+            timezone = pytz.timezone(settings.TZ)
+            checkin_trigger = CronTrigger.from_crontab(
+                self._checkin_cron,
+                timezone=timezone,
+            )
+            if self._checkin_auto_retry:
+                retry_times = TimerUtils.random_even_scheduler(
+                    num_executions=self._configured_retry_count(),
+                    begin_hour=self._RETRY_START_HOUR,
+                    end_hour=self._RETRY_END_HOUR,
+                )
+                checkin_trigger = OrTrigger(
+                    [checkin_trigger] + [
+                        CronTrigger(
+                            minute=retry_time.minute,
+                            hour=retry_time.hour,
+                            timezone=timezone,
+                        )
+                        for retry_time in retry_times
+                    ]
+                )
+            services.append({
+                "id": "CloudSubscribe_Checkin",
+                "name": "签到服务",
+                "trigger": checkin_trigger,
+                "func": self.run_scheduled_checkins,
+                "kwargs": {},
+            })
 
         return services
 

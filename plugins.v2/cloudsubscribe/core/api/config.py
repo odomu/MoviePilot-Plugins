@@ -1,6 +1,6 @@
 """配置保存与智能体配置 API。"""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.log import logger
 from fastapi import Request
@@ -35,6 +35,43 @@ class ConfigApi(OwnerDelegator):
         payload["search_proxy_username"] = username
         payload["search_proxy_password"] = password
 
+    def _validate_checkin_config(
+            self,
+            payload: Dict[str, Any],
+    ) -> Optional[str]:
+        providers = self.get_checkin_provider_specs()
+        for provider in providers:
+            mode_key = f"{provider['key']}_checkin_mode"
+            mode = str(
+                payload.get(mode_key, "normal") or "normal"
+            ).strip().lower()
+            if mode not in {"normal", "gambler"}:
+                return f"{provider['name']} 签到模式无效"
+            payload[mode_key] = mode
+        cron = str(
+            payload.get("checkin_cron", "0 8 * * *")
+            or "0 8 * * *"
+        ).strip()
+        enabled = any(
+            payload.get(f"{provider['key']}_checkin_enabled")
+            for provider in providers
+        )
+        if enabled and not self._cron_is_valid(cron):
+            return "签到服务 Cron 表达式无效"
+        payload["checkin_cron"] = cron
+        payload.pop("checkin_retry_period", None)
+        payload["checkin_auto_retry"] = bool(
+            payload.get("checkin_auto_retry", True)
+        )
+        try:
+            retry_count = int(payload.get("checkin_retry_count", 2) or 2)
+        except (TypeError, ValueError):
+            return "自动重试次数必须是整数"
+        if not 1 <= retry_count <= 10:
+            return "自动重试次数需在 1-10 次之间"
+        payload["checkin_retry_count"] = retry_count
+        return None
+
     def _queue_pending_config(self, payload: Dict[str, Any]) -> None:
         """保存运行期间最后一次配置，等待同步任务结束后应用。"""
         with self._pending_config_lock:
@@ -66,6 +103,9 @@ class ConfigApi(OwnerDelegator):
             if not isinstance(payload, dict):
                 return {"success": False, "message": "配置数据格式错误"}
             self._validate_search_proxy_config(payload)
+            checkin_error = self._validate_checkin_config(payload)
+            if checkin_error:
+                return {"success": False, "message": checkin_error}
             self.update_config(payload)
             clear_ui_options_cache()
             clear_account_cache()

@@ -20,12 +20,68 @@ class CloudSubscribeSyncInput(BaseModel):
 
 
 class CloudSubscribeLinksInput(BaseModel):
-    subscribe_id: int = Field(..., gt=0, description="要关联的订阅 ID")
-    resource_links: List[str] = Field(
-        ...,
+    subscribe_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="要关联的订阅 ID；不存在或未指定时将改用 TMDB 媒体",
+    )
+    resource_links: Optional[List[str]] = Field(
+        default=None,
         min_length=1,
         max_length=50,
-        description="115分享、ED2K或Magnet链接列表",
+        description="115分享、ED2K或Magnet链接列表；选择 TMDB 候选时可省略",
+    )
+    title: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="无有效订阅时用于平台识别的媒体名称",
+    )
+    media_type: Optional[str] = Field(
+        default=None,
+        description="媒体类型，仅支持 movie 或 tv；选择 TMDB 候选时应与 tmdb_id 一并传入",
+    )
+    season: Optional[int] = Field(default=None, ge=1, le=999, description="电视剧季号")
+    episode_start: Optional[int] = Field(default=None, ge=1, le=9999, description="起始集")
+    episode_end: Optional[int] = Field(default=None, ge=1, le=9999, description="结束集")
+    selection_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+        description="上次调用返回的 TMDB 选择 ID",
+    )
+    tmdb_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="用户从 selection_id 对应候选中确认的 TMDB ID，需同时传入候选媒体类型",
+    )
+
+
+class CloudSubscribeCheckinInput(BaseModel):
+    provider: Optional[str] = Field(
+        default=None,
+        description="签到渠道标识；省略时执行全部已启用渠道",
+    )
+    mode: Optional[str] = Field(
+        default=None,
+        description="签到模式 normal 或 gambler；省略时使用渠道配置",
+    )
+    confirm_gambler: bool = Field(
+        default=False,
+        description="是否已明确确认赌狗签到可能最多扣除 3 积分",
+    )
+
+
+class CloudSubscribeCheckinHistoryInput(BaseModel):
+    provider: Optional[str] = Field(
+        default=None,
+        description="签到渠道标识；省略时按渠道列出全部签到详情",
+    )
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description="每个渠道返回的最近记录数，默认 10，最多 60",
     )
 
 

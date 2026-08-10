@@ -1,3 +1,4 @@
+import {createCheckinGroups} from "./checkin.js";
 import {createButailingGroups} from "./butailing.js";
 import {createCommonSearchGroups} from "./common.js";
 import {createDian115Groups} from "./dian115.js";
@@ -11,10 +12,11 @@ import {createOnlineDocsGroups} from "./online_docs.js";
 export function createSearchSection(resourceTypeItems, options = {}) {
   return {
     value: "search",
-    title: "搜索设置",
+    title: "搜索渠道",
     icon: "mdi-magnify",
     subtabs: [
       {value: "common", title: "通用设置", icon: "mdi-tune"},
+      {value: "checkin", title: "签到服务", icon: "mdi-calendar-check-outline"},
       {value: "pansou", title: "PanSou", icon: "mdi-magnify-scan"},
       {value: "hdhive", title: "HDHive", icon: "mdi-hexagon-multiple-outline",},
       {value: "dian115", title: "Dian115", icon: "mdi-cloud-search"},
@@ -26,6 +28,7 @@ export function createSearchSection(resourceTypeItems, options = {}) {
     ],
     groups: [
       ...createCommonSearchGroups(resourceTypeItems),
+      ...createCheckinGroups(),
       ...createPansouGroups(options.pansou || {}),
       ...createJuyingGroups(options),
       ...createSeedhubGroups(),

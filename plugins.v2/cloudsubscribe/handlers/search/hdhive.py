@@ -137,6 +137,11 @@ class HDHiveSearchService(OwnerDelegator):
                 self._hdhive_web_resources = resources
             return resources
 
+    def get_hdhive_web_client(self) -> HDHiveClient:
+        """返回搜索、账户信息与签到共同复用的唯一 WebAPI 客户端。"""
+        self._get_hdhive_web_resources()
+        return self._hdhive_web_client
+
     def close(self, release_cache: bool = False) -> None:
         """释放 HDHive Web 客户端资源。"""
         with self._hdhive_web_lock:

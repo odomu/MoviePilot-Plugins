@@ -7,6 +7,7 @@ import re
 import time
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 import pytz
@@ -42,6 +43,12 @@ class PlatformIntegrationService(OwnerDelegator):
         )
         self._agent_resource_cache = create_platform_ttl_cache(
             "platform:agent_resources",
+            owner,
+            maxsize=256,
+            ttl=30 * 60,
+        )
+        self._link_selection_cache = create_platform_ttl_cache(
+            "platform:link_selections",
             owner,
             maxsize=256,
             ttl=30 * 60,
@@ -720,15 +727,220 @@ class PlatformIntegrationService(OwnerDelegator):
 
     def submit_platform_links(
             self,
-            subscribe_id: int,
-            resource_links: Any,
+            subscribe_id: Optional[int] = None,
+            resource_links: Any = None,
             wait: bool = False,
+            title: str = "",
+            media_type: str = "",
+            season: Optional[int] = None,
+            episode_start: Optional[int] = None,
+            episode_end: Optional[int] = None,
+            selection_id: str = "",
+            tmdb_id: Optional[int] = None,
+            selection_scope: str = "",
     ) -> Dict[str, Any]:
-        links = self.extract_resource_links(resource_links)
-        return self.api_vue_start_manual_sync({
-            "subscribe_id": subscribe_id,
+        """提交链接；无有效订阅时先完成 TMDB 快速识别与选择。"""
+        try:
+            normalized_subscribe_id = int(subscribe_id or 0)
+        except (TypeError, ValueError):
+            normalized_subscribe_id = 0
+        if normalized_subscribe_id > 0:
+            subscribe = SubscribeOper().get(normalized_subscribe_id)
+            if subscribe:
+                return self.api_vue_start_manual_sync({
+                    "subscribe_id": normalized_subscribe_id,
+                    "resource_links": self.extract_resource_links(resource_links),
+                }, wait=wait)
+            if not str(title or "").strip():
+                title = str(normalized_subscribe_id)
+
+        normalized_selection_id = str(selection_id or "").strip()
+        requested_selection_type = str(media_type or "").strip().lower()
+        selected_candidate = None
+        if normalized_selection_id:
+            cached = self._link_selection_cache.get(normalized_selection_id)
+            if not isinstance(cached, dict):
+                return {"success": False, "message": "TMDB 候选已过期，请重新提交链接识别"}
+            cached_scope = str(cached.get("scope") or "")
+            if cached_scope and cached_scope != str(selection_scope or ""):
+                return {"success": False, "message": "TMDB 候选不属于当前会话"}
+            try:
+                selected_tmdb_id = int(tmdb_id or 0)
+            except (TypeError, ValueError):
+                selected_tmdb_id = 0
+            if selected_tmdb_id <= 0:
+                return {"success": False, "message": "请选择有效的 TMDB ID"}
+            matched_candidates = [
+                item for item in cached.get("candidates", [])
+                if int(item.get("tmdb_id") or 0) == selected_tmdb_id
+                   and (
+                           not requested_selection_type
+                           or item.get("media_type") == requested_selection_type
+                   )
+            ]
+            if len(matched_candidates) > 1:
+                return {"success": False, "message": "TMDB ID 同时匹配电影和电视剧，请指定媒体类型"}
+            selected_candidate = matched_candidates[0] if matched_candidates else None
+            if selected_candidate is None:
+                return {"success": False, "message": "所选 TMDB ID 不在待选候选中"}
+            links = list(cached.get("links") or [])
+            title = str(cached.get("title") or "")
+            media_type = str(cached.get("media_type") or "")
+            season = cached.get("season")
+            episode_start = cached.get("episode_start")
+            episode_end = cached.get("episode_end")
+        else:
+            links = self.extract_resource_links(resource_links)
+        if not links:
+            return {"success": False, "message": "请至少提供一个有效资源链接"}
+
+        if selected_candidate is None:
+            recognized_title = str(title or "").strip() or self._link_media_title(links)
+            if not recognized_title:
+                return {
+                    "success": False,
+                    "message": "未指定有效订阅，请同时提供媒体名称以便识别 TMDB",
+                }
+            title = recognized_title
+            normalized_type = str(media_type or "").strip().lower()
+            if normalized_type and normalized_type not in {"movie", "tv"}:
+                return {"success": False, "message": "媒体类型仅支持 movie 或 tv"}
+            search_result = self.api_vue_search_tmdb_candidates({"title": recognized_title})
+            if not search_result.get("success"):
+                return search_result
+            candidates = list((search_result.get("data") or {}).get("items") or [])
+            if normalized_type:
+                candidates = [
+                    item for item in candidates
+                    if item.get("media_type") == normalized_type
+                ]
+            if not candidates:
+                return {"success": False, "message": f"未识别到“{recognized_title}”的 TMDB 媒体"}
+            try:
+                selected_tmdb_id = int(tmdb_id or 0)
+            except (TypeError, ValueError):
+                selected_tmdb_id = 0
+            if selected_tmdb_id:
+                selected_candidate = next(
+                    (
+                        item for item in candidates
+                        if int(item.get("tmdb_id") or 0) == selected_tmdb_id
+                    ),
+                    None,
+                )
+                if not selected_candidate:
+                    return {"success": False, "message": "指定 TMDB ID 与识别结果不匹配"}
+            elif len(candidates) == 1:
+                selected_candidate = candidates[0]
+            else:
+                next_selection_id = uuid4().hex[:12]
+                self._link_selection_cache[next_selection_id] = {
+                    "scope": str(selection_scope or ""),
+                    "links": links,
+                    "title": recognized_title,
+                    "media_type": normalized_type,
+                    "season": season,
+                    "episode_start": episode_start,
+                    "episode_end": episode_end,
+                    "candidates": candidates,
+                }
+                return {
+                    "success": False,
+                    "message": f"“{recognized_title}”匹配到多个 TMDB 媒体，请先选择",
+                    "data": {
+                        "selection_required": True,
+                        "selection_id": next_selection_id,
+                        "candidates": candidates,
+                        "next_step": "请选择候选的 media_type 与 tmdb_id 后继续提交",
+                    },
+                }
+
+        media = self._link_media_payload(
+            selected_candidate,
+            source_title=title,
+            season=season,
+            episode_start=episode_start,
+            episode_end=episode_end,
+        )
+        result = self.api_vue_start_manual_sync({
             "resource_links": links,
+            "media": media,
         }, wait=wait)
+        if result.get("success") and normalized_selection_id:
+            try:
+                del self._link_selection_cache[normalized_selection_id]
+            except KeyError:
+                pass
+        data = dict(result.get("data") or {})
+        data["media"] = media
+        result["data"] = data
+        return result
+
+    @staticmethod
+    def _link_media_title(links: List[str]) -> str:
+        """从 ED2K 文件名或 Magnet dn 中提取可供平台识别的标题。"""
+        for link in links:
+            lowered = str(link or "").lower()
+            if lowered.startswith("ed2k://|file|"):
+                parts = str(link).split("|")
+                if len(parts) > 2:
+                    return unquote(parts[2]).strip()
+            if lowered.startswith("magnet:?"):
+                values = parse_qs(urlparse(str(link)).query).get("dn") or []
+                if values and str(values[0]).strip():
+                    return unquote(str(values[0])).strip()
+        return ""
+
+    @staticmethod
+    def _link_media_payload(
+            candidate: Dict[str, Any],
+            source_title: str = "",
+            season: Optional[int] = None,
+            episode_start: Optional[int] = None,
+            episode_end: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        media_type = str(candidate.get("media_type") or "").lower()
+        media = {
+            "tmdb_id": int(candidate.get("tmdb_id") or 0),
+            "media_type": media_type,
+            "title": str(candidate.get("title") or source_title or "").strip(),
+            "year": candidate.get("year"),
+        }
+        if media_type != "tv":
+            return media
+        meta = MetaInfo(str(source_title or media["title"]))
+        parsed_episodes = [
+            int(value) for value in (getattr(meta, "episode_list", None) or [])
+            if str(value).isdigit()
+        ]
+        episode_range = re.search(
+            r"(?i)S\d{1,3}E(\d{1,4})(?:\s*[-~～]\s*(?:E)?(\d{1,4}))?",
+            str(source_title or ""),
+        )
+        if episode_range:
+            range_start = int(episode_range.group(1))
+            range_end = int(episode_range.group(2) or range_start)
+            parsed_episodes.extend(range(range_start, max(range_start, range_end) + 1))
+        resolved_season = int(
+            season or getattr(meta, "begin_season", None) or 1
+        )
+        resolved_start = int(
+            episode_start
+            or (min(parsed_episodes) if parsed_episodes else None)
+            or getattr(meta, "begin_episode", None)
+            or 1
+        )
+        resolved_end = int(
+            episode_end
+            or (max(parsed_episodes) if parsed_episodes else None)
+            or resolved_start
+        )
+        media.update({
+            "season": max(1, resolved_season),
+            "episode_start": max(1, resolved_start),
+            "episode_end": max(resolved_start, resolved_end),
+        })
+        return media
 
     @staticmethod
     def _set_workflow_output(context: Any, name: str, result: Dict[str, Any]) -> Any:
@@ -812,16 +1024,43 @@ class PlatformIntegrationService(OwnerDelegator):
             context: Any,
             subscribe_id: int = 0,
             resource_links: Any = None,
+            title: str = "",
+            media_type: str = "",
+            season: Optional[int] = None,
+            episode_start: Optional[int] = None,
+            episode_end: Optional[int] = None,
+            selection_id: str = "",
+            tmdb_id: Optional[int] = None,
             **kwargs,
     ) -> tuple[bool, Any]:
         if not subscribe_id:
             subscribes = list(getattr(context, "subscribes", None) or [])
             if len(subscribes) == 1:
                 subscribe_id = int(getattr(subscribes[0], "id", 0) or 0)
-        links = self.extract_resource_links(
-            resource_links if resource_links is not None else getattr(context, "content", "")
+        raw_content = (
+            resource_links
+            if resource_links is not None else getattr(context, "content", "")
         )
-        result = self.submit_platform_links(subscribe_id, links, wait=True)
+        links = self.extract_resource_links(raw_content)
+        recognized_title = str(title or "").strip()
+        if not recognized_title and resource_links is None:
+            recognized_title = str(raw_content or "")
+            for link in links:
+                recognized_title = recognized_title.replace(link, " ")
+            recognized_title = " ".join(recognized_title.split())
+        result = self.submit_platform_links(
+            subscribe_id=subscribe_id,
+            resource_links=links,
+            wait=True,
+            title=recognized_title,
+            media_type=media_type,
+            season=season,
+            episode_start=episode_start,
+            episode_end=episode_end,
+            selection_id=selection_id,
+            tmdb_id=tmdb_id,
+            selection_scope="workflow",
+        )
         return bool(result.get("success")), self._set_workflow_output(
             context, "cloudsubscribe_links", result
         )

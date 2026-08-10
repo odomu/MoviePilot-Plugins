@@ -10,9 +10,10 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
-from urllib.parse import urljoin
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urljoin, urlsplit
 
 from app.log import logger
 
@@ -81,6 +82,7 @@ class HDHiveClient:
     _SIGNED_RESPONSE_PATHS = {
         "/api/customer/user/current",
         "/api/customer/points-logs",
+        "/api/customer/user/checkin",
     }
     _SECURITY_RETRY_CODES = {
         "invalid_session", "missing_signature", "signature_invalid",
@@ -622,12 +624,14 @@ class HDHiveClient:
 
     @classmethod
     def _requires_signed_response(cls, path: str) -> bool:
-        if path in cls._SIGNED_RESPONSE_PATHS:
+        normalized_path = urlsplit(path).path
+        if normalized_path in cls._SIGNED_RESPONSE_PATHS:
             return True
-        return cls._is_unlock_path(path)
+        return cls._is_unlock_path(normalized_path)
 
     @staticmethod
     def _is_unlock_path(path: str) -> bool:
+        path = urlsplit(path).path
         return bool(re.fullmatch(
             r"/api/customer/(?:resources|music_resources)/[^/]+/unlock",
             path,
@@ -724,15 +728,29 @@ class HDHiveClient:
             body: bytes = b"",
             headers: Optional[Dict[str, str]] = None,
             retry: bool = True,
+            retry_captcha: bool = True,
+            canonical_path: str = "",
     ):
         if self._is_unlock_path(path):
             with self._unlock_lock():
                 self._wait_for_unlock_slot()
                 return self._signed_request_once(
-                    method, path, body=body, headers=headers, retry=retry
+                    method,
+                    path,
+                    body=body,
+                    headers=headers,
+                    retry=retry,
+                    retry_captcha=retry_captcha,
+                    canonical_path=canonical_path,
                 )
         return self._signed_request_once(
-            method, path, body=body, headers=headers, retry=retry
+            method,
+            path,
+            body=body,
+            headers=headers,
+            retry=retry,
+            retry_captcha=retry_captcha,
+            canonical_path=canonical_path,
         )
 
     def _signed_request_once(
@@ -742,12 +760,15 @@ class HDHiveClient:
             body: bytes = b"",
             headers: Optional[Dict[str, str]] = None,
             retry: bool = True,
+            retry_captcha: bool = True,
+            canonical_path: str = "",
     ):
         self._ensure_security_session()
+        signed_path = str(canonical_path or urlsplit(path).path or "/")
         timestamp = str(int(time.time() * 1000) + self._clock_offset_ms)
         nonce = self._security.nonce()
         signature = self._security.sign_request(
-            method, path, timestamp, nonce, body, self._user_id()
+            method, signed_path, timestamp, nonce, body, self._user_id()
         )
         request_headers = dict(headers or {})
         request_headers.update({
@@ -770,11 +791,49 @@ class HDHiveClient:
             raise
         if is_unlock:
             self._record_unlock_attempt()
+        if self._captcha.is_challenge_response(response):
+            if not retry_captcha:
+                raise HDHiveWebError(
+                    "HDHive 验证通过后仍要求安全验证",
+                    code="captcha_retry_failed",
+                    status_code=response.status_code,
+                )
+            logger.debug(
+                f"HDHive 签名请求命中验证码挑战：{method} {signed_path}"
+            )
+            with self.related_requests(4):
+                try:
+                    clearance_seconds = self._captcha.solve(response, path)
+                except HDHiveCaptchaError as error:
+                    raise HDHiveWebError(
+                        str(error),
+                        code=error.code,
+                        status_code=response.status_code,
+                    ) from error
+                self._save_cookies()
+                logger.info(
+                    "HDHive 动态验证码验证通过"
+                    + (
+                        f"，有效期 {clearance_seconds} 秒"
+                        if clearance_seconds > 0 else ""
+                    )
+                )
+                retried = self._signed_request(
+                    method,
+                    path,
+                    body,
+                    headers,
+                    retry=retry,
+                    retry_captcha=False,
+                    canonical_path=signed_path,
+                )
+                setattr(retried, "hdhive_captcha_verified", True)
+                return retried
         response_body = bytes(response.content or b"")
         response_signature = str(response.headers.get("X-HDH-RSig") or "")
         if response_signature:
             if not self._security.verify_response(
-                    path,
+                    signed_path,
                     response.status_code,
                     str(response.headers.get("X-HDH-RTS") or ""),
                     response_body,
@@ -819,7 +878,13 @@ class HDHiveClient:
             error_code = self._security_error_code(response)
             if self._prepare_security_retry(error_code):
                 return self._signed_request(
-                    method, path, body, headers, retry=False
+                    method,
+                    path,
+                    body,
+                    headers,
+                    retry=False,
+                    retry_captcha=retry_captcha,
+                    canonical_path=signed_path,
                 )
         return response
 
@@ -853,11 +918,16 @@ class HDHiveClient:
             body: bytes = b"",
             headers: Optional[Dict[str, str]] = None,
             response_handler: Optional[Callable] = None,
+            canonical_path: str = "",
     ):
         """执行带 HDHive 安全会话签名的授权请求。"""
         with self._lock:
             response = self._signed_request(
-                method, path, body=body, headers=headers
+                method,
+                path,
+                body=body,
+                headers=headers,
+                canonical_path=canonical_path,
             )
             return response_handler(response) if response_handler else response
 
@@ -1027,6 +1097,259 @@ class HDHiveClient:
             "created_at": str(data.get("created_at") or ""),
             "last_login_at": str(data.get("last_web_login_at") or ""),
             "status": str(data.get("lifecycle_status") or ""),
+            "captcha_verified": bool(
+                getattr(response, "hdhive_captcha_verified", False)
+            ),
+        }
+
+    @staticmethod
+    def _checkin_message(payload: Dict[str, Any]) -> str:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        error = payload.get("error") if isinstance(payload, dict) else None
+        candidates = (
+            data.get("message") if isinstance(data, dict) else "",
+            data.get("description") if isinstance(data, dict) else "",
+            data.get("detail") if isinstance(data, dict) else "",
+            payload.get("message") if isinstance(payload, dict) else "",
+            payload.get("description") if isinstance(payload, dict) else "",
+            payload.get("detail") if isinstance(payload, dict) else "",
+            error.get("message") if isinstance(error, dict) else "",
+            error.get("description") if isinstance(error, dict) else "",
+            error.get("detail") if isinstance(error, dict) else "",
+            error if isinstance(error, str) else "",
+        )
+        return next((str(value).strip() for value in candidates if value), "")
+
+    @staticmethod
+    def _checkin_error_code(payload: Dict[str, Any]) -> str:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return str(
+            payload.get("code")
+            or payload.get("error_code")
+            or (error.get("code") if isinstance(error, dict) else "")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _points_log_items(payload: Any) -> List[Dict[str, Any]]:
+        """兼容积分日志接口的列表和常见分页对象。"""
+        containers = []
+        if isinstance(payload, dict):
+            containers.extend((payload.get("data"), payload))
+        else:
+            containers.append(payload)
+        for container in containers:
+            if isinstance(container, list):
+                return [item for item in container if isinstance(item, dict)]
+            if not isinstance(container, dict):
+                continue
+            for key in ("items", "logs", "records", "results", "rows", "list"):
+                items = container.get(key)
+                if isinstance(items, list):
+                    return [item for item in items if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _parse_points_log_time(value: Any) -> Optional[datetime]:
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            try:
+                return datetime.fromtimestamp(timestamp).astimezone()
+            except (OSError, OverflowError, ValueError):
+                return None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed
+        return parsed.astimezone()
+
+    @classmethod
+    def _is_today_checkin_log(cls, item: Dict[str, Any]) -> bool:
+        description = " ".join(
+            str(item.get(key) or "")
+            for key in (
+                "change_type", "type", "action", "source", "title",
+                "remark", "description", "message",
+            )
+        )
+        normalized = re.sub(r"[\s_-]+", "", description.casefold())
+        if not any(marker in normalized for marker in ("签到", "checkin", "signin")):
+            return False
+        occurred_at = None
+        for key in (
+                "created_at", "createdAt", "create_time", "add_time",
+                "occurred_at", "updated_at", "date", "time",
+        ):
+            occurred_at = cls._parse_points_log_time(item.get(key))
+            if occurred_at is not None:
+                break
+        return bool(
+            occurred_at
+            and occurred_at.date() == datetime.now().astimezone().date()
+        )
+
+    def get_points_logs(
+            self,
+            page: int = 1,
+            page_size: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """读取积分明细；签名只使用不含查询参数的 canonical path。"""
+        normalized_page = max(1, int(page or 1))
+        normalized_size = max(1, min(int(page_size or 20), 100))
+        path = (
+            "/api/customer/points-logs"
+            f"?page={normalized_page}&page_size={normalized_size}"
+        )
+        response = self.signed_request(
+            "GET",
+            path,
+            canonical_path="/api/customer/points-logs",
+        )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise HDHiveWebError(
+                "HDHive 积分日志接口返回格式异常",
+                code="schema_changed",
+                status_code=response.status_code,
+            ) from error
+        if response.status_code >= 400:
+            raise HDHiveWebError(
+                "HDHive 积分日志读取失败",
+                code="request_failed",
+                status_code=response.status_code,
+            )
+        return self._points_log_items(payload)
+
+    def has_checked_in_today(self) -> bool:
+        return any(
+            self._is_today_checkin_log(item)
+            for item in self.get_points_logs(page=1, page_size=20)
+        )
+
+    def checkin(self, is_gambler: bool = False) -> Dict[str, Any]:
+        """执行无浏览器签到，并返回签到前后的积分与累计天数。"""
+        request_body = json.dumps(
+            {"is_gambler": True} if is_gambler else {},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with self.related_requests(3):
+            before = self.get_account_info()
+            response = None
+            payload: Dict[str, Any] = {}
+            try:
+                response = self.signed_request(
+                    "POST",
+                    "/api/customer/user/checkin",
+                    body=request_body,
+                    headers={
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                        "origin": self.BASE_URL,
+                        "referer": f"{self.BASE_URL}/user/{self._user_id()}",
+                    },
+                )
+            except HDHiveWebError as error:
+                if error.status_code != 400 or not self.has_checked_in_today():
+                    raise
+                status_code = error.status_code
+                message = "今日已签到"
+                error_code = error.code
+                checked_in_value = False
+                already_checked_in = True
+                success = True
+            else:
+                try:
+                    payload = response.json()
+                except ValueError as error:
+                    raise HDHiveWebError(
+                        "HDHive 签到接口返回格式异常",
+                        code="schema_changed",
+                        status_code=response.status_code,
+                    ) from error
+                if not isinstance(payload, dict):
+                    raise HDHiveWebError(
+                        "HDHive 签到接口返回格式异常",
+                        code="schema_changed",
+                        status_code=response.status_code,
+                    )
+                status_code = int(response.status_code or 0)
+                message = self._checkin_message(payload)
+                error_code = self._checkin_error_code(payload)
+                data = payload.get("data")
+                data = data if isinstance(data, dict) else {}
+                already_checked_in = bool(
+                    data.get("already_checked_in")
+                    or any(marker in message for marker in (
+                        "已经签到", "今日已签到", "签到过", "明天再来",
+                    ))
+                    or error_code in {
+                        "ALREADY_CHECKED_IN", "CHECKIN_ALREADY_COMPLETED",
+                    }
+                )
+                checked_in_value = data.get("checked_in")
+                if (
+                        status_code < 400
+                        and checked_in_value is False
+                        and not already_checked_in
+                ):
+                    already_checked_in = True
+                success = bool(
+                    already_checked_in
+                    or (
+                            status_code < 400
+                            and payload.get("success") is not False
+                    )
+                )
+                if (
+                        not success
+                        and status_code == 400
+                        and self.has_checked_in_today()
+                ):
+                    already_checked_in = True
+                    success = True
+                    message = "今日已签到"
+            after = (
+                before if already_checked_in
+                else self.get_account_info() if success
+                else before
+            )
+        points_before = int(before.get("points") or 0)
+        points_after = int(after.get("points") or 0)
+        points_change = points_after - points_before
+        return {
+            "success": success,
+            "checked_in": bool(checked_in_value) and not already_checked_in,
+            "already_checked_in": already_checked_in,
+            "status": (
+                "今日已签到" if already_checked_in
+                else "签到成功" if success else "签到失败"
+            ),
+            "message": message or (
+                "今日已签到" if already_checked_in
+                else "签到成功" if success
+                else f"签到失败（HTTP {status_code}）"
+            ),
+            "is_gambler": bool(is_gambler),
+            "points_change": points_change,
+            "points_before": points_before,
+            "points_after": points_after,
+            "signin_days": int(after.get("signin_days") or 0),
+            "status_code": status_code,
+            "error_code": error_code,
+            "captcha_verified": bool(
+                before.get("captcha_verified")
+                or after.get("captcha_verified")
+                or getattr(response, "hdhive_captcha_verified", False)
+            ),
+            "raw": payload,
         }
 
     def _load_cookies(self) -> None:

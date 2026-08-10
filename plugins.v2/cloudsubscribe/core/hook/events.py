@@ -192,15 +192,115 @@ class PluginEventHandler(OwnerDelegator):
     def _submit_remote_links(
             self,
             event_data: dict,
-            subscribe_id: int,
-            raw_links: str,
+            subscribe_id: int = 0,
+            raw_links: str = "",
+            title: str = "",
+            media_type: str = "",
+            selection_id: str = "",
+            tmdb_id: Optional[int] = None,
     ) -> None:
-        result = self.submit_platform_links(subscribe_id, raw_links)
+        result = self.submit_platform_links(
+            subscribe_id=subscribe_id,
+            resource_links=raw_links,
+            title=title,
+            media_type=media_type,
+            selection_id=selection_id,
+            tmdb_id=tmdb_id,
+            selection_scope=self._command_selection_scope(event_data),
+        )
         self._post_command_message(
             event_data,
             "【网盘订阅】资源提交结果",
-            str(result.get("message") or "资源提交失败"),
+            self._format_remote_link_result(result),
         )
+
+    @staticmethod
+    def _command_selection_scope(event_data: dict) -> str:
+        return f"telegram:{event_data.get('channel')}:{event_data.get('user')}"
+
+    @staticmethod
+    def _format_remote_link_result(result: dict) -> str:
+        data = result.get("data") or {}
+        if not data.get("selection_required"):
+            return str(result.get("message") or "资源提交失败")
+        selection_id = str(data.get("selection_id") or "")
+        lines = [str(result.get("message") or "请选择 TMDB 媒体")]
+        for item in list(data.get("candidates") or [])[:10]:
+            year = f" ({item.get('year')})" if item.get("year") else ""
+            media_type = item.get("media_type_name") or item.get("media_type") or ""
+            lines.append(
+                f"{item.get('media_type')}:{item.get('tmdb_id')}｜"
+                f"{item.get('title') or '未知媒体'}{year} · {media_type}"
+            )
+        lines.append(f"选择格式：/cloud_link_select {selection_id} movie:TMDB_ID")
+        return "\n".join(lines)
+
+    def _run_remote_checkin(
+            self,
+            event_data: dict,
+            provider: str,
+            mode: str,
+            confirm_gambler: bool,
+    ) -> None:
+        result = self.run_quick_checkin(
+            provider=provider,
+            mode=mode,
+            confirm_gambler=confirm_gambler,
+        )
+        data = result.get("data") or {}
+        lines = [str(result.get("message") or "签到失败")]
+        for item in data.get("items") or []:
+            record = item.get("data") or {}
+            details = [
+                str(record.get("status") or item.get("message") or "签到失败"),
+            ]
+            if record.get("points_change") is not None:
+                details.append(f"积分 {int(record.get('points_change') or 0):+d}")
+            if record.get("points_after") is not None:
+                details.append(f"当前 {record.get('points_after')}")
+            lines.append(f"{item.get('provider_name') or item.get('provider')}：{' · '.join(details)}")
+        self._post_command_message(
+            event_data,
+            "【网盘订阅】签到结果",
+            "\n".join(lines),
+        )
+
+    @staticmethod
+    def _format_checkin_history(result: dict) -> str:
+        if not result.get("success"):
+            return str(result.get("message") or "签到详情查询失败")
+        channels = (result.get("data") or {}).get("channels") or []
+        lines = []
+        trigger_names = {
+            "scheduled": "定时执行",
+            "retry": "异常重试",
+            "manual": "手动执行",
+        }
+        for channel in channels:
+            lines.append(
+                f"【{channel.get('provider_name') or channel.get('provider')}】"
+                f"共 {channel.get('total') or 0} 条"
+            )
+            records = channel.get("items") or []
+            if not records:
+                lines.append("暂无签到记录")
+                continue
+            for record in records:
+                executed_at = str(record.get("executed_at") or "").replace("T", " ")
+                mode = "赌狗签到" if record.get("mode") == "gambler" else "普通签到"
+                details = [
+                    trigger_names.get(record.get("trigger"), "手动执行"),
+                    str(record.get("status") or "签到失败"),
+                    mode,
+                ]
+                if record.get("points_change") is not None:
+                    details.append(f"积分 {int(record.get('points_change') or 0):+d}")
+                if record.get("points_after") is not None:
+                    details.append(f"当前 {record.get('points_after')}")
+                if record.get("signin_days") is not None:
+                    details.append(f"累计 {record.get('signin_days')} 天")
+                lines.append(f"{executed_at}｜{' · '.join(details)}")
+        return "\n".join(lines) if lines else "暂无签到记录"
 
     def on_plugin_action(self, event: Event):
         """处理通用远程命令，耗时校验交给后台线程。"""
@@ -238,17 +338,28 @@ class PluginEventHandler(OwnerDelegator):
 
         if action == "cloudsubscribe_links":
             raw = str(event_data.get("arg_str") or "").strip()
-            subscribe_text, separator, links_text = raw.partition(" ")
-            if not separator or not subscribe_text.isdigit() or not links_text.strip():
+            links = self.extract_resource_links(raw)
+            if not links:
                 self._post_command_message(
                     event_data,
                     "【网盘订阅】参数错误",
-                    "格式：/cloud_link 订阅ID 115分享、ED2K或Magnet链接",
+                    "格式：/cloud_link [订阅ID或媒体名称] 115分享、ED2K或Magnet链接",
                 )
                 return
+            target_text = raw
+            for link in links:
+                target_text = target_text.replace(link, " ")
+            target_parts = target_text.split()
+            subscribe_id = int(target_parts.pop(0)) if target_parts and target_parts[0].isdigit() else 0
+            title = " ".join(target_parts).strip()
             Thread(
                 target=self._submit_remote_links,
-                args=(dict(event_data), int(subscribe_text), links_text),
+                kwargs={
+                    "event_data": dict(event_data),
+                    "subscribe_id": subscribe_id,
+                    "raw_links": "\n".join(links),
+                    "title": title,
+                },
                 daemon=True,
                 name="cloudsubscribe-command-links",
             ).start()
@@ -256,6 +367,104 @@ class PluginEventHandler(OwnerDelegator):
                 event_data,
                 "【网盘订阅】正在校验资源",
                 "链接已接收，正在校验并提交。",
+            )
+            return
+
+        if action == "cloudsubscribe_link_select":
+            args = str(event_data.get("arg_str") or "").strip().split()
+            selection_type, separator, tmdb_text = (
+                args[1].lower().partition(":") if len(args) == 2 else ("", "", "")
+            )
+            if (
+                    len(args) != 2
+                    or not separator
+                    or selection_type not in {"movie", "tv"}
+                    or not tmdb_text.isdigit()
+            ):
+                self._post_command_message(
+                    event_data,
+                    "【网盘订阅】参数错误",
+                    "格式：/cloud_link_select 选择ID movie:TMDB_ID",
+                )
+                return
+            Thread(
+                target=self._submit_remote_links,
+                kwargs={
+                    "event_data": dict(event_data),
+                    "selection_id": args[0],
+                    "media_type": selection_type,
+                    "tmdb_id": int(tmdb_text),
+                },
+                daemon=True,
+                name="cloudsubscribe-command-link-select",
+            ).start()
+            self._post_command_message(
+                event_data,
+                "【网盘订阅】正在提交资源",
+                "已收到 TMDB 选择，正在继续完整转存流程。",
+            )
+            return
+
+        if action == "cloudsubscribe_checkin":
+            args = str(event_data.get("arg_str") or "").strip().lower().split()
+            confirm_gambler = any(value in {"confirm", "确认"} for value in args)
+            args = [value for value in args if value not in {"confirm", "确认"}]
+            mode_aliases = {"normal": "normal", "普通": "normal", "gambler": "gambler", "赌狗": "gambler"}
+            mode = ""
+            provider = ""
+            for value in args:
+                if value in mode_aliases and not mode:
+                    mode = mode_aliases[value]
+                elif not provider:
+                    provider = value
+                else:
+                    self._post_command_message(
+                        event_data,
+                        "【网盘订阅】参数错误",
+                        "格式：/cloud_checkin [渠道] [normal|gambler] [confirm]",
+                    )
+                    return
+            Thread(
+                target=self._run_remote_checkin,
+                args=(dict(event_data), provider, mode, confirm_gambler),
+                daemon=True,
+                name="cloudsubscribe-command-checkin",
+            ).start()
+            self._post_command_message(
+                event_data,
+                "【网盘订阅】正在签到",
+                "签到请求已接收，完成后将发送结果。",
+            )
+            return
+
+        if action == "cloudsubscribe_checkin_history":
+            args = str(event_data.get("arg_str") or "").strip().lower().split()
+            if len(args) > 2:
+                self._post_command_message(
+                    event_data,
+                    "【网盘订阅】参数错误",
+                    "格式：/cloud_checkin_history [渠道] [数量]",
+                )
+                return
+            provider = ""
+            limit = 10
+            for value in args:
+                if value.isdigit():
+                    limit = max(1, min(int(value), 60))
+                elif not provider:
+                    provider = value
+                else:
+                    self._post_command_message(
+                        event_data,
+                        "【网盘订阅】参数错误",
+                        "格式：/cloud_checkin_history [渠道] [数量]",
+                    )
+                    return
+            result = self.list_checkin_details(provider=provider, limit=limit)
+            self._post_command_message(
+                event_data,
+                "【网盘订阅】签到详情",
+                self._format_checkin_history(result),
             )
             return
 

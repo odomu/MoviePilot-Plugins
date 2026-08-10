@@ -2,6 +2,8 @@
 
 from .tools import (
     CloudSubscribeCacheClearTool,
+    CloudSubscribeCheckinTool,
+    CloudSubscribeCheckinHistoryTool,
     CloudSubscribeConfigUpdateTool,
     CloudSubscribeLinksTool,
     CloudSubscribePerformanceTool,
@@ -13,6 +15,8 @@ from .tools import (
 
 __all__ = [
     "CloudSubscribeCacheClearTool",
+    "CloudSubscribeCheckinTool",
+    "CloudSubscribeCheckinHistoryTool",
     "CloudSubscribeConfigUpdateTool",
     "CloudSubscribeLinksTool",
     "CloudSubscribePerformanceTool",

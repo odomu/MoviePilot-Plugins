@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 from .schemas import (
     CloudSubscribeCacheClearInput,
+    CloudSubscribeCheckinInput,
+    CloudSubscribeCheckinHistoryInput,
     CloudSubscribeConfigUpdateInput,
     CloudSubscribeLinksInput,
     CloudSubscribePerformanceInput,
@@ -79,8 +81,10 @@ class CloudSubscribeLinksTool(MoviePilotTool):
         ToolTag.Transfer,
     ]
     description: str = (
-        "校验并向指定订阅提交用户直接提供的115分享、ED2K或Magnet链接，"
-        "链接仍通过网盘订阅助手现有转存流程处理。仅处理用户明确提供的链接；"
+        "校验并提交用户直接提供的115分享、ED2K或Magnet链接。订阅不存在或未指定时，"
+        "使用媒体名称快速识别 TMDB；只有一个候选会直接进入完整转存流程，多个候选会"
+        "返回 selection_id，此时应让用户选择媒体类型和 TMDB ID 后再次调用本工具。"
+        "仅处理用户明确提供的链接；"
         "搜索工具返回的候选必须改用 cloudsubscribe_select_resources，禁止复制或改写候选链接。"
     )
     args_schema: Type[BaseModel] = CloudSubscribeLinksInput
@@ -91,20 +95,104 @@ class CloudSubscribeLinksTool(MoviePilotTool):
 
     async def run(
             self,
-            subscribe_id: int,
-            resource_links: list[str],
+            subscribe_id: Optional[int] = None,
+            resource_links: Optional[list[str]] = None,
+            title: Optional[str] = None,
+            media_type: Optional[str] = None,
+            season: Optional[int] = None,
+            episode_start: Optional[int] = None,
+            episode_end: Optional[int] = None,
+            selection_id: Optional[str] = None,
+            tmdb_id: Optional[int] = None,
+            **kwargs,
+    ) -> str:
+        plugin = _plugin()
+        if not plugin:
+            return "网盘订阅助手未运行"
+        if not resource_links and not selection_id:
+            return "请提供资源链接，或提供上次返回的 selection_id 与已选 TMDB ID"
+        if media_type and media_type not in {"movie", "tv"}:
+            return "媒体类型仅支持 movie（电影）或 tv（电视剧）"
+        if selection_id and (not tmdb_id or media_type not in {"movie", "tv"}):
+            return "选择 TMDB 候选时请同时提供 selection_id、media_type 和 tmdb_id"
+        result = await self.run_blocking(
+            "storage",
+            plugin.submit_platform_links,
+            subscribe_id=subscribe_id,
+            resource_links=resource_links,
+            title=title or "",
+            media_type=media_type or "",
+            season=season,
+            episode_start=episode_start,
+            episode_end=episode_end,
+            selection_id=selection_id or "",
+            tmdb_id=tmdb_id,
+            selection_scope=f"agent:{self._session_id}",
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+class CloudSubscribeCheckinTool(MoviePilotTool):
+    name: str = "cloudsubscribe_checkin"
+    tags: list[str] = [ToolTag.Write, ToolTag.Plugin]
+    description: str = (
+        "立即执行网盘订阅助手签到。可指定渠道，省略时签到全部已启用渠道。"
+        "normal 为普通签到；gambler 可能扣除积分，必须先取得用户明确确认，"
+        "再将 confirm_gambler 设为 true。"
+    )
+    args_schema: Type[BaseModel] = CloudSubscribeCheckinInput
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        return "正在执行网盘渠道签到"
+
+    async def run(
+            self,
+            provider: Optional[str] = None,
+            mode: Optional[str] = None,
+            confirm_gambler: bool = False,
             **kwargs,
     ) -> str:
         plugin = _plugin()
         if not plugin:
             return "网盘订阅助手未运行"
         result = await self.run_blocking(
-            "storage",
-            plugin.submit_platform_links,
-            subscribe_id,
-            resource_links,
+            "web",
+            plugin.run_quick_checkin,
+            provider=provider or "",
+            mode=mode or "",
+            confirm_gambler=confirm_gambler,
         )
-        return str(result.get("message") or ("提交成功" if result.get("success") else "提交失败"))
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+class CloudSubscribeCheckinHistoryTool(MoviePilotTool):
+    name: str = "cloudsubscribe_checkin_history"
+    tags: list[str] = [ToolTag.Read, ToolTag.Plugin]
+    description: str = (
+        "按渠道列举网盘订阅助手的签到详情，包括执行时间、状态、模式、积分变化、"
+        "当前积分和累计签到天数。不会返回 HTTP、错误码或验证码等内部信息。"
+    )
+    args_schema: Type[BaseModel] = CloudSubscribeCheckinHistoryInput
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        return "正在查询网盘渠道签到详情"
+
+    async def run(
+            self,
+            provider: Optional[str] = None,
+            limit: int = 10,
+            **kwargs,
+    ) -> str:
+        plugin = _plugin()
+        if not plugin:
+            return "网盘订阅助手未运行"
+        result = await self.run_blocking(
+            "default",
+            plugin.list_checkin_details,
+            provider=provider or "",
+            limit=limit,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 
 class CloudSubscribeResourceSearchTool(MoviePilotTool):

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import pathlib
 import re
 import threading
 from dataclasses import dataclass
@@ -485,6 +483,35 @@ class HDHiveCaptchaSolver:
         candidate = cls._valid_challenge_url(response_url)
         if candidate:
             return candidate
+        if int(getattr(response, "status_code", 0) or 0) == 428:
+            try:
+                payload = response.json()
+            except (AttributeError, ValueError):
+                payload = {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            error = payload.get("error") if isinstance(payload, dict) else None
+            error_data = error.get("data") if isinstance(error, dict) else None
+            challenge_id = str(
+                (data or {}).get("challenge_id")
+                if isinstance(data, dict)
+                else ""
+            ).strip() or str(
+                (error_data or {}).get("challenge_id")
+                if isinstance(error_data, dict)
+                else ""
+            ).strip()
+            error_code = str(
+                payload.get("code")
+                or payload.get("error_code")
+                or (error or {}).get("code")
+                if isinstance(payload, dict)
+                else ""
+            ).strip()
+            if (
+                    error_code == "ABUSE_CHALLENGE_REQUIRED"
+                    and UUID_RE.fullmatch(challenge_id)
+            ):
+                return f"{BASE_URL}{CHALLENGE_PATH}?challenge={challenge_id}"
         text = cls._body(response).decode("utf-8", errors="replace")
         normalized = text.replace(r"\u0026", "&").replace(r"\u002F", "/")
         redirect = NEXT_REDIRECT_RE.search(normalized)
