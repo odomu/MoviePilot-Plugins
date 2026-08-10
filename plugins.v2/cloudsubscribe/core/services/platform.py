@@ -6,6 +6,7 @@ import heapq
 import re
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
@@ -21,6 +22,11 @@ from app.schemas.types import MediaType
 from app.utils.string import StringUtils
 
 from ...core import CloudDriveCapability, OwnerDelegator
+from ...search.types import (
+    PREVIEW_PROVIDER_KEYS,
+    resource_type_from_url,
+    resource_type_name,
+)
 from ...utils.cache import create_platform_ttl_cache
 
 
@@ -796,10 +802,24 @@ class PlatformIntegrationService(OwnerDelegator):
 
         if selected_candidate is None:
             recognized_title = str(title or "").strip() or self._link_media_title(links)
+            preview = {}
+            if not recognized_title:
+                preview = self._preview_link_media(links)
+                recognized_title = str(preview.get("title") or "").strip()
+                if preview.get("year") and str(preview["year"]) not in recognized_title:
+                    recognized_title = f"{recognized_title} ({preview['year']})"
+                if not media_type:
+                    media_type = str(preview.get("media_type") or "")
+                if season is None:
+                    season = preview.get("season")
+                if episode_start is None:
+                    episode_start = preview.get("episode_start")
+                if episode_end is None:
+                    episode_end = preview.get("episode_end")
             if not recognized_title:
                 return {
                     "success": False,
-                    "message": "未指定有效订阅，请同时提供媒体名称以便识别 TMDB",
+                    "message": "未能从分享内容识别媒体名称，请在链接前补充名称后重试",
                 }
             title = recognized_title
             normalized_type = str(media_type or "").strip().lower()
@@ -816,6 +836,10 @@ class PlatformIntegrationService(OwnerDelegator):
                 ]
             if not candidates:
                 return {"success": False, "message": f"未识别到“{recognized_title}”的 TMDB 媒体"}
+            logger.info(
+                f"分享内容 TMDB 匹配：标题={recognized_title}，"
+                f"类型={normalized_type or '不限'}，候选={len(candidates)}"
+            )
             try:
                 selected_tmdb_id = int(tmdb_id or 0)
             except (TypeError, ValueError):
@@ -866,6 +890,11 @@ class PlatformIntegrationService(OwnerDelegator):
             "resource_links": links,
             "media": media,
         }, wait=wait)
+        logger.info(
+            f"分享资源转存提交：媒体={media.get('title') or title}，"
+            f"类型={media.get('media_type') or '未知'}，链接数={len(links)}，"
+            f"成功={bool(result.get('success'))}"
+        )
         if result.get("success") and normalized_selection_id:
             try:
                 del self._link_selection_cache[normalized_selection_id]
@@ -890,6 +919,106 @@ class PlatformIntegrationService(OwnerDelegator):
                 if values and str(values[0]).strip():
                     return unquote(str(values[0])).strip()
         return ""
+
+    def _preview_link_media(self, links: List[str]) -> Dict[str, Any]:
+        """从已配置网盘的分享文件名推断媒体名称和季集范围。"""
+        if not self._sync_handler:
+            return {}
+        for link in links:
+            if resource_type_from_url(link) not in PREVIEW_PROVIDER_KEYS:
+                continue
+            try:
+                files = self._sync_handler.preview_resource_files(link)
+            except Exception as error:
+                logger.warning(f"分享内容快速识别失败：{error}")
+                continue
+            resource_type = resource_type_from_url(link)
+            logger.info(
+                f"分享内容预览：类型={resource_type_name(resource_type, '未知')}，"
+                f"文件数={len(files)}"
+            )
+            inferred = self._infer_link_media(files)
+            if inferred:
+                logger.info(
+                    f"分享内容识别完成：标题={inferred.get('title')}，"
+                    f"类型={inferred.get('media_type') or '待 TMDB 判断'}，"
+                    f"季={inferred.get('season') or '未指定'}，"
+                    f"集数范围={inferred.get('episode_start') or '-'}~"
+                    f"{inferred.get('episode_end') or '-'}"
+                )
+                return inferred
+            logger.warning(
+                f"分享内容未识别到媒体文件名："
+                f"类型={resource_type_name(resource_type, '未知')}"
+            )
+        return {}
+
+    @staticmethod
+    def _infer_link_media(files: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """聚合分享中的视频文件名，选择出现频率最高的媒体元数据。"""
+        scores: Counter = Counter()
+        candidates: Dict[str, Dict[str, Any]] = {}
+        episodes: Dict[str, List[int]] = {}
+        media_extensions = {
+            str(value).lower() for value in (settings.RMT_MEDIAEXT or [])
+        }
+        for item in files or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(
+                item.get("name")
+                or item.get("file_name")
+                or item.get("filename")
+                or item.get("path")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            file_name = Path(name).name
+            if media_extensions and Path(file_name).suffix.lower() not in media_extensions:
+                continue
+            try:
+                meta = MetaInfo(file_name)
+            except Exception as error:
+                logger.debug(f"分享文件名解析失败：{file_name}，原因：{error}")
+                continue
+            parsed_title = str(getattr(meta, "name", "") or "").strip()
+            if not parsed_title:
+                continue
+            key = PlatformIntegrationService._normalize_agent_title(parsed_title)
+            if not key:
+                continue
+            scores[key] += 1
+            candidates.setdefault(key, {
+                "title": parsed_title,
+                "year": getattr(meta, "year", None),
+                "media_type": (
+                    "tv"
+                    if getattr(meta, "begin_season", None) is not None
+                       or getattr(meta, "begin_episode", None) is not None
+                    else ""
+                ),
+                "season": getattr(meta, "begin_season", None),
+            })
+            values = list(getattr(meta, "episode_list", None) or [])
+            if not values and getattr(meta, "begin_episode", None) is not None:
+                values = [getattr(meta, "begin_episode")]
+            for value in values:
+                try:
+                    episode = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if episode > 0:
+                    episodes.setdefault(key, []).append(episode)
+        if not scores:
+            return {}
+        selected_key = scores.most_common(1)[0][0]
+        result = dict(candidates[selected_key])
+        selected_episodes = episodes.get(selected_key) or []
+        if selected_episodes:
+            result["episode_start"] = min(selected_episodes)
+            result["episode_end"] = max(selected_episodes)
+        return result
 
     @staticmethod
     def _link_media_payload(

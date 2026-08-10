@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Dict, List
 
 from app.core.cache import TTLCache
 
 from ..common import (
+    CloudDriveFileServiceBase,
     create_directory_cache,
     create_directory_path_cache,
     resolve_directory_path,
@@ -37,7 +38,9 @@ def cloud_file(item: dict | None) -> CloudFile | None:
 
 
 @dataclass
-class AliPanFileService:
+class AliPanFileService(CloudDriveFileServiceBase):
+    provider_name = "阿里云盘"
+
     client: Any
     _items: dict[str, dict] = field(default_factory=dict)
     _directory_cache: TTLCache = field(init=False, repr=False)
@@ -209,6 +212,121 @@ class AliPanFileService:
             self._invalidate_directory_cache()
             self._directory_path_cache.clear()
         return success
+
+    def _batch_request(self, requests: List[Dict[str, Any]]) -> set[str]:
+        if not requests:
+            return set()
+        data = self.client.request("/v2/batch", {
+            "requests": requests,
+            "resource": "file",
+        })
+        succeeded = set()
+        for response in data.get("responses") or []:
+            request_id = str(response.get("id") or "")
+            try:
+                status = int(response.get("status") or 200)
+            except (TypeError, ValueError):
+                status = 0
+            body = response.get("body")
+            body_code = body.get("code") if isinstance(body, dict) else None
+            if request_id and 200 <= status < 300 and body_code in (None, 0, "0"):
+                succeeded.add(request_id)
+        return succeeded
+
+    def rename_files(self, path: str, items: dict) -> dict[str, CloudFile]:
+        """使用阿里云盘 /v2/batch 批量更新文件名。"""
+        entries = list(dict(items or {}).items())
+        renamed = {}
+        for offset in range(0, len(entries), 100):
+            batch = entries[offset:offset + 100]
+            succeeded = self._batch_request([
+                {
+                    "body": {
+                        "drive_id": self.client.drive_id,
+                        "file_id": value["item"].id,
+                        "name": str(value["target_name"]),
+                        "check_name_mode": "refuse",
+                    },
+                    "headers": {"Content-Type": "application/json"},
+                    "id": str(key),
+                    "method": "POST",
+                    "url": "/file/update",
+                }
+                for key, value in batch
+                if value.get("item") and value.get("target_name")
+            ])
+            for key, value in batch:
+                if str(key) not in succeeded:
+                    continue
+                renamed[str(key)] = replace(
+                    value["item"], name=str(value["target_name"])
+                )
+        if renamed:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in renamed.values()):
+                self._directory_path_cache.clear()
+        return renamed
+
+    def move_files(
+            self, items: dict[str, CloudFile], save_path: str
+    ) -> dict[str, CloudFile]:
+        """使用阿里云盘 /v2/batch 批量移动文件。"""
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return {}
+        entries = list(dict(items or {}).items())
+        moved = {}
+        for offset in range(0, len(entries), 100):
+            batch = entries[offset:offset + 100]
+            succeeded = self._batch_request([
+                {
+                    "body": {
+                        "drive_id": self.client.drive_id,
+                        "file_id": item.id,
+                        "to_parent_file_id": lookup.directory_id,
+                        "auto_rename": False,
+                    },
+                    "headers": {"Content-Type": "application/json"},
+                    "id": str(key),
+                    "method": "POST",
+                    "url": "/file/move",
+                }
+                for key, item in batch
+            ])
+            moved.update({
+                str(key): item for key, item in batch if str(key) in succeeded
+            })
+        if moved:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in moved.values()):
+                self._directory_path_cache.clear()
+        return moved
+
+    def delete_files(self, file_ids: list[str]) -> set[str]:
+        """使用阿里云盘 /v2/batch 批量移入回收站。"""
+        file_ids = list(dict.fromkeys(
+            str(value) for value in (file_ids or []) if str(value or "")
+        ))
+        deleted = set()
+        for offset in range(0, len(file_ids), 100):
+            batch = file_ids[offset:offset + 100]
+            deleted.update(self._batch_request([
+                {
+                    "body": {
+                        "drive_id": self.client.drive_id,
+                        "file_id": file_id,
+                    },
+                    "headers": {"Content-Type": "application/json"},
+                    "id": file_id,
+                    "method": "POST",
+                    "url": "/recyclebin/trash",
+                }
+                for file_id in batch
+            ]))
+        if deleted:
+            self._invalidate_directory_cache()
+            self._directory_path_cache.clear()
+        return deleted
 
     def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
         data = self.client.request("/v2/file/get_download_url", {

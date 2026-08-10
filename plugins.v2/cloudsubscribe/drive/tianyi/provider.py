@@ -34,6 +34,7 @@ def create_tianyi_provider(drive: TianyiDrive) -> CloudDriveProvider:
             CloudDriveCapability.DIRECTORY_READ: files,
             CloudDriveCapability.FILE_QUERY: files,
             CloudDriveCapability.FILE_MUTATION: files,
+            CloudDriveCapability.BATCH_FILE_MUTATION: files,
             CloudDriveCapability.SHARE_TRANSFER: share,
             CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.RAPID_UPLOAD: LocalRapidUploadAdapter(upload, files, frozenset({"md5"})),

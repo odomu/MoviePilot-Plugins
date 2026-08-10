@@ -1,21 +1,29 @@
 """订阅、入库与资源下载事件响应。"""
 
 import io
+import re
 from threading import Thread
 from typing import Any, Dict, Optional, Tuple
 
 from app.core.event import Event
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
+from app.schemas import Notification
 from app.schemas.event import ResourceDownloadEventData
 from app.schemas.types import MediaType, NotificationType
 from torf import Torrent, TorfError
 
 from ...core import OwnerDelegator
+from ...search.types import resource_type_from_url, resource_type_name
 
 
 class PluginEventHandler(OwnerDelegator):
     """处理事件总线回调。"""
+
+    _ACCESS_CODE_PATTERN = re.compile(
+        r"(?:提取码|访问码|密码|口令|pwd|password)\s*[:：=]?\s*[A-Za-z0-9]{1,16}",
+        re.IGNORECASE,
+    )
 
     @staticmethod
     def _torrent_payload_to_magnet(payload: bytes) -> Tuple[str, Dict[str, Any]]:
@@ -180,14 +188,105 @@ class PluginEventHandler(OwnerDelegator):
             name="cloudsubscribe-pt-upgrade",
         ).start()
 
-    def _post_command_message(self, event_data: dict, title: str, text: str) -> None:
+    @staticmethod
+    def _event_userid(event_data: dict):
+        return event_data.get("userid") or event_data.get("user")
+
+    def _post_command_message(
+            self,
+            event_data: dict,
+            title: str,
+            text: str,
+            buttons: Optional[list] = None,
+    ) -> None:
         self.post_message(
             mtype=NotificationType.Plugin,
             channel=event_data.get("channel"),
+            source=event_data.get("source"),
             title=title,
             text=text,
-            userid=event_data.get("user"),
+            userid=self._event_userid(event_data),
+            username=event_data.get("username"),
+            buttons=buttons,
+            disable_web_page_preview=True,
         )
+
+    @staticmethod
+    def _progress_message_data(response) -> Optional[dict]:
+        if not response or not getattr(response, "success", False):
+            return None
+        message_id = getattr(response, "message_id", None)
+        chat_id = getattr(response, "chat_id", None)
+        if message_id is None or chat_id is None:
+            return None
+        return {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "channel": getattr(response, "channel", None),
+            "source": getattr(response, "source", None),
+            "metadata": getattr(response, "metadata", None),
+        }
+
+    def _start_progress_message(
+            self,
+            event_data: dict,
+            title: str,
+            text: str,
+    ) -> Optional[dict]:
+        """直接发送可编辑的进度消息，失败时退回普通插件通知。"""
+        try:
+            response = self.chain.send_direct_message(Notification(
+                mtype=NotificationType.Plugin,
+                channel=event_data.get("channel"),
+                source=event_data.get("source"),
+                title=title,
+                text=text,
+                userid=self._event_userid(event_data),
+                username=event_data.get("username"),
+                disable_web_page_preview=True,
+                save_history=False,
+            ))
+            progress_message = self._progress_message_data(response)
+            if progress_message:
+                return progress_message
+        except Exception as error:
+            logger.warning(f"Telegram 进度消息发送失败，将使用普通通知：{error}")
+        self._post_command_message(event_data, title, text)
+        return None
+
+    def _edit_progress_message(
+            self,
+            event_data: dict,
+            title: str,
+            text: str,
+            buttons: Optional[list] = None,
+    ) -> bool:
+        progress_message = event_data.get("progress_message") or {}
+        if not progress_message:
+            return False
+        try:
+            edited = self.chain.edit_message(
+                channel=progress_message.get("channel") or event_data.get("channel"),
+                source=progress_message.get("source") or event_data.get("source"),
+                message_id=progress_message.get("message_id"),
+                chat_id=progress_message.get("chat_id"),
+                title=title,
+                text=text,
+                buttons=buttons if buttons is not None else [],
+                metadata=progress_message.get("metadata"),
+            )
+            if edited:
+                return True
+            logger.warning("Telegram 进度消息更新失败，将发送普通通知")
+        except Exception as error:
+            logger.warning(f"Telegram 进度消息更新异常，将发送普通通知：{error}")
+        self._post_command_message(
+            event_data,
+            title,
+            text,
+            buttons=buttons or None,
+        )
+        return False
 
     def _submit_remote_links(
             self,
@@ -198,42 +297,240 @@ class PluginEventHandler(OwnerDelegator):
             media_type: str = "",
             selection_id: str = "",
             tmdb_id: Optional[int] = None,
-    ) -> None:
-        result = self.submit_platform_links(
-            subscribe_id=subscribe_id,
-            resource_links=raw_links,
-            title=title,
-            media_type=media_type,
-            selection_id=selection_id,
-            tmdb_id=tmdb_id,
-            selection_scope=self._command_selection_scope(event_data),
+    ) -> dict:
+        resource_types = list(dict.fromkeys(
+            resource_type_name(resource_type_from_url(link))
+            for link in self.extract_resource_links(raw_links)
+            if resource_type_from_url(link)
+        ))
+        logger.info(
+            f"Telegram 资源提交开始：类型={','.join(resource_types) or '未知'}，"
+            f"标题={title or '自动识别'}，候选选择={'是' if selection_id else '否'}"
         )
-        self._post_command_message(
-            event_data,
-            "【网盘订阅】资源提交结果",
-            self._format_remote_link_result(result),
+        try:
+            result = self.submit_platform_links(
+                subscribe_id=subscribe_id,
+                resource_links=raw_links,
+                title=title,
+                media_type=media_type,
+                selection_id=selection_id,
+                tmdb_id=tmdb_id,
+                selection_scope=self._command_selection_scope(event_data),
+            )
+        except Exception as error:
+            logger.error(f"Telegram 资源提交异常：{error}", exc_info=True)
+            result = {
+                "success": False,
+                "message": "资源处理异常，请查看插件日志后重试",
+            }
+        label = str(event_data.get("link_label") or "").strip()
+        result_title = f"【网盘订阅】{label + ' ' if label else ''}资源提交结果"
+        result_text = self._format_remote_link_result(result)
+        result_buttons = self._remote_link_result_buttons(result)
+        if not self._edit_progress_message(
+                event_data,
+                result_title,
+                result_text,
+                buttons=result_buttons,
+        ):
+            if not event_data.get("progress_message"):
+                self._post_command_message(
+                    event_data,
+                    result_title,
+                    result_text,
+                    buttons=result_buttons,
+                )
+        logger.info(
+            f"Telegram 资源提交完成：成功={bool(result.get('success'))}，"
+            f"需要选择={bool((result.get('data') or {}).get('selection_required'))}，"
+            f"结果={result.get('message') or '无'}"
         )
+        return result
 
     @staticmethod
     def _command_selection_scope(event_data: dict) -> str:
-        return f"telegram:{event_data.get('channel')}:{event_data.get('user')}"
+        channel = getattr(event_data.get("channel"), "value", event_data.get("channel"))
+        userid = event_data.get("userid") or event_data.get("user")
+        source = str(event_data.get("source") or "")
+        return f"telegram:{channel}:{source}:{userid}"
 
     @staticmethod
     def _format_remote_link_result(result: dict) -> str:
         data = result.get("data") or {}
         if not data.get("selection_required"):
-            return str(result.get("message") or "资源提交失败")
-        selection_id = str(data.get("selection_id") or "")
+            lines = [str(result.get("message") or "资源提交失败")]
+            media = data.get("media") or {}
+            if media:
+                media_type = {
+                    "movie": "电影",
+                    "tv": "电视剧",
+                }.get(media.get("media_type"), "媒体")
+                year = f" ({media.get('year')})" if media.get("year") else ""
+                season = (
+                    f" · S{int(media.get('season')):02d}"
+                    if media.get("season") else ""
+                )
+                lines.append(
+                    f"已识别：{media.get('title') or '未知媒体'}{year} · "
+                    f"{media_type}{season}"
+                )
+            return "\n".join(lines)
         lines = [str(result.get("message") or "请选择 TMDB 媒体")]
         for item in list(data.get("candidates") or [])[:10]:
             year = f" ({item.get('year')})" if item.get("year") else ""
             media_type = item.get("media_type_name") or item.get("media_type") or ""
             lines.append(
-                f"{item.get('media_type')}:{item.get('tmdb_id')}｜"
                 f"{item.get('title') or '未知媒体'}{year} · {media_type}"
             )
-        lines.append(f"选择格式：/cloud_link_select {selection_id} movie:TMDB_ID")
         return "\n".join(lines)
+
+    def _remote_link_result_buttons(self, result: dict) -> Optional[list]:
+        data = result.get("data") or {}
+        selection_id = str(data.get("selection_id") or "")
+        if not data.get("selection_required") or not selection_id:
+            return None
+        plugin_id = self._owner.__class__.__name__
+        buttons = []
+        for item in list(data.get("candidates") or [])[:10]:
+            media_type = str(item.get("media_type") or "").lower()
+            media_code = (
+                "m" if media_type == "movie"
+                else "t" if media_type == "tv"
+                else ""
+            )
+            try:
+                tmdb_id = int(item.get("tmdb_id") or 0)
+            except (TypeError, ValueError):
+                tmdb_id = 0
+            if not media_code or tmdb_id <= 0:
+                continue
+            type_name = "电影" if media_code == "m" else "电视剧"
+            year = f" ({item.get('year')})" if item.get("year") else ""
+            label = f"{type_name} · {item.get('title') or '未知媒体'}{year}"
+            buttons.append([{
+                "text": label,
+                "callback_data": (
+                    f"[PLUGIN]{plugin_id}|cl|{selection_id}|{media_code}|{tmdb_id}"
+                ),
+            }])
+        return buttons or None
+
+    def handle_telegram_links(self, event_data: dict) -> None:
+        """处理 Telegram 普通消息中的资源链接。"""
+        links = list(event_data.get("links") or [])
+        raw_text = str(event_data.get("text") or "").strip()
+        if not links:
+            return
+        items = self._telegram_link_items(raw_text, links)
+        for index, item in enumerate(items, start=1):
+            item_event = dict(event_data)
+            if len(items) > 1:
+                item_event["link_label"] = f"第 {index}/{len(items)} 条"
+            resource_type = resource_type_from_url(item["link"])
+            label = str(item_event.get("link_label") or "").strip()
+            item_event["progress_message"] = self._start_progress_message(
+                item_event,
+                f"【网盘订阅】{label + ' ' if label else ''}正在识别",
+                f"正在识别{resource_type_name(resource_type, '网盘')}分享内容并校验转存流程。",
+            )
+            logger.info(
+                f"Telegram 分享链接识别：进度={index}/{len(items)}，"
+                f"类型={resource_type_name(resource_type, '未知')}，"
+                f"标题={item['title'] or '从分享内容识别'}"
+            )
+            self._submit_remote_links(
+                event_data=item_event,
+                raw_links=item["link"],
+                title=item["title"],
+            )
+
+    @staticmethod
+    def _normalize_telegram_title(value: str) -> str:
+        """移除分享访问码等非媒体文本，避免误送 TMDB 查询。"""
+        cleaned = PluginEventHandler._ACCESS_CODE_PATTERN.sub(" ", str(value or ""))
+        return " ".join(cleaned.split()).strip(" -—|｜,，;；")
+
+    @staticmethod
+    def _telegram_link_items(raw_text: str, links: list) -> list:
+        """按消息行拆分链接，并为每条链接提取就近的可选媒体名称。"""
+        if len(links) == 1:
+            return [{
+                "link": links[0],
+                "title": PluginEventHandler._normalize_telegram_title(
+                    raw_text.replace(links[0], " ")
+                ),
+            }]
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        items = []
+        for link in links:
+            title = ""
+            line_index = next(
+                (index for index, line in enumerate(lines) if link in line),
+                -1,
+            )
+            if line_index >= 0:
+                line = lines[line_index]
+                links_in_line = [value for value in links if value in line]
+                if len(links_in_line) == 1:
+                    title = PluginEventHandler._normalize_telegram_title(
+                        line.replace(link, " ")
+                    )
+                if (
+                        not title
+                        and line_index > 0
+                        and not any(value in lines[line_index - 1] for value in links)
+                ):
+                    title = PluginEventHandler._normalize_telegram_title(
+                        lines[line_index - 1]
+                    )
+            items.append({"link": link, "title": title})
+        return items
+
+    def on_message_action(self, event: Event) -> None:
+        """处理 Telegram TMDB 候选按钮回调。"""
+        if not event or not self._enabled:
+            return
+        event_data = event.event_data or {}
+        plugin_id = str(event_data.get("plugin_id") or "").strip().lower()
+        own_plugin_id = self._owner.__class__.__name__.lower()
+        if plugin_id and plugin_id != own_plugin_id:
+            return
+        parts = str(event_data.get("text") or "").strip().split("|")
+        if len(parts) != 4 or parts[0] != "cl":
+            return
+        media_type = {"m": "movie", "t": "tv"}.get(parts[2])
+        if not media_type or not parts[3].isdigit():
+            return
+        progress_message = {
+            "message_id": event_data.get("original_message_id"),
+            "chat_id": event_data.get("original_chat_id") or event_data.get("chat_id"),
+            "channel": event_data.get("channel"),
+            "source": event_data.get("source"),
+            "metadata": event_data.get("metadata"),
+        }
+        submit_event = dict(event_data)
+        if (
+                progress_message["message_id"] is not None
+                and progress_message["chat_id"] is not None
+        ):
+            submit_event["progress_message"] = progress_message
+        self._edit_progress_message(
+            submit_event,
+            "【网盘订阅】正在提交资源",
+            "已选择媒体，正在继续完整转存流程。",
+            buttons=[],
+        )
+        Thread(
+            target=self._submit_remote_links,
+            kwargs={
+                "event_data": submit_event,
+                "selection_id": parts[1],
+                "media_type": media_type,
+                "tmdb_id": int(parts[3]),
+            },
+            daemon=True,
+            name="cloudsubscribe-telegram-link-select",
+        ).start()
 
     def _run_remote_checkin(
             self,

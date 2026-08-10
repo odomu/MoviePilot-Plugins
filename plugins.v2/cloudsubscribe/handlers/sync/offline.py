@@ -20,6 +20,17 @@ from ...utils import MediaFileParser
 class OfflineTaskService(OwnerDelegator):
     """监控待处理文件并完成重命名、STRM和历史状态更新。"""
 
+    @staticmethod
+    def _upgrade_backup_name(file_name: str, task_id: str) -> str:
+        """仅在原文件名后追加短任务 ID，避免隐藏文件和冗长标记。"""
+        source = Path(str(file_name or ""))
+        short_id = "".join(
+            value for value in str(task_id or "") if value.isalnum()
+        )[:10]
+        if not short_id:
+            short_id = uuid.uuid4().hex[:10]
+        return f"{source.stem}-{short_id}{source.suffix}"
+
     def _activate_persisted_pending_tasks(
             self, pending: Dict[str, Dict[str, Any]], now: float
     ) -> int:
@@ -221,10 +232,10 @@ class OfflineTaskService(OwnerDelegator):
         if not item.get("upgrade_old_backed_up") and old_file and (
                 str(getattr(old_file, "id", "")) != str(getattr(target_file, "id", ""))
         ):
-            old_path = Path(old_name)
             backup_name = backup_name or (
-                f".{old_path.stem}.cloudsubscribe-upgrade-"
-                f"{str(pending_key).replace(':', '')[:10]}.bak{old_path.suffix}"
+                self._upgrade_backup_name(
+                    old_name, item.get("task_id") or pending_key
+                )
             )
             logger.info(
                 f"洗版临时备份旧文件：{old_dir}/{old_name} -> {backup_name}"
@@ -272,6 +283,27 @@ class OfflineTaskService(OwnerDelegator):
 
         return target_file
 
+    def _upgrade_old_file_id(
+            self,
+            item: Dict[str, Any],
+            directory_snapshot,
+    ) -> str:
+        """解析已备份旧文件的真实 ID，供单个或批量回收复用。"""
+        if item.get("upgrade_old_deleted") or not item.get("upgrade_old_backed_up"):
+            return ""
+        old_dir = str(
+            item.get("upgrade_old_cloud_dir") or item.get("cloud_dir") or "/"
+        ).rstrip("/") or "/"
+        backup_name = str(item.get("upgrade_backup_name") or "").strip()
+        backup_id = str(item.get("upgrade_old_file_id") or "").strip()
+        if backup_id:
+            return backup_id
+        if not backup_name:
+            return ""
+        _, backup_index = directory_snapshot(old_dir)
+        backup_file = backup_index.get(backup_name)
+        return str(getattr(backup_file, "id", "") or "") if backup_file else ""
+
     def _delete_upgrade_old_file(
             self,
             item: Dict[str, Any],
@@ -284,16 +316,9 @@ class OfflineTaskService(OwnerDelegator):
             item.get("upgrade_old_cloud_dir") or item.get("cloud_dir") or "/"
         ).rstrip("/") or "/"
         backup_name = str(item.get("upgrade_backup_name") or "").strip()
-        backup_id = str(item.get("upgrade_old_file_id") or "").strip()
+        backup_id = self._upgrade_old_file_id(item, directory_snapshot)
         if backup_id and self._cloud_mutations.delete_file(backup_id):
             item["upgrade_old_deleted"] = True
-        elif backup_name:
-            _, backup_index = directory_snapshot(old_dir)
-            backup_file = backup_index.get(backup_name)
-            if backup_file and self._cloud_mutations.delete_file(
-                    str(getattr(backup_file, "id", ""))
-            ):
-                item["upgrade_old_deleted"] = True
         if item.get("upgrade_old_deleted"):
             logger.info(f"洗版完成，已删除旧文件：{old_dir}/{backup_name}")
             return True
@@ -439,16 +464,151 @@ class OfflineTaskService(OwnerDelegator):
                 directory_snapshots[normalized_dir] = result
                 return result
 
+            upgrade_delete_batch: Dict[str, Dict[str, Any]] = {}
+            finalized_success_keys: Set[str] = set()
+
+            def finish_finalized_item(
+                    item: Dict[str, Any],
+                    pending_key: str,
+                    strm_path,
+                    media,
+                    media_data: Dict[str, Any],
+            ) -> None:
+                nonlocal completed
+                if item.get("upgrade") and str(
+                        item.get("upgrade_mode") or self._upgrade_mode
+                ) != "coexist":
+                    self._delete_upgrade_old_strm(
+                        item, replacement_path=strm_path
+                    )
+                queue_subscription_completion(item, media, media_data)
+                detail = self._notify_pending_file_finalized(
+                    item,
+                    pending_key,
+                    strm_path,
+                    mediainfo=media,
+                    media_data=media_data,
+                    finish_subscription=media is None,
+                    subscribe_cache=subscribe_cache,
+                )
+                if detail:
+                    finalized_details.append(detail)
+                finalized_success_keys.add(pending_key)
+                logger.debug(
+                    f"文件后处理完成"
+                    f"{'并生成 STRM' if strm_path else ''}："
+                    f"{strm_path or item.get('file_name') or pending_key}"
+                )
+                pending.pop(pending_key, None)
+                completed += 1
+
+            def finalize_ready_item(
+                    item: Dict[str, Any],
+                    pending_key: str,
+                    strm_path,
+                    media,
+                    media_data: Dict[str, Any],
+            ) -> None:
+                is_replacement = item.get("upgrade") and str(
+                    item.get("upgrade_mode") or self._upgrade_mode
+                ) != "coexist"
+                if is_replacement and self._cloud_batch_mutations:
+                    backup_id = self._upgrade_old_file_id(item, directory_snapshot)
+                    if backup_id:
+                        upgrade_delete_batch[pending_key] = {
+                            "item": item,
+                            "file_id": backup_id,
+                            "strm_path": strm_path,
+                            "media": media,
+                            "media_data": media_data,
+                        }
+                        return
+                if is_replacement and not self._delete_upgrade_old_file(
+                        item, directory_snapshot
+                ):
+                    self._schedule_finalize_retry(item, now)
+                    return
+                finish_finalized_item(
+                    item, pending_key, strm_path, media, media_data
+                )
+
             prepared_files: Dict[str, Any] = {}
             moved_files: Dict[str, Any] = {}
             if self._cloud_batch_mutations:
+                # 洗版先批量避让旧文件，再让新文件进入统一重命名、移动批次。
+                # 单项失败仍由后续逐项流程恢复旧文件并安排重试。
+                upgrade_backup_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for pending_key in due_keys:
+                    item = pending.get(pending_key) or {}
+                    task_type = str(item.get("task_type") or "share")
+                    task = task_map.get(
+                        str(item.get("task_id") or pending_key).upper()
+                    )
+                    if (
+                            task_type == "magnet"
+                            or (task_type == "ed2k" and not bool(
+                        task and task.get("completed")
+                    ))
+                            or not item.get("upgrade")
+                            or str(item.get("upgrade_mode") or self._upgrade_mode)
+                            == "coexist"
+                            or item.get("upgrade_old_backed_up")
+                    ):
+                        continue
+                    old_dir = str(
+                        item.get("upgrade_old_cloud_dir")
+                        or item.get("cloud_dir") or "/"
+                    ).rstrip("/") or "/"
+                    old_name = str(item.get("upgrade_old_file_name") or "").strip()
+                    old_id = str(item.get("upgrade_old_file_id") or "").strip()
+                    directory_valid, old_index = directory_snapshot(old_dir)
+                    if not directory_valid:
+                        continue
+                    old_file = next(
+                        (
+                            value for value in old_index.values()
+                            if old_id and str(getattr(value, "id", "")) == old_id
+                        ),
+                        None,
+                    ) or old_index.get(old_name)
+                    if not old_file:
+                        continue
+                    backup_name = self._upgrade_backup_name(
+                        old_name, item.get("task_id") or pending_key
+                    )
+                    upgrade_backup_groups.setdefault(old_dir, {})[pending_key] = {
+                        "item": old_file,
+                        "target_name": backup_name,
+                    }
+                    item["upgrade_backup_name"] = backup_name
+
+                for old_dir, rename_items in upgrade_backup_groups.items():
+                    renamed = self._cloud_batch_mutations.rename_files(
+                        old_dir, rename_items
+                    )
+                    for pending_key, backup_file in renamed.items():
+                        item = pending.get(pending_key)
+                        if not item:
+                            continue
+                        item["upgrade_old_backed_up"] = True
+                        item["upgrade_old_file_id"] = str(
+                            getattr(backup_file, "id", "")
+                            or item.get("upgrade_old_file_id") or ""
+                        )
+                    if renamed:
+                        directory_snapshots.pop(old_dir, None)
+
                 rename_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
                 for pending_key in due_keys:
                     item = pending.get(pending_key) or {}
                     task_type = str(item.get("task_type") or "share")
-                    if task_type == "magnet" or item.get("moved_at") or (
-                            item.get("upgrade")
-                            and str(item.get("upgrade_mode") or self._upgrade_mode) != "coexist"
+                    is_replacement = item.get("upgrade") and str(
+                        item.get("upgrade_mode") or self._upgrade_mode
+                    ) != "coexist"
+                    if (
+                            task_type == "magnet"
+                            or item.get("moved_at")
+                            or (is_replacement and not item.get("upgrade_old_backed_up"))
                     ):
                         continue
                     task = task_map.get(
@@ -516,63 +676,6 @@ class OfflineTaskService(OwnerDelegator):
                             continue
                         item["moved_at"] = now
                         moved_files[pending_key] = target_file
-
-                # 洗版旧文件先按目录批量改为备份名；后续仍逐项确认新文件和 STRM
-                # 就绪后再删除备份，保留单集失败时的回滚边界。
-                upgrade_backup_groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
-                for pending_key in due_keys:
-                    item = pending.get(pending_key) or {}
-                    if (
-                            not item.get("upgrade")
-                            or str(item.get("upgrade_mode") or self._upgrade_mode)
-                            == "coexist"
-                            or item.get("upgrade_old_backed_up")
-                    ):
-                        continue
-                    old_dir = str(
-                        item.get("upgrade_old_cloud_dir")
-                        or item.get("cloud_dir") or "/"
-                    ).rstrip("/") or "/"
-                    old_name = str(item.get("upgrade_old_file_name") or "").strip()
-                    old_id = str(item.get("upgrade_old_file_id") or "").strip()
-                    directory_valid, old_index = directory_snapshot(old_dir)
-                    if not directory_valid:
-                        continue
-                    old_file = next(
-                        (
-                            value for value in old_index.values()
-                            if old_id and str(getattr(value, "id", "")) == old_id
-                        ),
-                        None,
-                    ) or old_index.get(old_name)
-                    if not old_file:
-                        continue
-                    old_path = Path(old_name)
-                    backup_name = (
-                        f".{old_path.stem}.cloudsubscribe-upgrade-"
-                        f"{str(pending_key).replace(':', '')[:10]}.bak{old_path.suffix}"
-                    )
-                    upgrade_backup_groups.setdefault(old_dir, {})[pending_key] = {
-                        "item": old_file,
-                        "target_name": backup_name,
-                    }
-                    item["upgrade_backup_name"] = backup_name
-
-                for old_dir, rename_items in upgrade_backup_groups.items():
-                    renamed = self._cloud_batch_mutations.rename_files(
-                        old_dir, rename_items
-                    )
-                    for pending_key, backup_file in renamed.items():
-                        item = pending.get(pending_key)
-                        if not item:
-                            continue
-                        item["upgrade_old_backed_up"] = True
-                        item["upgrade_old_file_id"] = str(
-                            getattr(backup_file, "id", "")
-                            or item.get("upgrade_old_file_id") or ""
-                        )
-                    if renamed:
-                        directory_snapshots.pop(old_dir, None)
 
             metadata_batches = {}
             for pending_key in due_keys:
@@ -822,29 +925,9 @@ class OfflineTaskService(OwnerDelegator):
                     if not self._finalize_subtitle_files(item, directory_snapshot):
                         self._schedule_finalize_retry(item, now)
                         continue
-                    if item.get("upgrade") and str(
-                            item.get("upgrade_mode") or self._upgrade_mode
-                    ) != "coexist":
-                        if not self._delete_upgrade_old_file(item, directory_snapshot):
-                            self._schedule_finalize_retry(item, now)
-                            continue
-                        self._delete_upgrade_old_strm(item)
-                    queue_subscription_completion(item, media, media_data)
-                    detail = self._notify_pending_file_finalized(
-                        item,
-                        pending_key,
-                        None,
-                        mediainfo=media,
-                        media_data=media_data,
-                        finish_subscription=media is None,
-                        subscribe_cache=subscribe_cache,
+                    finalize_ready_item(
+                        item, pending_key, None, media, media_data
                     )
-                    if detail:
-                        finalized_details.append(detail)
-                    self._mark_offline_history_status(pending_key, "成功")
-                    logger.debug(f"文件后处理完成：{file_name}（未启用 STRM）")
-                    pending.pop(pending_key, None)
-                    completed += 1
                     continue
 
                 strm_path = self._generate_strm(
@@ -859,35 +942,13 @@ class OfflineTaskService(OwnerDelegator):
                     ):
                         self._schedule_finalize_retry(item, now)
                         continue
-                    if item.get("upgrade") and str(
-                            item.get("upgrade_mode") or self._upgrade_mode
-                    ) != "coexist":
-                        if not self._delete_upgrade_old_file(item, directory_snapshot):
-                            self._schedule_finalize_retry(item, now)
-                            continue
-                        self._delete_upgrade_old_strm(
-                            item, replacement_path=strm_path
-                        )
                     if not self._strm_file_ready(strm_path):
                         logger.error(f"洗版后 STRM 文件不存在或为空：{strm_path}")
                         self._schedule_finalize_retry(item, now)
                         continue
-                    queue_subscription_completion(item, media, media_data)
-                    detail = self._notify_pending_file_finalized(
-                        item,
-                        pending_key,
-                        strm_path,
-                        mediainfo=media,
-                        media_data=media_data,
-                        finish_subscription=media is None,
-                        subscribe_cache=subscribe_cache,
+                    finalize_ready_item(
+                        item, pending_key, strm_path, media, media_data
                     )
-                    if detail:
-                        finalized_details.append(detail)
-                    self._mark_offline_history_status(pending_key, "成功")
-                    logger.debug(f"文件后处理完成并生成 STRM：{strm_path}")
-                    pending.pop(pending_key, None)
-                    completed += 1
                     continue
 
                 ready_at = float(item.get("download_completed_at") or created_at)
@@ -898,6 +959,43 @@ class OfflineTaskService(OwnerDelegator):
                     failed += 1
                 else:
                     self._schedule_finalize_retry(item, now)
+
+            if upgrade_delete_batch:
+                delete_ids = list(dict.fromkeys(
+                    value["file_id"] for value in upgrade_delete_batch.values()
+                ))
+                deleted_ids = {
+                    str(file_id) for file_id in
+                    self._cloud_batch_mutations.delete_files(delete_ids)
+                }
+                for pending_key, value in upgrade_delete_batch.items():
+                    item = value["item"]
+                    if str(value["file_id"]) not in deleted_ids:
+                        self._schedule_finalize_retry(item, now)
+                        continue
+                    item["upgrade_old_deleted"] = True
+                    finish_finalized_item(
+                        item,
+                        pending_key,
+                        value["strm_path"],
+                        value["media"],
+                        value["media_data"],
+                    )
+                success_count = len(deleted_ids & set(map(str, delete_ids)))
+                total_count = len(delete_ids)
+                logger.info(
+                    f"洗版旧文件批量回收完成：成功 {success_count}/{total_count} 个"
+                )
+                if success_count < total_count:
+                    logger.warning(
+                        f"洗版旧文件有 {total_count - success_count} 个回收失败，"
+                        "已保留后处理任务等待重试"
+                    )
+
+            if finalized_success_keys:
+                self._mark_offline_history_status_batch(
+                    finalized_success_keys, "成功"
+                )
 
             for batch in metadata_batches.values():
                 self._scrape_metadata_batch(

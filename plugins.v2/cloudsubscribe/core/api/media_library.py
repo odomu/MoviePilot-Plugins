@@ -27,7 +27,7 @@ class MediaLibraryApi(OwnerDelegator):
             return False
         event_name = str(getattr(event_info, "event", "") or "").strip().lower()
         channel = str(getattr(event_info, "channel", "") or "").strip().lower()
-        if channel == "emby" and event_name == "deep.delete":
+        if event_name == "deep.delete":
             return self._handle_platform_deep_delete(event_info)
         if not self._platform_media_sync_enabled:
             return False
@@ -58,6 +58,7 @@ class MediaLibraryApi(OwnerDelegator):
     def _handle_platform_deep_delete(self, event_info: Any) -> bool:
         """按神医通知中的媒体服务器路径精确删除关联内容。"""
         if not self._platform_deep_delete_enabled:
+            logger.info("收到神医深度删除事件，联动删除未启用，已跳过")
             return False
         if not self._sync_handler:
             logger.warning("神医深度删除联动失败：同步处理器未初始化")
@@ -66,17 +67,33 @@ class MediaLibraryApi(OwnerDelegator):
         if not paths:
             logger.warning("神医深度删除通知缺少 Item Path，已跳过")
             return False
+        logger.info(
+            f"收到神医深度删除事件：路径={len(paths)} 个，开始匹配插件历史"
+        )
         result = self._sync_handler.delete_by_media_server_paths(paths)
         if not result["matched"]:
             logger.warning(
                 f"神医深度删除未匹配插件历史：{', '.join(paths)}"
             )
             return False
-        logger.info(
-            f"神医深度删除联动完成：路径={len(paths)} 个，"
-            f"匹配={result['matched']} 条，删除={result['deleted']} 条，"
-            f"跳过={result['skipped']} 条"
+        message = (
+            f"路径 {len(paths)} 个，匹配 {result['matched']} 条，"
+            f"删除历史 {result['deleted']} 条、网盘文件 "
+            f"{result.get('cloud_files_deleted', 0)} 个、STRM "
+            f"{result.get('strm_deleted', 0)} 个"
         )
+        if result["skipped"]:
+            message += f"，跳过 {result['skipped']} 条"
+        logger.info(f"神医深度删除联动完成：{message}")
+        if self._notify:
+            try:
+                self.post_message(
+                    mtype=self._notification_type,
+                    title="【网盘订阅】神医联动删除完成",
+                    text=message,
+                )
+            except Exception as error:
+                logger.warning(f"神医深度删除结果通知发送失败：{error}")
         return result["deleted"] > 0
 
     @classmethod

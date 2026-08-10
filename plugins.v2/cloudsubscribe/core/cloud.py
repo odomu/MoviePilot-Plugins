@@ -448,6 +448,15 @@ class CloudDriveProvider:
                 if str(value or "").strip()
             ),
         )
+        services = dict(self.services)
+        mutations = services.get(CloudDriveCapability.FILE_MUTATION)
+        if (
+                mutations
+                and CloudDriveCapability.BATCH_FILE_MUTATION not in services
+                and _implements_contract(mutations, BatchFileMutationOperations)
+        ):
+            services[CloudDriveCapability.BATCH_FILE_MUTATION] = mutations
+        object.__setattr__(self, "services", services)
         io_gate = _ProviderIoGate(self.policy.max_concurrency)
         io_capabilities = {
             CloudDriveCapability.SHARE_TRANSFER,

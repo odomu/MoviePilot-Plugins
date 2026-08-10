@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from app.core.cache import TTLCache
 
 from ..common import (
+    CloudDriveFileServiceBase,
     create_directory_cache,
     create_directory_path_cache,
     resolve_directory_path,
@@ -15,7 +16,9 @@ from ...core.cloud import CloudFile, DirectoryListing, DirectoryLookup
 from ...core.transfer import HttpFileDownloadService
 
 
-class TianyiFileService:
+class TianyiFileService(CloudDriveFileServiceBase):
+    provider_name = "天翼"
+
     def __init__(self, client):
         self.client = client
         self._items_by_id: dict[str, CloudFile] = {}
@@ -171,17 +174,25 @@ class TianyiFileService:
             self._directory_path_cache.clear()
         return success
 
-    def _batch_task(self, task_type: str, item: CloudFile, target_id: str = "") -> None:
+    def _batch_task(
+            self, task_type: str, items: list[CloudFile], target_id: str = ""
+    ) -> None:
+        items = [item for item in items if item]
+        if not items:
+            raise ValueError("天翼批量任务缺少文件")
         created = self.client.request(
             "POST", "https://cloud.189.cn/api/open/batch/createBatchTask.action",
             data={
                 "type": task_type,
                 "targetFolderId": target_id,
-                "taskInfos": json.dumps([{
-                    "fileId": item.id,
-                    "fileName": item.name,
-                    "isFolder": 1 if item.is_directory else 0,
-                }], ensure_ascii=False),
+                "taskInfos": json.dumps([
+                    {
+                        "fileId": item.id,
+                        "fileName": item.name,
+                        "isFolder": 1 if item.is_directory else 0,
+                    }
+                    for item in items
+                ], ensure_ascii=False),
             },
         )
         task_id = str(created.get("taskId") or created.get("task_id") or "")
@@ -209,7 +220,7 @@ class TianyiFileService:
         lookup = self.resolve_directory(save_path, create=True)
         if not lookup.directory_id:
             return None
-        self._batch_task("MOVE", item, lookup.directory_id)
+        self._batch_task("MOVE", [item], lookup.directory_id)
         self._invalidate_directory_cache()
         if item.is_directory:
             self._directory_path_cache.clear()
@@ -226,9 +237,61 @@ class TianyiFileService:
         item = self._items_by_id.get(str(file_id or ""))
         if not item:
             return False
-        self._batch_task("DELETE", item)
+        self._batch_task("DELETE", [item])
         self._invalidate_directory_cache()
         self._items_by_id.pop(item.id, None)
         if item.is_directory:
             self._directory_path_cache.clear()
         return True
+
+    def move_files(
+            self, items: dict[str, CloudFile], save_path: str
+    ) -> dict[str, CloudFile]:
+        """使用天翼批量任务一次移动最多 100 项。"""
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return {}
+        entries = list(dict(items or {}).items())
+        moved = {}
+        for offset in range(0, len(entries), 100):
+            batch = entries[offset:offset + 100]
+            try:
+                self._batch_task(
+                    "MOVE", [item for _, item in batch], lookup.directory_id
+                )
+            except (RuntimeError, TimeoutError, ValueError):
+                continue
+            moved.update({str(key): item for key, item in batch})
+        if moved:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in moved.values()):
+                self._directory_path_cache.clear()
+        return moved
+
+    def delete_files(self, file_ids: list[str]) -> set[str]:
+        """使用天翼批量任务一次回收最多 100 项。"""
+        file_ids = list(dict.fromkeys(
+            str(value) for value in (file_ids or []) if str(value or "")
+        ))
+        deleted = set()
+        for offset in range(0, len(file_ids), 100):
+            batch_ids = file_ids[offset:offset + 100]
+            items = [
+                self._items_by_id[file_id]
+                for file_id in batch_ids
+                if file_id in self._items_by_id
+            ]
+            if not items:
+                continue
+            try:
+                self._batch_task("DELETE", items)
+            except (RuntimeError, TimeoutError, ValueError):
+                continue
+            success_ids = {item.id for item in items}
+            deleted.update(success_ids)
+            for file_id in success_ids:
+                self._items_by_id.pop(file_id, None)
+        if deleted:
+            self._invalidate_directory_cache()
+            self._directory_path_cache.clear()
+        return deleted

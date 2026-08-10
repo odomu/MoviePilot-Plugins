@@ -773,7 +773,7 @@ class P115FileService(OwnerDelegator):
             self._delete_items([file_id])
             self._target_file_cache.clear()
             self.path_cache.clear()
-            logger.info(f"115文件已移入回收站：file_id={file_id}")
+            logger.debug(f"115文件已移入回收站：file_id={file_id}")
             return True
         except Exception as error:
             logger.error(f"删除115文件失败：file_id={file_id}，错误：{error}")
@@ -787,7 +787,7 @@ class P115FileService(OwnerDelegator):
             deleted = self._delete_items(file_ids)
             self._target_file_cache.clear()
             self.path_cache.clear()
-            logger.info(f"115文件批量移入回收站：{len(deleted)} 个")
+            logger.debug(f"115文件批量移入回收站：{len(deleted)} 个")
             return deleted
         except Exception as error:
             logger.error(f"批量删除115文件失败：数量={len(file_ids)}，错误：{error}")

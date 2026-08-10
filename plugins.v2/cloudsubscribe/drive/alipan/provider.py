@@ -31,11 +31,16 @@ def create_alipan_provider(drive: AliPanDrive) -> CloudDriveProvider:
             CloudDriveCapability.DIRECTORY_READ: files,
             CloudDriveCapability.FILE_QUERY: files,
             CloudDriveCapability.FILE_MUTATION: files,
+            CloudDriveCapability.BATCH_FILE_MUTATION: files,
             CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.FILE_DOWNLOAD: files,
             CloudDriveCapability.QRCODE_AUTH: drive.client,
         },
         policy=CloudDrivePolicy(
-            pagination_mode="cursor", max_page_size=100, max_concurrency=2
+            pagination_mode="cursor",
+            max_page_size=100,
+            supports_batch=True,
+            max_batch_size=100,
+            max_concurrency=2,
         ),
     )

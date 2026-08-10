@@ -59,6 +59,7 @@ def create_p123_provider(drive: P123Drive) -> CloudDriveProvider:
             CloudDriveCapability.DIRECTORY_READ: files,
             CloudDriveCapability.FILE_QUERY: files,
             CloudDriveCapability.FILE_MUTATION: files,
+            CloudDriveCapability.BATCH_FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
             CloudDriveCapability.OFFLINE_TASKS: offline,
             CloudDriveCapability.LOCAL_UPLOAD: upload,

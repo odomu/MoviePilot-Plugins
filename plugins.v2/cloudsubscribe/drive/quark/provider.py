@@ -55,6 +55,7 @@ def create_quark_provider(drive: QuarkDrive) -> CloudDriveProvider:
             CloudDriveCapability.DIRECTORY_READ: files,
             CloudDriveCapability.FILE_QUERY: files,
             CloudDriveCapability.FILE_MUTATION: files,
+            CloudDriveCapability.BATCH_FILE_MUTATION: files,
             CloudDriveCapability.PLAYBACK_REFERENCE: playback_reference,
             CloudDriveCapability.LOCAL_UPLOAD: upload,
             CloudDriveCapability.RAPID_UPLOAD: LocalRapidUploadAdapter(upload, files, frozenset({"md5"})),

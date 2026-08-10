@@ -247,3 +247,65 @@ class QuarkFileService(CloudDriveFileServiceBase):
             self._invalidate_directory_cache()
             self._invalidate_path_cache()
         return success
+
+    def _batch_action_completed(self, response: Dict[str, Any]) -> bool:
+        if not self._is_success(response):
+            return False
+        data = self.client.data(response)
+        if not isinstance(data, dict):
+            return True
+        task_id = str(data.get("task_id") or "")
+        if task_id and data.get("finish") is not True:
+            return self.client.wait_for_task(task_id)
+        return data.get("finish") is not False
+
+    def move_files(
+            self, items: dict[str, CloudFile], save_path: str
+    ) -> dict[str, CloudFile]:
+        """使用夸克 file/move 原生批量接口并等待异步任务完成。"""
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return {}
+        entries = list(dict(items or {}).items())
+        moved = {}
+        for offset in range(0, len(entries), 50):
+            batch = entries[offset:offset + 50]
+            response = self.client.request(
+                "POST", "file/move",
+                json_data={
+                    "action_type": 1,
+                    "to_pdir_fid": lookup.directory_id,
+                    "filelist": [item.id for _, item in batch],
+                    "exclude_fids": [],
+                },
+            )
+            if self._batch_action_completed(response):
+                moved.update({str(key): item for key, item in batch})
+        if moved:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in moved.values()):
+                self._invalidate_path_cache()
+        return moved
+
+    def delete_files(self, file_ids: list[str]) -> set[str]:
+        """使用夸克 file/delete 原生批量接口并等待异步任务完成。"""
+        file_ids = list(dict.fromkeys(
+            str(value) for value in (file_ids or []) if str(value or "")
+        ))
+        deleted = set()
+        for offset in range(0, len(file_ids), 50):
+            batch = file_ids[offset:offset + 50]
+            response = self.client.request(
+                "POST", "file/delete",
+                json_data={
+                    "action_type": 2,
+                    "filelist": batch,
+                    "exclude_fids": [],
+                },
+            )
+            if self._batch_action_completed(response):
+                deleted.update(batch)
+        if deleted:
+            self._invalidate_directory_cache()
+            self._invalidate_path_cache()
+        return deleted

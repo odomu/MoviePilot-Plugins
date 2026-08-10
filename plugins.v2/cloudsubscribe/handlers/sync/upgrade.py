@@ -48,6 +48,7 @@ class UpgradeService(OwnerDelegator):
         from app.db.subscribe_oper import SubscribeOper
 
         try:
+            transient_target = bool(getattr(subscribe, "_transient_target", False))
             season = subscribe.season or 1
             sub_key = self.subscription_budget_key(subscribe, MediaType.TV)
             if hasattr(self._search_handler, "reset_sub_spent_points"):
@@ -395,7 +396,7 @@ class UpgradeService(OwnerDelegator):
                             upgrade=bool(upgrade_baseline),
                             upgrade_mode=self._upgrade_mode,
                             upgrade_baseline=upgrade_baseline,
-                            transient_target=manual_upgrade,
+                            transient_target=transient_target,
                         )
                         if not pending_key:
                             self._release_transfer_slots(1)
@@ -551,7 +552,7 @@ class UpgradeService(OwnerDelegator):
                         subscribe,
                         season,
                         sub_key,
-                        track_subscription=not manual_upgrade,
+                        track_subscription=not manual_upgrade and not transient_target,
                     )
                     if not transfer_results:
                         if reserved_count <= 0:
@@ -634,7 +635,7 @@ class UpgradeService(OwnerDelegator):
                         )
 
             # 洗版转存的集数同样计入已入库进度。
-            if upgrade_episodes and not manual_upgrade:
+            if upgrade_episodes and not manual_upgrade and not transient_target:
                 remaining_lack = self._subscribe_handler.update_subscribe_progress(
                     subscribe=subscribe,
                     mediainfo=mediainfo,
@@ -646,7 +647,11 @@ class UpgradeService(OwnerDelegator):
                     logger.warning(f"{upgrade_log_prefix} 更新订阅进度失败")
 
             # 更新单集优先级
-            if new_priority != existing_ep_pri and not manual_upgrade:
+            if (
+                    new_priority != existing_ep_pri
+                    and not manual_upgrade
+                    and not transient_target
+            ):
                 try:
                     SubscribeOper().update(subscribe.id, {"episode_priority": new_priority})
                     logger.debug(f"{upgrade_log_prefix} 已更新 {len(new_priority)} 集评分")

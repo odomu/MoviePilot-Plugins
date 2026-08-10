@@ -1387,6 +1387,19 @@ class HistoryService(OwnerDelegator):
         self._notify_offline_pending_changed(pending_count)
         return len(removed_keys)
 
+    def stop_pending_finalize_tasks(self, pending_keys: Set[str]) -> int:
+        """安全停止后移除尚未提交的后处理任务，并记录准确的停止原因。"""
+        removed_keys, pending_count = self._remove_pending_finalize_tasks(
+            pending_keys
+        )
+        if not removed_keys:
+            return 0
+        self._mark_offline_history_status_batch(
+            removed_keys, "失败", "后处理任务已由用户停止"
+        )
+        self._notify_offline_pending_changed(pending_count)
+        return len(removed_keys)
+
     def _remove_pending_finalize_tasks(
             self,
             pending_keys: Set[str],
@@ -1935,6 +1948,7 @@ class HistoryService(OwnerDelegator):
 
         pending_count = 0
         pending_removed = False
+        linked_stats: Dict[str, int] = {}
         with self._offline_pending_lock:
             history = self._get_data("history") or []
             selected_indexes = []
@@ -1971,7 +1985,9 @@ class HistoryService(OwnerDelegator):
                 pending_removed = bool(removed_keys)
 
             if delete_linked_files and deletable_records:
-                self._delete_history_linked_files_batch(deletable_records)
+                linked_stats = self._delete_history_linked_files_batch(
+                    deletable_records
+                )
                 self._refresh_deleted_media(deletable_records)
                 linked_deleted = len(deletable_records)
 
@@ -2002,6 +2018,7 @@ class HistoryService(OwnerDelegator):
             "linked_deleted": linked_deleted,
             "cache_deleted": cache_deleted,
             "skipped": skipped,
+            **linked_stats,
         }
 
     def _refresh_deleted_media(self, records: List[Dict[str, Any]]) -> None:
@@ -2144,7 +2161,7 @@ class HistoryService(OwnerDelegator):
     def _delete_history_linked_files_batch(
             self, records: List[Dict[str, Any]]
     ) -> Dict[str, int]:
-        """按115目录聚合删除；目录内容全部命中时直接删除目录。"""
+        """按网盘目录聚合删除；目录内容全部命中时直接删除目录。"""
         preflight = self._preflight_linked_media_directories(records)
         local_handled = preflight["local_handled"]
         cloud_handled = preflight["cloud_handled"]
@@ -2241,11 +2258,11 @@ class HistoryService(OwnerDelegator):
                 deleted_ids = self._cloud_batch_mutations.delete_files(file_ids)
                 cloud_deleted += len(deleted_ids)
             except Exception as error:
-                logger.warning(f"批量删除关联115内容失败：{cloud_dir} - {error}")
+                logger.warning(f"批量删除关联网盘内容失败：{cloud_dir} - {error}")
 
         logger.info(
             f"历史联动批量删除完成：历史记录={len(records)} 条，"
-            f"115文件={cloud_deleted} 个，115目录={directories_deleted} 个，"
+            f"网盘文件={cloud_deleted} 个，网盘目录={directories_deleted} 个，"
             f"STRM={strm_deleted} 个，本地目录={local_directories_deleted} 个"
         )
         return {

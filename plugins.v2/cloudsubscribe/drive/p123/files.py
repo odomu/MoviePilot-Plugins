@@ -1,6 +1,6 @@
 """123 网盘目录、查询与文件变更能力。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Mapping, Optional
 
 from app.core.cache import TTLCache
@@ -189,3 +189,68 @@ class P123FileService(CloudDriveFileServiceBase):
             self._invalidate_directory_cache()
             self._invalidate_path_cache()
         return success
+
+    def rename_files(self, path: str, items: dict) -> dict[str, CloudFile]:
+        """使用 123 批量重命名接口，每批最多 30 项。"""
+        entries = list(dict(items or {}).items())
+        renamed = {}
+        for offset in range(0, len(entries), 30):
+            batch = entries[offset:offset + 30]
+            payload = [
+                (int(value["item"].id), str(value["target_name"]))
+                for _, value in batch
+                if value.get("item") and value.get("target_name")
+            ]
+            if not payload or not self._is_success(self.client.fs_rename(payload)):
+                continue
+            for key, value in batch:
+                item = value.get("item")
+                target_name = str(value.get("target_name") or "")
+                if item and target_name:
+                    renamed[str(key)] = replace(item, name=target_name)
+        if renamed:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in renamed.values()):
+                self._invalidate_path_cache()
+        return renamed
+
+    def move_files(
+            self, items: dict[str, CloudFile], save_path: str
+    ) -> dict[str, CloudFile]:
+        """使用 123 批量移动接口，每批最多 100 项。"""
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return {}
+        entries = list(dict(items or {}).items())
+        moved = {}
+        for offset in range(0, len(entries), 100):
+            batch = entries[offset:offset + 100]
+            response = self.client.fs_move(
+                [int(item.id) for _, item in batch],
+                parent_id=int(lookup.directory_id),
+            )
+            if self._is_success(response):
+                moved.update({str(key): item for key, item in batch})
+        if moved:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in moved.values()):
+                self._invalidate_path_cache()
+        return moved
+
+    def delete_files(self, file_ids: list[str]) -> set[str]:
+        """使用 123 批量回收接口，每批最多 100 项。"""
+        file_ids = list(dict.fromkeys(
+            str(value) for value in (file_ids or []) if str(value or "")
+        ))
+        deleted = set()
+        for offset in range(0, len(file_ids), 100):
+            batch = file_ids[offset:offset + 100]
+            response = self.client.fs_trash(
+                [int(value) for value in batch], event="intoRecycle"
+            )
+            if self._is_success(response):
+                deleted.update(batch)
+        if deleted:
+            self._invalidate_directory_cache()
+            self._invalidate_path_cache()
+        return deleted

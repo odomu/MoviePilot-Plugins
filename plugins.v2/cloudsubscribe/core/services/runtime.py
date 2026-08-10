@@ -3,7 +3,7 @@
 import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Event as ThreadEvent, Lock
+from threading import Event as ThreadEvent, Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -569,6 +569,25 @@ class SyncRuntimeService(OwnerDelegator):
         logger.info("收到快速停止请求，当前操作结束后将立即停止任务")
         return {"success": True, "message": "已发送停止请求"}
 
+    def _postprocessing_pending_keys(
+            self, task_snapshot: Dict[str, Any]
+    ) -> set[str]:
+        if not self._sync_handler:
+            return set()
+        subscribe_id = int(task_snapshot.get("subscribe_id") or 0)
+        sub_key = str(task_snapshot.get("sub_key") or "").strip()
+        return {
+            str(item.get("pending_key") or "")
+            for item in self._sync_handler.get_pending_finalize_tasks()
+            if (
+                       subscribe_id > 0
+                       and int(item.get("subscribe_id") or 0) == subscribe_id
+               ) or (
+                       bool(sub_key)
+                       and str(item.get("sub_key") or "") == sub_key
+               )
+        }
+
     def api_stop_sync_task(self, apikey: str, task_id: str) -> dict:
         if apikey != settings.API_TOKEN:
             return {"success": False, "message": "API密钥错误"}
@@ -579,7 +598,17 @@ class SyncRuntimeService(OwnerDelegator):
                 if transfer_manager and transfer_manager.cancel(task_id):
                     return {"success": True, "message": "已发送跨盘任务取消请求"}
                 return {"success": False, "message": "订阅任务不存在"}
+            if (
+                    task.get("status") == "stopping"
+                    and task.get("postprocess_stop_token")
+            ):
+                return {
+                    "success": True,
+                    "message": "文件后处理正在安全停止，请等待当前提交完成",
+                }
             if task.get("status") == "postprocessing":
+                stop_token = f"{task_id}:{time.time_ns()}"
+                task["postprocess_stop_token"] = stop_token
                 task_snapshot = dict(task)
             else:
                 task_snapshot = None
@@ -602,23 +631,23 @@ class SyncRuntimeService(OwnerDelegator):
             transfer_manager.cancel_parent(task_id)
 
         if task_snapshot:
-            subscribe_id = int(task_snapshot.get("subscribe_id") or 0)
-            sub_key = str(task_snapshot.get("sub_key") or "").strip()
-            pending_keys = {
-                str(item.get("pending_key") or "")
-                for item in self._sync_handler.get_pending_finalize_tasks()
-                if (
-                           subscribe_id > 0
-                           and int(item.get("subscribe_id") or 0) == subscribe_id
-                   ) or (
-                           bool(sub_key)
-                           and str(item.get("sub_key") or "") == sub_key
-                   )
-            } if self._sync_handler else set()
             try:
-                removed = self._sync_handler.delete_pending_finalize_tasks(
-                    pending_keys
-                ) if self._sync_handler and pending_keys else 0
+                pending_keys = self._postprocessing_pending_keys(task_snapshot)
+                with self._sync_tasks_lock:
+                    current = self._sync_tasks.get(task_id)
+                    if (
+                            not current
+                            or str(current.get("postprocess_stop_token") or "")
+                            != str(task_snapshot.get("postprocess_stop_token") or "")
+                    ):
+                        return {"success": False, "message": "任务状态已变化，请刷新后重试"}
+                    current["postprocess_stop_pending_keys"] = set(pending_keys)
+                Thread(
+                    target=self._finish_postprocessing_stop,
+                    args=(task_id, task_snapshot),
+                    daemon=True,
+                    name="cloudsubscribe-safe-postprocess-stop",
+                ).start()
             except Exception as error:
                 with self._sync_tasks_lock:
                     current = self._sync_tasks.get(task_id)
@@ -628,33 +657,88 @@ class SyncRuntimeService(OwnerDelegator):
                             "phase": task_snapshot.get("phase")
                                      or "文件后处理中",
                         })
+                        current.pop("postprocess_stop_token", None)
+                        current.pop("postprocess_stop_pending_keys", None)
                 logger.error(
-                    f"停止文件后处理任务失败：{task_snapshot.get('title')}，{error}"
+                    f"启动文件后处理安全停止失败："
+                    f"{task_snapshot.get('title')}，{error}"
                 )
                 return {"success": False, "message": f"停止后处理失败：{error}"}
-            with self._sync_tasks_lock:
-                current = self._sync_tasks.get(task_id)
-                if current:
-                    current.update({
-                        "status": "stopped",
-                        "phase": "文件后处理已停止",
-                        "progress": 100,
-                        "pending_count": 0,
-                        "finished_at": time.time(),
-                    })
             logger.info(
-                f"已停止文件后处理任务：{task_snapshot.get('title')}，"
-                f"移除 {removed} 个待处理文件，保留网盘离线任务和文件"
+                f"文件后处理任务进入安全停止：{task_snapshot.get('title')}，"
+                "等待当前文件提交完成"
             )
             return {
                 "success": True,
                 "message": (
-                    f"已停止后处理：{task_snapshot.get('title')}，"
-                    "115离线任务和文件已保留"
+                    f"正在安全停止：{task_snapshot.get('title')}，"
+                    "当前文件提交完成后停止"
                 ),
             }
         logger.info(f"收到单任务停止请求：{task.get('title')}（{task_id}）")
         return {"success": True, "message": f"已请求停止：{task.get('title')}"}
+
+    def _finish_postprocessing_stop(
+            self,
+            task_id: str,
+            task_snapshot: Dict[str, Any],
+    ) -> None:
+        """等待当前后处理原子提交完成，再移除尚未开始的持久任务。"""
+        stop_token = str(task_snapshot.get("postprocess_stop_token") or "")
+        self._offline_monitor_lock.acquire()
+        try:
+            with self._sync_tasks_lock:
+                current = self._sync_tasks.get(task_id)
+                if (
+                        not current
+                        or str(current.get("postprocess_stop_token") or "")
+                        != stop_token
+                ):
+                    return
+            pending_keys = self._postprocessing_pending_keys(task_snapshot)
+            removed = self._sync_handler.stop_pending_finalize_tasks(
+                pending_keys
+            ) if self._sync_handler and pending_keys else 0
+            with self._sync_tasks_lock:
+                current = self._sync_tasks.get(task_id)
+                if (
+                        not current
+                        or str(current.get("postprocess_stop_token") or "")
+                        != stop_token
+                ):
+                    return
+                current.update({
+                    "status": "stopped",
+                    "phase": "文件后处理已安全停止",
+                    "progress": 100,
+                    "pending_count": 0,
+                    "finished_at": time.time(),
+                })
+                current.pop("postprocess_stop_token", None)
+                current.pop("postprocess_stop_pending_keys", None)
+            logger.info(
+                f"文件后处理任务已安全停止：{task_snapshot.get('title')}，"
+                f"当前提交已完成，取消剩余 {removed} 个文件；"
+                "保留网盘离线任务和文件"
+            )
+        except Exception as error:
+            with self._sync_tasks_lock:
+                current = self._sync_tasks.get(task_id)
+                if current and str(
+                        current.get("postprocess_stop_token") or ""
+                ) == stop_token:
+                    current.update({
+                        "status": "postprocessing",
+                        "phase": task_snapshot.get("phase") or "文件后处理中",
+                    })
+                    current.pop("postprocess_stop_token", None)
+                    current.pop("postprocess_stop_pending_keys", None)
+            logger.error(
+                f"安全停止文件后处理任务失败："
+                f"{task_snapshot.get('title')}，{error}"
+            )
+        finally:
+            self._offline_monitor_lock.release()
 
     def _monitor_offline_task_groups(
             self,
@@ -666,6 +750,31 @@ class SyncRuntimeService(OwnerDelegator):
             force=bool(kwargs.get("force")),
             pending_keys=kwargs.get("pending_keys"),
         )
+        with self._sync_tasks_lock:
+            stopping_keys = {
+                str(pending_key)
+                for task in self._sync_tasks.values()
+                if task.get("status") == "stopping"
+                   and task.get("postprocess_stop_token")
+                for pending_key in task.get("postprocess_stop_pending_keys") or set()
+            }
+        if stopping_keys:
+            filtered_groups = []
+            for group in groups:
+                active_keys = set(group["pending_keys"]) - stopping_keys
+                if not active_keys:
+                    continue
+                filtered_group = dict(group)
+                filtered_group["pending_keys"] = active_keys
+                filtered_groups.append(filtered_group)
+            groups = filtered_groups
+        if not groups:
+            return {
+                "checked": 0,
+                "completed": 0,
+                "failed": 0,
+                "pending": len(sync_handler.get_pending_finalize_tasks()),
+            }
         shared_kwargs = dict(kwargs)
         if (
                 any(group["needs_offline"] for group in groups)
@@ -678,9 +787,8 @@ class SyncRuntimeService(OwnerDelegator):
             shared_kwargs["offline_tasks"] = snapshot.get("tasks") or []
             shared_kwargs["offline_tasks_valid"] = bool(snapshot.get("refresh_ok"))
 
-        if len(groups) <= 1:
-            if groups:
-                shared_kwargs["pending_keys"] = set(groups[0]["pending_keys"])
+        if len(groups) == 1:
+            shared_kwargs["pending_keys"] = set(groups[0]["pending_keys"])
             return sync_handler.monitor_offline_strm_tasks(**shared_kwargs)
 
         policy = getattr(getattr(self, "_cloud_drive", None), "policy", None)

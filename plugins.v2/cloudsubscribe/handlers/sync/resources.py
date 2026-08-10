@@ -285,6 +285,14 @@ class ResourceTransferService(OwnerDelegator):
             )
         return files
 
+    def preview_resource_files(self, share_url: str) -> List[Dict[str, Any]]:
+        """只读校验分享链接并列举媒体文件，供无订阅入口识别内容。"""
+        return self._validated_resource_files(
+            share_url,
+            resource_title="Telegram 分享链接",
+            log_prefix="快速识别",
+        )
+
     def _transfer_history_status(self, success: bool, share_url: str) -> str:
         if not success:
             return "失败"

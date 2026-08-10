@@ -1,5 +1,6 @@
 """光鸭目录与文件操作能力。"""
 
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -186,3 +187,77 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         if success:
             self._invalidate_path_cache()
         return success
+
+    def _batch_action_completed(self, response: Dict[str, Any]) -> bool:
+        if not self._is_success(response):
+            return False
+        data = self.client.data(response)
+        task_id = str(
+            data.get("taskId") or data.get("task_id") or ""
+        ) if isinstance(data, dict) else ""
+        if not task_id:
+            return True
+        for retry_index in range(120):
+            status_response = self.client.request(
+                "POST",
+                f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/get_task_status",
+                json_data={"taskId": task_id},
+            )
+            status_data = self.client.data(status_response)
+            status = (
+                status_data.get("status", status_data.get("taskStatus"))
+                if isinstance(status_data, dict) else None
+            )
+            if status in (2, "2", "success", "done", "finished"):
+                return True
+            if status in (3, "3", "failed", "error") or status_response.get(
+                    "code"
+            ) in (145, "145"):
+                return False
+            if retry_index < 119:
+                time.sleep(0.5)
+        return False
+
+    def move_files(
+            self, items: dict[str, CloudFile], save_path: str
+    ) -> dict[str, CloudFile]:
+        """使用光鸭 move_file 原生批量接口。"""
+        lookup = self.resolve_directory(save_path, create=True)
+        if not lookup.checked or lookup.directory_id is None:
+            return {}
+        entries = list(dict(items or {}).items())
+        moved = {}
+        for offset in range(0, len(entries), 50):
+            batch = entries[offset:offset + 50]
+            response = self.client.request(
+                "POST",
+                f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/move_file",
+                json_data={
+                    "fileIds": [item.id for _, item in batch],
+                    "parentId": lookup.directory_id or "",
+                },
+            )
+            if self._batch_action_completed(response):
+                moved.update({str(key): item for key, item in batch})
+        if moved and any(item.is_directory for item in moved.values()):
+            self._invalidate_path_cache()
+        return moved
+
+    def delete_files(self, file_ids: list[str]) -> set[str]:
+        """使用光鸭 delete_file 原生批量接口。"""
+        file_ids = list(dict.fromkeys(
+            str(value) for value in (file_ids or []) if str(value or "")
+        ))
+        deleted = set()
+        for offset in range(0, len(file_ids), 50):
+            batch = file_ids[offset:offset + 50]
+            response = self.client.request(
+                "POST",
+                f"{self.client.API_BASE_URL}/nd.bizuserres.s/v1/file/delete_file",
+                json_data={"fileIds": batch},
+            )
+            if self._batch_action_completed(response):
+                deleted.update(batch)
+        if deleted:
+            self._invalidate_path_cache()
+        return deleted

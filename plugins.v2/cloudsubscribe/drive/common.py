@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import PurePosixPath
 from random import uniform
@@ -409,3 +410,69 @@ class CloudDriveFileServiceBase:
 
     def delete_file(self, file_id: str) -> bool:
         return self._is_success(self.client.delete_files([file_id]))
+
+    def _log_batch_failures(self, action: str, failures: list[str]) -> None:
+        if not failures:
+            return
+        logger.warning(
+            f"{self.provider_name}批量{action}异常 {len(failures)} 项，"
+            f"首项：{failures[0]}"
+        )
+
+    def rename_files(self, path: str, items: dict) -> dict[str, CloudFile]:
+        """顺序执行批量重命名，原生支持批量的平台可覆盖此方法。"""
+        renamed = {}
+        failures = []
+        for key, value in dict(items or {}).items():
+            item = value.get("item") if isinstance(value, dict) else None
+            target_name = str(value.get("target_name") or "") if isinstance(
+                value, dict
+            ) else ""
+            if not item or not target_name:
+                continue
+            try:
+                if self.rename_file(path, item, target_name):
+                    renamed[str(key)] = replace(item, name=target_name)
+            except Exception as error:
+                failures.append(
+                    f"{getattr(item, 'name', item)} -> {target_name}，{error}"
+                )
+        self._log_batch_failures("重命名", failures)
+        return renamed
+
+    def move_files(
+            self, items: dict[str, CloudFile], save_path: str
+    ) -> dict[str, CloudFile]:
+        """顺序执行批量移动，并返回成功项供上层统一提交。"""
+        moved = {}
+        failures = []
+        for key, item in dict(items or {}).items():
+            if not item:
+                continue
+            try:
+                target = self.move_file(item, save_path, item.name)
+                if target:
+                    moved[str(key)] = target
+            except Exception as error:
+                failures.append(
+                    f"{getattr(item, 'name', item)} -> {save_path}，{error}"
+                )
+        self._log_batch_failures("移动", failures)
+        return moved
+
+    def delete_files(self, file_ids: list[str]) -> set[str]:
+        """顺序执行批量删除，失败项不计入结果并由上层重试。"""
+        deleted = set()
+        failures = []
+        for file_id in dict.fromkeys(
+                str(value) for value in (file_ids or []) if str(value or "")
+        ):
+            if not file_id:
+                continue
+            try:
+                if self.delete_file(file_id):
+                    deleted.add(file_id)
+            except Exception as error:
+                failures.append(f"{file_id}，{error}")
+        self._log_batch_failures("删除", failures)
+        return deleted

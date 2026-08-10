@@ -641,23 +641,6 @@ class SyncExecutionService(OwnerDelegator):
             ).append(record)
         transfer_details: List[Dict[str, Any]] = []
         transferred_count = 0
-        active_tv_count = 0
-        active_movie_count = 0
-        for subscribe in active_subscribes:
-            if subscribe.type == MediaType.TV.value:
-                active_tv_count += 1
-            elif subscribe.type == MediaType.MOVIE.value:
-                active_movie_count += 1
-        scope_label = (
-            f"手动洗版 {total_subscribes} 项"
-            if upgrade_request
-            else
-            f"手动添加 {len(manual_resources)} 条"
-            if manual_resources
-            else "指定订阅"
-            if subscribe_id or subscribe_ids is not None
-            else "全部订阅"
-        )
         self._set_sync_status(
             "running",
             f"已加载 {total_subscribes} 个订阅，准备搜索资源",
@@ -669,19 +652,6 @@ class SyncExecutionService(OwnerDelegator):
                 "phase": "准备搜索资源",
             },
         )
-        if self._notify:
-            skipped_text = f"，本轮跳过 {skipped_count} 个" if skipped_count else ""
-            self.post_message(
-                mtype=self._notification_type,
-                title="【网盘订阅助手】开始同步",
-                text=(
-                    f"{self._cloud_drive.name} · {scope_label}\n"
-                    f"待处理 {total_subscribes} 个订阅（电视剧 {active_tv_count}，"
-                    f"电影 {active_movie_count}）{skipped_text}。\n"
-                    "正在按搜索源优先级检查缺失内容并转存匹配资源。"
-                ),
-            )
-
         if self._sync_handler:
             self._sync_handler.reset_transfer_budget()
         self._register_sync_tasks(active_subscribes)

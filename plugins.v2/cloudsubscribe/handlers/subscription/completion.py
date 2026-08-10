@@ -14,7 +14,7 @@ from app.db.systemconfig_oper import SystemConfigOper
 from app.helper.message import TemplateHelper
 from app.log import logger
 from app.schemas import MediaInfo
-from app.schemas.types import MediaType, NotificationType, SystemConfigKey
+from app.schemas.types import MediaType, SystemConfigKey
 
 
 class SubscribeCompletionChain(SubscribeChain):
@@ -62,20 +62,13 @@ class SubscribeHandler:
     def __init__(
             self,
             exclude_subscribes: List[int] = None,
-            notify: bool = False,
-            notification_type: NotificationType = NotificationType.Plugin,
-            post_message_func: Callable = None,
             is_excluded_func: Callable[[int], bool] = None
     ):
         """
         :param exclude_subscribes: 排除的订阅ID列表（is_excluded_func 未提供时使用）
-        :param notification_type:消息通知类型
         :param is_excluded_func: 订阅过滤判断函数，支持排除/指定两种模式
         """
         self._exclude_subscribes = exclude_subscribes or []
-        self._notify = notify
-        self._notification_type = notification_type
-        self._post_message = post_message_func
         self._is_excluded_func = is_excluded_func
         self._progress_lock = RLock()
 
@@ -93,7 +86,7 @@ class SubscribeHandler:
     ):
         """在持锁状态下合并进度，返回最新订阅和剩余缺集数。"""
         subscribe_id = int(getattr(subscribe, "id", 0) or 0)
-        if subscribe_id:
+        if subscribe_id > 0:
             with SessionFactory() as db:
                 latest_subscribe = SubscribeOper(db=db).get(subscribe_id)
             if not latest_subscribe:
@@ -141,7 +134,8 @@ class SubscribeHandler:
                 f"{current_lack} -> {new_lack}"
             )
         if update_data:
-            SubscribeOper().update(subscribe.id, update_data)
+            if subscribe_id > 0:
+                SubscribeOper().update(subscribe.id, update_data)
             for key, value in update_data.items():
                 setattr(subscribe, key, value)
         return subscribe, new_lack
@@ -214,13 +208,6 @@ class SubscribeHandler:
                         force=True
                     )
                     logger.info(f"订阅 {subscribe.name} 已移至历史记录")
-                    if self._notify and self._post_message:
-                        season_text = f" 第{subscribe.season}季" if subscribe.type == MediaType.TV.value and subscribe.season else ""
-                        self._post_message(
-                            mtype=self._notification_type,
-                            title="【网盘订阅助手】订阅完成",
-                            text=f"{subscribe.name}{season_text} 已完成，订阅已移至历史记录。"
-                        )
                     return 0
                 except Exception as e:
                     import traceback

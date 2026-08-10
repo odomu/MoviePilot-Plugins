@@ -39,7 +39,7 @@ from .core.api import (
     SearchApi,
     SyncApi,
 )
-from .core.hook import PluginEventHandler, SubscriptionSearchHook
+from .core.hook import MessageRoutingHook, PluginEventHandler, SubscriptionSearchHook
 from .core.services import (
     SubscriptionControlService,
     CheckinService,
@@ -78,6 +78,7 @@ _COMPONENT_TYPES = (
     MediaLibraryApi,
     QRCodeService,
     HistoryApi,
+    MessageRoutingHook,
     PluginEventHandler,
     MoviePilotRegistration,
     SyncRuntimeService,
@@ -100,7 +101,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -172,6 +173,10 @@ class CloudSubscribe(_PluginBase):
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event: Event):
         return self._get_component(PluginEventHandler).on_plugin_action(event)
+
+    @eventmanager.register(EventType.MessageAction)
+    def on_message_action(self, event: Event):
+        return self._get_component(PluginEventHandler).on_message_action(event)
 
     @eventmanager.register(EventType.WebhookMessage)
     def on_media_server_webhook(self, event: Event):
@@ -1041,6 +1046,7 @@ class CloudSubscribe(_PluginBase):
         if not reset_runtime:
             self._refresh_platform_services()
         self._install_subscribe_search_takeover()
+        self._get_component(MessageRoutingHook).install()
 
         action = "插件初始化" if reset_runtime else "插件配置已应用"
         self._applied_config = copy.deepcopy(config)
@@ -1530,9 +1536,6 @@ class CloudSubscribe(_PluginBase):
     def _init_subscribe_handler(self):
         self._subscribe_handler = SubscribeHandler(
             exclude_subscribes=self._exclude_subscribes,
-            notify=self._notify,
-            notification_type=self._notification_type,
-            post_message_func=self.post_message,
             is_excluded_func=self._is_subscribe_excluded
         )
 
@@ -1860,6 +1863,13 @@ class CloudSubscribe(_PluginBase):
                     if stop_event:
                         stop_event.set()
         self._restore_subscribe_search_takeover()
+        try:
+            components = self.__dict__.get("_plugin_components", {})
+            message_hook = components.pop(MessageRoutingHook, None)
+            if message_hook:
+                message_hook.close()
+        except Exception as error:
+            logger.debug(f"恢复平台消息路由失败：{error}")
         try:
             components = self.__dict__.get("_plugin_components", {})
             search_api = components.get(SearchApi)
