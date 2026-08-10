@@ -208,6 +208,9 @@ class MediaServerNotifier:
     _BATCH_WINDOW_SECONDS = 2
     _REFRESH_TIMEOUT_SECONDS = 60
     _MEDIAINFO_TIMER_LIMIT = 256
+    _EMBY_REFRESH_DEDUPE_SECONDS = 15
+    _EMBY_REFRESH_RETRY_DELAYS = (0, 1, 2)
+    _EMBY_RETRY_STATUS_CODES = {500, 502, 503, 504}
 
     def __init__(
             self,
@@ -234,6 +237,7 @@ class MediaServerNotifier:
             max_workers=max(1, min(len(self.mediaservers) or 1, 4)),
             thread_name_prefix="cloudsubscribe-media-refresh",
         )
+        self._emby_refresh_recent: Dict[str, float] = {}
         self._mediainfo_timers: Dict[str, Timer] = {}
 
     def begin_task_batch(self) -> bool:
@@ -306,6 +310,7 @@ class MediaServerNotifier:
             media_info,
             file_name=str(record.get("file_name") or ""),
             force=True,
+            deleted=True,
         )
 
     def notify(
@@ -314,6 +319,7 @@ class MediaServerNotifier:
             mediainfo: MediaInfo,
             file_name: str = "",
             force: bool = False,
+            deleted: bool = False,
     ) -> bool:
         if not self.enabled and not force:
             return True
@@ -341,11 +347,14 @@ class MediaServerNotifier:
             pending = self._pending.get(key)
             if pending:
                 pending["paths"].add(target_path)
+                if deleted:
+                    pending.setdefault("deleted_paths", set()).add(target_path)
             else:
                 self._pending[key] = {
                     "item": item,
                     "folder": target_folder,
                     "paths": {target_path},
+                    "deleted_paths": {target_path} if deleted else set(),
                 }
             if self._task_batch_depth > 0:
                 logger.debug("入库通知批次已更新，将在当前任务结束后统一提交")
@@ -384,14 +393,20 @@ class MediaServerNotifier:
             name: str,
             service: Any,
             items: List[RefreshMediaItem],
+            entries: List[Dict[str, Any]],
     ) -> bool:
         started_at = time.monotonic()
-        logger.info(f"开始刷新媒体库：{name} - {len(items)} 个媒体目录")
-        future = self._refresh_executor.submit(
-            service.instance.refresh_library_by_items, items
-        )
+        logger.debug(f"开始刷新媒体库：{name} - {len(items)} 个媒体目录")
+        if service.type == "emby":
+            future = self._refresh_executor.submit(
+                self._refresh_emby_entries, name, service, entries
+            )
+        else:
+            future = self._refresh_executor.submit(
+                service.instance.refresh_library_by_items, items
+            )
         try:
-            future.result(timeout=self._REFRESH_TIMEOUT_SECONDS)
+            success = bool(future.result(timeout=self._REFRESH_TIMEOUT_SECONDS))
         except FutureTimeoutError:
             future.cancel()
             logger.error(
@@ -407,6 +422,12 @@ class MediaServerNotifier:
             return False
 
         elapsed = time.monotonic() - started_at
+        if not success:
+            logger.error(
+                f"媒体库刷新失败：{name} - {len(items)} 个媒体目录，"
+                f"耗时 {elapsed:.2f} 秒，媒体服务器未确认刷新请求"
+            )
+            return False
         logger.debug(
             f"媒体库刷新完成：{name} - {len(items)} 个媒体目录，"
             f"耗时 {elapsed:.2f} 秒"
@@ -429,6 +450,12 @@ class MediaServerNotifier:
                 for path in entry.get("paths", set())
             )
         )
+        deleted_paths = {
+            path
+            for entry in entries
+            for path in entry.get("deleted_paths", set())
+        }
+        mediainfo_paths = [path for path in paths if path not in deleted_paths]
         refreshed = 0
         submitted = 0
         started_at = time.monotonic()
@@ -440,14 +467,14 @@ class MediaServerNotifier:
                 logger.warning(f"媒体服务器不支持按项入库通知：{name}")
                 continue
             submitted += 1
-            if self._refresh_service(name, service, items):
+            if self._refresh_service(name, service, items, entries):
                 refreshed += 1
                 if self.emby_mediainfo_enabled and service.type == "emby":
-                    for path in paths:
+                    for path in mediainfo_paths:
                         self._schedule_emby_mediainfo(name, path, attempt=1)
         if submitted:
             logger.info(
-                f"媒体库刷新批次结束：成功 {refreshed}/{submitted}，"
+                f"媒体库刷新批次完成：成功 {refreshed}/{submitted}，"
                 f"耗时 {time.monotonic() - started_at:.2f} 秒"
             )
         return refreshed > 0
@@ -463,6 +490,7 @@ class MediaServerNotifier:
                 timer.cancel()
             entries = list(self._pending.values()) if flush else []
             self._pending.clear()
+            self._emby_refresh_recent.clear()
             mediainfo_timers = list(self._mediainfo_timers.values())
             self._mediainfo_timers.clear()
         for mediainfo_timer in mediainfo_timers:
@@ -482,20 +510,243 @@ class MediaServerNotifier:
         finally:
             self._refresh_executor.shutdown(wait=False, cancel_futures=True)
 
-    @staticmethod
-    def _emby_connection(name: str):
+    @classmethod
+    def _emby_connection(cls, name: str):
         service = MediaServerHelper().get_service(name=name, type_filter="emby")
         if not service or service.instance.is_inactive():
             return None
-        config = service.config.config or {}
-        host = str(config.get("host") or "").strip().rstrip("/")
-        api_key = str(config.get("apikey") or "").strip()
+        connection = cls._emby_refresh_connection(service)
         user_id = str(service.instance.get_user() or "").strip()
-        if not host or not api_key or not user_id:
+        if not connection or not user_id:
+            return None
+        host, api_key = connection
+        return host, api_key, user_id
+
+    @staticmethod
+    def _emby_refresh_connection(service: Any):
+        """读取 Emby 刷新所需连接信息，不依赖用户 ID。"""
+        config = service.config.config or {}
+        instance = service.instance
+        host = str(
+            config.get("host") or getattr(instance, "_host", "") or ""
+        ).strip().rstrip("/")
+        api_key = str(
+            config.get("apikey") or getattr(instance, "_apikey", "") or ""
+        ).strip()
+        if not host or not api_key:
             return None
         if not host.startswith(("http://", "https://")):
             host = f"http://{host}"
-        return host, api_key, user_id
+        return host, api_key
+
+    def _emby_item_id_by_path(
+            self,
+            host: str,
+            api_key: str,
+            folder: Path,
+            cache: Dict[str, Optional[str]],
+    ) -> Optional[str]:
+        """从目标目录向上查找 Emby 中最近的已存在项目。"""
+        candidates = [folder, *folder.parents]
+        for candidate in candidates:
+            path = self._normalize_path(candidate.as_posix())
+            if path in {".", "/"}:
+                break
+            if path in cache:
+                item_id = cache[path]
+                if item_id:
+                    return item_id
+                continue
+            item_id = None
+            try:
+                with RequestUtils(timeout=15).get_res(
+                        url=f"{host}/emby/Items",
+                        params={
+                            "Path": path,
+                            "Recursive": "true",
+                            "Fields": "Path",
+                            "IncludeItemTypes": (
+                                    "Movie,Episode,Folder,Series,CollectionFolder"
+                            ),
+                            "api_key": api_key,
+                        },
+                ) as response:
+                    if response and response.status_code == 200:
+                        data = response.json() or {}
+                        item_id = next(
+                            (
+                                str(item.get("Id"))
+                                for item in data.get("Items", [])
+                                if item.get("Id")
+                                   and self._normalize_path(item.get("Path")) == path
+                            ),
+                            None,
+                        )
+            except Exception as error:
+                logger.warning(
+                    f"查询 Emby 刷新目录异常：{path}，原因：{error}"
+                )
+            cache[path] = item_id
+            if item_id:
+                return item_id
+        return None
+
+    @classmethod
+    def _post_emby_request(
+            cls,
+            url: str,
+            params: Dict[str, Any],
+            operation: str,
+            json_data: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        last_error = "无有效响应"
+        for delay in cls._EMBY_REFRESH_RETRY_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                response = RequestUtils(timeout=30).post_res(
+                    url=url, params=params, json=json_data
+                )
+                if response is None:
+                    continue
+                with response:
+                    status_code = getattr(response, "status_code", None)
+                    if status_code in {200, 204}:
+                        return True
+                    last_error = f"HTTP {status_code}"
+                    if status_code not in cls._EMBY_RETRY_STATUS_CODES:
+                        break
+            except Exception as error:
+                last_error = str(error) or error.__class__.__name__
+        logger.warning(f"{operation}失败：{last_error}")
+        return False
+
+    @classmethod
+    def _post_emby_refresh(
+            cls,
+            host: str,
+            api_key: str,
+            item_id: str,
+    ) -> bool:
+        return cls._post_emby_request(
+            url=f"{host}/emby/Items/{item_id}/Refresh",
+            params={
+                "Recursive": "true",
+                "MetadataRefreshMode": "Default",
+                "ImageRefreshMode": "Default",
+                "ReplaceAllMetadata": "false",
+                "ReplaceAllImages": "false",
+                "api_key": api_key,
+            },
+            operation=f"提交 Emby 项目刷新 {item_id}",
+        )
+
+    @classmethod
+    def _notify_emby_deleted_paths(
+            cls,
+            host: str,
+            api_key: str,
+            paths: List[str],
+    ) -> bool:
+        if not paths:
+            return True
+        return cls._post_emby_request(
+            url=f"{host}/emby/Library/Media/Updated",
+            params={"api_key": api_key},
+            json_data={
+                "Updates": [
+                    {"Path": path, "UpdateType": "Deleted"}
+                    for path in paths
+                ]
+            },
+            operation=f"提交 Emby 删除通知 {len(paths)} 个路径",
+        )
+
+    def _refresh_emby_item(
+            self,
+            host: str,
+            api_key: str,
+            item_id: str,
+            dedupe: bool,
+    ) -> bool:
+        key = f"{host}\0{item_id}"
+        now = time.monotonic()
+        if dedupe:
+            with self._batch_lock:
+                if now - self._emby_refresh_recent.get(key, 0) < (
+                        self._EMBY_REFRESH_DEDUPE_SECONDS
+                ):
+                    logger.debug(f"Emby 项目刷新已去重：{item_id}")
+                    return True
+        success = self._post_emby_refresh(host, api_key, item_id)
+        if success:
+            with self._batch_lock:
+                expire_before = now - self._EMBY_REFRESH_DEDUPE_SECONDS
+                self._emby_refresh_recent = {
+                    cache_key: refreshed_at
+                    for cache_key, refreshed_at in self._emby_refresh_recent.items()
+                    if refreshed_at >= expire_before
+                }
+                self._emby_refresh_recent[key] = now
+        return success
+
+    def _refresh_emby_entries(
+            self,
+            name: str,
+            service: Any,
+            entries: List[Dict[str, Any]],
+    ) -> bool:
+        """按最近父项目刷新全部目录，避开平台批量仅处理首项的问题。"""
+        connection = self._emby_refresh_connection(service)
+        if not connection:
+            logger.warning(f"Emby 刷新配置无效：{name}")
+            return False
+        host, api_key = connection
+        deleted_paths = list(dict.fromkeys(
+            self._normalize_path(path.as_posix())
+            for entry in entries
+            for path in entry.get("deleted_paths", set())
+        ))
+        deleted_notified = self._notify_emby_deleted_paths(
+            host, api_key, deleted_paths
+        )
+        cache: Dict[str, Optional[str]] = {}
+        item_ids = []
+        unresolved_count = 0
+        for entry in entries:
+            folder = Path(entry["folder"])
+            item_id = self._emby_item_id_by_path(
+                host, api_key, folder, cache
+            )
+            if not item_id:
+                unresolved_count += 1
+            elif item_id not in item_ids:
+                item_ids.append(item_id)
+
+        if not item_ids:
+            logger.warning(
+                f"Emby 未解析到可刷新的媒体项目，"
+                f"跳过 {unresolved_count} 个目录且不执行全库刷新"
+            )
+            return False
+
+        succeeded = sum(
+            1
+            for item_id in item_ids
+            if self._refresh_emby_item(
+                host, api_key, item_id, dedupe=not deleted_paths
+            )
+        )
+        logger.info(
+            f"Emby 刷新请求提交完成：目录 {len(entries)} 个，"
+            f"目标项目 {len(item_ids)} 个，成功 {succeeded}/{len(item_ids)}，"
+            f"未定位目录 {unresolved_count} 个"
+        )
+        return (
+                deleted_notified
+                and succeeded == len(item_ids)
+                and not unresolved_count
+        )
 
     def _schedule_emby_mediainfo(
             self, name: str, path: Path, attempt: int

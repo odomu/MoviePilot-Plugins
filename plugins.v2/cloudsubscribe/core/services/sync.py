@@ -860,7 +860,7 @@ class SyncExecutionService(OwnerDelegator):
             self._sync_context["offline_pending"] = offline_pending_count
             self._sync_context["cloud_pending"] = cloud_pending_count
             if pending_finalize_count:
-                logger.info(
+                logger.debug(
                     f"本次仍有 {pending_finalize_count} 个文件等待网盘文件就绪，"
                     "暂不发送完成确认"
                 )

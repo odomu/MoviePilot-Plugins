@@ -2018,6 +2018,11 @@ class HistoryService(OwnerDelegator):
                     cloud_dir=cloud_dir,
                     file_name=file_name,
                 )
+                if local_path.exists():
+                    logger.warning(
+                        f"关联 STRM 仍然存在，跳过媒体库删除通知：{local_path}"
+                    )
+                    continue
                 self._media_server_notifier.notify_deleted_path(local_path, record)
             except Exception as error:
                 logger.warning(
