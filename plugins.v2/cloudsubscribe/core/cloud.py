@@ -202,6 +202,8 @@ class OfflineDownloadOperations(Protocol):
 
 @runtime_checkable
 class DirectoryReadOperations(Protocol):
+    def refresh_directories(self) -> None: ...
+
     def resolve_directory(
             self, path: str, create: bool = False
     ) -> DirectoryLookup: ...

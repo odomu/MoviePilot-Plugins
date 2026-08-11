@@ -29,9 +29,6 @@ class TianyiFileService(CloudDriveFileServiceBase):
             "tianyi", client
         )
 
-    def _invalidate_directory_cache(self) -> None:
-        self._directory_cache.clear()
-
     def _remember(self, item: CloudFile) -> CloudFile:
         if item.id:
             self._items_by_id[item.id] = item
@@ -101,7 +98,9 @@ class TianyiFileService(CloudDriveFileServiceBase):
                                        params={"pageSize": 60, "pageNum": page, "mediaType": 0,
                                                "folderId": directory_id, "iconOption": 5,
                                                "orderBy": "lastOpTime", "descending": "true"})
-            info = data.get("fileListAO") or {}
+            info = data.get("fileListAO")
+            if not isinstance(info, dict):
+                raise RuntimeError("天翼目录响应缺少 fileListAO")
             for item in info.get("folderList") or []:
                 result.append(self._remember(
                     CloudFile(str(item.get("id") or ""), str(item.get("name") or ""), True, native=item)))

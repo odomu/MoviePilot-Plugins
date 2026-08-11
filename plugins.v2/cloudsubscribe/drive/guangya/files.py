@@ -1,10 +1,17 @@
 """光鸭目录与文件操作能力。"""
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ..common import CloudDriveFileServiceBase, extract_list, safe_int
+from app.core.cache import TTLCache
+
+from ..common import (
+    CloudDriveFileServiceBase,
+    create_directory_cache,
+    extract_list,
+    safe_int,
+)
 from ...core.cloud import CloudFile
 from ...core.transfer import HttpFileDownloadService
 
@@ -57,6 +64,10 @@ class GuangyaFileService(CloudDriveFileServiceBase):
     root_directory_id = ""
     provider_name = "光鸭"
     provider_key = "guangya"
+    _directory_cache: TTLCache = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._directory_cache = create_directory_cache("guangya", self.client)
 
     def download_file(self, file_item: CloudFile, local_path: str,
                       progress_callback=None, stop_requested=None,
@@ -123,6 +134,10 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         )
 
     def _list(self, directory_id: str) -> List[CloudFile]:
+        directory_id = str(directory_id or "")
+        cached = self._directory_cache.get(directory_id)
+        if cached is not None:
+            return list(cached)
         files: List[CloudFile] = []
         page = 0
         while True:
@@ -134,6 +149,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             data = self.client.data(response)
             total = safe_int(data.get("total") if isinstance(data, dict) else 0)
             if len(raw_items) < self.page_size or (total and len(files) >= total):
+                self._directory_cache.set(directory_id, tuple(files))
                 return files
             page += 1
 
@@ -141,6 +157,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         response = self._create_folder_request(name, parent_id)
         if not self._is_success(response):
             raise RuntimeError(response.get("msg") or response.get("error") or "创建光鸭目录失败")
+        self._invalidate_directory_cache()
         return cloud_file(self.client.data(response))
 
     def _is_success(self, response: Any) -> bool:
@@ -153,8 +170,10 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             json_data={"fileId": item.id, "newName": target_name},
         )
         success = self._is_success(response)
-        if success and item.is_directory:
-            self._invalidate_path_cache()
+        if success:
+            self._invalidate_directory_cache()
+            if item.is_directory:
+                self._invalidate_path_cache()
         return success
 
     def move_file(
@@ -170,6 +189,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         )
         if not self._is_success(moved):
             return None
+        self._invalidate_directory_cache()
         if item.is_directory:
             self._invalidate_path_cache()
         if target_name and target_name != item.name:
@@ -185,6 +205,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
         )
         success = self._is_success(response)
         if success:
+            self._invalidate_directory_cache()
             self._invalidate_path_cache()
         return success
 
@@ -239,8 +260,10 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             )
             if self._batch_action_completed(response):
                 moved.update({str(key): item for key, item in batch})
-        if moved and any(item.is_directory for item in moved.values()):
-            self._invalidate_path_cache()
+        if moved:
+            self._invalidate_directory_cache()
+            if any(item.is_directory for item in moved.values()):
+                self._invalidate_path_cache()
         return moved
 
     def delete_files(self, file_ids: list[str]) -> set[str]:
@@ -259,5 +282,6 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             if self._batch_action_completed(response):
                 deleted.update(batch)
         if deleted:
+            self._invalidate_directory_cache()
             self._invalidate_path_cache()
         return deleted

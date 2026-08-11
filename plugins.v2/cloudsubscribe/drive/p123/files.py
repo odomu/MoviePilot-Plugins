@@ -77,9 +77,6 @@ class P123FileService(CloudDriveFileServiceBase):
     def __post_init__(self):
         self._directory_cache = create_directory_cache("p123", self.client)
 
-    def _invalidate_directory_cache(self) -> None:
-        self._directory_cache.clear()
-
     def download_file(self, file_item: CloudFile, local_path: str,
                       progress_callback=None, stop_requested=None,
                       preserve_partial: bool = False,

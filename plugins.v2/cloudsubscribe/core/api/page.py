@@ -280,7 +280,7 @@ class PageApi(OwnerDelegator):
         return result
 
     def api_vue_cloud_directories(
-            self, path: str = "/", provider: str = ""
+            self, path: str = "/", provider: str = "", refresh: bool = False
     ) -> dict:
         """列出指定或当前网盘目录，供配置页选择转存路径。"""
         normalized_path = str(path or "/").strip()
@@ -300,6 +300,8 @@ class PageApi(OwnerDelegator):
             return {"success": False, "message": "当前网盘不支持目录浏览"}
         try:
             service = drive.require(CloudDriveCapability.DIRECTORY_READ)
+            if refresh:
+                service.refresh_directories()
             directories = service.list_directories(normalized_path)
             breadcrumbs = [{"name": "根目录", "path": "/"}]
             current_path = ""
@@ -318,13 +320,23 @@ class PageApi(OwnerDelegator):
             logger.error(f"读取网盘目录失败：{normalized_path}，{error}")
             return {"success": False, "message": f"读取网盘目录失败：{error}"}
 
-    def api_vue_create_cloud_directory(
-            self, path: str = "/", name: str = "", provider: str = ""
-    ) -> dict:
+    def api_vue_create_cloud_directory(self, payload: dict) -> dict:
         """在目录选择器当前目录创建子文件夹。"""
+        request = payload or {}
+        path = request.get("path", "/")
+        name = request.get("name", "")
+        provider = request.get("provider", "")
         normalized_path = str(path or "/").strip() or "/"
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+        normalized_path = normalized_path.rstrip("/") or "/"
         folder_name = str(name or "").strip()
-        if not folder_name or folder_name in {".", ".."} or "/" in folder_name or "\\" in folder_name:
+        if (
+                not folder_name
+                or folder_name in {".", ".."}
+                or "/" in folder_name
+                or "\\" in folder_name
+        ):
             return {"success": False, "message": "文件夹名称无效"}
         drive = self._cloud_drive
         provider_key = str(provider or "").strip().lower()

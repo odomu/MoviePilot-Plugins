@@ -3,13 +3,14 @@
 import hashlib
 import time
 from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
+from app.core.cache import TTLCache
 from app.log import logger
 
-from ..common import normalize_path, safe_int
+from ..common import create_directory_cache, normalize_path, safe_int
 from ...core import OwnerDelegator
 from ...core.cloud import CloudFile, DirectoryListing, DirectoryLookup
 from ...core.transfer import HttpFileDownloadService
@@ -51,6 +52,14 @@ def cloud_files(items: Iterable[Any]) -> list[CloudFile]:
 @dataclass(frozen=True)
 class P115DirectoryReader:
     manager: Any
+    _directory_cache: TTLCache = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "_directory_cache",
+            create_directory_cache("115", self.manager),
+        )
 
     def resolve_directory(self, path: str, create: bool = False) -> DirectoryLookup:
         if create:
@@ -66,18 +75,37 @@ class P115DirectoryReader:
         )
 
     def list_directory(self, directory_id: str) -> DirectoryListing:
+        directory_id = str(directory_id or "0")
+        cached = self._directory_cache.get(directory_id)
+        if cached is not None:
+            return cached
         checked, files = self.manager.list_files_by_cid_checked(directory_id)
-        return DirectoryListing(bool(checked), tuple(cloud_files(files)))
+        listing = DirectoryListing(bool(checked), tuple(cloud_files(files)))
+        if listing.checked:
+            self._directory_cache.set(directory_id, listing)
+        return listing
 
     def list_directories(self, path: str) -> list[Dict[str, str]]:
+        lookup = self.resolve_directory(path)
+        if not lookup.checked or lookup.directory_id is None:
+            raise RuntimeError(f"无法读取115目录：{path}")
+        listing = self.list_directory(lookup.directory_id)
+        if not listing.checked:
+            raise RuntimeError(f"列出115目录失败：{path}")
+        base = PurePosixPath(normalize_path(path))
         return [
             {
-                "id": str(item.get("cid") or ""),
-                "name": str(item.get("name") or ""),
-                "path": str(item.get("path") or ""),
+                "id": item.id,
+                "name": item.name,
+                "path": str(base / item.name),
             }
-            for item in self.manager.list_directories(path)
+            for item in listing.files
+            if item.is_directory
         ]
+
+    def refresh_directories(self) -> None:
+        self._directory_cache.clear()
+        self.manager.clear_path_cache()
 
 
 @dataclass(frozen=True)

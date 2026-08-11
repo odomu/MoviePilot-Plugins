@@ -51,9 +51,6 @@ class AliPanFileService(CloudDriveFileServiceBase):
             "alipan", self.client, "root"
         )
 
-    def _invalidate_directory_cache(self) -> None:
-        self._directory_cache.clear()
-
     def _remember(self, item: dict) -> CloudFile | None:
         value = cloud_file(item)
         if value:

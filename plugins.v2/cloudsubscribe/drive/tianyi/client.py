@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import os
+import random
 import re
 import time
 import uuid
@@ -46,8 +47,14 @@ class TianyiClient:
             "tianyi", self.session_key or self.access_token, min_interval=0.5
         )
         self.session = requests.Session()
-        self.session.headers.update({"Referer": "https://cloud.189.cn/",
-                                     "User-Agent": "Mozilla/5.0"})
+        self.session.headers.update({
+            "Accept": "application/json;charset=UTF-8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": "https://cloud.189.cn/",
+            "Sign-Type": "1",
+            "User-Agent": "Mozilla/5.0",
+        })
         if cookie:
             self.session.headers["Cookie"] = cookie
 
@@ -130,6 +137,7 @@ class TianyiClient:
         if url.startswith(self.WEB_URL):
             self.ensure_session()
             params = dict(kwargs.pop("params", {}) or {})
+            params.setdefault("noCache", random.random())
             params.setdefault("sessionKey", self.session_key)
             kwargs["params"] = params
         return self._raw_request(method, url, **kwargs)
@@ -154,12 +162,19 @@ class TianyiClient:
             match = re.search(pattern, html)
             if not match:
                 raise TianyiApiError(f"天翼扫码登录页缺少 {name}")
-            return match.group(1)
+            value = match.group(1).strip()
+            if not value.isascii() or "\r" in value or "\n" in value:
+                raise TianyiApiError(f"天翼扫码登录页的 {name} 参数无效")
+            return value
 
         return {
-            "lt": extract(r'lt\s*=\s*["\'](.+?)["\']', "lt"),
-            "param_id": extract(r'paramId\s*=\s*["\'](.+?)["\']', "paramId"),
-            "req_id": extract(r'reqId\s*=\s*["\'](.+?)["\']', "reqId"),
+            "lt": extract(r'\blt\s*=\s*["\']([^"\']+)["\']', "lt"),
+            "param_id": extract(
+                r'\bparamId\s*=\s*["\']([^"\']+)["\']', "paramId"
+            ),
+            "req_id": extract(
+                r'\breqId\s*=\s*["\']([^"\']+)["\']', "reqId"
+            ),
         }
 
     def create_qrcode_login(self, client_type: str = "") -> dict:
@@ -223,6 +238,10 @@ class TianyiClient:
         }
         if not all(qr_data.values()):
             raise ValueError("缺少天翼云盘扫码会话参数")
+        for name in ("req_id", "lt"):
+            value = qr_data[name]
+            if not value.isascii() or "\r" in value or "\n" in value:
+                raise ValueError(f"天翼云盘扫码会话参数 {name} 无效")
         now = time.localtime()
         milliseconds = int(time.time() * 1000) % 1000
         date = time.strftime("%Y-%m-%d%H:%M:%S", now) + f".{milliseconds:03d}"
@@ -232,6 +251,7 @@ class TianyiClient:
                 "Referer": self.AUTH_URL,
                 "Reqid": qr_data["req_id"],
                 "lt": qr_data["lt"],
+                "Accept": "application/json;charset=UTF-8",
             },
             data={
                 "appId": self.APP_ID,
@@ -242,17 +262,21 @@ class TianyiClient:
                 "encryuuid": qr_data["encryuuid"],
                 "date": date,
                 "timeStamp": int(time.time() * 1000),
+                "cb_SaveName": "0",
+                "isOauth2": "true",
+                "state": "",
             },
         )
         status = int(data.get("status") or 0)
-        if status == 0:
+        if status == -106:
             return {"status": "waiting", "message": "等待扫码"}
-        if status == 1:
+        if status == -11002:
             return {"status": "scanned", "message": "已扫码，请在手机上确认"}
-        if status == -1:
+        if status == -11001:
             return {"status": "expired", "message": "二维码已失效"}
-        if status != 2:
-            return {"status": "waiting", "message": "等待扫码"}
+        if status != 0:
+            message = str(data.get("msg") or data.get("message") or "").strip()
+            raise TianyiApiError(message or f"天翼扫码登录状态异常：{status}")
         redirect_url = str(data.get("redirectUrl") or "").strip()
         if not redirect_url:
             raise TianyiApiError("天翼扫码成功但未返回登录地址")

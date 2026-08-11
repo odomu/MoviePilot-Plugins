@@ -19,15 +19,24 @@
               hide-details
               @keyup.enter="loadDirectories(currentPath)"
           />
-          <v-btn
-              prepend-icon="mdi-folder-plus"
-              variant="tonal"
-              size="small"
-              class="mb-2"
-              :disabled="loading"
-              @click="createDirectory"
-          >新建文件夹
-          </v-btn>
+          <div class="directory-actions mb-2">
+            <v-btn
+                prepend-icon="mdi-folder-plus"
+                variant="tonal"
+                size="small"
+                :disabled="loading || createLoading"
+                @click="openCreateDirectoryDialog"
+            >新建文件夹
+            </v-btn>
+            <v-btn
+                prepend-icon="mdi-refresh"
+                variant="text"
+                size="small"
+                :disabled="loading || createLoading"
+                @click="refreshDirectories"
+            >刷新
+            </v-btn>
+          </div>
           <v-list class="directory-list border rounded">
             <v-list-item
                 v-if="currentPath !== '/'"
@@ -96,6 +105,41 @@
       </v-card-actions>
     </v-card>
   </v-dialog>
+
+  <v-dialog v-model="createDirectoryVisible" max-width="420" persistent>
+    <v-card rounded="lg">
+      <v-card-title class="text-subtitle-1">新建文件夹</v-card-title>
+      <v-card-text>
+        <v-text-field
+            v-model="newDirectoryName"
+            label="文件夹名称"
+            placeholder="请输入文件夹名称"
+            variant="outlined"
+            density="compact"
+            autofocus
+            :disabled="createLoading"
+            :error-messages="createDirectoryError"
+            @keyup.enter="createDirectory"
+        />
+      </v-card-text>
+      <v-card-actions class="px-4 pb-3">
+        <v-spacer/>
+        <v-btn
+            variant="text"
+            :disabled="createLoading"
+            @click="closeCreateDirectoryDialog"
+        >取消
+        </v-btn>
+        <v-btn
+            color="primary"
+            :loading="createLoading"
+            :disabled="!newDirectoryName.trim()"
+            @click="createDirectory"
+        >创建
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 </template>
 
 <script setup>
@@ -114,6 +158,10 @@ const directories = ref([]);
 const loading = ref(false);
 const errorMessage = ref("");
 const lastRequestedPath = ref("");
+const createDirectoryVisible = ref(false);
+const newDirectoryName = ref("");
+const createDirectoryError = ref("");
+const createLoading = ref(false);
 
 const visible = computed({
   get: () => props.modelValue,
@@ -131,18 +179,19 @@ function unwrap(raw) {
   return raw || {};
 }
 
-async function loadDirectories(path) {
+async function loadDirectories(path, force = false) {
   if (loading.value) return;
+  const normalized = String(path || "/").trim() || "/";
+  if (!force && lastRequestedPath.value === normalized) return;
   loading.value = true;
   errorMessage.value = "";
   try {
-    const normalized = String(path || "/").trim() || "/";
-    if (lastRequestedPath.value === normalized) return;
     lastRequestedPath.value = normalized;
     const query = new URLSearchParams({
       path: normalized,
       provider: props.provider || "",
     });
+    if (force) query.set("refresh", "true");
     const response = unwrap(
         await props.api.get(
             `plugin/${props.pluginId}/cloud/directories?${query}`,
@@ -169,30 +218,49 @@ async function loadDirectories(path) {
   }
 }
 
+function refreshDirectories() {
+  loadDirectories(currentPath.value, true);
+}
+
+function openCreateDirectoryDialog() {
+  newDirectoryName.value = "";
+  createDirectoryError.value = "";
+  createDirectoryVisible.value = true;
+}
+
+function closeCreateDirectoryDialog() {
+  if (createLoading.value) return;
+  createDirectoryVisible.value = false;
+}
+
 async function createDirectory() {
-  const name = window.prompt("请输入文件夹名称", "");
-  if (name === null) return;
-  const folderName = name.trim();
+  if (createLoading.value) return;
+  const folderName = newDirectoryName.value.trim();
   if (!folderName) {
-    errorMessage.value = "文件夹名称不能为空";
+    createDirectoryError.value = "文件夹名称不能为空";
     return;
   }
-  loading.value = true;
-  errorMessage.value = "";
+  createLoading.value = true;
+  createDirectoryError.value = "";
+  const directoryPath = currentPath.value || "/";
   try {
     const response = unwrap(await props.api.post(
         `plugin/${props.pluginId}/cloud/directories/create`,
-        {path: currentPath.value || "/", name: folderName, provider: props.provider || ""},
+        {
+          path: directoryPath,
+          name: folderName,
+          provider: props.provider || "",
+        },
     ));
     if (response.success === false)
       throw new Error(response.message || "创建文件夹失败");
-    loading.value = false;
-    await loadDirectories(
-        response.data?.path || `${currentPath.value.replace(/\/$/, "")}/${folderName}`,
-    );
+    createDirectoryVisible.value = false;
+    newDirectoryName.value = "";
+    await loadDirectories(directoryPath, true);
   } catch (error) {
-    errorMessage.value = error.message || String(error);
-    loading.value = false;
+    createDirectoryError.value = error.message || String(error);
+  } finally {
+    createLoading.value = false;
   }
 }
 
@@ -209,6 +277,10 @@ watch(
         // 清掉上次请求标记，避免 loadDirectories 将首次加载误判为重复请求。
         lastRequestedPath.value = "";
         loadDirectories(currentPath.value);
+      } else {
+        createDirectoryVisible.value = false;
+        newDirectoryName.value = "";
+        createDirectoryError.value = "";
       }
     },
     {immediate: true},
@@ -228,6 +300,11 @@ watch(
 .directory-list {
   height: min(390px, calc(72vh - 168px));
   overflow-y: auto;
+}
+
+.directory-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .directory-loading {

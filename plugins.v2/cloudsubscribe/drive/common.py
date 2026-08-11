@@ -303,6 +303,16 @@ class CloudDriveFileServiceBase:
     def _invalidate_path_cache(self) -> None:
         self._get_directory_path_cache().clear()
 
+    def _invalidate_directory_cache(self) -> None:
+        cache = getattr(self, "_directory_cache", None)
+        if cache is not None:
+            cache.clear()
+
+    def refresh_directories(self) -> None:
+        """清空目录相关短缓存，使目录选择器重新读取网盘。"""
+        self._invalidate_directory_cache()
+        self._invalidate_path_cache()
+
     def _list(self, directory_id: str) -> list[CloudFile]:
         raise NotImplementedError
 
