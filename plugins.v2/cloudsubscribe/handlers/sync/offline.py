@@ -361,7 +361,6 @@ class OfflineTaskService(OwnerDelegator):
             pending_snapshot = copy.deepcopy(pending)
         completed = 0
         failed = 0
-        finalized_details: List[Dict[str, Any]] = []
         subscription_batches: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         media_context_cache: Dict[
             Tuple[Any, ...], Tuple[Any, Dict[str, Any]]
@@ -465,8 +464,6 @@ class OfflineTaskService(OwnerDelegator):
                 return result
 
             upgrade_delete_batch: Dict[str, Dict[str, Any]] = {}
-            finalized_success_keys: Set[str] = set()
-
             def finish_finalized_item(
                     item: Dict[str, Any],
                     pending_key: str,
@@ -491,9 +488,11 @@ class OfflineTaskService(OwnerDelegator):
                     finish_subscription=media is None,
                     subscribe_cache=subscribe_cache,
                 )
+                # 单项后处理完成后立即提交历史终态并将通知入队，不能等本轮
+                # pending 扫描结束，否则中途停止会丢失已完成项的通知。
+                self._mark_offline_history_status(pending_key, "成功")
                 if detail:
-                    finalized_details.append(detail)
-                finalized_success_keys.add(pending_key)
+                    self._send_finalized_batch([detail])
                 logger.debug(
                     f"文件后处理完成"
                     f"{'并生成 STRM' if strm_path else ''}："
@@ -712,7 +711,9 @@ class OfflineTaskService(OwnerDelegator):
                         continue
                     pending.pop(pending_key, None)
                     if finalized:
-                        finalized_details.extend(finalized)
+                        # Magnet 一个离线任务可能匹配多个真实文件；该任务的
+                        # 历史已在 _finalize_magnet_package 中持久化，立即入队。
+                        self._send_finalized_batch(finalized)
                         completed += len(finalized)
                     else:
                         failed += 1
@@ -992,11 +993,6 @@ class OfflineTaskService(OwnerDelegator):
                         "已保留后处理任务等待重试"
                     )
 
-            if finalized_success_keys:
-                self._mark_offline_history_status_batch(
-                    finalized_success_keys, "成功"
-                )
-
             for batch in metadata_batches.values():
                 self._scrape_metadata_batch(
                     batch["items"], batch["mediainfo"], season=batch["season"]
@@ -1058,7 +1054,6 @@ class OfflineTaskService(OwnerDelegator):
             "failed": failed,
             "pending": pending_count,
         }
-        self._send_finalized_batch(finalized_details)
         self._notify_offline_pending_changed(result["pending"])
         return result
 

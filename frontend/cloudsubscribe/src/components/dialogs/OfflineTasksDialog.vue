@@ -241,13 +241,13 @@
 </template>
 
 <script setup>
-import {computed, onBeforeUnmount, ref, watch} from "vue";
+import {computed, onBeforeUnmount, onMounted, ref, watch} from "vue";
 
 const props = defineProps({
   modelValue: Boolean,
   api: {type: [Object, Function], required: true},
 });
-const emit = defineEmits(["update:modelValue", "updated"]);
+const emit = defineEmits(["update:modelValue"]);
 const pluginId = "CloudSubscribe";
 const tasks = ref([]);
 const quota = ref({});
@@ -264,6 +264,7 @@ const retrying = ref(false);
 const retryingKey = ref("");
 const batchDeleting = ref(false);
 let refreshTimer = null;
+let loadRequest = null;
 
 const updatedText = computed(() =>
     updatedAt.value
@@ -356,36 +357,44 @@ function progressValue(task) {
 }
 
 async function load(force = false) {
-  loading.value = true;
-  error.value = "";
-  try {
-    const response = unwrapResponse(
-        await props.api.get(`plugin/${pluginId}/offline?refresh=${force}`),
-    );
-    if (response.success === false) {
-      throw new Error(response.message || "加载失败");
+  if (loadRequest) return loadRequest;
+  stopAutoRefresh();
+  loadRequest = (async () => {
+    loading.value = true;
+    error.value = "";
+    try {
+      const response = unwrapResponse(
+          force
+              ? await props.api.post(`plugin/${pluginId}/offline/refresh`)
+              : await props.api.get(`plugin/${pluginId}/offline`),
+      );
+      if (response.success === false) {
+        throw new Error(response.message || "加载失败");
+      }
+      const snapshot = response.data?.data || response.data || response;
+      tasks.value = Array.isArray(snapshot)
+          ? snapshot
+          : Array.isArray(snapshot?.tasks)
+              ? snapshot.tasks
+              : [];
+      updatedAt.value = Number(snapshot?.updated_at || 0);
+      quota.value = snapshot?.quota && typeof snapshot.quota === "object" ? snapshot.quota : {};
+      providerName.value = String(snapshot?.provider_name || "网盘");
+      const availableKeys = new Set(
+          tasks.value.map(taskSelectionKey).filter(Boolean),
+      );
+      selectedKeys.value = selectedKeys.value.filter((key) =>
+          availableKeys.has(key),
+      );
+    } catch (loadError) {
+      error.value = loadError.message || "加载失败";
+    } finally {
+      loading.value = false;
+      loadRequest = null;
+      scheduleAutoRefresh();
     }
-    const snapshot = response.data?.data || response.data || response;
-    tasks.value = Array.isArray(snapshot)
-        ? snapshot
-        : Array.isArray(snapshot?.tasks)
-            ? snapshot.tasks
-            : [];
-    updatedAt.value = Number(snapshot?.updated_at || 0);
-    quota.value = snapshot?.quota && typeof snapshot.quota === "object" ? snapshot.quota : {};
-    providerName.value = String(snapshot?.provider_name || "网盘");
-    const availableKeys = new Set(
-        tasks.value.map(taskSelectionKey).filter(Boolean),
-    );
-    selectedKeys.value = selectedKeys.value.filter((key) =>
-        availableKeys.has(key),
-    );
-    emit("updated");
-  } catch (loadError) {
-    error.value = loadError.message || "加载失败";
-  } finally {
-    loading.value = false;
-  }
+  })();
+  return loadRequest;
 }
 
 async function refreshAll() {
@@ -393,17 +402,34 @@ async function refreshAll() {
   await load(true);
 }
 
-function startAutoRefresh() {
-  if (refreshTimer !== null) return;
-  refreshTimer = window.setInterval(() => {
-    if (props.modelValue && !loading.value) load(false);
-  }, 30000);
+function hasPendingTasks() {
+  return tasks.value.some(
+      (task) => task?.finalize_pending || (!task?.completed && !task?.failed),
+  );
+}
+
+function scheduleAutoRefresh() {
+  stopAutoRefresh();
+  if (!props.modelValue || document.visibilityState === "hidden") return;
+  const delay = hasPendingTasks() ? 30000 : 120000;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = null;
+    void load(false);
+  }, delay);
 }
 
 function stopAutoRefresh() {
   if (refreshTimer === null) return;
-  window.clearInterval(refreshTimer);
+  window.clearTimeout(refreshTimer);
   refreshTimer = null;
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    stopAutoRefresh();
+  } else if (props.modelValue) {
+    void load(false);
+  }
 }
 
 async function retryTasks(pendingKeys) {
@@ -506,7 +532,6 @@ watch(
     (value) => {
       if (value) {
         refreshAll();
-        startAutoRefresh();
       } else {
         stopAutoRefresh();
       }
@@ -514,7 +539,11 @@ watch(
     {immediate: true},
 );
 
-onBeforeUnmount(stopAutoRefresh);
+onMounted(() => document.addEventListener("visibilitychange", handleVisibilityChange));
+onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  stopAutoRefresh();
+});
 </script>
 
 <style scoped>

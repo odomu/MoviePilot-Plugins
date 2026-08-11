@@ -4,7 +4,7 @@ import copy
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, Type
 
 import pytz
@@ -12,7 +12,9 @@ from app.core.config import settings
 from app.log import logger
 
 from .. import OwnerDelegator
-from ...search.hdhive import HDHiveWebError
+from ...search.dian115 import Dian115Error
+from ...search.hdhive import HDHiveOpenAPIError, HDHiveWebError
+from ...search.juying import JuyingError
 
 
 @dataclass(frozen=True)
@@ -23,7 +25,10 @@ class CheckinProvider:
     name: str
     client_getter: str
     credential_attrs: Tuple[str, ...]
-    error_type: Type[Exception]
+    error_types: Tuple[Type[Exception], ...]
+    modes: Tuple[str, ...]
+    risky_modes: Tuple[str, ...] = ()
+    risk_warning: str = ""
 
     @property
     def history_key(self) -> str:
@@ -39,7 +44,31 @@ class CheckinService(OwnerDelegator):
             name="HDHive",
             client_getter="get_hdhive_web_client",
             credential_attrs=("_hdhive_username", "_hdhive_password"),
-            error_type=HDHiveWebError,
+            error_types=(HDHiveWebError, HDHiveOpenAPIError),
+            modes=("normal", "gambler"),
+            risky_modes=("gambler",),
+            risk_warning="奖励会乘以 -1～3 的随机倍数，最多扣除 3 积分",
+        ),
+        "dian115": CheckinProvider(
+            key="dian115",
+            name="Dian115",
+            client_getter="get_dian115_client",
+            credential_attrs=("_dian115_email", "_dian115_password"),
+            error_types=(Dian115Error,),
+            modes=("normal", "lucky"),
+            risky_modes=("lucky",),
+            risk_warning=(
+                "运气签到有 21% 概率扣除 1 倍普通签到积分，"
+                "同时可能获得 3～10 倍奖励"
+            ),
+        ),
+        "juying": CheckinProvider(
+            key="juying",
+            name="聚影",
+            client_getter="get_juying_client",
+            credential_attrs=("_juying_username", "_juying_password"),
+            error_types=(JuyingError,),
+            modes=("normal",),
         ),
     }
     _HISTORY_LIMIT = 60
@@ -69,6 +98,63 @@ class CheckinService(OwnerDelegator):
     def _resolve_provider(cls, provider: str) -> Optional[CheckinProvider]:
         return cls._PROVIDERS.get(str(provider or "").strip().lower())
 
+    def _checkin_credentials_ready(self, provider: CheckinProvider) -> bool:
+        if (
+                provider.key == "hdhive"
+                and str(getattr(self, "_hdhive_query_mode", "web")) == "api"
+        ):
+            client = getattr(self, "_hdhive_client", None)
+            return bool(client and client.is_ready)
+        return all(
+            bool(getattr(self, attr, None))
+            for attr in provider.credential_attrs
+        )
+
+    def _checkin_configuration_message(self, provider: CheckinProvider) -> str:
+        if (
+                provider.key == "hdhive"
+                and str(getattr(self, "_hdhive_query_mode", "web")) == "api"
+        ):
+            return "请先配置并保存 HDHive OpenAPI 应用 Secret 和用户授权"
+        return f"请先配置并保存 {provider.name} 账号和密码"
+
+    def _get_checkin_client(self, provider: CheckinProvider) -> Any:
+        if (
+                provider.key == "hdhive"
+                and str(getattr(self, "_hdhive_query_mode", "web")) == "api"
+        ):
+            client = getattr(self, "_hdhive_client", None)
+            if not client or not client.is_ready:
+                raise HDHiveOpenAPIError(
+                    "OPENAPI_USER_REQUIRED",
+                    "HDHive OpenAPI 应用配置或用户授权不完整",
+                )
+            return client
+        client_getter = getattr(self._search_handler, provider.client_getter)
+        return client_getter()
+
+    def _refresh_checkin_account(
+            self,
+            provider: CheckinProvider,
+            record: Dict[str, Any],
+    ) -> None:
+        from ..api.account import clear_account_cache
+        from ..api.page import clear_ui_options_cache
+
+        account_key = f"search:{provider.key}"
+        try:
+            updated = self.update_search_account_points(
+                provider.key,
+                record.get("points_after"),
+                record.get("signin_days"),
+            )
+            if not updated:
+                clear_account_cache(account_key)
+                self._account_info(account_key, refresh=True)
+            clear_ui_options_cache()
+        except Exception as error:
+            logger.debug(f"刷新 {provider.name} 搜索账户积分失败：{error}")
+
     def get_checkin_provider_specs(self) -> list[Dict[str, Any]]:
         """向配置校验与调度注册暴露稳定、无客户端对象的提供方信息。"""
         return [
@@ -76,6 +162,8 @@ class CheckinService(OwnerDelegator):
                 "key": item.key,
                 "name": item.name,
                 "credential_attrs": item.credential_attrs,
+                "modes": item.modes,
+                "risky_modes": item.risky_modes,
             }
             for item in self._PROVIDERS.values()
         ]
@@ -129,6 +217,10 @@ class CheckinService(OwnerDelegator):
                 "id", "provider", "provider_name", "executed_at", "trigger",
                 "mode", "success", "status", "points_change",
                 "points_before", "points_after", "signin_days",
+                "signin_points", "message",
+                "lottery_target_count", "lottery_executed",
+                "lottery_cost_points", "lottery_award_points",
+                "lottery_vip_days",
             )
         }
 
@@ -173,6 +265,180 @@ class CheckinService(OwnerDelegator):
             "data": {"channels": channels, "total": total},
         }
 
+    @staticmethod
+    def _record_date_key(record: Dict[str, Any]) -> str:
+        value = str(record.get("executed_at") or "").strip()
+        if not value:
+            return ""
+        try:
+            executed_at = datetime.fromisoformat(value)
+            timezone = pytz.timezone(settings.TZ)
+            if executed_at.tzinfo is None:
+                executed_at = timezone.localize(executed_at)
+            return executed_at.astimezone(timezone).strftime("%Y-%m-%d")
+        except ValueError:
+            return value[:10]
+
+    @staticmethod
+    def _number(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _overview_status(
+            self,
+            record: Optional[Dict[str, Any]],
+            *,
+            enabled: bool,
+            configured: bool,
+            retry_pending: bool,
+    ) -> Dict[str, str]:
+        if not enabled:
+            return {"key": "disabled", "label": "未启用", "tone": "disabled"}
+        if not configured:
+            return {"key": "unconfigured", "label": "未配置", "tone": "warning"}
+        if not record:
+            return {"key": "pending", "label": "待签到", "tone": "pending"}
+        if record.get("success"):
+            already = any(
+                "已签到" in str(record.get(key) or "")
+                for key in ("status", "message")
+            )
+            return {
+                "key": "already" if already else "success",
+                "label": "已签到" if already else "签到成功",
+                "tone": "success",
+            }
+        if retry_pending and self._checkin_auto_retry:
+            return {"key": "retry", "label": "等待重试", "tone": "warning"}
+        return {"key": "failed", "label": "签到失败", "tone": "error"}
+
+    def get_checkin_overview(self, days: int = 7) -> Dict[str, Any]:
+        """聚合多渠道签到状态，供平台仪表盘一次读取。"""
+        normalized_days = max(3, min(int(days or 7), 14))
+        snapshot = self._get_data_store().load_checkin_snapshot()
+        histories = snapshot.get("histories") or {}
+        schedule = snapshot.get("schedule") or {}
+        now = self._now()
+        date_keys = [
+            (now - timedelta(days=index)).strftime("%Y-%m-%d")
+            for index in range(normalized_days)
+        ]
+        today = date_keys[0]
+        retry_providers = {
+            str(value or "").strip().lower()
+            for value in (schedule.get("pending_providers") or [])
+            if str(value or "").strip()
+        }
+        channels = []
+        today_points = 0
+        lottery_net_points = 0
+        lottery_executed = 0
+
+        for provider in self._PROVIDERS.values():
+            records = [
+                copy.deepcopy(item)
+                for item in (histories.get(provider.key) or [])
+                if isinstance(item, dict)
+            ]
+            records_by_date = {}
+            for record in records:
+                date_key = self._record_date_key(record)
+                if date_key:
+                    records_by_date[date_key] = record
+                if date_key == today:
+                    today_points += self._number(record.get("points_change"))
+                    lottery_executed += self._number(
+                        record.get("lottery_executed")
+                    )
+                    lottery_net_points += (
+                            self._number(record.get("lottery_award_points"))
+                            - self._number(record.get("lottery_cost_points"))
+                    )
+
+            enabled = bool(getattr(
+                self, f"_{provider.key}_checkin_enabled", False
+            ))
+            configured = self._checkin_credentials_ready(provider)
+            today_record = records_by_date.get(today)
+            status = self._overview_status(
+                today_record,
+                enabled=enabled,
+                configured=configured,
+                retry_pending=provider.key in retry_providers,
+            )
+            timeline = []
+            for date_key in date_keys:
+                record = records_by_date.get(date_key)
+                day_status = self._overview_status(
+                    record,
+                    enabled=enabled if record is None else True,
+                    configured=configured if record is None else True,
+                    retry_pending=(
+                            date_key == today
+                            and provider.key in retry_providers
+                    ),
+                )
+                timeline.append({
+                    "date": date_key,
+                    "status": day_status["key"],
+                    "label": day_status["label"],
+                    "success": bool(record and record.get("success")),
+                })
+            latest = self._public_record(records[-1]) if records else None
+            channels.append({
+                "provider": provider.key,
+                "provider_name": provider.name,
+                "enabled": enabled,
+                "configured": configured,
+                "mode": str(getattr(
+                    self, f"_{provider.key}_checkin_mode", "normal"
+                ) or "normal"),
+                "status": status,
+                "today": self._public_record(today_record)
+                if today_record else None,
+                "latest": latest,
+                "timeline": timeline,
+                "total": len(records),
+            })
+
+        ready_channels = [
+            item for item in channels
+            if item["enabled"] and item["configured"]
+        ]
+        return {
+            "generated_at": now.isoformat(timespec="seconds"),
+            "running": self._run_lock.locked(),
+            "days": date_keys,
+            "summary": {
+                "enabled": sum(item["enabled"] for item in channels),
+                "ready": len(ready_channels),
+                "today_success": sum(
+                    item["status"]["key"] in {"success", "already"}
+                    for item in ready_channels
+                ),
+                "today_failed": sum(
+                    item["status"]["key"] in {"failed", "retry"}
+                    for item in ready_channels
+                ),
+                "today_pending": sum(
+                    item["status"]["key"] == "pending"
+                    for item in ready_channels
+                ),
+                "today_points": today_points,
+                "lottery_executed": lottery_executed,
+                "lottery_net_points": lottery_net_points,
+            },
+            "schedule": {
+                "cron": str(self._checkin_cron or ""),
+                "auto_retry": bool(self._checkin_auto_retry),
+                "retry_count": self._configured_retry_count(),
+                "state": copy.deepcopy(schedule),
+            },
+            "channels": channels,
+        }
+
     def _notify_checkin(
             self,
             provider: CheckinProvider,
@@ -181,20 +447,27 @@ class CheckinService(OwnerDelegator):
         if not self._notify:
             return
         delta = record.get("points_change")
-        delta_text = (
-            f"{int(delta):+d}"
-            if isinstance(delta, (int, float)) else "未知"
-        )
+        delta_text = self._signed_points(delta)
         balance = record.get("points_after")
-        mode = "赌狗签到" if record.get("mode") == "gambler" else "普通签到"
-        text = (
-            f"模式：{mode}\n"
-            f"结果：{record.get('status') or '未知'}\n"
-            f"积分变化：{delta_text}\n"
-            f"当前积分：{balance if balance is not None else '未知'}\n"
-            f"累计签到：{record.get('signin_days') or 0} 天\n"
-            f"消息：{record.get('message') or '-'}"
-        )
+        signin_days = record.get("signin_days")
+        mode = {
+            "gambler": "赌狗签到",
+            "lucky": "运气签到",
+        }.get(record.get("mode"), "普通签到")
+        lines = [
+            f"模式：{mode}",
+            f"状态：{record.get('status') or '未知'}",
+            f"积分：{delta_text}，余额 {balance if balance is not None else '未知'}",
+            f"累计：{signin_days if signin_days is not None else '未知'} 天",
+        ]
+        if record.get("lottery_target_count"):
+            lines.append(
+                f"转盘：{record.get('lottery_executed') or 0}/"
+                f"{record.get('lottery_target_count')} 次，净积分 "
+                f"{self._signed_points((record.get('lottery_award_points') or 0) - (record.get('lottery_cost_points') or 0))}"
+            )
+        if not record.get("success") and record.get("message"):
+            lines.append(f"原因：{record.get('message')}")
         self.post_message(
             mtype=self._notification_type,
             title=(
@@ -202,8 +475,16 @@ class CheckinService(OwnerDelegator):
                 if record.get("success")
                 else f"【网盘订阅助手】{provider.name} 签到失败"
             ),
-            text=text,
+            text="\n".join(lines),
         )
+
+    @staticmethod
+    def _signed_points(value: Any) -> str:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return "未知"
+        return f"{normalized:+d}"
 
     def _build_record(
             self,
@@ -214,6 +495,8 @@ class CheckinService(OwnerDelegator):
             error: Optional[Exception] = None,
     ) -> Dict[str, Any]:
         data = result or {}
+        lottery = data.get("lottery") if isinstance(data, dict) else None
+        lottery = lottery if isinstance(lottery, dict) else {}
         success = bool(data.get("success")) if result is not None else False
         default_message = "" if result is not None else str(error or "签到失败")
         return {
@@ -232,9 +515,18 @@ class CheckinService(OwnerDelegator):
             "points_before": data.get("points_before"),
             "points_after": data.get("points_after"),
             "signin_days": data.get("signin_days"),
+            "signin_points": data.get("signin_points"),
+            "lottery_target_count": lottery.get("target_count"),
+            "lottery_executed": lottery.get(
+                "used_after", lottery.get("executed")
+            ),
+            "lottery_cost_points": lottery.get("cost_points"),
+            "lottery_award_points": lottery.get("award_points"),
+            "lottery_vip_days": lottery.get("vip_days"),
             "http_status": int(
                 data.get("status_code")
                 or getattr(error, "status_code", 0)
+                or getattr(error, "status", 0)
                 or 0
             ),
             "error_code": str(
@@ -245,36 +537,181 @@ class CheckinService(OwnerDelegator):
             "captcha_verified": bool(data.get("captcha_verified")),
         }
 
-    def run_checkin(
-            self,
-            provider: str,
-            trigger: str = "manual",
-            mode: str = "",
+    def _run_dian115_actions(
+            self, client: Any, mode: str
     ) -> Dict[str, Any]:
-        """执行一次提供方签到；同一插件实例不允许签到并发。"""
+        """分别执行 Dian115 签到和转盘，再合并为单条业务结果。"""
+        before = client.get_account_info(allow_browser_login=False)
+        signin = client.signin(mode=mode)
+        lottery_count = (
+            getattr(self, "_dian115_lottery_count", 0)
+            if getattr(self, "_dian115_lottery_enabled", False)
+            else 0
+        )
+        lottery = (
+            client.run_lottery(lottery_count)
+            if lottery_count else {
+                "success": True,
+                "target_count": 0,
+                "executed": 0,
+                "cost_points": 0,
+                "award_points": 0,
+                "vip_days": 0,
+            }
+        )
+        try:
+            after = client.get_account_info(allow_browser_login=False)
+        except Dian115Error:
+            after = dict(before)
+            fallback_balance = (
+                lottery.get("new_balance")
+                if lottery.get("new_balance") is not None
+                else signin.get("new_balance")
+            )
+            if fallback_balance is not None:
+                after["points"] = fallback_balance
+        points_before = int(before.get("points") or 0)
+        points_after = int(after.get("points") or 0)
+        signin_points = signin.get("award_points")
+        if signin_points is None:
+            signin_points = (
+                    points_after - points_before
+                    - int(lottery.get("points_change") or 0)
+            )
+        signin_label = (
+            "今日已签到"
+            if signin.get("already_checked_in")
+            else f"签到 {self._signed_points(signin_points)}"
+        )
+        parts = [signin_label]
+        if lottery_count:
+            parts.append(
+                f"转盘 {lottery.get('used_after') or 0}/"
+                f"{lottery.get('target_count') or lottery_count}"
+            )
+        if not lottery.get("success"):
+            parts.append(
+                f"转盘未完成：{lottery.get('message') or '接口返回失败'}"
+            )
+        success = bool(signin.get("success") and lottery.get("success"))
+        return {
+            "success": success,
+            "status": (
+                "今日已签到" if signin.get("already_checked_in") and not lottery_count
+                else "签到完成" if success else "签到未完成"
+            ),
+            "message": "；".join(parts),
+            "mode": mode,
+            "signin_points": signin_points,
+            "points_change": points_after - points_before,
+            "points_before": points_before,
+            "points_after": points_after,
+            "signin_days": int(
+                after.get("consecutive_signin")
+                or signin.get("signin_days")
+                or 0
+            ),
+            "status_code": int(
+                lottery.get("status_code") or signin.get("status_code") or 0
+            ),
+            "error_code": str(
+                lottery.get("error_code") or signin.get("error_code") or ""
+            ),
+            "lottery": lottery,
+        }
+
+    def _execute_provider_checkin(
+            self, adapter: CheckinProvider, client: Any, mode: str
+    ) -> Dict[str, Any]:
+        if adapter.key == "dian115":
+            return self._run_dian115_actions(client, mode)
+        if adapter.key == "hdhive":
+            return client.checkin(is_gambler=mode == "gambler")
+        return client.checkin()
+
+    def _prepare_checkin(
+            self, provider: str, mode: str
+    ) -> Tuple[
+        Optional[CheckinProvider], str, Optional[Dict[str, Any]]
+    ]:
         adapter = self._resolve_provider(provider)
         if adapter is None:
-            return {"success": False, "message": "不支持的签到提供方"}
+            return None, "", {
+                "success": False,
+                "message": "不支持的签到提供方",
+            }
         if not bool(getattr(self, f"_{adapter.key}_checkin_enabled", False)):
-            return {
+            return adapter, "", {
                 "success": False,
                 "message": f"{adapter.name} 每日签到未启用",
             }
-        if not all(getattr(self, name, None) for name in adapter.credential_attrs):
-            return {
+        if not self._checkin_credentials_ready(adapter):
+            return adapter, "", {
                 "success": False,
-                "message": f"请先配置并保存 {adapter.name} 账号和密码",
+                "message": self._checkin_configuration_message(adapter),
             }
         default_mode = getattr(
             self, f"_{adapter.key}_checkin_mode", "normal"
         )
         normalized_mode = str(mode or default_mode).strip().lower()
-        if normalized_mode not in {"normal", "gambler"}:
-            return {
+        if normalized_mode not in adapter.modes:
+            return adapter, normalized_mode, {
                 "success": False,
                 "message": f"{adapter.name} 签到模式无效",
             }
+        return adapter, normalized_mode, None
+
+    def start_manual_checkin(
+            self, provider: str, mode: str = ""
+    ) -> Dict[str, Any]:
+        """预占签到锁并后台执行，避免长耗时渠道阻塞 HTTP 请求。"""
+        adapter, normalized_mode, error = self._prepare_checkin(provider, mode)
+        if error:
+            return error
         if not self._run_lock.acquire(blocking=False):
+            return {
+                "success": False,
+                "message": f"{adapter.name} 签到正在执行，请稍后重试",
+            }
+        try:
+            threading.Thread(
+                target=self.run_checkin,
+                kwargs={
+                    "provider": adapter.key,
+                    "trigger": "manual",
+                    "mode": normalized_mode,
+                    "lock_acquired": True,
+                },
+                daemon=True,
+                name=f"cloudsubscribe-checkin-{adapter.key}",
+            ).start()
+        except Exception:
+            self._run_lock.release()
+            raise
+        return {
+            "success": True,
+            "message": f"{adapter.name} 签到任务已提交",
+            "data": {
+                "provider": adapter.key,
+                "mode": normalized_mode,
+                "running": True,
+            },
+        }
+
+    def run_checkin(
+            self,
+            provider: str,
+            trigger: str = "manual",
+            mode: str = "",
+            lock_acquired: bool = False,
+    ) -> Dict[str, Any]:
+        """执行一次提供方签到；同一插件实例不允许签到并发。"""
+        adapter, normalized_mode, error = self._prepare_checkin(provider, mode)
+        if error:
+            if lock_acquired:
+                self._run_lock.release()
+            return error
+        if not lock_acquired and not self._run_lock.acquire(blocking=False):
             return {
                 "success": False,
                 "message": f"{adapter.name} 签到正在执行，请稍后重试",
@@ -282,21 +719,24 @@ class CheckinService(OwnerDelegator):
 
         try:
             try:
-                client_getter = getattr(
-                    self._search_handler, adapter.client_getter
-                )
-                result = client_getter().checkin(
-                    is_gambler=normalized_mode == "gambler"
+                client = self._get_checkin_client(adapter)
+                result = self._execute_provider_checkin(
+                    adapter, client, normalized_mode
                 )
                 record = self._build_record(
                     adapter, trigger, normalized_mode, result=result
                 )
             except Exception as error:
-                if not isinstance(error, adapter.error_type):
-                    logger.exception(f"{adapter.name} 签到异常：{error}")
+                if not isinstance(error, adapter.error_types):
+                    logger.error(
+                        f"{adapter.name} 签到异常："
+                        f"{type(error).__name__}: {error}"
+                    )
                 record = self._build_record(
                     adapter, trigger, normalized_mode, error=error
                 )
+            if record["success"]:
+                self._refresh_checkin_account(adapter, record)
             self._save_history(adapter, record)
             self._notify_checkin(adapter, record)
             log_func = logger.info if record["success"] else logger.warning
@@ -318,6 +758,7 @@ class CheckinService(OwnerDelegator):
             provider: str = "",
             mode: str = "",
             confirm_gambler: bool = False,
+            confirm_risky: bool = False,
     ) -> Dict[str, Any]:
         """供智能体和远程命令复用的安全签到入口。"""
         provider_key = str(provider or "").strip().lower()
@@ -334,24 +775,35 @@ class CheckinService(OwnerDelegator):
             return {"success": False, "message": "没有已启用且配置完整的签到渠道"}
 
         requested_mode = str(mode or "").strip().lower()
-        if requested_mode and requested_mode not in {"normal", "gambler"}:
-            return {"success": False, "message": "签到模式仅支持 normal 或 gambler"}
+        if requested_mode and not all(
+                requested_mode in item.modes for item in providers
+        ):
+            supported = sorted({mode for item in providers for mode in item.modes})
+            return {
+                "success": False,
+                "message": f"所选渠道签到模式仅支持 {', '.join(supported)}",
+            }
         risky = [
-            item.name
+            item
             for item in providers
             if (
                        requested_mode
                        or str(getattr(self, f"_{item.key}_checkin_mode", "normal"))
-               ).lower() == "gambler"
+               ).lower() in item.risky_modes
         ]
-        if risky and not confirm_gambler:
+        if risky and not (confirm_risky or confirm_gambler):
             return {
                 "success": False,
                 "message": (
-                    f"{', '.join(risky)} 当前将执行赌狗签到，奖励会乘以 -1～3 的随机倍数，"
-                    "最多扣除 3 积分；请明确确认后重试"
+                        "；".join(
+                            f"{item.name}：{item.risk_warning}" for item in risky
+                        )
+                        + "；请明确确认后重试"
                 ),
-                "data": {"confirmation_required": True, "providers": risky},
+                "data": {
+                    "confirmation_required": True,
+                    "providers": [item.name for item in risky],
+                },
             }
 
         items = []
@@ -386,10 +838,7 @@ class CheckinService(OwnerDelegator):
             if bool(getattr(
                 self, f"_{provider.key}_checkin_enabled", False
             ))
-               and all(
-                getattr(self, name, None)
-                for name in provider.credential_attrs
-            )
+               and self._checkin_credentials_ready(provider)
         ]
 
     def _today_records(
@@ -430,12 +879,14 @@ class CheckinService(OwnerDelegator):
             today: str,
             providers: list[CheckinProvider],
     ) -> Dict[str, Any]:
+        provider_keys = sorted(provider.key for provider in providers)
         stored = self.get_data(self._SCHEDULE_STATE_KEY)
         if (
                 isinstance(stored, dict)
                 and stored.get("date") == today
                 and stored.get("full_completed") is True
                 and stored.get("retry_count") == self._configured_retry_count()
+                and stored.get("providers") == provider_keys
         ):
             return copy.deepcopy(stored)
 
@@ -456,6 +907,7 @@ class CheckinService(OwnerDelegator):
                     pending.append(provider.key)
         return {
             "date": today,
+            "providers": provider_keys,
             "full_completed": full_completed,
             "retry_count": retry_count,
             "pending_providers": pending,

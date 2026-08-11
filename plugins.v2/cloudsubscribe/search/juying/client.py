@@ -365,6 +365,73 @@ class JuyingClient:
             "created_at": str(user.get("date_joined") or ""),
         }
 
+    def get_checkin_stats(self) -> Dict[str, Any]:
+        """读取聚影当日签到状态与奖励。"""
+        payload = self.request_json("GET", "/api/app/checkin/stats/")
+        if payload.get("status") != "success":
+            raise JuyingError(
+                "聚影签到状态接口返回异常", "juying_schema_changed"
+            )
+        return payload
+
+    def checkin(self) -> Dict[str, Any]:
+        """通过聚影 WebAPI 完成每日签到。"""
+        before = self.get_account_info()
+        stats_before = self.get_checkin_stats()
+        already_checked_in = bool(stats_before.get("checked_today"))
+        payload: Dict[str, Any] = {}
+        stats_after = stats_before
+        if not already_checked_in:
+            try:
+                payload = self.request_json(
+                    "POST", "/api/app/checkin/do/"
+                )
+            except JuyingError:
+                stats_after = self.get_checkin_stats()
+                if not stats_after.get("checked_today"):
+                    raise
+            else:
+                stats_after = self.get_checkin_stats()
+        after = before if already_checked_in else self.get_account_info()
+        success = bool(
+            already_checked_in
+            or payload.get("status") == "success"
+            or stats_after.get("checked_today")
+        )
+        points_before = int(before.get("points") or 0)
+        points_after = int(after.get("points") or 0)
+        reward_points = stats_before.get("reward_points")
+        try:
+            reward_points = int(reward_points or 0)
+        except (TypeError, ValueError):
+            reward_points = points_after - points_before
+        status = (
+            "今日已签到"
+            if already_checked_in
+            else "签到成功" if success else "签到失败"
+        )
+        return {
+            "success": success,
+            "already_checked_in": already_checked_in,
+            "status": status,
+            "message": str(
+                payload.get("message")
+                or status
+            ),
+            "mode": "normal",
+            "signin_points": 0 if already_checked_in else reward_points,
+            "points_change": points_after - points_before,
+            "points_before": points_before,
+            "points_after": points_after,
+            "signin_days": int(
+                stats_after.get("my_total_days")
+                or after.get("checkin_days")
+                or 0
+            ),
+            "status_code": 200,
+            "error_code": "",
+        }
+
     def close(self) -> None:
         with self._lock:
             self._session.close()

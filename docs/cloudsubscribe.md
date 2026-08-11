@@ -71,9 +71,9 @@ Hash，校验失败不会提交离线任务。
 搜索源配置：
 
 - PanSou：配置服务地址，可选认证、频道、插件、关键词过滤、结果数、并发、刷新和超时。
-- HDHive：默认使用 WebAPI，可直接使用站点账号密码完成登录和授权；OpenAPI 功能不完整时无需选择。确需 OpenAPI 时填写 Client
-  ID、应用 Secret、Redirect URI，选择 Redirect 或 PostMessage 回调模式后发起 OAuth 授权，成功取得的 Access Token/Refresh
-  Token 会写回配置或指定挂载文件。
+- HDHive：WebAPI 使用站点账号密码；OpenAPI 填写 Client ID、应用 Secret、Redirect URI，并通过 OAuth 获取
+  `query unlock write` 权限。Access Token 过期后会使用 Refresh Token 自动刷新并写回插件配置，查询、解锁和签到均使用
+  OpenAPI。
 - Dian115：配置邮箱和密码；积分解锁默认关闭，开启后必须设置单次总预算和单订阅预算。
 - 聚影：配置网页登录账号和密码，可设置候选上限和访问间隔。
 - SeedHub、不太灵：无需账号，可限制候选数量。

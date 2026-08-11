@@ -1,9 +1,14 @@
 """运行状态、离线任务与历史操作 API。"""
 
+import asyncio
+import json
+import time
 from typing import Any, Dict, Optional
 
-from app.core.config import settings
+from app.core.config import global_vars, settings
 from app.log import logger
+from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from .page import clear_ui_options_cache
 from .. import CloudDriveCapability, OwnerDelegator
@@ -23,8 +28,49 @@ class RuntimeApi(OwnerDelegator):
     def api_vue_runtime_status(self) -> dict:
         return self.api_runtime_status(settings.API_TOKEN)
 
+    async def api_vue_runtime_stream(self, request: Request) -> StreamingResponse:
+        """以单条 SSE 连接推送运行态，合并高频进度变化。"""
+
+        async def event_generator():
+            last_revision = -1
+            last_heartbeat = time.monotonic()
+            yield "retry: 3000\n\n"
+            try:
+                while not global_vars.is_system_stopped:
+                    if await request.is_disconnected():
+                        break
+                    revision = self._runtime_revision_value()
+                    now = time.monotonic()
+                    if revision != last_revision:
+                        snapshot = self._runtime_snapshot()
+                        last_revision = int(snapshot.get("revision") or 0)
+                        payload = json.dumps(
+                            snapshot, ensure_ascii=False, separators=(",", ":")
+                        )
+                        yield f"data: {payload}\n\n"
+                        last_heartbeat = now
+                    elif now - last_heartbeat >= 15:
+                        yield ": keepalive\n\n"
+                        last_heartbeat = now
+                    await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                return
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     def api_vue_offline_tasks(self, refresh: bool = False) -> dict:
         return self.api_offline_tasks(settings.API_TOKEN, refresh)
+
+    def api_vue_refresh_offline_tasks(self) -> dict:
+        """显式刷新离线任务；周期读取保持只读缓存语义。"""
+        return self.api_offline_tasks(settings.API_TOKEN, refresh=True)
 
     def api_vue_delete_offline_task(self, payload: Dict[str, Any]) -> dict:
         return self.api_delete_offline_task(

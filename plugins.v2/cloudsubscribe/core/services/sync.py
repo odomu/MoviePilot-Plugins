@@ -725,6 +725,25 @@ class SyncExecutionService(OwnerDelegator):
                             self._sync_handler.append_history_records,
                             new_history_records,
                         )
+                    # 每个并行订阅组完成并持久化历史后立即入队，避免停止同步时
+                    # 只完成了前几个任务却因整批收尾未执行而漏发通知。
+                    completed_details = result.get("transfer_details") or []
+                    if completed_details:
+                        completed_count = sum(
+                            len(item.get("episodes") or [])
+                            if item.get("type") == "电视剧"
+                            else 1
+                            for item in completed_details
+                        )
+                        if self._notify:
+                            self._sync_handler.send_transfer_notification(
+                                completed_details, completed_count
+                            )
+                        if self._webhook_handler:
+                            self._webhook_handler.send_transfer_complete(
+                                transfer_details=completed_details,
+                                total_count=completed_count,
+                            )
                     transfer_details.extend(result["transfer_details"])
                     transferred_count += int(result["transferred"] or 0)
                     completed_subscribes += len(group)
@@ -856,29 +875,12 @@ class SyncExecutionService(OwnerDelegator):
                 ]
                 logger.debug(f"搜索性能汇总：{'；'.join(summary)}")
 
-        completed_count = sum(
-            len(item.get("episodes") or [])
-            if item.get("type") == "电视剧"
-            else 1
-            for item in transfer_details
-        )
-        if completed_count > 0 and self._webhook_handler:
-            self._webhook_handler.send_transfer_complete(
-                transfer_details=transfer_details,
-                total_count=completed_count,
+        if self._notify and transferred_count == 0:
+            self.post_message(
+                mtype=self._notification_type,
+                title="【网盘订阅助手】执行完成",
+                text="本次同步未发现需要转存的新资源。"
             )
-
-        if self._notify:
-            if completed_count > 0:
-                self._sync_handler.send_transfer_notification(
-                    transfer_details, completed_count
-                )
-            elif transferred_count == 0:
-                self.post_message(
-                    mtype=self._notification_type,
-                    title="【网盘订阅助手】执行完成",
-                    text="本次同步未发现需要转存的新资源。"
-                )
 
         return True
 

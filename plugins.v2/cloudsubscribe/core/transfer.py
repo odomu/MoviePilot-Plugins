@@ -431,13 +431,19 @@ class CrossTransferTaskManager:
 
     def __init__(self, provider_resolver: Callable[[str], CloudDriveProvider],
                  download_path: str = "", download_threads: int = 5,
-                 max_concurrent: int = 2):
+                 max_concurrent: int = 2,
+                 on_change: Optional[Callable[[], None]] = None):
         self._provider_resolver = provider_resolver
         self._download_path = str(download_path or "").strip()
         self._download_threads = max(1, min(int(download_threads or 5), 10))
         self._transfer_slots = Semaphore(max(1, min(int(max_concurrent or 2), 10)))
         self._tasks: dict[str, dict] = {}
         self._lock = Lock()
+        self._on_change = on_change
+
+    def _notify_change(self) -> None:
+        if self._on_change:
+            self._on_change()
 
     def _cache_root(self) -> Path:
         root = Path(self._download_path) if self._download_path else Path(tempfile.gettempdir())
@@ -650,6 +656,7 @@ class CrossTransferTaskManager:
             for stale_id in terminal[:-49]:
                 self._tasks.pop(stale_id, None)
             self._tasks[task["id"]] = task
+        self._notify_change()
         Thread(target=self._run, args=(task["id"], checksum), daemon=True).start()
         return self._public(task)
 
@@ -701,7 +708,8 @@ class CrossTransferTaskManager:
             task["status"], task["phase"] = "stopping", "stopping"
             task["message"] = "等待当前网络操作安全停止"
             task["stop_event"].set()
-            return True
+        self._notify_change()
+        return True
 
     def cancel_parent(self, parent_task_id: str) -> int:
         """取消属于同一订阅任务的全部跨盘子任务。"""
@@ -719,14 +727,20 @@ class CrossTransferTaskManager:
                     task["message"] = "等待当前网络操作安全停止"
                     task["stop_event"].set()
                     canceled += 1
+        if canceled:
+            self._notify_change()
         return canceled
 
     def _update(self, task_id: str, **values) -> None:
+        changed = False
         with self._lock:
             task = self._tasks.get(task_id)
-            if task:
+            if task and any(task.get(key) != value for key, value in values.items()):
                 task.update(values)
                 task["updated_at"] = time.time()
+                changed = True
+        if changed:
+            self._notify_change()
 
     @staticmethod
     def _public(task: dict) -> dict:

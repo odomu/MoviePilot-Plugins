@@ -3,8 +3,6 @@
 from .open import (
     HDHiveOpenAPIClient,
     HDHiveOpenAPIError,
-    HDHiveTokenStore,
-    HDHiveTokenStoreError,
 )
 from .web import (
     HDHIVE_DETAIL_RESOURCE_TYPES,
@@ -20,8 +18,6 @@ __all__ = [
     "HDHiveWebError",
     "HDHiveOpenAPIClient",
     "HDHiveOpenAPIError",
-    "HDHiveTokenStore",
-    "HDHiveTokenStoreError",
     "HDHIVE_DETAIL_RESOURCE_TYPES",
     "HDHIVE_RESOURCE_TYPES",
 ]

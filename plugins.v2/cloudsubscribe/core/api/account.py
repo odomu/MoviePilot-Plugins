@@ -1,6 +1,7 @@
 """网盘与搜索源账户、HDHive OAuth API。"""
 
 import asyncio
+import copy
 import inspect
 import secrets
 import time
@@ -22,7 +23,6 @@ _ACCOUNT_REFRESH_GUARD = create_platform_ttl_cache(
     "account:refresh_guard", maxsize=16, ttl=30
 )
 _ACCOUNT_INFO_LOCK = RLock()
-_ACCOUNT_INFO_DATA_KEY = "account_info_cache"
 _HDHIVE_OAUTH_PENDING = create_platform_ttl_cache(
     "hdhive:oauth_pending", maxsize=16, ttl=10 * 60
 )
@@ -148,6 +148,7 @@ class AccountApi(OwnerDelegator):
                 client = Dian115Client(
                     email=self._dian115_email,
                     password=self._dian115_password,
+                    base_url=self._dian115_base_url,
                     proxy=self._search_proxy,
                     request_interval=self._dian115_request_interval,
                     unlocks_per_minute=self._dian115_unlocks_per_minute,
@@ -227,7 +228,7 @@ class AccountApi(OwnerDelegator):
     def _account_info(
             self, account_key: str, refresh: bool = False
     ) -> Tuple[Dict[str, Any], bool]:
-        """读取单卡片信息，持久化快照并实施刷新冷却。"""
+        """读取单卡片信息，使用独立数据库快照并实施刷新冷却。"""
         normalized_key = str(account_key or "").strip().lower()
         if ":" not in normalized_key:
             raise ValueError("账户卡片标识无效")
@@ -236,10 +237,7 @@ class AccountApi(OwnerDelegator):
             raise ValueError("账户卡片标识无效")
 
         with _ACCOUNT_INFO_LOCK:
-            stored = self.get_data(_ACCOUNT_INFO_DATA_KEY) or {}
-            stored_account = (
-                stored.get(normalized_key) if isinstance(stored, dict) else None
-            )
+            stored_account = self._get_data_store().load_account(normalized_key)
             cached_account = (
                     _ACCOUNT_INFO_CACHE.get(normalized_key) or stored_account
             )
@@ -262,26 +260,69 @@ class AccountApi(OwnerDelegator):
         account["refreshed_at"] = int(time.time())
         with _ACCOUNT_INFO_LOCK:
             _ACCOUNT_INFO_CACHE.set(normalized_key, account)
-            stored = self.get_data(_ACCOUNT_INFO_DATA_KEY) or {}
-            stored = dict(stored) if isinstance(stored, dict) else {}
-            stored[normalized_key] = account
-            self.save_data(_ACCOUNT_INFO_DATA_KEY, stored)
+            self._get_data_store().save_account(normalized_key, account)
         return account, False
 
     def _cached_account_info(
             self, account_key: str, fallback: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """配置页只读取内存或持久化快照，不访问第三方接口。"""
+        """配置页只读取内存或独立数据库快照，不访问第三方接口。"""
         with _ACCOUNT_INFO_LOCK:
             cached = _ACCOUNT_INFO_CACHE.get(account_key)
             if cached:
                 return cached
-            stored = self.get_data(_ACCOUNT_INFO_DATA_KEY) or {}
-            account = stored.get(account_key) if isinstance(stored, dict) else None
+            account = self._get_data_store().load_account(account_key)
             if account:
                 _ACCOUNT_INFO_CACHE.set(account_key, account)
                 return account
             return fallback
+
+    def update_search_account_points(
+            self,
+            source: str,
+            points: Any,
+            signin_days: Any = None,
+    ) -> bool:
+        """用签到结果更新搜索渠道账户快照，避免重复请求第三方接口。"""
+        account_key = f"search:{str(source or '').strip().lower()}"
+        try:
+            normalized_points = max(0, int(points))
+        except (TypeError, ValueError):
+            return False
+        try:
+            normalized_days = (
+                max(0, int(signin_days))
+                if signin_days is not None else None
+            )
+        except (TypeError, ValueError):
+            normalized_days = None
+
+        with _ACCOUNT_INFO_LOCK:
+            account = (
+                    _ACCOUNT_INFO_CACHE.get(account_key)
+                    or self._get_data_store().load_account(account_key)
+            )
+            if not isinstance(account, dict) or not account.get("connected"):
+                return False
+            account = copy.deepcopy(account)
+            point_info = dict(account.get("points") or {})
+            point_info["available"] = normalized_points
+            account["points"] = point_info
+            if normalized_days is not None:
+                details = list(account.get("details") or [])
+                for item in details:
+                    if (
+                            isinstance(item, dict)
+                            and item.get("label") in {"累计签到", "连续签到"}
+                    ):
+                        item["value"] = f"{normalized_days} 天"
+                        break
+                account["details"] = details
+            account["refreshed_at"] = int(time.time())
+            _ACCOUNT_INFO_CACHE.set(account_key, account)
+            _ACCOUNT_REFRESH_GUARD.set(account_key, True)
+            self._get_data_store().save_account(account_key, account)
+        return True
 
     async def api_vue_refresh_account(self, request: Request) -> dict:
         """手动刷新单个账户信息卡片，不联动其他卡片或 Tab。"""
@@ -319,12 +360,16 @@ class AccountApi(OwnerDelegator):
         redirect_uri = str(payload.get("redirect_uri") or "").strip()
         response_mode = str(payload.get("response_mode") or "redirect").strip().lower()
         requested_scopes = [
-            value for value in str(payload.get("scope") or "query unlock").split()
-            if value in {"query", "unlock"}
+            value for value in str(
+                payload.get("scope") or "query unlock write"
+            ).split()
+            if value in {"query", "unlock", "write"}
         ]
         scopes = list(dict.fromkeys(requested_scopes))
         if "query" not in scopes:
             scopes.insert(0, "query")
+        if "write" not in scopes:
+            scopes.append("write")
         if not client_id:
             raise ValueError("请填写 HDHive OpenAPI Client ID")
         parsed = urlparse(redirect_uri)

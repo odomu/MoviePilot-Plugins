@@ -82,6 +82,7 @@
                 <div class="checkin-tooltip-meta">
                   {{ day.executionLabel }}
                   <span v-if="day.pointsDetail"> · {{ day.pointsDetail }}</span>
+                  <span v-if="day.lotteryDetail"> · {{ day.lotteryDetail }}</span>
                 </div>
                 <div v-if="day.message" class="checkin-tooltip-message">
                   {{ day.message }}
@@ -115,10 +116,11 @@
       <v-card rounded="lg">
         <v-card-title class="text-subtitle-1 d-flex align-center ga-2">
           <v-icon icon="mdi-alert-outline" color="warning"/>
-          确认执行赌狗签到
+          {{ confirmationTitle }}
         </v-card-title>
         <v-card-text>
-          确认立即执行 {{ pendingProvider?.name || "当前渠道" }} 赌狗签到？
+          确认立即执行 {{ pendingProvider?.name || "当前渠道" }}
+          {{ riskyModeLabel(pendingProvider) }}？
           <v-alert
               type="warning"
               variant="tonal"
@@ -126,8 +128,8 @@
               class="mt-3"
           >
             {{
-              pendingProvider?.gamblerWarning ||
-              "赌狗模式可能产生负积分奖励，执行后会直接扣除现有积分。"
+              riskWarning(pendingProvider) ||
+              "当前模式可能产生负积分奖励，执行后会直接扣除现有积分。"
             }}
           </v-alert>
         </v-card-text>
@@ -168,6 +170,9 @@ const confirmVisible = ref(false);
 const pendingProvider = ref(null);
 
 const dateColumns = computed(() => buildDateColumns());
+const confirmationTitle = computed(
+    () => "确认执行" + riskyModeLabel(pendingProvider.value),
+);
 
 function unwrapResponse(raw) {
   if (raw?.data && typeof raw.data === "object" && "success" in raw.data)
@@ -211,6 +216,17 @@ function providerEnabled(provider) {
 }
 
 function providerConfigured(provider) {
+  if (provider.key === "hdhive") {
+    if (String(props.config.hdhive_query_mode || "web") === "api") {
+      return Boolean(
+          String(props.config.hdhive_api_key || "").trim() &&
+          (
+              String(props.config.hdhive_access_token || "").trim() ||
+              String(props.config.hdhive_refresh_token || "").trim()
+          ),
+      );
+    }
+  }
   return provider.credentialKeys.every((key) =>
       Boolean(String(props.config[key] || "").trim()),
   );
@@ -218,6 +234,20 @@ function providerConfigured(provider) {
 
 function providerMode(provider) {
   return String(props.config[provider.modeKey] || "normal");
+}
+
+function riskWarning(provider) {
+  if (!provider) return "";
+  return provider.riskWarnings?.[providerMode(provider)] || "";
+}
+
+function isRiskyMode(provider) {
+  return Boolean(riskWarning(provider));
+}
+
+function riskyModeLabel(provider) {
+  const mode = provider ? providerMode(provider) : "";
+  return mode === "lucky" ? "运气签到" : "赌狗签到";
 }
 
 function latestRecord(provider) {
@@ -234,9 +264,11 @@ function providerStatus(provider) {
     return !Number.isNaN(parsed.getTime()) && localDateKey(parsed) === today;
   });
   if (!record) return null;
-  const already = [record.status, record.message].some((value) =>
-      String(value || "").includes("已签到"),
-  );
+  const already =
+      record.success &&
+      [record.status, record.message].some((value) =>
+          String(value || "").includes("已签到"),
+      );
   if (already) {
     return {label: "已签到", tone: "already", icon: "mdi-check-circle"};
   }
@@ -309,10 +341,12 @@ function timelineDays(provider) {
   return dateColumns.value.map((date) => {
     const records = recordsByDay.get(date.key) || [];
     const latest = records[0];
-    const already = records.some((item) =>
-        [item.status, item.message].some((value) =>
+    const already = records.some(
+        (item) =>
+            item.success &&
+            [item.status, item.message].some((value) =>
             String(value || "").includes("已签到"),
-        ),
+            ),
     );
     const success = records.some((item) => item.success);
     const waitingRetry =
@@ -375,8 +409,11 @@ function timelineDays(provider) {
         none: "mdi-minus",
       }[status],
       pointsDetail: pointsChange === null ? "" : `积分 ${pointsLabel || "0"}`,
+      lotteryDetail: latest?.lottery_target_count
+          ? `转盘 ${latest.lottery_executed || 0}/${latest.lottery_target_count} 次`
+          : "",
       executionLabel,
-      message: latest?.message || "",
+      message: latest && !latest.success ? latest.message || "" : "",
       ariaLabel: [date.fullLabel, statusLabel, pointsLabel]
           .filter(Boolean)
           .join("，"),
@@ -438,7 +475,7 @@ async function loadHistories() {
 
 function requestCheckin(provider) {
   if (runningProvider.value) return;
-  if (providerMode(provider) === "gambler") {
+  if (isRiskyMode(provider)) {
     pendingProvider.value = provider;
     confirmVisible.value = true;
     return;
@@ -457,25 +494,54 @@ function confirmCheckin() {
   if (provider) runCheckin(provider);
 }
 
+function wait(delay) {
+  return new Promise((resolve) => window.setTimeout(resolve, delay));
+}
+
+async function waitForProviderResult(provider, previousRecordId) {
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    await wait(attempt === 0 ? 500 : 2000);
+    await loadProviderHistory(provider);
+    const record = latestRecord(provider);
+    if (record?.id && record.id !== previousRecordId) return record;
+  }
+  return null;
+}
+
 async function runCheckin(provider) {
   if (runningProvider.value) return;
   runningProvider.value = provider.key;
+  const previousRecordId = latestRecord(provider)?.id || "";
   try {
     const response = unwrapResponse(
         await props.api.post(
             "plugin/CloudSubscribe/checkin/" + encodeURIComponent(provider.key),
-            {mode: providerMode(provider)},
+            {
+              mode: providerMode(provider),
+              confirm_risky: isRiskyMode(provider),
+            },
         ),
     );
+    let success = response.success !== false;
+    let message = response.message || (success ? "签到完成" : "签到失败");
+    if (success && response.data?.running) {
+      const record = await waitForProviderResult(provider, previousRecordId);
+      if (record) {
+        success = Boolean(record.success);
+        message = record.message || record.status || message;
+      } else {
+        message = "签到任务已提交，仍在后台执行";
+      }
+    }
     emit("result", {
+      providerKey: provider.key,
       providerName: provider.name,
-      success: response.success !== false,
-      message:
-          response.message ||
-          (response.success === false ? "签到失败" : "签到完成"),
+      success,
+      message,
     });
   } catch (error) {
     emit("result", {
+      providerKey: provider.key,
       providerName: provider.name,
       success: false,
       message: error.message || String(error),

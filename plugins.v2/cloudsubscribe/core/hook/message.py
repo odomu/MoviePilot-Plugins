@@ -27,7 +27,7 @@ class MessageRoutingHook(OwnerDelegator):
         return str(getattr(channel, "value", channel) or "").strip().lower()
 
     def _message_payload(self, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not self._enabled:
+        if not self._enabled or not self._direct_transfer_enabled:
             return None
         channel = arguments.get("channel")
         if self._channel_value(channel) != MessageChannel.Telegram.value.lower():
@@ -83,6 +83,9 @@ class MessageRoutingHook(OwnerDelegator):
 
     def install(self) -> None:
         """安装消息路由包装，并在插件重载时切换到最新实例。"""
+        if not self._enabled or not self._direct_transfer_enabled:
+            self.close()
+            return
         cls = type(self)
         with cls._patch_lock:
             cls._active = self
@@ -107,7 +110,6 @@ class MessageRoutingHook(OwnerDelegator):
 
             MessageChain._handle_message_core = wrapped
             cls._wrapped = wrapped
-            logger.info("已启用 Telegram 资源链接直达转存")
 
     def close(self) -> None:
         """卸载当前实例，并在没有接管方时恢复平台原方法。"""

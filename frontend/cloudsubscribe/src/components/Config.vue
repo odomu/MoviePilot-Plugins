@@ -61,7 +61,7 @@
                   :section="section"
                   :config="config"
                   :api="api"
-                  :refreshing-account="refreshingAccount"
+                  :refreshing-accounts="refreshingAccounts"
                   :testing-source="testingSource"
                   :testing-proxy="testingProxy"
                   :hdhive-oauth-action="hdhiveOauthAction"
@@ -600,6 +600,16 @@ if (!config.online_docs.length) {
 config.online_docs_urls = [];
 config.online_docs_resource_types = [];
 const activeTab = ref("basic");
+const optionScopeByTab = Object.freeze({
+  basic: "base",
+  transfer: "subscriptions",
+  upgrade: "subscriptions",
+  drive: "drive",
+  search: "search",
+  notify: "notify",
+});
+const loadedOptionScopes = new Set();
+const optionScopeRequests = new Map();
 const qrVisible = ref(false),
     qrProvider = ref("115"),
     directoryVisible = ref(false),
@@ -607,7 +617,7 @@ const qrVisible = ref(false),
     directoryInitialPath = ref("/"),
     directoryProvider = ref("115"),
     saving = ref(false),
-    refreshingAccount = ref(""),
+    refreshingAccounts = ref([]),
     hdhiveOauthAction = ref(""),
     testingSource = ref(""),
     testingProxy = ref(false),
@@ -764,31 +774,49 @@ function applyOptions(data) {
   Object.entries(data.defaults || {}).forEach(([key, value]) => {
     if (!(key in config)) config[key] = value;
   });
-  options.subscribes = Array.isArray(data.subscribes) ? data.subscribes : [];
-  options.mediaservers = Array.isArray(data.mediaservers)
-      ? data.mediaservers
-      : [];
-  options.mediaLibraryWebhookUrls =
-      data.media_library_webhook_urls &&
-      typeof data.media_library_webhook_urls === "object"
-          ? data.media_library_webhook_urls
-          : {};
-  options.notificationTypes = Array.isArray(data.notification_types)
-      ? data.notification_types
-      : [];
-  options.cloudDrives = Array.isArray(data.cloud_drives)
-      ? data.cloud_drives
-      : [];
-  options.account =
-      data.account && typeof data.account === "object" ? data.account : {};
-  options.accounts =
-      data.accounts && typeof data.accounts === "object" ? data.accounts : {};
-  options.searchAccounts =
-      data.search_accounts && typeof data.search_accounts === "object"
-      ? data.search_accounts
-      : {};
-  options.pansou =
-      data.pansou && typeof data.pansou === "object" ? data.pansou : {};
+  if ("subscribes" in data) {
+    options.subscribes = Array.isArray(data.subscribes) ? data.subscribes : [];
+  }
+  if ("mediaservers" in data) {
+    options.mediaservers = Array.isArray(data.mediaservers)
+        ? data.mediaservers
+        : [];
+  }
+  if ("media_library_webhook_urls" in data) {
+    options.mediaLibraryWebhookUrls =
+        data.media_library_webhook_urls &&
+        typeof data.media_library_webhook_urls === "object"
+            ? data.media_library_webhook_urls
+            : {};
+  }
+  if ("notification_types" in data) {
+    options.notificationTypes = Array.isArray(data.notification_types)
+        ? data.notification_types
+        : [];
+  }
+  if ("cloud_drives" in data) {
+    options.cloudDrives = Array.isArray(data.cloud_drives)
+        ? data.cloud_drives
+        : [];
+  }
+  if ("account" in data) {
+    options.account =
+        data.account && typeof data.account === "object" ? data.account : {};
+  }
+  if ("accounts" in data) {
+    options.accounts =
+        data.accounts && typeof data.accounts === "object" ? data.accounts : {};
+  }
+  if ("search_accounts" in data) {
+    options.searchAccounts =
+        data.search_accounts && typeof data.search_accounts === "object"
+            ? data.search_accounts
+            : {};
+  }
+  if ("pansou" in data) {
+    options.pansou =
+        data.pansou && typeof data.pansou === "object" ? data.pansou : {};
+  }
   const configuredSources = Array.isArray(config.search_source_order)
       ? config.search_source_order.filter(Boolean)
       : String(config.search_source_order || "")
@@ -1177,7 +1205,6 @@ async function handleQrSuccess(payload) {
     if (provider) {
       await refreshAccount(`drive:${provider}`, {silent: true});
     }
-    await loadOptions();
   } catch (error) {
     notify(`账号信息刷新失败：${error.message || error}`, "warning");
   }
@@ -1195,22 +1222,47 @@ function selectDirectory(path) {
   directoryVisible.value = false;
 }
 
-async function loadOptions() {
-  const response = unwrapResponse(
-      await api.get("plugin/CloudSubscribe/ui_options"),
-  );
-  if (response.success === false) {
-    throw new Error(response.message || "加载配置选项失败");
+function optionScopeForTab(tab = activeTab.value) {
+  return optionScopeByTab[String(tab || "basic")] || "base";
+}
+
+async function loadOptions(scope = "base", {force = false} = {}) {
+  const normalizedScope = String(scope || "base").trim().toLowerCase();
+  if (!force && loadedOptionScopes.has(normalizedScope)) return;
+  if (optionScopeRequests.has(normalizedScope)) {
+    return optionScopeRequests.get(normalizedScope);
   }
-  applyOptions(response.data?.data || response.data || response);
+  const request = (async () => {
+    const query = new URLSearchParams({scope: normalizedScope});
+    const response = unwrapResponse(
+        await api.get(`plugin/CloudSubscribe/ui_options?${query}`),
+    );
+    if (response.success === false) {
+      throw new Error(response.message || "加载配置选项失败");
+    }
+    applyOptions(response.data?.data || response.data || response);
+    loadedOptionScopes.add(normalizedScope);
+  })();
+  optionScopeRequests.set(normalizedScope, request);
+  try {
+    return await request;
+  } finally {
+    optionScopeRequests.delete(normalizedScope);
+  }
+}
+
+async function reloadVisibleOptionScopes() {
+  loadedOptionScopes.clear();
+  const scopes = [...new Set(["base", optionScopeForTab()])];
+  await Promise.all(scopes.map((scope) => loadOptions(scope, {force: true})));
 }
 
 async function refreshAccount(accountKey, {silent = false} = {}) {
   const normalizedKey = String(accountKey || "")
       .trim()
       .toLowerCase();
-  if (!normalizedKey || refreshingAccount.value) return;
-  refreshingAccount.value = normalizedKey;
+  if (!normalizedKey || refreshingAccounts.value.includes(normalizedKey)) return;
+  refreshingAccounts.value = [...refreshingAccounts.value, normalizedKey];
   try {
     const response = unwrapResponse(
         await api.post("plugin/CloudSubscribe/account/refresh", {
@@ -1246,7 +1298,9 @@ async function refreshAccount(accountKey, {silent = false} = {}) {
       notify(`账户信息刷新失败：${error.message || error}`, "error");
     }
   } finally {
-    refreshingAccount.value = "";
+    refreshingAccounts.value = refreshingAccounts.value.filter(
+        (key) => key !== normalizedKey,
+    );
   }
 }
 
@@ -1267,7 +1321,7 @@ async function save() {
     if (savedConfig && typeof savedConfig === "object") {
       Object.assign(config, JSON.parse(JSON.stringify(savedConfig)));
     }
-    await loadOptions();
+    await reloadVisibleOptionScopes();
     notify(response.message || "配置已保存");
   } catch (e) {
     notify(`保存配置失败：${e.message || e}`, "error");
@@ -1276,8 +1330,11 @@ async function save() {
   }
 }
 
-function handleCheckinResult(result) {
+async function handleCheckinResult(result) {
   const providerName = result?.providerName || "签到服务";
+  if (result?.success && result?.providerKey) {
+    await refreshAccount(`search:${result.providerKey}`, {silent: true});
+  }
   notify(
       result?.message ||
       (result?.success
@@ -1293,7 +1350,7 @@ function hdhiveOAuthPayload() {
     app_secret: String(config.hdhive_api_key || "").trim(),
     redirect_uri: String(config.hdhive_redirect_uri || "").trim(),
     response_mode: String(config.hdhive_response_mode || "redirect").trim(),
-    scope: "query unlock",
+    scope: "query unlock write",
   };
 }
 
@@ -1474,10 +1531,16 @@ onMounted(async () => {
   window.addEventListener("message", handleHdhiveOAuthMessage);
   emit("layout", {maxWidth: "62rem"});
   try {
-    await loadOptions();
+    await loadOptions("base");
   } catch (e) {
     notify(`加载配置选项失败：${e.message || e}`, "warning");
   }
+});
+
+watch(activeTab, (tab) => {
+  loadOptions(optionScopeForTab(tab)).catch((error) => {
+    notify(`加载配置选项失败：${error.message || error}`, "warning");
+  });
 });
 
 onBeforeUnmount(() => {
@@ -1546,7 +1609,7 @@ watch(
   width: min(62rem, calc(100vw - 32px));
   max-width: min(62rem, 100%);
   min-width: 0;
-  height: auto;
+  height: min(800px, calc(100dvh - 64px));
   max-height: min(800px, calc(100dvh - 64px));
   min-height: 0;
   flex-direction: column;
@@ -1619,18 +1682,8 @@ watch(
 .config-content-scroll {
   flex: 1 1 0;
   min-height: 0;
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
-  touch-action: pan-y;
-  scrollbar-width: none !important;
-}
-
-.config-content-scroll::-webkit-scrollbar {
-  display: none !important;
-  width: 0 !important;
-  height: 0 !important;
+  display: flex;
+  overflow: hidden;
 }
 
 .config-actions {
@@ -1966,7 +2019,9 @@ watch(
   max-width: 100%;
   min-width: 0;
   min-height: 0;
-  overflow: visible;
+  flex: 1 1 0;
+  display: flex;
+  overflow: hidden;
 }
 
 .config-window-section {
@@ -1974,15 +2029,12 @@ watch(
   width: 100%;
   max-width: 100%;
   min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  overflow: hidden;
 }
 
 @media (min-width: 601px) {
-  .config-shell,
-  .config-body,
-  .config-content-scroll {
-    flex: 0 1 auto;
-  }
-
   .config-window-section {
     padding: 12px 14px 20px;
   }

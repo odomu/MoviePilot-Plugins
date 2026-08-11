@@ -1,215 +1,180 @@
-import {computed, onMounted, onUnmounted, reactive, ref} from "vue";
+import {computed, reactive, ref} from "vue";
 
-export function usePageData(api, notify, pluginId = "CloudSubscribe") {
-    const history = ref([]);
+export function useHistoryPageData(api, notify, pluginId = "CloudSubscribe") {
+    const historyGroups = ref([]);
     const embyPlayItems = ref({});
-    const offlineSupported = ref(false);
     const loading = ref(false);
-    const runtime = reactive({
-        status: "idle",
-        task: "当前没有订阅处理任务",
-        progress: 0,
-        tasks: [],
+    const historyPage = reactive({
+        page: 1,
+        pageSize: 10,
+        total: 0,
+        totalPages: 1,
+        filterOptions: {
+            resourceTypes: [],
+            sources: [],
+        },
     });
-
-    const active = computed(
-        () =>
-            ["starting", "running", "stopping"].includes(runtime.status) ||
-            (runtime.tasks || []).some((task) =>
-                ["queued", "running", "stopping"].includes(task.status),
-            ),
-    );
-    const stats = computed(() => {
-        const today = new Date().toISOString().slice(0, 10);
-        let todayCount = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        for (const item of history.value) {
-            const time = String(item?.time || "");
-            if (time.startsWith(today)) todayCount += 1;
-            if (item?.status === "成功") successCount += 1;
-            if (item?.status === "失败") failedCount += 1;
-        }
-        return [
+    const historyStats = reactive({
+        total: 0,
+        today: 0,
+        success: 0,
+        failed: 0,
+    });
+    const historyQuery = reactive({
+        page: 1,
+        pageSize: 10,
+        keyword: "",
+        resourceTypes: [],
+        sources: [],
+        taskTypes: [],
+        statuses: [],
+    });
+    const stats = computed(() => [
             {
                 title: "总转存",
-                value: history.value.length,
+                value: historyStats.total,
                 color: "primary",
                 icon: "mdi-cloud-upload-outline",
             },
             {
                 title: "今日转存",
-                value: todayCount,
+                value: historyStats.today,
                 color: "info",
                 icon: "mdi-calendar-today",
             },
             {
                 title: "成功",
-                value: successCount,
+                value: historyStats.success,
                 color: "success",
                 icon: "mdi-check-circle-outline",
             },
             {
                 title: "失败",
-                value: failedCount,
+                value: historyStats.failed,
                 color: "error",
                 icon: "mdi-alert-circle-outline",
             },
-        ];
-    });
+    ]);
 
-    let pageRequest = null;
-    let runtimeTimer = null;
-    let startRequestedUntil = 0;
+    let pageRequestSequence = 0;
+    let summaryRequestSequence = 0;
 
-    function hasActiveRuntime() {
-        return (
-            Date.now() < startRequestedUntil ||
-            ["starting", "running", "stopping"].includes(runtime.status) ||
-            (runtime.tasks || []).some((task) =>
-                ["queued", "running", "stopping", "postprocessing"].includes(task.status),
-            )
-        );
+    function normalizeQueryList(value) {
+        return [...new Set(
+            (Array.isArray(value) ? value : [])
+                .map((item) => String(item || "").trim())
+                .filter(Boolean),
+        )];
     }
 
-    function stopRuntimePolling() {
-        if (runtimeTimer) {
-            window.clearInterval(runtimeTimer);
-            runtimeTimer = null;
+    function pageQueryString() {
+        const query = new URLSearchParams({
+            page: String(historyQuery.page),
+            page_size: String(historyQuery.pageSize),
+        });
+        if (historyQuery.keyword) query.set("keyword", historyQuery.keyword);
+        for (const [key, values] of [
+            ["resource_types", historyQuery.resourceTypes],
+            ["sources", historyQuery.sources],
+            ["task_types", historyQuery.taskTypes],
+            ["statuses", historyQuery.statuses],
+        ]) {
+            if (values.length) query.set(key, values.join(","));
         }
-    }
-
-    function ensureRuntimePolling() {
-        if (!hasActiveRuntime()) {
-            stopRuntimePolling();
-            return;
-        }
-        if (runtimeTimer) return;
-        runtimeTimer = window.setInterval(async () => {
-            await loadRuntime();
-            if (!hasActiveRuntime()) {
-                stopRuntimePolling();
-                await loadPage(false);
-            }
-        }, 5000);
+        return query.toString();
     }
 
     async function loadPage(showLoading = true) {
-        if (pageRequest) return pageRequest;
+        const requestId = ++pageRequestSequence;
         if (showLoading) loading.value = true;
-        pageRequest = (async () => {
-            try {
-                const result = await api.get(`plugin/${pluginId}/page_data`);
-                if (!result?.success) throw new Error(result?.message || "加载失败");
-                history.value = result.data?.history || [];
-                embyPlayItems.value = result.data?.emby_play_items || {};
-                offlineSupported.value = Boolean(result.data?.offline_supported);
-                Object.assign(runtime, result.data?.runtime || {});
-                ensureRuntimePolling();
-            } catch (error) {
-                if (showLoading) notify(error.message || "加载失败", "error");
-            } finally {
-                if (showLoading) loading.value = false;
-                pageRequest = null;
-            }
-        })();
-        return pageRequest;
-    }
-
-    async function loadRuntime() {
         try {
-            const result = await api.get(`plugin/${pluginId}/runtime`);
-            if (result?.success) {
-                const nextRuntime = result.data || {};
-                if (nextRuntime.status === "idle" && Date.now() < startRequestedUntil) {
-                    Object.assign(runtime, {
-                        ...nextRuntime,
-                        status: "starting",
-                        task: "正在准备订阅任务",
-                    });
-                } else {
-                    Object.assign(runtime, nextRuntime);
-                    if (nextRuntime.status === "running") startRequestedUntil = 0;
-                }
-                ensureRuntimePolling();
-            }
-        } catch (_) {
-        }
-    }
-
-    async function startSync(selection = null) {
-        try {
-            const selectedCount = Math.max(0, Number(selection?.groupCount || 0));
-            const payload = selectedCount
-                ? {
-                    selected_count: selectedCount,
-                    subscribe_ids: Array.isArray(selection?.subscribeIds)
-                        ? selection.subscribeIds
+            const result = await api.get(
+                `plugin/${pluginId}/page_data?${pageQueryString()}`,
+            );
+            if (!result?.success) throw new Error(result?.message || "加载失败");
+            if (requestId !== pageRequestSequence) return false;
+            const data = result.data || {};
+            const pageData = data.history_page || {};
+            historyGroups.value = Array.isArray(data.history_groups)
+                ? data.history_groups
+                : [];
+            embyPlayItems.value = data.emby_play_items || {};
+            Object.assign(historyPage, {
+                page: Math.max(1, Number(pageData.page || 1)),
+                pageSize: Math.max(1, Number(pageData.page_size || 10)),
+                total: Math.max(0, Number(pageData.total || 0)),
+                totalPages: Math.max(1, Number(pageData.total_pages || 1)),
+                filterOptions: {
+                    resourceTypes: Array.isArray(pageData.filter_options?.resource_types)
+                        ? pageData.filter_options.resource_types
                         : [],
-                    history_targets: Array.isArray(selection?.targets)
-                        ? selection.targets
+                    sources: Array.isArray(pageData.filter_options?.sources)
+                        ? pageData.filter_options.sources
                         : [],
-                }
-                : {};
-            const result = await api.post(`plugin/${pluginId}/sync/start`, payload);
-            if (!result?.success) throw new Error(result?.message || "启动失败");
-            const selectedScope = result?.data?.scope === "selected";
-            const subscribeCount = Number(result?.data?.subscribe_count || 0);
-            startRequestedUntil = Date.now() + 10000;
-            Object.assign(runtime, {
-                status: "starting",
-                task: selectedScope
-                    ? `正在准备所选 ${subscribeCount} 个订阅`
-                    : "正在准备全部订阅",
-                progress: 0,
-                tasks: [],
+                },
             });
-            notify(result.message || "订阅搜索任务已启动");
-            await loadRuntime();
-            ensureRuntimePolling();
+            historyQuery.page = historyPage.page;
+            historyQuery.pageSize = historyPage.pageSize;
             return true;
         } catch (error) {
-            notify(error.message || "启动失败", "error");
-            return false;
-        }
-    }
-
-
-    async function stopSync() {
-        try {
-            runtime.status = "stopping";
-            runtime.task = "正在停止当前任务";
-            const result = await api.post(`plugin/${pluginId}/sync/stop`);
-            if (!result?.success) throw new Error(result?.message || "停止失败");
-            await loadRuntime();
-            ensureRuntimePolling();
-            return true;
-        } catch (error) {
-            notify(error.message || "停止失败", "error");
-            await loadRuntime();
-            return false;
-        }
-    }
-
-    async function stopTask(taskId) {
-        try {
-            const task = (runtime.tasks || []).find((item) => item.id === taskId);
-            if (task) {
-                task.status = "stopping";
-                task.phase = "等待安全停止";
+            if (requestId === pageRequestSequence && showLoading) {
+                notify(error.message || "加载失败", "error");
             }
-            const result = await api.post(`plugin/${pluginId}/sync/task/stop`, {
-                task_id: taskId,
+            return false;
+        } finally {
+            if (requestId === pageRequestSequence) loading.value = false;
+        }
+    }
+
+    async function loadSummary(showError = true) {
+        const requestId = ++summaryRequestSequence;
+        try {
+            const result = await api.get(`plugin/${pluginId}/history/summary`);
+            if (!result?.success) {
+                throw new Error(result?.message || "加载历史摘要失败");
+            }
+            if (requestId !== summaryRequestSequence) return false;
+            const data = result.data || {};
+            Object.assign(historyStats, {
+                total: Math.max(0, Number(data.total || 0)),
+                today: Math.max(0, Number(data.today || 0)),
+                success: Math.max(0, Number(data.success || 0)),
+                failed: Math.max(0, Number(data.failed || 0)),
             });
-            if (!result?.success) throw new Error(result?.message || "停止任务失败");
-            await loadRuntime();
-            ensureRuntimePolling();
             return true;
         } catch (error) {
-            notify(error.message || "停止任务失败", "error");
-            await loadRuntime();
+            if (requestId === summaryRequestSequence && showError) {
+                notify(error.message || "加载历史摘要失败", "error");
+            }
             return false;
         }
+    }
+
+    async function updateHistoryQuery(nextQuery = {}) {
+        const normalized = {
+            page: Math.max(1, Number(nextQuery.page ?? historyQuery.page) || 1),
+            pageSize: Math.min(
+                50,
+                Math.max(1, Number(nextQuery.pageSize ?? historyQuery.pageSize) || 10),
+            ),
+            keyword: String(nextQuery.keyword ?? historyQuery.keyword).trim(),
+            resourceTypes: normalizeQueryList(
+                nextQuery.resourceTypes ?? historyQuery.resourceTypes,
+            ),
+            sources: normalizeQueryList(nextQuery.sources ?? historyQuery.sources),
+            taskTypes: normalizeQueryList(
+                nextQuery.taskTypes ?? historyQuery.taskTypes,
+            ),
+            statuses: normalizeQueryList(nextQuery.statuses ?? historyQuery.statuses),
+        };
+        const unchanged = Object.entries(normalized).every(([key, value]) =>
+            Array.isArray(value)
+                ? JSON.stringify(value) === JSON.stringify(historyQuery[key])
+                : value === historyQuery[key],
+        );
+        if (unchanged) return false;
+        Object.assign(historyQuery, normalized);
+        return loadPage();
     }
 
     async function clearHistory(force = false) {
@@ -217,7 +182,7 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
             force: Boolean(force),
         });
         if (!result?.success) throw new Error(result?.message || "清空失败");
-        await loadPage(false);
+        await Promise.all([loadPage(false), loadSummary(false)]);
         return result.message || "历史已清空";
     }
 
@@ -232,7 +197,7 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
             delete_linked_files: Boolean(deleteLinkedFiles),
         });
         if (!result?.success) throw new Error(result?.message || "删除失败");
-        await loadPage(false);
+        await Promise.all([loadPage(false), loadSummary(false)]);
         return result.message || "历史记录已删除";
     }
 
@@ -251,7 +216,7 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
             delete_linked_files: Boolean(deleteLinkedFiles),
         });
         if (!result?.success) throw new Error(result?.message || "批量删除失败");
-        await loadPage(false);
+        await Promise.all([loadPage(false), loadSummary(false)]);
         return result.message || "所选历史记录已删除";
     }
 
@@ -268,62 +233,19 @@ export function usePageData(api, notify, pluginId = "CloudSubscribe") {
         return result.message || "通知已补发";
     }
 
-    async function upgradeHistory(records, scope = "record") {
-        const identities = (records || []).map((record) => ({
-            record_id: record.record_id,
-            time: record.time,
-            share_url: record.share_url,
-            file_name: record.file_name,
-            tmdb_id: record.tmdb_id,
-            season: record.season,
-            episode: record.episode,
-        }));
-        const result = await api.post(`plugin/${pluginId}/history/upgrade`, {
-            source: "history",
-            scope,
-            records: identities,
-        });
-        if (!result?.success) throw new Error(result?.message || "洗版任务提交失败");
-        startRequestedUntil = Date.now() + 10000;
-        Object.assign(runtime, {
-            status: "starting",
-            task: "正在准备洗版任务",
-            progress: 0,
-            tasks: [],
-        });
-        await loadRuntime();
-        ensureRuntimePolling();
-        return result.message || "洗版任务已提交";
-    }
-
-    async function clearCache(categories) {
-        const result = await api.post(`plugin/${pluginId}/cache/clear`, {
-            categories,
-        });
-        if (!result?.success) throw new Error(result?.message || "清理缓存失败");
-        return result.message || "缓存已清理";
-    }
-
-    onMounted(() => loadPage());
-    onUnmounted(stopRuntimePolling);
-
     return {
-        history,
+        historyGroups,
+        historyPage,
+        historyStats,
         embyPlayItems,
-        offlineSupported,
         loading,
-        runtime,
-        active,
         stats,
         loadPage,
-        startSync,
-        stopSync,
-        stopTask,
+        loadSummary,
+        updateHistoryQuery,
         clearHistory,
         deleteHistory,
         deleteHistoryBatch,
         notifyHistory,
-        upgradeHistory,
-        clearCache,
     };
 }

@@ -255,3 +255,17 @@ class MediaLibraryApi(OwnerDelegator):
         except Exception as error:
             logger.warning(f"读取媒体服务器内容失败：{error}")
             return {"success": False, "message": str(error)}
+
+    def api_vue_media_servers(self) -> dict:
+        """返回可用于洗版的媒体服务器选项，不触发内容查询。"""
+        if not self._sync_handler:
+            return {"success": False, "message": "同步处理器未初始化"}
+        try:
+            data = self._sync_handler.list_media_server_content()
+            return {
+                "success": True,
+                "data": {"servers": data.get("servers") or []},
+            }
+        except Exception as error:
+            logger.warning(f"读取媒体服务器选项失败：{error}")
+            return {"success": False, "message": str(error)}

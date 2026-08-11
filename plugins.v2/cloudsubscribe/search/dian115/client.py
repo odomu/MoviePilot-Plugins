@@ -533,7 +533,7 @@ class Dian115Client:
                 except Exception:
                     pass
 
-    def _login(self) -> None:
+    def _login(self, allow_browser_login: bool = True) -> None:
         if not self.is_configured:
             raise Dian115Error("Dian115 未配置邮箱或密码")
         with self._LOGIN_LOCK:
@@ -569,6 +569,12 @@ class Dian115Client:
                 )
                 if not is_cloudflare:
                     raise
+                if not allow_browser_login:
+                    raise Dian115Error(
+                        "Dian115 HTTP 登录触发 Cloudflare，签到禁止使用浏览器回退",
+                        code="browser_login_forbidden",
+                        status_code=error.status_code,
+                    ) from error
                 logger.debug("Dian115 登录触发 Cloudflare，切换 CloakBrowser")
                 self._clear_portal_cookies()
                 self._login_with_browser()
@@ -579,11 +585,12 @@ class Dian115Client:
             api_path: str,
             current_path: str,
             retry_login: bool = True,
+            allow_browser_login: bool = True,
             **kwargs,
     ) -> Dict[str, Any]:
         with self._lock:
             if not self._authenticated:
-                self._login()
+                self._login(allow_browser_login=allow_browser_login)
             headers = self._authorized_headers(method, api_path, current_path)
             supplied_headers = dict(kwargs.pop("headers", {}) or {})
             headers.update(supplied_headers)
@@ -608,12 +615,13 @@ class Dian115Client:
                 self._authenticated = False
                 self._proof = None
                 self._browser_session_expires_at = 0.0
-                self._login()
+                self._login(allow_browser_login=allow_browser_login)
                 return self._request_json(
                     method,
                     api_path,
                     current_path,
                     retry_login=False,
+                    allow_browser_login=allow_browser_login,
                     **kwargs,
                 )
             self._raise_response_error(response, payload)
@@ -623,14 +631,28 @@ class Dian115Client:
             method: str,
             api_path: str,
             current_path: str,
+            allow_browser_login: bool = True,
             **kwargs,
     ) -> Dict[str, Any]:
         """执行带登录态和浏览器证明的门户 JSON 请求。"""
-        return self._request_json(method, api_path, current_path, **kwargs)
+        return self._request_json(
+            method,
+            api_path,
+            current_path,
+            allow_browser_login=allow_browser_login,
+            **kwargs,
+        )
 
-    def get_account_info(self) -> Dict[str, Any]:
+    def get_account_info(
+            self, allow_browser_login: bool = True
+    ) -> Dict[str, Any]:
         """读取当前 Dian115 账户及可用积分。"""
-        payload = self.request_json("GET", "/api/portal/me", "/me")
+        payload = self.request_json(
+            "GET",
+            "/api/portal/me",
+            "/me",
+            allow_browser_login=allow_browser_login,
+        )
         user = payload.get("user") if isinstance(payload, dict) else None
         if not isinstance(user, dict) or "points" not in user:
             raise Dian115Error(
@@ -660,4 +682,140 @@ class Dian115Client:
             ),
             "created_at": str(user.get("created_at") or ""),
             "last_login_at": str(user.get("last_login_at") or ""),
+        }
+
+    @staticmethod
+    def _game_item(payload: Dict[str, Any], key: str) -> Dict[str, Any]:
+        items = payload.get("items") if isinstance(payload, dict) else None
+        item = items.get(key) if isinstance(items, dict) else None
+        if not isinstance(item, dict):
+            raise Dian115Error(
+                f"Dian115 娱乐状态缺少 {key} 字段", code="schema_changed"
+            )
+        return item
+
+    def get_game_status(self) -> Dict[str, Any]:
+        """读取每日转盘次数；签到链路禁止触发浏览器登录。"""
+        return self.request_json(
+            "GET",
+            "/api/portal/games/status",
+            "/me/lottery",
+            allow_browser_login=False,
+        )
+
+    def signin(self, mode: str = "normal") -> Dict[str, Any]:
+        """通过门户签到接口执行普通或运气签到。"""
+        normalized_mode = str(mode or "normal").strip().lower()
+        if normalized_mode not in {"normal", "lucky"}:
+            raise Dian115Error("Dian115 签到模式无效", code="invalid_mode")
+        try:
+            payload = self.request_json(
+                "POST",
+                "/api/portal/signin",
+                "/me/signin",
+                allow_browser_login=False,
+                json={"mode": normalized_mode},
+            )
+        except Dian115Error as error:
+            if error.code != "already_signed":
+                raise
+            return {
+                "success": True,
+                "already_checked_in": True,
+                "status": "今日已签到",
+                "message": "今日已签到",
+                "mode": normalized_mode,
+                "award_points": 0,
+                "status_code": error.status_code,
+                "error_code": error.code,
+            }
+        return {
+            "success": True,
+            "already_checked_in": False,
+            "status": "签到成功",
+            "message": str(payload.get("message") or "签到成功"),
+            "mode": normalized_mode,
+            "award_points": payload.get("award"),
+            "new_balance": payload.get("new_balance"),
+            "signin_days": payload.get("streak_after"),
+            "lucky_tier": payload.get("lucky_tier"),
+            "multiplier": payload.get("multiplier"),
+            "status_code": 200,
+            "error_code": "",
+        }
+
+    def run_lottery(self, target_count: int) -> Dict[str, Any]:
+        """将幸运转盘补齐到当天目标次数，目标值硬限制为 20。"""
+        target_plays = max(0, min(int(target_count or 0), 20))
+        wheel_results = []
+        wheel_error: Optional[Dian115Error] = None
+        used_before = 0
+        max_plays = 20
+        play_count = 0
+        if target_plays:
+            wheel = self._game_item(self.get_game_status(), "daily_wheel")
+            try:
+                used_before = max(0, int(wheel.get("used_today") or 0))
+                max_plays = max(
+                    0, min(int(wheel.get("max_plays") or 0), 20)
+                )
+            except (TypeError, ValueError) as error:
+                raise Dian115Error(
+                    "Dian115 转盘次数格式异常", code="schema_changed"
+                ) from error
+            play_count = max(
+                0, min(target_plays, max_plays) - used_before
+            )
+            for _ in range(play_count):
+                try:
+                    wheel_results.append(self.request_json(
+                        "POST",
+                        "/api/portal/lottery/wheel",
+                        "/me/lottery",
+                        allow_browser_login=False,
+                    ))
+                except Dian115Error as error:
+                    wheel_error = error
+                    break
+        wheel_cost = 0
+        wheel_award = 0
+        wheel_vip_days = 0
+        for item in wheel_results:
+            prize = item.get("prize") if isinstance(item, dict) else None
+            prize = prize if isinstance(prize, dict) else {}
+            try:
+                wheel_cost += max(0, int(item.get("cost") or 0))
+                wheel_award += int(prize.get("points") or 0)
+                wheel_vip_days += max(0, int(prize.get("vip_days") or 0))
+            except (TypeError, ValueError):
+                continue
+        executed = len(wheel_results)
+        success = wheel_error is None
+        message = f"转盘 {executed}/{target_plays} 次"
+        if target_plays and executed == 0 and used_before >= target_plays:
+            message = f"今日转盘已完成 {used_before} 次"
+        elif wheel_error:
+            message = f"{message}，中断：{wheel_error}"
+        balances = [
+            item.get("new_balance")
+            for item in wheel_results
+            if isinstance(item, dict) and item.get("new_balance") is not None
+        ]
+        return {
+            "success": success,
+            "status": "转盘完成" if success else "转盘未完成",
+            "message": message,
+            "new_balance": balances[-1] if balances else None,
+            "points_change": wheel_award - wheel_cost,
+            "status_code": int(getattr(wheel_error, "status_code", 0) or 200),
+            "error_code": str(getattr(wheel_error, "code", "") or ""),
+            "target_count": target_plays,
+            "max_plays": max_plays,
+            "used_before": used_before,
+            "planned": play_count,
+            "executed": executed,
+            "used_after": used_before + executed,
+            "cost_points": wheel_cost,
+            "award_points": wheel_award,
+            "vip_days": wheel_vip_days,
         }

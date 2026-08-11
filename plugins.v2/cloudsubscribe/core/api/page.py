@@ -1,9 +1,10 @@
 """配置页选项与详情页数据 API。"""
 
 import copy
-import re
+import datetime
 from urllib.parse import urlencode
 
+import pytz
 from app.core.config import settings
 from app.log import logger
 from app.schemas.types import NotificationType
@@ -13,96 +14,204 @@ from ..config import UIConfig
 from ...utils.cache import create_platform_ttl_cache
 
 _UI_OPTIONS_CACHE = create_platform_ttl_cache(
-    "ui:options", maxsize=1, ttl=2 * 60
+    "ui:options", maxsize=16, ttl=2 * 60
 )
 
 
 class PageApi(OwnerDelegator):
-    def api_vue_page_data(self) -> dict:
-        # 页面读取不得触发历史合并和持久化，避免展示请求改写运行中的历史数据。
-        history = [
-            copy.deepcopy(record)
-            for record in (self.get_data("history") or [])
-            if isinstance(record, dict)
+    @staticmethod
+    def _history_filter_values(value: str) -> set[str]:
+        return {
+            item.strip().lower()
+            for item in str(value or "").split(",")
+            if item.strip()
+        }
+
+    def api_vue_page_data(
+            self,
+            page: int = 1,
+            page_size: int = 10,
+            keyword: str = "",
+            resource_types: str = "",
+            sources: str = "",
+            task_types: str = "",
+            statuses: str = "",
+    ) -> dict:
+        page_result = self._get_data_store().query_history_page(
+            page=page,
+            page_size=page_size,
+            keyword=keyword,
+            resource_types=self._history_filter_values(resource_types),
+            sources=self._history_filter_values(sources),
+            task_types=self._history_filter_values(task_types),
+            statuses=self._history_filter_values(statuses),
+        )
+        page_groups = page_result.pop("groups", [])
+        page_history = [
+            record for group in page_groups
+            for record in group.get("records", [])
         ]
         if self._sync_handler:
-            history = self._sync_handler.prepare_history_records(history)
-        history.sort(key=self._history_episode_sort_key, reverse=True)
+            page_history = self._sync_handler.prepare_history_records(
+                page_history
+            )
+            prepared_by_id = {
+                str(record.get("record_id") or ""): record
+                for record in page_history
+            }
+            history_groups = []
+            for group in page_groups:
+                group["records"] = [
+                    prepared_by_id.get(
+                        str(record.get("record_id") or ""), record
+                    )
+                    for record in group.get("records", [])
+                ]
+                history_groups.append(
+                    self._sync_handler.prepare_history_group(group)
+                )
+        else:
+            page_history = [copy.deepcopy(item) for item in page_history]
+            history_groups = [copy.deepcopy(group) for group in page_groups]
         return {
             "success": True,
             "data": {
-                "history": history,
-                "emby_play_items": self._history_emby_play_items(history),
-                "offline_supported": bool(
-                    self._cloud_drive
-                    and self._cloud_drive.supports(CloudDriveCapability.OFFLINE_TASKS)
-                ),
-                "runtime": {
-                    "status": self._sync_status,
-                    "task": self._sync_task_text,
-                    "progress": self._sync_progress,
-                    "context": dict(self._sync_context),
-                    "tasks": self._serialize_runtime_tasks(),
+                "history_groups": history_groups,
+                "history_page": {
+                    "page": page_result["page"],
+                    "page_size": page_result["page_size"],
+                    "total": page_result["total"],
+                    "total_pages": page_result["total_pages"],
+                    "filter_options": page_result["filter_options"],
                 },
+                "emby_play_items": self._history_emby_play_items(page_history),
             },
         }
 
-    @staticmethod
-    def _history_episode_sort_key(record: dict) -> tuple:
-        """按季、集数数值倒序，避免 E100 被字符串排序到 E20 后面。"""
-        try:
-            season = int(record.get("season") or 0)
-        except (TypeError, ValueError):
-            season = 0
-        try:
-            episode = int(record.get("episode") or 0)
-        except (TypeError, ValueError):
-            episode = 0
-        if episode <= 0:
-            target_episodes = record.get("target_episodes")
-            values = (
-                target_episodes
-                if isinstance(target_episodes, (list, tuple, set))
-                else re.findall(r"\d+", str(target_episodes or ""))
-            )
-            episodes = []
-            for value in values:
-                try:
-                    number = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if number > 0:
-                    episodes.append(number)
-            episode = max(episodes, default=0)
-        return season, episode, str(record.get("time") or "")
+    def api_vue_history_summary(self) -> dict:
+        today = datetime.datetime.now(
+            tz=pytz.timezone(settings.TZ)
+        ).strftime("%Y-%m-%d")
+        return {
+            "success": True,
+            "data": self._get_data_store().history_summary(today),
+        }
 
-    def api_vue_ui_options(self) -> dict:
-        cache_key = f"instance:{id(self)}"
+    def api_vue_ui_options(self, scope: str = "base") -> dict:
+        normalized_scope = str(scope or "base").strip().lower()
+        normalized_scope = {
+            "transfer": "subscriptions",
+            "upgrade": "subscriptions",
+            "manual": "subscriptions",
+        }.get(normalized_scope, normalized_scope)
+        if normalized_scope not in {
+            "base", "subscriptions", "drive", "search", "notify"
+        }:
+            return {"success": False, "message": "未知的配置选项范围"}
+        cache_key = f"instance:{id(self)}:{normalized_scope}"
         cached = _UI_OPTIONS_CACHE.get(cache_key)
         if isinstance(cached, dict):
             return copy.deepcopy(cached)
+
+        if normalized_scope == "subscriptions":
+            result = {
+                "success": True,
+                "data": {
+                    "subscribes": UIConfig.get_subscribe_options_grouped(),
+                },
+            }
+            _UI_OPTIONS_CACHE.set(cache_key, copy.deepcopy(result))
+            return result
+
+        if normalized_scope in {"base", "drive"}:
+            providers = (
+                self._cloud_drive_registry.available()
+                if self._cloud_drive_registry else []
+            )
+            if normalized_scope == "base":
+                result = {
+                    "success": True,
+                    "data": {
+                        "defaults": UIConfig.get_default_config(),
+                        "cloud_drives": [
+                            {
+                                "title": provider.name,
+                                "value": provider.key,
+                                "capabilities": sorted(
+                                    capability.value
+                                    for capability in provider.capabilities
+                                ),
+                                "resource_types": sorted(provider.resource_types),
+                                "policy": {
+                                    "pagination_mode": provider.policy.pagination_mode,
+                                    "max_page_size": provider.policy.max_page_size,
+                                    "supports_batch": provider.policy.supports_batch,
+                                    "max_batch_size": provider.policy.max_batch_size,
+                                    "supports_cancel": provider.policy.supports_cancel,
+                                    "max_concurrency": provider.policy.max_concurrency,
+                                    "cache_ttl_seconds": dict(
+                                        provider.policy.cache_ttl_seconds
+                                    ),
+                                },
+                            }
+                            for provider in providers
+                        ],
+                    },
+                }
+            else:
+                accounts = {}
+                for provider in providers:
+                    if not provider.supports(CloudDriveCapability.ACCOUNT):
+                        continue
+                    accounts[provider.key] = self._cached_account_info(
+                        f"drive:{provider.key}",
+                        {
+                            "connected": False,
+                            "error": "点击刷新按钮读取账户信息",
+                        },
+                    )
+                result = {
+                    "success": True,
+                    "data": {
+                        "account": accounts.get(self._cloud_drive_key, {
+                            "connected": False,
+                            "error": "请先配置当前网盘账号",
+                        }),
+                        "accounts": accounts,
+                    },
+                }
+            _UI_OPTIONS_CACHE.set(cache_key, copy.deepcopy(result))
+            return result
+
+        if normalized_scope == "notify":
+            mediaservers = UIConfig.get_media_server_options()
+            result = {
+                "success": True,
+                "data": {
+                    "mediaservers": mediaservers,
+                    "media_library_webhook_urls": {
+                        str(item.get("value") or ""): (
+                                "/api/v1/webhook/?"
+                                + urlencode({
+                            "token": settings.API_TOKEN,
+                            "source": str(item.get("value") or ""),
+                        })
+                        )
+                        for item in mediaservers
+                        if str(item.get("type") or "").strip().lower() == "emby"
+                           and str(item.get("value") or "").strip()
+                    },
+                    "notification_types": [
+                        {"title": item.value, "value": item.name}
+                        for item in NotificationType
+                    ],
+                },
+            }
+            _UI_OPTIONS_CACHE.set(cache_key, copy.deepcopy(result))
+            return result
+
         from ...search.pansou import PanSouClient
         from ...search.types import PANSOU_RESOURCE_TYPES, resource_type_name
-
-        providers = (
-            self._cloud_drive_registry.available()
-            if self._cloud_drive_registry else []
-        )
-        accounts = {}
-        for provider in providers:
-            if not provider.supports(CloudDriveCapability.ACCOUNT):
-                continue
-            accounts[provider.key] = self._cached_account_info(
-                f"drive:{provider.key}",
-                {
-                    "connected": False,
-                    "error": "点击刷新按钮读取账户信息",
-                },
-            )
-        account = accounts.get(self._cloud_drive_key, {
-            "connected": False,
-            "error": "请先配置当前网盘账号",
-        })
 
         search_accounts = {
             "hdhive": {
@@ -127,26 +236,6 @@ class PageApi(OwnerDelegator):
             search_accounts[source] = self._cached_account_info(
                 f"search:{source}", search_accounts[source]
             )
-        cloud_drives = [
-            {
-                "title": provider.name,
-                "value": provider.key,
-                "capabilities": sorted(
-                    capability.value for capability in provider.capabilities
-                ),
-                "resource_types": sorted(provider.resource_types),
-                "policy": {
-                    "pagination_mode": provider.policy.pagination_mode,
-                    "max_page_size": provider.policy.max_page_size,
-                    "supports_batch": provider.policy.supports_batch,
-                    "max_batch_size": provider.policy.max_batch_size,
-                    "supports_cancel": provider.policy.supports_cancel,
-                    "max_concurrency": provider.policy.max_concurrency,
-                    "cache_ttl_seconds": dict(provider.policy.cache_ttl_seconds),
-                },
-            }
-            for provider in providers
-        ]
         pansou_options = {
             "status": "unavailable",
             "plugins": [],
@@ -180,35 +269,10 @@ class PageApi(OwnerDelegator):
                     for value in health.get("channels", [])
                 ],
             })
-        mediaservers = UIConfig.get_media_server_options()
-        media_library_webhook_urls = {
-            str(item.get("value") or ""): (
-                    "/api/v1/webhook/?"
-                    + urlencode({
-                "token": settings.API_TOKEN,
-                "source": str(item.get("value") or ""),
-            })
-            )
-            for item in mediaservers
-            if str(item.get("type") or "").strip().lower() == "emby"
-               and str(item.get("value") or "").strip()
-        }
         result = {
             "success": True,
             "data": {
-                "defaults": UIConfig.get_default_config(),
-                "subscribes": UIConfig.get_subscribe_options_grouped(),
-                "sites": UIConfig.get_site_name_options(),
-                "mediaservers": mediaservers,
-                "media_library_webhook_urls": media_library_webhook_urls,
-                "notification_types": [
-                    {"title": item.value, "value": item.name}
-                    for item in NotificationType
-                ],
-                "account": account,
-                "accounts": accounts,
                 "search_accounts": search_accounts,
-                "cloud_drives": cloud_drives,
                 "pansou": pansou_options,
             },
         }

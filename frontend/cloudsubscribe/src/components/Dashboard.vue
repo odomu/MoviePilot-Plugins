@@ -1,5 +1,12 @@
 <template>
-  <div ref="widgetRef" class="cloud-dashboard">
+  <CheckinDashboard
+      v-if="isCheckinDashboard"
+      :api="api"
+      :config="config"
+      :allow-refresh="allowRefresh"
+      :refresh-interval="refreshInterval"
+  />
+  <div v-else ref="widgetRef" class="cloud-dashboard">
     <v-card :flat="cardFlat" :loading="loading" class="dashboard-card">
       <v-card-item class="dashboard-header">
         <template #prepend>
@@ -91,7 +98,9 @@
 </template>
 
 <script setup>
-import {computed, onMounted, onUnmounted, ref} from "vue";
+import {computed, onMounted, onUnmounted, ref, watch} from "vue";
+import {connectRuntimeStream} from "../utils/runtimeStream.js";
+import CheckinDashboard from "./dashboard/CheckinDashboard.vue";
 
 const props = defineProps({
   api: {type: Object, default: () => ({})},
@@ -105,9 +114,16 @@ const loaded = ref(false);
 const error = ref("");
 const refreshedAt = ref(0);
 const overview = ref({runtime: {}, stats: [], recent_history: []});
-let timer = null;
+let refreshTimer = null;
+let runtimeStream = null;
+let runtimeStreamFailures = 0;
+let runtimeStreamDisabled = false;
 
 const attrs = computed(() => props.config?.attrs || {});
+const dashboardType = computed(
+    () => props.config?.key || attrs.value.dashboard || "overview",
+);
+const isCheckinDashboard = computed(() => dashboardType.value === "checkin");
 const cardTitle = computed(() => attrs.value.title || "网盘订阅助手");
 const cardSubtitle = computed(
     () => attrs.value.subtitle || "订阅任务与转存概览",
@@ -155,13 +171,18 @@ function historyKey(item) {
 }
 
 async function loadOverview() {
-  if (!props.api?.get || loading.value) return;
+  if (isCheckinDashboard.value || !props.api?.get || loading.value) return;
   loading.value = true;
   error.value = "";
   try {
-    const result = await props.api.get("plugin/CloudSubscribe/overview");
+    const result = await props.api.get(
+        "plugin/CloudSubscribe/overview?include_runtime=false",
+    );
     if (!result?.success) throw new Error(result?.message || "获取数据失败");
-    overview.value = result.data || overview.value;
+    overview.value = {
+      ...overview.value,
+      ...(result.data || {}),
+    };
     loaded.value = true;
     refreshedAt.value = Date.now();
   } catch (e) {
@@ -171,15 +192,112 @@ async function loadOverview() {
   }
 }
 
-onMounted(() => {
-  loadOverview();
-  if (refreshSeconds.value > 0) {
-    timer = window.setInterval(loadOverview, refreshSeconds.value * 1000);
+function runtimeIsActive(value) {
+  return (
+      ["starting", "running", "stopping"].includes(value?.status) ||
+      (value?.tasks || []).some((task) =>
+          ["queued", "running", "stopping", "postprocessing"].includes(task.status),
+      )
+  );
+}
+
+function isPageVisible() {
+  return document.visibilityState !== "hidden";
+}
+
+function clearRefreshTimer() {
+  if (refreshTimer !== null) {
+    window.clearTimeout(refreshTimer);
+    refreshTimer = null;
   }
+}
+
+function closeRuntimeStream() {
+  if (runtimeStream) {
+    runtimeStream.close();
+    runtimeStream = null;
+  }
+}
+
+function stopAutoRefresh() {
+  clearRefreshTimer();
+  closeRuntimeStream();
+}
+
+function scheduleFallbackRefresh(delay = refreshSeconds.value * 1000) {
+  clearRefreshTimer();
+  if (refreshSeconds.value <= 0 || !isPageVisible()) return;
+  refreshTimer = window.setTimeout(
+      async () => {
+        refreshTimer = null;
+        await loadOverview();
+        scheduleFallbackRefresh();
+      },
+      Math.max(1000, Number(delay) || 0),
+  );
+}
+
+function openRuntimeStream() {
+  if (runtimeStreamDisabled || runtimeStream || refreshSeconds.value <= 0)
+    return false;
+  const source = connectRuntimeStream("CloudSubscribe", {
+    onOpen() {
+      runtimeStreamFailures = 0;
+      clearRefreshTimer();
+    },
+    onRuntime(nextRuntime) {
+      const wasActive = runtimeIsActive(overview.value.runtime);
+      overview.value = {...overview.value, runtime: nextRuntime};
+      loaded.value = true;
+      refreshedAt.value = Date.now();
+      if (wasActive && !runtimeIsActive(nextRuntime)) void loadOverview();
+    },
+    onError() {
+      runtimeStreamFailures += 1;
+      if (runtimeStreamFailures < 2) return;
+      closeRuntimeStream();
+      runtimeStreamDisabled = true;
+      scheduleFallbackRefresh(1000);
+    },
+  });
+  if (!source) return false;
+  runtimeStream = source;
+  return true;
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  if (isCheckinDashboard.value || refreshSeconds.value <= 0 || !isPageVisible())
+    return;
+  if (!openRuntimeStream()) scheduleFallbackRefresh();
+}
+
+function handleVisibilityChange() {
+  if (!isPageVisible()) {
+    stopAutoRefresh();
+    return;
+  }
+  runtimeStreamDisabled = false;
+  runtimeStreamFailures = 0;
+  void loadOverview().finally(startAutoRefresh);
+}
+
+watch(refreshSeconds, () => {
+  if (isCheckinDashboard.value) return;
+  runtimeStreamDisabled = false;
+  runtimeStreamFailures = 0;
+  startAutoRefresh();
+});
+
+onMounted(() => {
+  if (isCheckinDashboard.value) return;
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  void loadOverview().finally(startAutoRefresh);
 });
 
 onUnmounted(() => {
-  if (timer) window.clearInterval(timer);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  stopAutoRefresh();
 });
 </script>
 

@@ -9,7 +9,6 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import unicodedata
 from app.chain.mediaserver import MediaServerChain
 from app.core.context import MediaInfo
 from app.core.metainfo import MetaInfo
@@ -23,6 +22,7 @@ from app.schemas.types import MediaType
 from sqlalchemy import func, or_
 
 from ...core import CloudDriveCapability, CloudFile, OwnerDelegator
+from ...core.history import history_group_key
 from ...search.types import normalize_resource_type, resource_type_from_url
 
 
@@ -853,20 +853,6 @@ class HistoryService(OwnerDelegator):
     def _history_page_fields(record: Dict[str, Any]) -> Dict[str, str]:
         """生成历史页面所需的稳定标识、名称和可点击链接。"""
         media_type = str(record.get("type") or "未知类型")
-        tmdb_id = str(record.get("tmdb_id") or "").strip()
-        if tmdb_id:
-            group_key = f"tmdb:{media_type}:{tmdb_id}"
-        else:
-            title_key = " ".join(
-                unicodedata.normalize(
-                    "NFKC", str(record.get("title") or "")
-                ).casefold().split()
-            )
-            year = (
-                str(record.get("year") or "").strip()
-                if media_type == "电影" else ""
-            )
-            group_key = f"legacy:{media_type}:{title_key}:{year}"
 
         file_name = str(
             record.get("file_name") or record.get("source_file_name") or ""
@@ -929,7 +915,7 @@ class HistoryService(OwnerDelegator):
             else ""
         )
         return {
-            "history_group_key": group_key,
+            "history_group_key": history_group_key(record),
             "display_name": display_name,
             "display_file_name": file_name,
             "file_extension": extension,
@@ -1030,6 +1016,60 @@ class HistoryService(OwnerDelegator):
                     f"原版{count_label}：{' · '.join(parts) or '版本信息缺失'}"
                 )
             prepared.append(record)
+        return prepared
+
+    @staticmethod
+    def prepare_history_group(group: Dict[str, Any]) -> Dict[str, Any]:
+        """补充单个数据库媒体组的展示字段，不在应用层重新分组。"""
+        prepared = copy.deepcopy(group)
+        records = prepared.get("records") or []
+        first = records[0] if records else {}
+        prepared.update({
+            "tmdb_id": first.get("tmdb_id"),
+            "title": first.get("title") or "未知媒体",
+            "year": first.get("year") or "",
+            "type": first.get("type") or "未知类型",
+            "resource_types": list(dict.fromkeys(
+                str(record.get("resource_type") or "unknown")
+                for record in records
+                if str(record.get("resource_type") or "").strip()
+            )),
+        })
+        prepared["sources"] = list(dict.fromkeys(
+            "manual"
+            if str(record.get("source") or "").strip().casefold()
+               in {"manual", "手动添加", "手动资源"}
+            else str(record.get("source") or "unknown").strip().casefold()
+            for record in records
+        ))
+        prepared["source_items"] = [
+            {"value": source} for source in prepared["sources"]
+        ]
+        prepared["seasons"] = sorted({
+            int(record.get("season") or 0)
+            for record in records
+            if str(record.get("season") or "").isdigit()
+               and int(record.get("season") or 0) > 0
+        })
+        prepared["resource_link_count"] = len({
+            str(record.get("resource_link") or "").strip()
+            for record in records
+            if str(record.get("resource_link") or "").strip()
+        })
+        prepared["notification_record"] = max(
+            (
+                record for record in records
+                if record.get("status") == "成功" and not record.get("finalize_key")
+            ),
+            key=lambda record: str(record.get("time") or ""),
+            default=None,
+        )
+        prepared["selectable"] = bool(records)
+        prepared["deletable"] = bool(records) and all(
+            record.get("status") in {"成功", "失败"}
+            or bool(record.get("finalize_key"))
+            for record in records
+        )
         return prepared
 
     def reconcile_orphaned_history(self) -> int:
@@ -1307,14 +1347,14 @@ class HistoryService(OwnerDelegator):
             try:
                 self.send_transfer_notification(aggregated, total_count)
             except Exception as error:
-                logger.warning(f"文件完成汇总通知发送失败：{error}")
+                logger.warning(f"文件完成通知入队失败：{error}")
         if self._file_finalized:
             try:
                 self._file_finalized(aggregated, total_count)
             except Exception as error:
                 logger.warning(f"文件完成汇总 Webhook 发送失败：{error}")
         logger.debug(
-            f"网盘文件后处理完成汇总：{total_count} 个文件，"
+            f"网盘文件后处理完成通知已入队：{total_count} 个文件，"
             f"{len(aggregated)} 个媒体项"
         )
 

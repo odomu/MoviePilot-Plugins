@@ -133,6 +133,18 @@ class QRCodeService(OwnerDelegator):
             logger.error(f"检查网盘扫码登录状态失败：{provider} - {error}")
             return {"success": False, "message": str(error)}
 
+    def api_vue_check_qrcode_post(self, payload: Dict[str, Any]) -> dict:
+        """POST 版本的扫码状态检查，避免把临时凭据放进 URL。"""
+        data = payload or {}
+        fields = (
+            "provider", "uid", "time", "sign", "client_type", "qr_token",
+            "uni_id", "device_code", "device_id", "client_id", "t", "ck",
+            "uuid", "encryuuid", "req_id", "lt", "param_id",
+        )
+        return self.api_vue_check_qrcode(**{
+            field: data.get(field, "") for field in fields if field in data
+        })
+
     def _apply_qrcode_credentials(
             self, provider: str, result: Dict[str, Any]
     ) -> Dict[str, str]:

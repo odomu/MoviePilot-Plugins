@@ -19,8 +19,30 @@ export function createCheckinGroups() {
                             enabledKey: "hdhive_checkin_enabled",
                             modeKey: "hdhive_checkin_mode",
                             credentialKeys: ["hdhive_username", "hdhive_password"],
-                            gamblerWarning:
-                                "HDHive 赌狗模式会将签到奖励乘以 -1～3 的随机倍数，最多扣除 3 积分。",
+                            riskWarnings: {
+                                gambler:
+                                    "HDHive 赌狗模式会将签到奖励乘以 -1～3 的随机倍数，最多扣除 3 积分。",
+                            },
+                        },
+                        {
+                            key: "dian115",
+                            name: "Dian115",
+                            icon: "mdi-cloud-search",
+                            enabledKey: "dian115_checkin_enabled",
+                            modeKey: "dian115_checkin_mode",
+                            credentialKeys: ["dian115_email", "dian115_password"],
+                            riskWarnings: {
+                                lucky:
+                                    "运气签到有 21% 概率扣除 1 倍普通签到积分，也可能获得 3～10 倍奖励。",
+                            },
+                        },
+                        {
+                            key: "juying",
+                            name: "聚影",
+                            icon: "mdi-movie-check-outline",
+                            enabledKey: "juying_checkin_enabled",
+                            modeKey: "juying_checkin_mode",
+                            credentialKeys: ["juying_username", "juying_password"],
                         },
                     ],
                     cols: 12,
@@ -65,13 +87,12 @@ export function createCheckinGroups() {
             tab: "checkin",
             title: "HDHive 签到",
             icon: "mdi-hexagon-multiple-outline",
-            hint: "复用 HDHive WebAPI 账号和动态验证码识别，不会启动浏览器。",
             fields: [
                 {
                     key: "hdhive_checkin_enabled",
                     label: "启用每日签到",
                     type: "switch",
-                    cols: 6,
+                    cols: 4,
                 },
                 {
                     key: "hdhive_checkin_mode",
@@ -79,14 +100,72 @@ export function createCheckinGroups() {
                     type: "select",
                     items: [
                         {title: "普通签到", value: "normal"},
-                        {
-                            title: "赌狗签到（-1～3 倍，最多扣 3 积分）",
-                            value: "gambler",
-                        },
+                        {title: "赌狗签到", value: "gambler",},
                     ],
                     hint: "HDHive 赌狗模式会将签到奖励乘以 -1～3 的随机倍数，最坏扣除 3 积分。",
-                    cols: 6,
+                    cols: 8,
                     show: enabled("hdhive_checkin_enabled"),
+                },
+            ],
+        },
+        {
+            tab: "checkin",
+            title: "Dian115 签到与娱乐",
+            icon: "mdi-cloud-search",
+            fields: [
+                {
+                    key: "dian115_checkin_enabled",
+                    label: "启用每日签到",
+                    type: "switch",
+                    cols: 4,
+                },
+                {
+                    key: "dian115_checkin_mode",
+                    label: "签到模式",
+                    type: "select",
+                    items: [
+                        {title: "普通签到", value: "normal"},
+                        {title: "运气签到", value: "lucky"},
+                    ],
+                    hint: "运气签到可能获得 3～10 倍奖励，也有 21% 概率扣除 1 倍普通签到积分。",
+                    cols: 8,
+                    show: enabled("dian115_checkin_enabled"),
+                },
+                {
+                    key: "dian115_lottery_enabled",
+                    label: "启用幸运转盘",
+                    type: "switch",
+                    hint: "每次消耗 5 积分",
+                    cols: 4,
+                    show: enabled("dian115_checkin_enabled"),
+                },
+                {
+                    key: "dian115_lottery_count",
+                    label: "每日转盘目标次数",
+                    type: "number",
+                    min: 1,
+                    max: 20,
+                    suffix: "次",
+                    hint: "最多 20 次；会先读取站点当天已用次数，只执行尚缺的次数。",
+                    cols: 8,
+                    show: (config) =>
+                        Boolean(
+                            config.dian115_checkin_enabled &&
+                            config.dian115_lottery_enabled,
+                        ),
+                },
+            ],
+        },
+        {
+            tab: "checkin",
+            title: "聚影签到",
+            icon: "mdi-movie-check-outline",
+            fields: [
+                {
+                    key: "juying_checkin_enabled",
+                    label: "启用每日签到",
+                    type: "switch",
+                    cols: 12,
                 },
             ],
         },

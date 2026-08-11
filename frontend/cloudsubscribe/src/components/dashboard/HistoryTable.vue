@@ -128,6 +128,9 @@
             density="compact"
             variant="outlined"
             hide-details
+            @keyup.enter="submitSearch"
+            @click:prepend-inner="submitSearch"
+            @click:clear="clearSearch"
         />
         <div v-else class="history-search-trigger">
           <v-menu
@@ -157,6 +160,9 @@
                     density="compact"
                     variant="outlined"
                     hide-details
+                    @keyup.enter="submitSearch"
+                    @click:prepend-inner="submitSearch"
+                    @click:clear="clearSearch"
                 />
               </v-card-text>
             </v-card>
@@ -201,13 +207,32 @@
       <v-divider/>
     </div>
 
-    <v-data-table
-        v-if="!isMobile && (loading || groupedItems.length)"
+    <div class="history-content">
+      <div
+          v-if="loading"
+          :class="[
+            'history-loading-mask',
+            {
+              'history-loading-mask--empty': !historyGroups.length,
+              'history-loading-mask--mobile': isMobile,
+              'history-loading-mask--mobile-pagination': isMobile && totalPages > 1,
+            },
+          ]"
+      >
+        <div class="history-loading-state">
+          <v-progress-circular indeterminate color="primary" size="42" width="4"/>
+          <span class="text-body-2">正在加载历史记录...</span>
+        </div>
+      </div>
+
+      <v-data-table-server
+          v-if="!isMobile"
         :headers="headers"
-        :items="groupedItems"
+          :items="historyGroups"
+        :items-length="total"
+        :page="page"
         v-model="selectedGroupKeys"
         v-model:expanded="expanded"
-        :loading="loading"
         item-value="group_key"
         item-selectable="selectable"
         select-strategy="all"
@@ -216,13 +241,15 @@
         density="compact"
         hover
         fixed-header
-        :items-per-page="10"
+        :items-per-page="pageSize"
         :items-per-page-options="pageSizes"
         items-per-page-text="每页"
         page-text="第 {0}-{1} 条，共 {2} 条"
         no-data-text="暂无符合条件的转存记录"
         loading-text="正在加载转存记录..."
         class="history-table"
+        @update:page="changePage"
+        @update:items-per-page="changePageSize"
         @click:row="toggleExpanded"
     >
       <template #item.media="{ item }">
@@ -509,25 +536,12 @@
         </tr>
       </template>
 
-    </v-data-table>
+      </v-data-table-server>
 
-    <div
-        v-else-if="!isMobile"
-        class="history-empty text-body-2 text-medium-emphasis"
-    >
-      暂无符合条件的转存记录
-    </div>
-
-    <div v-else class="history-mobile-list">
-      <v-progress-linear
-          v-if="loading"
-          indeterminate
-          color="primary"
-          height="2"
-      />
+      <div v-else class="history-mobile-list">
       <div class="history-mobile-scroll">
         <div
-            v-if="!loading && !groupedItems.length"
+            v-if="!loading && !historyGroups.length"
             class="history-mobile-empty text-body-2 text-medium-emphasis"
         >
           暂无符合条件的转存记录
@@ -540,7 +554,7 @@
             class="history-mobile-panels"
         >
           <v-expansion-panel
-              v-for="item in mobilePagedItems"
+              v-for="item in historyGroups"
               :key="item.group_key"
               :value="item.group_key"
               :class="[
@@ -777,13 +791,15 @@
         </v-expansion-panels>
       </div>
       <v-pagination
-          v-if="mobileTotalPages > 1"
-          v-model="mobilePage"
-          :length="mobileTotalPages"
+          v-if="totalPages > 1"
+          :model-value="page"
+          :length="totalPages"
           :total-visible="5"
           density="compact"
           class="history-mobile-pagination"
+          @update:model-value="changePage"
       />
+      </div>
     </div>
   </div>
 </template>
@@ -794,6 +810,11 @@ import {useDisplay} from "vuetify";
 
 const props = defineProps({
   items: {type: Array, default: () => []},
+  page: {type: Number, default: 1},
+  pageSize: {type: Number, default: 10},
+  total: {type: Number, default: 0},
+  totalPages: {type: Number, default: 1},
+  filterOptions: {type: Object, default: () => ({})},
   embyPlayItems: {type: Object, default: () => ({})},
   loading: Boolean,
   retryingKey: {type: String, default: ""},
@@ -812,10 +833,12 @@ const emit = defineEmits([
   "upgrade",
   "play",
   "open-media",
+  "query-change",
 ]);
 const display = useDisplay();
 const isMobile = computed(() => display.xs.value);
 const keyword = ref("");
+const appliedKeyword = ref("");
 const selectedResourceTypes = ref([]);
 const selectedSources = ref([]);
 const selectedTaskTypes = ref([]);
@@ -824,8 +847,7 @@ const expanded = ref([]);
 const selectedGroupKeys = ref([]);
 const filtersVisible = ref(false);
 const searchVisible = ref(false);
-const mobilePage = ref(1);
-const mobilePageSize = 10;
+let lastQuerySignature = "";
 
 const sourceNames = {
   hdhive: "HDHive",
@@ -848,7 +870,6 @@ const pageSizes = [
   {value: 10, title: "10"},
   {value: 20, title: "20"},
   {value: 50, title: "50"},
-  {value: -1, title: "全部"},
 ];
 const headers = [
   {title: "媒体", key: "media", sortable: false, width: "25%"},
@@ -862,57 +883,16 @@ const headers = [
 ];
 
 const resourceTypeOptions = computed(() =>
-    uniqueOptions(props.items.map((item) => resourceType(item))).map((value) => ({
+    uniqueOptions(props.filterOptions?.resourceTypes || []).map((value) => ({
       title: resourceTypeLabel(value),
       value,
     })),
 );
 const sourceOptions = computed(() =>
-    uniqueOptions(props.items.map((item) => normalizeSource(item.source))).map(
+    uniqueOptions(props.filterOptions?.sources || []).map(
         (value) => ({title: sourceLabel(value), value}),
     ),
 );
-const filteredRecords = computed(() => {
-  const query = String(keyword.value || "")
-      .trim()
-      .toLowerCase();
-  return props.items.filter((item) => {
-    const type = resourceType(item);
-    const source = normalizeSource(item.source);
-    if (
-        selectedResourceTypes.value.length &&
-        !selectedResourceTypes.value.includes(type)
-    )
-      return false;
-    if (selectedSources.value.length && !selectedSources.value.includes(source))
-      return false;
-    if (
-        selectedTaskTypes.value.length &&
-        !selectedTaskTypes.value.some((value) =>
-            (item.task_types || []).includes(value),
-        )
-    )
-      return false;
-    if (
-        selectedStatuses.value.length &&
-        !selectedStatuses.value.includes(item.status)
-    )
-      return false;
-    if (!query) return true;
-    return [
-      item.title,
-      item.file_name,
-      item.type,
-      item.tmdb_id,
-      resourceTypeLabel(type),
-      sourceLabel(source),
-    ].some((value) =>
-        String(value || "")
-            .toLowerCase()
-            .includes(query),
-    );
-  });
-});
 
 function notificationSummaryTitle(item) {
   const title = String(item?.title || "未知媒体").trim();
@@ -920,67 +900,9 @@ function notificationSummaryTitle(item) {
   return year ? title + "（" + year + "）" : title;
 }
 
-const groupedItems = computed(() => {
-  const groups = new Map();
-  for (const record of filteredRecords.value) {
-    const mediaType = record.type || "未知类型";
-    const groupKey = String(
-        record.history_group_key || record.time || record.file_name || groups.size,
-    );
-    if (!groups.has(groupKey)) {
-      groups.set(groupKey, {
-        group_key: groupKey,
-        tmdb_id: record.tmdb_id || null,
-        title: record.title || "未知媒体",
-        year: record.year || "",
-        type: mediaType,
-        latest_time: record.time || "",
-        records: [],
-        resource_types: [],
-        sources: [],
-        success_count: 0,
-        pending_count: 0,
-        failed_count: 0,
-        total_size: 0,
-      });
-    }
-    const group = groups.get(groupKey);
-    group.records.push(record);
-    if (String(record.time || "") > group.latest_time)
-      group.latest_time = record.time;
-    if (record.status === "成功") group.success_count += 1;
-    else if (["处理中", "下载中"].includes(record.status))
-      group.pending_count += 1;
-    else group.failed_count += 1;
-    group.total_size += Number(record.file_size || 0);
-  }
-  return [...groups.values()]
-      .map((group) => ({
-        ...group,
-        records: [...group.records],
-        resource_types: uniqueOptions(
-            group.records.map((record) => resourceType(record)),
-        ),
-        sources: uniqueOptions(
-            group.records.map((record) => normalizeSource(record.source)),
-        ),
-        seasons: historySeasons(group.records),
-        source_items: uniqueOptions(
-            group.records.map((record) => normalizeSource(record.source)),
-        ).map((value) => ({value})),
-        resource_link_count: uniqueOptions(
-            group.records.map((record) => record.resource_link),
-        ).length,
-        notification_record:
-            [...group.records]
-                .filter(canNotifyRecord)
-                .sort(compareTimeDesc)[0] || null,
-        selectable: group.records.length > 0,
-        deletable:
-            group.records.length > 0 && group.records.every(canDeleteRecord),
-      }))
-      .sort((left, right) => compareTimeDesc(left, right, "latest_time"));
-});
+const historyGroups = computed(() =>
+    Array.isArray(props.items) ? props.items : [],
+);
 const activeFilterCount = computed(
     () =>
         selectedResourceTypes.value.length +
@@ -988,16 +910,9 @@ const activeFilterCount = computed(
         selectedTaskTypes.value.length +
         selectedStatuses.value.length,
 );
-const mobileTotalPages = computed(() =>
-    Math.max(1, Math.ceil(groupedItems.value.length / mobilePageSize)),
-);
-const mobilePagedItems = computed(() => {
-  const start = (mobilePage.value - 1) * mobilePageSize;
-  return groupedItems.value.slice(start, start + mobilePageSize);
-});
 const selectedGroups = computed(() => {
   const keys = new Set(selectedGroupKeys.value);
-  return groupedItems.value.filter(
+  return historyGroups.value.filter(
       (group) => keys.has(group.group_key),
   );
 });
@@ -1005,17 +920,64 @@ const deletableSelectedGroups = computed(() =>
     selectedGroups.value.filter((group) => group.deletable),
 );
 const groupedItemKeys = computed(
-    () => new Set(groupedItems.value.map((group) => group.group_key)),
+    () => new Set(historyGroups.value.map((group) => group.group_key)),
+);
+
+function emitQueryChange(overrides = {}) {
+  const query = {
+    page: props.page,
+    pageSize: props.pageSize,
+    keyword: appliedKeyword.value,
+    resourceTypes: [...selectedResourceTypes.value],
+    sources: [...selectedSources.value],
+    taskTypes: [...selectedTaskTypes.value],
+    statuses: [...selectedStatuses.value],
+    ...overrides,
+  };
+  const signature = JSON.stringify(query);
+  if (signature === lastQuerySignature) return;
+  lastQuerySignature = signature;
+  expanded.value = [];
+  selectedGroupKeys.value = [];
+  emit("query-change", query);
+}
+
+function changePage(value) {
+  emitQueryChange({page: Math.max(1, Number(value) || 1)});
+}
+
+function changePageSize(value) {
+  emitQueryChange({
+    page: 1,
+    pageSize: Math.min(50, Math.max(1, Number(value) || 10)),
+  });
+}
+
+function submitSearch() {
+  const nextKeyword = String(keyword.value || "").trim();
+  appliedKeyword.value = nextKeyword;
+  searchVisible.value = false;
+  emitQueryChange({page: 1, keyword: nextKeyword});
+}
+
+function clearSearch() {
+  keyword.value = "";
+  appliedKeyword.value = "";
+  emitQueryChange({page: 1, keyword: ""});
+}
+
+watch(
+    [selectedResourceTypes, selectedSources, selectedTaskTypes, selectedStatuses],
+    () => emitQueryChange({page: 1}),
+    {deep: true},
 );
 
 watch(
-    [keyword, selectedResourceTypes, selectedSources, selectedTaskTypes, selectedStatuses],
+    () => props.page,
     () => {
-      mobilePage.value = 1;
       expanded.value = [];
       selectedGroupKeys.value = [];
     },
-    {deep: true},
 );
 
 watch(groupedItemKeys, (keys) => {
@@ -1046,23 +1008,8 @@ watch(
     {immediate: true},
 );
 
-function compareTimeDesc(left, right, key = "time") {
-  return String(right[key] || "").localeCompare(String(left[key] || ""));
-}
-
 function uniqueOptions(values) {
   return [...new Set(values.filter(Boolean))];
-}
-
-function historySeasons(records) {
-  return [
-    ...new Set(
-        records
-            .filter((record) => record.type !== "电影")
-            .map((record) => Number(record.season))
-            .filter((season) => Number.isInteger(season) && season > 0),
-    ),
-  ].sort((left, right) => left - right);
 }
 
 function normalizeSource(value) {
@@ -1269,10 +1216,6 @@ function deleteTitle(record) {
   return record?.finalize_key ? "删除此条后处理记录" : "删除此条历史记录";
 }
 
-function canNotifyRecord(record) {
-  return record?.status === "成功" && !record?.finalize_key;
-}
-
 const pad = (value) => String(Number(value || 0)).padStart(2, "0");
 </script>
 
@@ -1285,6 +1228,48 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
   flex-direction: column;
   overflow: hidden;
   background: rgb(var(--v-theme-surface));
+}
+
+.history-content {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.history-loading-mask {
+  position: absolute;
+  z-index: 5;
+  top: 48px;
+  right: 0;
+  bottom: 56px;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(var(--v-theme-surface), 0.76);
+  backdrop-filter: blur(1px);
+}
+
+.history-loading-mask--empty,
+.history-loading-mask--mobile {
+  top: 0;
+  bottom: 0;
+}
+
+.history-loading-mask--mobile-pagination {
+  bottom: 48px;
+}
+
+.history-loading-state {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 12px;
+  color: rgb(var(--v-theme-primary));
 }
 
 .history-toolbar {
@@ -1394,15 +1379,6 @@ const pad = (value) => String(Number(value || 0)).padStart(2, "0");
   flex: 1 1 auto;
   min-height: 0;
   flex-direction: column;
-}
-
-.history-empty {
-  display: flex;
-  flex: 1 1 auto;
-  min-height: 0;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
 }
 
 .history-table :deep(.v-data-table-footer) {

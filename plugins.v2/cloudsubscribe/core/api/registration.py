@@ -5,12 +5,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import pytz
 from app.core.config import settings
+from app.core.security import verify_resource_token
 from app.log import logger
 from app.schemas.types import EventType
 from app.utils.timer import TimerUtils
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from fastapi import Depends
 
 from .. import OwnerDelegator
 from ..agent import (
@@ -73,14 +75,21 @@ class MoviePilotRegistration(OwnerDelegator):
                 "endpoint": self.api_vue_page_data,
                 "methods": ["GET"],
                 "auth": "bear",
-                "summary": "获取Vue详情页数据",
+                "summary": "获取历史记录分页数据",
+            },
+            {
+                "path": "/history/summary",
+                "endpoint": self.api_vue_history_summary,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取历史记录聚合摘要",
             },
             {
                 "path": "/ui_options",
                 "endpoint": self.api_vue_ui_options,
                 "methods": ["GET"],
                 "auth": "bear",
-                "summary": "获取Vue配置页选项",
+                "summary": "获取指定配置作用域选项",
             },
             {
                 "path": "/account/refresh",
@@ -102,6 +111,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "校验HDHive OAuth回调并换取用户Token",
+            },
+            {
+                "path": "/checkin/overview",
+                "endpoint": self.api_vue_checkin_overview,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取多渠道签到仪表盘",
             },
             {
                 "path": "/checkin/{provider}",
@@ -209,11 +225,26 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "查看运行状态",
             },
             {
+                "path": "/runtime/stream",
+                "endpoint": self.api_vue_runtime_stream,
+                "methods": ["GET"],
+                "allow_anonymous": True,
+                "dependencies": [Depends(verify_resource_token)],
+                "summary": "实时推送运行状态",
+            },
+            {
                 "path": "/offline",
                 "endpoint": self.api_vue_offline_tasks,
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "查看当前网盘离线任务",
+            },
+            {
+                "path": "/offline/refresh",
+                "endpoint": self.api_vue_refresh_offline_tasks,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "刷新当前网盘离线任务",
             },
             {
                 "path": "/offline/delete",
@@ -272,6 +303,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "从历史记录或媒体服务器内容发起洗版",
             },
             {
+                "path": "/media/servers",
+                "endpoint": self.api_vue_media_servers,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取可用媒体服务器选项",
+            },
+            {
                 "path": "/media/content",
                 "endpoint": self.api_vue_media_server_content,
                 "methods": ["GET"],
@@ -314,6 +352,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "检查网盘扫码登录状态",
             },
             {
+                "path": "/qrcode/check",
+                "endpoint": self.api_vue_check_qrcode_post,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "检查网盘扫码登录状态（POST）",
+            },
+            {
                 "path": "/batch_re_score",
                 "endpoint": self.api_batch_re_score,
                 "methods": ["POST"],
@@ -332,21 +377,34 @@ class MoviePilotRegistration(OwnerDelegator):
     def get_dashboard_meta(self) -> List[Dict[str, str]]:
         if not self._enabled:
             return []
-        return [{"key": "overview", "name": "网盘订阅助手"}]
+        return [
+            {"key": "overview", "name": "网盘订阅助手"},
+            {"key": "checkin", "name": "签到概览"},
+        ]
 
     def get_dashboard(
             self, key: str = "overview", **kwargs
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], None]]:
-        if not self._enabled or key != "overview":
+        if not self._enabled:
+            return None
+        dashboards = {
+            "overview": {
+                "title": "网盘订阅助手",
+                "subtitle": "订阅任务与转存概览",
+                "dashboard": "overview",
+            },
+            "checkin": {
+                "title": "签到概览",
+                "subtitle": "多渠道每日签到与积分",
+                "dashboard": "checkin",
+            },
+        }
+        attrs = dashboards.get(key)
+        if attrs is None:
             return None
         return (
             {"cols": 12, "sm": 6, "md": 4},
-            {
-                "title": "网盘订阅助手",
-                "subtitle": "订阅任务与转存概览",
-                "refresh": 30,
-                "border": True,
-            },
+            {**attrs, "refresh": 30, "border": True},
             None,
         )
 
@@ -431,7 +489,7 @@ class MoviePilotRegistration(OwnerDelegator):
             {
                 "cmd": "/cloud_checkin",
                 "event": EventType.PluginAction,
-                "desc": "立即执行签到：渠道 模式",
+                "desc": "立即执行签到：渠道 normal|gambler|lucky confirm",
                 "category": "网盘订阅",
                 "data": {"action": "cloudsubscribe_checkin"},
             },

@@ -160,6 +160,7 @@ class SyncHandler:
     _RUNTIME_CACHE_TTL = 6 * 60 * 60
     _SUBSCRIBE_DEFER_CACHE_TTL = 32 * 24 * 60 * 60
     _SUBSCRIBE_CALENDAR_CACHE_TTL = 26 * 60 * 60
+    _NOTIFICATION_BATCH_WINDOW_SECONDS = 2
     _CLOUD_MEDIA_ROOT = "/"
     _OFFLINE_RESOURCE_URL_RE = re.compile(
         r"ed2k://\|file\|[^|\r\n]+\|\d+\|[0-9A-Fa-f]{32}"
@@ -215,6 +216,7 @@ class SyncHandler:
             platform_transfer_history_enabled: bool = False,
             should_stop: Callable[[], bool] = None,
             offline_pending_changed: Callable[[int], None] = None,
+            history_changed: Callable[[], None] = None,
             file_finalized: Callable[[List[Dict[str, Any]], int], None] = None,
             task_update: Callable[..., None] = None,
             task_context: Callable[[], Tuple[str, Any]] = None,
@@ -404,9 +406,16 @@ class SyncHandler:
             delay_seconds=media_server_refresh_delay,
             emby_mediainfo_enabled=emby_mediainfo_enabled,
         )
+        self._notification_delay_seconds = max(
+            0, int(media_server_refresh_delay or 0)
+        )
+        self._notification_batch_lock = threading.RLock()
+        self._notification_batch: List[Dict[str, Any]] = []
+        self._notification_batch_timer: Optional[threading.Timer] = None
         self._emby_media_resolver = EmbyMediaResolver()
         self._should_stop = should_stop
         self._offline_pending_changed = offline_pending_changed
+        self._history_changed = history_changed
         self._file_finalized = file_finalized
         self._task_update = task_update
         self._task_context = task_context
@@ -462,6 +471,19 @@ class SyncHandler:
             "sync:baseline_emby", self, maxsize=256,
             ttl=self._RUNTIME_CACHE_TTL,
         )
+
+    def append_history_records(
+            self,
+            records: List[Dict[str, Any]],
+            reopen_terminal: bool = False,
+    ) -> int:
+        """写入历史后通知运行态订阅者，避免前端等待整批任务结束。"""
+        count = self._get_component(HistoryService).append_history_records(
+            records, reopen_terminal=reopen_terminal
+        )
+        if count and self._history_changed:
+            self._history_changed()
+        return count
 
     def _is_cloud_upgrade_subscribe(self, subscribe: Any) -> bool:
         """判断订阅是否属于插件网盘洗版范围。"""
@@ -1105,7 +1127,8 @@ class SyncHandler:
         )
 
     def close(self) -> None:
-        """提交尚未发送的媒体目录通知并释放通知定时器。"""
+        """提交尚未发送的完成通知并释放通知定时器。"""
+        self._flush_transfer_notifications()
         self._media_server_notifier.close(flush=True)
 
     def update_notification_config(
@@ -1120,6 +1143,9 @@ class SyncHandler:
     ) -> None:
         self._notify = bool(notify)
         self._notification_type = notification_type
+        self._notification_delay_seconds = max(
+            0, int(media_server_refresh_delay or 0)
+        )
         old_notifier = self._media_server_notifier
         self._media_server_notifier = MediaServerNotifier(
             enabled=media_server_refresh_enabled,
@@ -2860,10 +2886,49 @@ class SyncHandler:
             "updated": bool(update_data),
         }
 
-    def send_transfer_notification(self, transfer_details: List[Dict[str, Any]], total_count: int):
-        """按普通转存、跨盘转存和洗版分别发送完成通知。"""
+    def send_transfer_notification(
+            self, transfer_details: List[Dict[str, Any]], total_count: int
+    ) -> None:
+        """完成即入队，并按延迟窗口合并相邻任务通知。"""
         if not transfer_details or not self._post_message:
             return
+        with self._notification_batch_lock:
+            self._notification_batch.extend(copy.deepcopy(transfer_details))
+            if self._notification_batch_timer:
+                self._notification_batch_timer.cancel()
+            wait_seconds = max(
+                self._notification_delay_seconds,
+                self._NOTIFICATION_BATCH_WINDOW_SECONDS,
+            )
+            self._notification_batch_timer = threading.Timer(
+                wait_seconds, self._flush_transfer_notifications
+            )
+            self._notification_batch_timer.daemon = True
+            self._notification_batch_timer.start()
+        logger.debug(
+            f"完成通知已入队：{total_count} 个文件，"
+            f"静默 {wait_seconds} 秒后合并发送"
+        )
+
+    def _flush_transfer_notifications(self) -> None:
+        with self._notification_batch_lock:
+            timer = self._notification_batch_timer
+            self._notification_batch_timer = None
+            if timer and timer is not threading.current_thread():
+                timer.cancel()
+            transfer_details = self._notification_batch
+            self._notification_batch = []
+        if not transfer_details or not self._post_message or not self._notify:
+            return
+        try:
+            self._send_transfer_notification_now(transfer_details)
+        except Exception as error:
+            logger.warning(f"完成通知发送失败：{error}")
+
+    def _send_transfer_notification_now(
+            self, transfer_details: List[Dict[str, Any]]
+    ) -> None:
+        """按普通转存、跨盘转存和洗版分别发送聚合后的完成通知。"""
         kind_config = {
             "transfer": ("【网盘订阅助手】转存完成", "转存"),
             "cross_transfer": ("【网盘订阅助手】跨盘转存完成", "跨盘转存"),

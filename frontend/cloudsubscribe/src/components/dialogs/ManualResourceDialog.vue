@@ -564,7 +564,11 @@ async function loadOptions() {
   loadingOptions.value = true;
   error.value = "";
   try {
-    const result = unwrap(await props.api.get(`plugin/${props.pluginId}/ui_options`));
+    const result = unwrap(
+        await props.api.get(
+            `plugin/${props.pluginId}/ui_options?scope=subscriptions`,
+        ),
+    );
     if (result.success === false) throw new Error(result.message || "加载订阅失败");
     const data = result.data?.data || result.data || result;
     subscribes.value = Array.isArray(data.subscribes) ? data.subscribes : [];
@@ -580,7 +584,9 @@ async function loadMediaServers() {
   loadingMediaServers.value = true;
   error.value = "";
   try {
-    const result = unwrap(await props.api.get(`plugin/${props.pluginId}/media/content`));
+    const result = unwrap(
+        await props.api.get(`plugin/${props.pluginId}/media/servers`),
+    );
     if (result.success === false) throw new Error(result.message || "加载媒体服务器失败");
     mediaServers.value = result.data?.servers || [];
     if (mediaServers.value.length === 1) mediaServer.value = mediaServers.value[0].value;

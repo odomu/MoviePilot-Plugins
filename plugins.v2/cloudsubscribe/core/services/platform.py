@@ -2,7 +2,6 @@
 
 import copy
 import datetime
-import heapq
 import re
 import time
 from collections import Counter
@@ -90,47 +89,28 @@ class PlatformIntegrationService(OwnerDelegator):
             stats[self._cloud_drive.key] = cache_service.get_cache_stats()
         return stats
 
-    def get_platform_overview(self, recent_limit: int = 5) -> Dict[str, Any]:
+    def get_platform_overview(
+            self, recent_limit: int = 5, include_runtime: bool = True
+    ) -> Dict[str, Any]:
         limit = max(0, min(int(recent_limit or 0), 20))
-        cached = self._overview_cache.get("overview")
+        cache_key = f"overview:{int(bool(include_runtime))}"
+        cached = self._overview_cache.get(cache_key)
         if isinstance(cached, dict):
             result = copy.deepcopy(cached)
             result["recent_history"] = list(cached.get("recent_history") or [])[:limit]
             return result
 
-        history_count = 0
-        recent_heap = []
         today = datetime.datetime.now(pytz.timezone(settings.TZ)).strftime("%Y-%m-%d")
-        success = 0
-        failed = 0
-        transferred_today = 0
-        for index, raw_record in enumerate(self.get_data("history") or []):
-            if not isinstance(raw_record, dict):
-                continue
-            record = dict(raw_record)
-            history_count += 1
-            status = record.get("status")
-            success += status == "成功"
-            failed += status == "失败"
-            record_time = str(record.get("time") or "")
-            transferred_today += record_time.startswith(today)
-            heap_entry = (record_time, index, record)
-            if len(recent_heap) < 20:
-                heapq.heappush(recent_heap, heap_entry)
-            elif heap_entry > recent_heap[0]:
-                heapq.heapreplace(recent_heap, heap_entry)
-        recent_history = [
-            entry[2] for entry in sorted(recent_heap, reverse=True)
-        ]
-        tasks = self._serialize_runtime_tasks()
+        database_overview = self._get_data_store().history_overview(
+            today, recent_limit=20
+        )
+        history_count = int(database_overview.get("total") or 0)
+        transferred_today = int(database_overview.get("today") or 0)
+        success = int(database_overview.get("success") or 0)
+        failed = int(database_overview.get("failed") or 0)
+        recent_history = list(database_overview.get("recent") or [])
         provider = self._cloud_drive
         overview = {
-            "runtime": {
-                "status": self._sync_status,
-                "task": self._sync_task_text,
-                "progress": self._sync_progress,
-                "tasks": tasks,
-            },
             "stats": [
                 {"title": "总转存", "value": history_count, "color": "primary", "icon": "mdi-cloud-upload-outline"},
                 {"title": "今日转存", "value": transferred_today, "color": "info", "icon": "mdi-calendar-today"},
@@ -148,7 +128,9 @@ class PlatformIntegrationService(OwnerDelegator):
                 ) if provider else [],
             },
         }
-        self._overview_cache["overview"] = copy.deepcopy(overview)
+        if include_runtime:
+            overview["runtime"] = self._runtime_snapshot()
+        self._overview_cache[cache_key] = copy.deepcopy(overview)
         result = copy.deepcopy(overview)
         result["recent_history"] = recent_history[:limit]
         return result
@@ -725,8 +707,13 @@ class PlatformIntegrationService(OwnerDelegator):
             ),
         }
 
-    def api_platform_overview(self) -> Dict[str, Any]:
-        return {"success": True, "data": self.get_platform_overview(6)}
+    def api_platform_overview(self, include_runtime: bool = True) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "data": self.get_platform_overview(
+                6, include_runtime=bool(include_runtime)
+            ),
+        }
 
     def start_platform_sync(self) -> Dict[str, Any]:
         return self.api_vue_start_sync()

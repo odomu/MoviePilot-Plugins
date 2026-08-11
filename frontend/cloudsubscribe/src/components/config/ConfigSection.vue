@@ -1,24 +1,25 @@
 <template>
   <div class="config-tab-content">
-    <template v-for="(group, index) in visibleGroups" :key="group.title">
-      <v-tabs
-          v-if="section.subtabs?.length && index === leadingGroupCount"
-          v-model="activeSubtab"
-          color="primary"
-          density="compact"
-          show-arrows
-          class="section-tabs mb-4"
+    <v-tabs
+        v-if="section.subtabs?.length"
+        v-model="activeSubtab"
+        color="primary"
+        density="compact"
+        show-arrows
+        class="section-tabs mb-4"
+    >
+      <v-tab
+          v-for="tab in section.subtabs"
+          :key="tab.value"
+          :value="tab.value"
       >
-        <v-tab
-            v-for="tab in section.subtabs"
-            :key="tab.value"
-            :value="tab.value"
-        >
-          <v-icon :icon="tab.icon" size="small" class="mr-2"/>
-          {{ tab.title }}
-        </v-tab>
-      </v-tabs>
-      <section class="config-group">
+        <v-icon :icon="tab.icon" size="small" class="mr-2"/>
+        {{ tab.title }}
+      </v-tab>
+    </v-tabs>
+    <div class="config-section-scroll">
+      <template v-for="(group, index) in visibleGroups" :key="group.title">
+        <section class="config-group">
         <div v-if="!group.hideHeading" class="group-heading">
           <v-icon :icon="group.icon" color="primary" size="small"/>
           <div>
@@ -43,12 +44,8 @@
                   v-if="field.type === 'account'"
                   :account="field.data"
                   :compact="Boolean(field.compact)"
-                  :loading="refreshingAccount === field.accountKey"
+                  :loading="refreshingAccounts.includes(field.accountKey)"
                   :refreshable="Boolean(field.accountKey)"
-                  :disabled="
-                  Boolean(refreshingAccount) &&
-                  refreshingAccount !== field.accountKey
-                "
                   @refresh="emit('refresh-account', field.accountKey)"
               />
               <v-alert
@@ -136,7 +133,7 @@
                     }}
                   </v-chip>
                   <span class="text-caption text-medium-emphasis">
-                    授权范围：query unlock
+                    授权范围：query unlock write
                   </span>
                 </div>
                 <v-text-field
@@ -409,8 +406,9 @@
             v-if="index < visibleGroups.length - 1"
             class="group-divider"
         />
-      </section>
-    </template>
+        </section>
+      </template>
+    </div>
   </div>
 </template>
 
@@ -423,7 +421,7 @@ const props = defineProps({
   section: {type: Object, required: true},
   config: {type: Object, required: true},
   api: {type: [Object, Function], required: true},
-  refreshingAccount: {type: String, default: ""},
+  refreshingAccounts: {type: Array, default: () => []},
   testingSource: {type: String, default: ""},
   testingProxy: {type: Boolean, default: false},
   hdhiveOauthAction: {type: String, default: ""},
@@ -525,9 +523,6 @@ const availableGroups = computed(() =>
     (group) => !group.show || group.show(props.config),
     ),
 );
-const leadingGroupCount = computed(
-    () => availableGroups.value.filter((group) => group.beforeTabs).length,
-);
 const visibleGroups = computed(() => {
   const leadingGroups = availableGroups.value.filter(
       (group) => group.beforeTabs,
@@ -553,7 +548,31 @@ function mediaLibraryWebhookUrl(field, serverName) {
   width: 100%;
   max-width: 100%;
   min-width: 0;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.config-section-scroll {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
   overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  scrollbar-width: none;
+}
+
+.config-section-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 .config-group {
@@ -566,6 +585,7 @@ function mediaLibraryWebhookUrl(field, serverName) {
   width: 100%;
   max-width: 100%;
   min-width: 0;
+  flex: 0 0 auto;
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 

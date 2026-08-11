@@ -41,7 +41,7 @@ class HDHiveOpenAPIClient:
     - Access Token 过期时自动用 Refresh Token 刷新，并通过回调持久化新 Token
     """
 
-    DEFAULT_SCOPE = "query unlock"
+    DEFAULT_SCOPE = "query unlock write"
     _RESOURCE_CACHE_TTL = 10 * 60
     _RESOURCE_CACHE_LIMIT = 256
     _DETAIL_CACHE_TTL = 10 * 60
@@ -235,6 +235,132 @@ class HDHiveOpenAPIClient:
     def get_me(self) -> Dict[str, Any]:
         """获取当前授权用户基础信息"""
         return self._request("GET", "/api/open/me")
+
+    def get_account_info(self) -> Dict[str, Any]:
+        """读取当前授权用户的账户信息和积分余额。"""
+        payload = self.get_me()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or "points" not in data:
+            raise HDHiveOpenAPIError(
+                "OPENAPI_SCHEMA_CHANGED",
+                "HDHive OpenAPI 账户接口缺少积分字段",
+            )
+        try:
+            points = max(0, int(data.get("points") or 0))
+        except (TypeError, ValueError) as error:
+            raise HDHiveOpenAPIError(
+                "OPENAPI_SCHEMA_CHANGED",
+                "HDHive OpenAPI 账户积分格式异常",
+            ) from error
+        raw_signin_days = data.get("signin_days_total")
+        try:
+            signin_days = (
+                max(0, int(raw_signin_days))
+                if raw_signin_days is not None else None
+            )
+        except (TypeError, ValueError):
+            signin_days = None
+        return {
+            "name": str(
+                data.get("nickname") or data.get("username") or "HDHive 用户"
+            ),
+            "username": str(data.get("username") or ""),
+            "email": str(data.get("email") or ""),
+            "avatar": str(data.get("avatar_url") or data.get("avatar") or ""),
+            "points": points,
+            "signin_days": signin_days,
+        }
+
+    @staticmethod
+    def _is_scope_error(error: HDHiveOpenAPIError) -> bool:
+        text = " ".join(
+            str(value or "")
+            for value in (error.code, error.message, error.description)
+        ).casefold()
+        if error.status != 403:
+            return False
+        if any(marker in text for marker in ("blocked", "banned", "封禁", "停用")):
+            return False
+        return True
+
+    def checkin(self, is_gambler: bool = False) -> Dict[str, Any]:
+        """通过 HDHive OpenAPI 完成每日签到，并返回统一签到结果。"""
+        before = self.get_account_info()
+        try:
+            payload = self._request(
+                "POST",
+                "/api/open/checkin",
+                body={"is_gambler": bool(is_gambler)},
+            )
+        except HDHiveOpenAPIError as error:
+            if self._is_scope_error(error):
+                raise HDHiveOpenAPIError(
+                    "OPENAPI_SCOPE_REQUIRED",
+                    "HDHive OpenAPI 应用或 Token 缺少 write 权限，"
+                    "请确认应用权限后重新授权",
+                    error.description,
+                    error.status,
+                ) from error
+            raise
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if (
+                not isinstance(data, dict)
+                or "checked_in" not in data
+                or "points" not in data
+        ):
+            raise HDHiveOpenAPIError(
+                "OPENAPI_SCHEMA_CHANGED",
+                "HDHive OpenAPI 签到接口返回格式异常",
+            )
+        status_code = payload.get("code") if isinstance(payload, dict) else 0
+        try:
+            status_code = int(status_code or 200)
+        except (TypeError, ValueError):
+            status_code = 200
+        message = str(
+            data.get("message")
+            or payload.get("message")
+            or "签到成功"
+        )
+        checked_in = bool(data.get("checked_in"))
+        response_success = payload.get("success") is not False
+        already_checked_in = bool(response_success and not checked_in)
+        success = bool(status_code < 400 and response_success)
+        after = (
+            before
+            if already_checked_in or not success
+            else self.get_account_info()
+        )
+        points_before = int(before.get("points") or 0)
+        points_after = int(after.get("points") or 0)
+        signin_points = 0
+        if checked_in:
+            try:
+                signin_points = int(data.get("points") or 0)
+            except (TypeError, ValueError):
+                signin_points = 0
+        return {
+            "success": success,
+            "checked_in": checked_in and not already_checked_in,
+            "already_checked_in": already_checked_in,
+            "status": (
+                "今日已签到"
+                if already_checked_in
+                else "签到成功" if success else "签到失败"
+            ),
+            "message": message,
+            "is_gambler": bool(is_gambler),
+            "signin_points": signin_points,
+            "points_change": points_after - points_before,
+            "points_before": points_before,
+            "points_after": points_after,
+            "signin_days": after.get("signin_days"),
+            "status_code": status_code,
+            "error_code": "" if success else str(payload.get("code") or ""),
+            "captcha_verified": False,
+            "raw": payload,
+        }
 
     def query_resources(
             self, media_type: str, tmdb_id: Any, force_refresh: bool = False

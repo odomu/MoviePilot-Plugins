@@ -104,7 +104,7 @@
 </template>
 
 <script setup>
-import {computed, onBeforeUnmount, ref, watch} from "vue";
+import {computed, onBeforeUnmount, onMounted, ref, watch} from "vue";
 
 const props = defineProps({
   modelValue: Boolean,
@@ -196,22 +196,36 @@ function buildStatusQuery() {
   return query;
 }
 
-function schedulePolling() {
-  if (!session.value) return;
+function schedulePolling(delay = pollInterval) {
+  if (!session.value || document.visibilityState === "hidden") return;
   stopPolling();
   timer = setTimeout(async () => {
     timer = null;
     await checkStatus();
-    if (session.value) schedulePolling();
-  }, pollInterval);
+    if (session.value) {
+      const retryDelay = failures
+          ? Math.min(pollInterval * 2 ** failures, 15000)
+          : pollInterval;
+      schedulePolling(retryDelay);
+    }
+  }, Math.max(0, delay));
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    stopPolling();
+  } else if (props.modelValue && session.value) {
+    schedulePolling(0);
+  }
 }
 
 async function checkStatus() {
   if (!session.value) return;
   try {
     const result = unwrapResponse(
-        await props.api.get(
-            `plugin/${pluginId}/qrcode/check?${buildStatusQuery()}`,
+        await props.api.post(
+            `plugin/${pluginId}/qrcode/check`,
+            Object.fromEntries(buildStatusQuery()),
         ),
     );
     if (result.success === false) {
@@ -294,7 +308,11 @@ watch(
     channel,
     () => props.modelValue && props.provider === "115" && loadQrCode(),
 );
-onBeforeUnmount(stopPolling);
+onMounted(() => document.addEventListener("visibilitychange", handleVisibilityChange));
+onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  stopPolling();
+});
 </script>
 
 <style scoped>

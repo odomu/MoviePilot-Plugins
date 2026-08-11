@@ -22,6 +22,38 @@ sync_lock = Lock()
 class SyncRuntimeService(OwnerDelegator):
     """管理同步任务运行态及离线任务生命周期。"""
 
+    def _runtime_revision_value(self) -> int:
+        with self._runtime_revision_lock:
+            return int(self._runtime_revision)
+
+    def _mark_runtime_changed(self) -> None:
+        """递增运行态版本，供 SSE 合并并推送状态变化。"""
+        with self._runtime_revision_lock:
+            self._runtime_revision += 1
+
+    def _runtime_snapshot(self) -> Dict[str, Any]:
+        with self._runtime_revision_lock:
+            revision = int(self._runtime_revision)
+            history_revision = int(self._history_revision)
+        return {
+            "status": self._sync_status,
+            "task": self._sync_task_text,
+            "progress": self._sync_progress,
+            "context": dict(self._sync_context),
+            "tasks": self._serialize_runtime_tasks(),
+            "offline_supported": bool(
+                self._cloud_drive
+                and self._cloud_drive.supports(CloudDriveCapability.OFFLINE_TASKS)
+            ),
+            "revision": revision,
+            "history_revision": history_revision,
+        }
+
+    def _mark_history_changed(self) -> None:
+        with self._runtime_revision_lock:
+            self._history_revision += 1
+            self._runtime_revision += 1
+
     def _current_task_context(self) -> Tuple[str, Optional[ThreadEvent]]:
         """返回当前订阅线程的任务标识与停止事件。"""
         if self._task_local is None:
@@ -104,12 +136,17 @@ class SyncRuntimeService(OwnerDelegator):
             }
             retained.update(tasks)
             self._sync_tasks = retained
+        self._mark_runtime_changed()
 
     def _update_sync_task(self, task_id: str, **values: Any) -> None:
+        changed = False
         with self._sync_tasks_lock:
             task = self._sync_tasks.get(task_id)
-            if task:
+            if task and any(task.get(key) != value for key, value in values.items()):
                 task.update(values)
+                changed = True
+        if changed:
+            self._mark_runtime_changed()
 
     def _serialize_sync_tasks(self) -> List[Dict[str, Any]]:
         now = time.time()
@@ -265,6 +302,7 @@ class SyncRuntimeService(OwnerDelegator):
             )
 
         now = time.time()
+        changed = False
         with self._sync_tasks_lock:
             for task in self._sync_tasks.values():
                 if task.get("status") != "postprocessing":
@@ -277,6 +315,7 @@ class SyncRuntimeService(OwnerDelegator):
                         "pending_count": 0,
                         "finished_at": now,
                     })
+                    changed = True
             for task_id, group in groups.items():
                 task = self._sync_tasks.get(task_id)
                 if task and task.get("status") in {"queued", "running", "stopping"}:
@@ -293,7 +332,9 @@ class SyncRuntimeService(OwnerDelegator):
                     "finished_at": None,
                 }
                 if task:
-                    task.update(values)
+                    if any(task.get(key) != value for key, value in values.items()):
+                        task.update(values)
+                        changed = True
                     continue
                 is_tv = bool(group.get("season"))
                 self._sync_tasks[task_id] = {
@@ -311,6 +352,9 @@ class SyncRuntimeService(OwnerDelegator):
                     "started_at": group["queued_at"],
                     "stop_event": ThreadEvent(),
                 }
+                changed = True
+        if changed:
+            self._mark_runtime_changed()
 
     def _run_subscription_group(
             self,
@@ -438,12 +482,26 @@ class SyncRuntimeService(OwnerDelegator):
             progress: int = None,
             context: Optional[Dict[str, Any]] = None,
     ) -> None:
+        previous = (
+            self._sync_status,
+            self._sync_task_text,
+            self._sync_progress,
+            dict(self._sync_context),
+        )
         self._sync_status = status
         self._sync_task_text = text
         if progress is not None:
             self._sync_progress = max(0, min(100, int(progress)))
         if context is not None:
             self._sync_context = dict(context)
+        current = (
+            self._sync_status,
+            self._sync_task_text,
+            self._sync_progress,
+            dict(self._sync_context),
+        )
+        if current != previous:
+            self._mark_runtime_changed()
 
     def _serialize_runtime_tasks(self) -> List[Dict[str, Any]]:
         """合并订阅任务与其跨盘子任务，避免同一操作重复展示。"""
@@ -531,13 +589,7 @@ class SyncRuntimeService(OwnerDelegator):
             return {"success": False, "message": "API密钥错误"}
         return {
             "success": True,
-            "data": {
-                "status": self._sync_status,
-                "task": self._sync_task_text,
-                "progress": self._sync_progress,
-                "context": dict(self._sync_context),
-                "tasks": self._serialize_runtime_tasks(),
-            },
+            "data": self._runtime_snapshot(),
         }
 
     def api_stop_sync(self, apikey: str) -> dict:
@@ -625,6 +677,8 @@ class SyncRuntimeService(OwnerDelegator):
                 task["status"] = "stopping"
                 task["phase"] = "等待安全停止"
                 stop_event.set()
+
+        self._mark_runtime_changed()
 
         transfer_manager = getattr(self, "_cross_transfer_manager", None)
         if transfer_manager:
@@ -739,6 +793,7 @@ class SyncRuntimeService(OwnerDelegator):
             )
         finally:
             self._offline_monitor_lock.release()
+            self._mark_runtime_changed()
 
     def _monitor_offline_task_groups(
             self,

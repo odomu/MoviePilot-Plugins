@@ -64,11 +64,15 @@ class CloudSubscribeCheckinInput(BaseModel):
     )
     mode: Optional[str] = Field(
         default=None,
-        description="签到模式 normal 或 gambler；省略时使用渠道配置",
+        description="签到模式 normal、gambler 或 lucky；省略时使用渠道配置",
     )
     confirm_gambler: bool = Field(
         default=False,
-        description="是否已明确确认赌狗签到可能最多扣除 3 积分",
+        description="兼容旧参数；是否已明确确认高风险签到可能扣除积分",
+    )
+    confirm_risky: bool = Field(
+        default=False,
+        description="是否已明确确认 gambler/lucky 模式可能扣除积分",
     )
 
 

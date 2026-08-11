@@ -55,6 +55,11 @@ class Dian115SearchService(OwnerDelegator):
                 self._dian115_resources = resources
             return resources
 
+    def get_dian115_client(self) -> Dian115Client:
+        """返回搜索、账户信息与签到共同复用的唯一接口客户端。"""
+        self._get_dian115_resources()
+        return self._dian115_client
+
     def close(self) -> None:
         with self._dian115_client_lock:
             client = self._dian115_client

@@ -137,8 +137,8 @@ class CloudSubscribeCheckinTool(MoviePilotTool):
     tags: list[str] = [ToolTag.Write, ToolTag.Plugin]
     description: str = (
         "立即执行网盘订阅助手签到。可指定渠道，省略时签到全部已启用渠道。"
-        "normal 为普通签到；gambler 可能扣除积分，必须先取得用户明确确认，"
-        "再将 confirm_gambler 设为 true。"
+        "normal 为普通签到；gambler/lucky 可能扣除积分，必须先取得用户明确确认，"
+        "再将 confirm_risky 设为 true。"
     )
     args_schema: Type[BaseModel] = CloudSubscribeCheckinInput
 
@@ -150,6 +150,7 @@ class CloudSubscribeCheckinTool(MoviePilotTool):
             provider: Optional[str] = None,
             mode: Optional[str] = None,
             confirm_gambler: bool = False,
+            confirm_risky: bool = False,
             **kwargs,
     ) -> str:
         plugin = _plugin()
@@ -161,6 +162,7 @@ class CloudSubscribeCheckinTool(MoviePilotTool):
             provider=provider or "",
             mode=mode or "",
             confirm_gambler=confirm_gambler,
+            confirm_risky=confirm_risky,
         )
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 

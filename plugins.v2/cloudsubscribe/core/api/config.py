@@ -45,9 +45,21 @@ class ConfigApi(OwnerDelegator):
             mode = str(
                 payload.get(mode_key, "normal") or "normal"
             ).strip().lower()
-            if mode not in {"normal", "gambler"}:
+            if mode not in provider["modes"]:
                 return f"{provider['name']} 签到模式无效"
             payload[mode_key] = mode
+        try:
+            lottery_count = int(
+                payload.get("dian115_lottery_count", 1) or 1
+            )
+        except (TypeError, ValueError):
+            return "Dian115 幸运转盘次数必须是整数"
+        if not 1 <= lottery_count <= 20:
+            return "Dian115 幸运转盘次数需在 1-20 次之间"
+        payload["dian115_lottery_count"] = lottery_count
+        payload["dian115_lottery_enabled"] = bool(
+            payload.get("dian115_lottery_enabled", False)
+        )
         cron = str(
             payload.get("checkin_cron", "0 8 * * *")
             or "0 8 * * *"

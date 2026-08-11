@@ -20,6 +20,7 @@ export function createHdhiveGroups(options = {}) {
                     key: "hdhive_base_url",
                     label: "服务地址",
                     cols: 12,
+                    show: (config) => config.hdhive_query_mode === "web",
                 },
                 {
                     key: "hdhive_query_mode",
@@ -35,14 +36,14 @@ export function createHdhiveGroups(options = {}) {
                     key: "hdhive_api_key",
                     label: "API Key / 应用 Secret",
                     type: "password",
-                    cols: 6,
+                    cols: 4,
                     show: (config) =>
                         config.hdhive_query_mode === "api",
                 },
                 {
                     key: "hdhive_client_id",
                     label: "Client ID",
-                    cols: 6,
+                    cols: 4,
                     show: (config) =>
                         config.hdhive_query_mode === "api",
                 },
@@ -90,28 +91,17 @@ export function createHdhiveGroups(options = {}) {
                         config.hdhive_query_mode === "api",
                 },
                 {
-                    key: "hdhive_token_file",
-                    label: "Token 挂载文件",
-                    cols: 12,
-                    show: (config) =>
-                        config.hdhive_query_mode === "api",
-                },
-                {
                     key: "hdhive_username",
                     label: "HDHive 用户名",
                     cols: 4,
-                    show: (config) =>
-                        config.hdhive_query_mode === "web" ||
-                        config.hdhive_checkin_enabled,
+                    show: (config) => config.hdhive_query_mode === "web",
                 },
                 {
                     key: "hdhive_password",
                     label: "HDHive 密码",
                     type: "password",
                     cols: 4,
-                    show: (config) =>
-                        config.hdhive_query_mode === "web" ||
-                        config.hdhive_checkin_enabled,
+                    show: (config) => config.hdhive_query_mode === "web",
                 },
                 {
                     key: "test_hdhive",

@@ -24,6 +24,13 @@ export function createBasicSection(cloudDriveItems) {
                         cols: 4,
                     },
                     {
+                        key: "direct_transfer_enabled",
+                        label: "链接直达转存",
+                        type: "switch",
+                        hint: "识别普通消息中的网盘资源链接并直接进入转存流程。",
+                        cols: 4,
+                    },
+                    {
                         key: "platform_transfer_history_enabled",
                         label: "写入整理历史",
                         type: "switch",
@@ -34,7 +41,7 @@ export function createBasicSection(cloudDriveItems) {
                         label: "拦截新增订阅",
                         type: "switch",
                         hint: "新增订阅的搜索调度交由本插件处理，不修改原有真实站点配置。接管态仍遵循订阅过滤规则。",
-                        cols: 8,
+                        cols: 4,
                     },
                     {
                         key: "cron",

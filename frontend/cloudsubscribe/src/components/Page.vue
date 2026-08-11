@@ -95,8 +95,8 @@
         <v-tab value="history">
           <v-icon icon="mdi-history" size="small" class="mr-2"/>
           历史记录
-          <v-chip v-if="history.length" size="x-small" class="ml-2">
-            {{ history.length }}
+          <v-chip v-if="historyStats.total" size="x-small" class="ml-2">
+            {{ historyStats.total }}
           </v-chip>
         </v-tab>
       </v-tabs>
@@ -113,7 +113,12 @@
           <div v-show="mainTab === 'history'" class="page-pane history-pane">
             <div class="history-shell">
               <HistoryTable
-                  :items="sortedHistory"
+                  :items="historyGroups"
+                  :page="historyPage.page"
+                  :page-size="historyPage.pageSize"
+                  :total="historyPage.total"
+                  :total-pages="historyPage.totalPages"
+                  :filter-options="historyPage.filterOptions"
                   :emby-play-items="embyPlayItems"
                   :loading="loading"
                   :retrying-key="retryingHistoryKey"
@@ -121,6 +126,7 @@
                   :notifying-key="notifyingHistoryKey"
                   :upgrading-key="upgradingHistoryKey"
                   @refresh="loadPage"
+                  @query-change="updateHistoryQuery"
                   @clear="openClearHistory"
                   @retry="confirmRetryHistory"
                   @delete="confirmDeleteHistory"
@@ -141,7 +147,6 @@
         v-show="offlineVisible"
         v-model="offlineVisible"
         :api="api"
-        @updated="loadPage(false)"
     />
     <ManualResourceDialog
         v-show="manualVisible"
@@ -361,11 +366,13 @@
 </template>
 
 <script setup>
-import {computed, defineAsyncComponent, ref} from "vue";
+import {computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch,} from "vue";
 import RuntimeCard from "./dashboard/RuntimeCard.vue";
 import HistoryTable from "./dashboard/HistoryTable.vue";
 import StatsGrid from "./dashboard/StatsGrid.vue";
-import {usePageData} from "../composables/usePageData.js";
+import {useHistoryPageData} from "../composables/usePageData.js";
+import {useRuntimeData} from "../composables/useRuntimeData.js";
+import {useCacheActions} from "../composables/useCacheActions.js";
 
 const CacheClearDialog = defineAsyncComponent(
     () => import("./dialogs/CacheClearDialog.vue"),
@@ -420,6 +427,7 @@ const message = ref(""),
     notifyError = ref(""),
     searchConfirmVisible = ref(false),
     searchStarting = ref(false),
+    historyDirty = ref(true),
     historySelection = ref({groupCount: 0, subscribeIds: [], targets: []});
 
 function notify(text, type = "success") {
@@ -430,7 +438,9 @@ function notify(text, type = "success") {
 
 async function manualStarted(text) {
   notify(text);
-  await loadPage(false);
+  await loadSummary(false);
+  if (mainTab.value === "history") await loadPage(false);
+  else historyDirty.value = true;
 }
 
 function openManualDialog(mode = "links", media = null) {
@@ -440,24 +450,61 @@ function openManualDialog(mode = "links", media = null) {
 }
 
 const {
-  history,
+  historyGroups,
+  historyPage,
+  historyStats,
   embyPlayItems,
-  offlineSupported,
   loading,
-  runtime,
-  active,
   stats,
   loadPage,
-  startSync,
-  stopSync: stopSyncRequest,
-  stopTask: stopTaskRequest,
+  loadSummary,
+  updateHistoryQuery,
   clearHistory: clearHistoryRequest,
   deleteHistory: deleteHistoryRequest,
   deleteHistoryBatch: deleteHistoryBatchRequest,
   notifyHistory: notifyHistoryRequest,
+} = useHistoryPageData(api, notify);
+const {clearCache: clearCacheRequest} = useCacheActions(api);
+let historyRefreshTimer = null;
+
+function scheduleHistoryRefresh() {
+  historyDirty.value = true;
+  if (historyRefreshTimer !== null) {
+    window.clearTimeout(historyRefreshTimer);
+  }
+  historyRefreshTimer = window.setTimeout(async () => {
+    historyRefreshTimer = null;
+    await loadSummary(false);
+    if (mainTab.value === "history" && historyDirty.value) {
+      historyDirty.value = false;
+      await loadPage(false);
+    }
+  }, 180);
+}
+
+const {
+  offlineSupported,
+  runtime,
+  active,
+  startSync,
+  stopSync: stopSyncRequest,
+  stopTask: stopTaskRequest,
   upgradeHistory: upgradeHistoryRequest,
-  clearCache: clearCacheRequest,
-} = usePageData(api, notify);
+} = useRuntimeData(api, notify, "CloudSubscribe", {
+  onSettled: scheduleHistoryRefresh,
+  onHistoryChanged: scheduleHistoryRefresh,
+});
+
+onMounted(() => void loadSummary());
+onUnmounted(() => {
+  if (historyRefreshTimer !== null) window.clearTimeout(historyRefreshTimer);
+});
+
+watch(mainTab, (tab) => {
+  if (tab !== "history" || !historyDirty.value) return;
+  historyDirty.value = false;
+  void loadPage();
+});
 const activeTaskCount = computed(
     () =>
         (runtime.tasks || []).filter((task) =>
@@ -469,11 +516,6 @@ const stoppableTaskCount = computed(
         (runtime.tasks || []).filter((task) =>
             ["queued", "running"].includes(task.status),
         ).length,
-);
-const sortedHistory = computed(() =>
-    [...history.value].sort((left, right) =>
-        String(right.time || "").localeCompare(String(left.time || "")),
-    ),
 );
 const selectedHistoryCount = computed(() =>
     Math.max(0, Number(historySelection.value.groupCount || 0)),
@@ -620,7 +662,7 @@ async function retryHistory() {
       file_name: record.file_name,
     });
     if (!result?.success) throw new Error(result?.message || "重试失败");
-    await loadPage(false);
+    await Promise.all([loadPage(false), loadSummary(false)]);
     retryVisible.value = false;
     retryingRecord.value = null;
   } catch (error) {

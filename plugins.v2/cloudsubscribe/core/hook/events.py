@@ -488,7 +488,11 @@ class PluginEventHandler(OwnerDelegator):
 
     def on_message_action(self, event: Event) -> None:
         """处理 Telegram TMDB 候选按钮回调。"""
-        if not event or not self._enabled:
+        if (
+                not event
+                or not self._enabled
+                or not self._direct_transfer_enabled
+        ):
             return
         event_data = event.event_data or {}
         plugin_id = str(event_data.get("plugin_id") or "").strip().lower()
@@ -542,7 +546,7 @@ class PluginEventHandler(OwnerDelegator):
         result = self.run_quick_checkin(
             provider=provider,
             mode=mode,
-            confirm_gambler=confirm_gambler,
+            confirm_risky=confirm_gambler,
         )
         data = result.get("data") or {}
         lines = [str(result.get("message") or "签到失败")]
@@ -555,6 +559,11 @@ class PluginEventHandler(OwnerDelegator):
                 details.append(f"积分 {int(record.get('points_change') or 0):+d}")
             if record.get("points_after") is not None:
                 details.append(f"当前 {record.get('points_after')}")
+            if record.get("lottery_target_count"):
+                details.append(
+                    f"转盘 {record.get('lottery_executed') or 0}/"
+                    f"{record.get('lottery_target_count')} 次"
+                )
             lines.append(f"{item.get('provider_name') or item.get('provider')}：{' · '.join(details)}")
         self._post_command_message(
             event_data,
@@ -706,7 +715,11 @@ class PluginEventHandler(OwnerDelegator):
             args = str(event_data.get("arg_str") or "").strip().lower().split()
             confirm_gambler = any(value in {"confirm", "确认"} for value in args)
             args = [value for value in args if value not in {"confirm", "确认"}]
-            mode_aliases = {"normal": "normal", "普通": "normal", "gambler": "gambler", "赌狗": "gambler"}
+            mode_aliases = {
+                "normal": "normal", "普通": "normal",
+                "gambler": "gambler", "赌狗": "gambler",
+                "lucky": "lucky", "运气": "lucky",
+            }
             mode = ""
             provider = ""
             for value in args:
@@ -718,7 +731,7 @@ class PluginEventHandler(OwnerDelegator):
                     self._post_command_message(
                         event_data,
                         "【网盘订阅】参数错误",
-                        "格式：/cloud_checkin [渠道] [normal|gambler] [confirm]",
+                        "格式：/cloud_checkin [渠道] [normal|gambler|lucky] [confirm]",
                     )
                     return
             Thread(

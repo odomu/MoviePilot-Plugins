@@ -23,7 +23,7 @@ from .platform_rules import PlatformRuleService
 from .source_dispatch import SourceDispatchService
 from .sources import PanSouSearchService
 from ...core import get_component, resolve_component
-from ...search.juying import JuyingResourceService
+from ...search.juying import JuyingError, JuyingResourceService
 from ...search.matching import positive_ints, unique_texts
 from ...search.types import SUPPORTED_RESOURCE_TYPES, normalize_resource_type
 from ...utils.cache import create_platform_ttl_cache
@@ -601,6 +601,12 @@ class SearchHandler:
             get_component(self, service_type, "_search_components")
             for service_type in (HDHiveSearchService, Dian115SearchService)
         )
+
+    def get_juying_client(self):
+        """返回搜索、账户信息与签到共同复用的聚影客户端。"""
+        if not self._juying_client:
+            raise JuyingError("聚影客户端未初始化", "juying_not_configured")
+        return self._juying_client
 
     def close(self, release_cache: bool = False) -> None:
         """释放搜索客户端。"""

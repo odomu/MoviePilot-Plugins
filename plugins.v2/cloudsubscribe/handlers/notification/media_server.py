@@ -241,30 +241,31 @@ class MediaServerNotifier:
         self._mediainfo_timers: Dict[str, Timer] = {}
 
     def begin_task_batch(self) -> bool:
-        """任务期间只聚合通知，禁止静默定时器提前提交。"""
+        """记录任务批次；通知仍按延迟窗口独立提交。"""
         with self._batch_lock:
             if self._closed:
                 return False
             self._task_batch_depth += 1
-            if self._batch_timer:
-                self._batch_timer.cancel()
-                self._batch_timer = None
         return True
 
     def finish_task_batch(self) -> bool:
-        """最外层任务结束后在后台提交已去重的媒体目录。"""
+        """结束任务批次，不绕过已配置的通知延迟。"""
         with self._batch_lock:
             if self._task_batch_depth <= 0:
                 return True
             self._task_batch_depth -= 1
-            if self._task_batch_depth > 0:
-                return True
-            if self._batch_timer:
-                self._batch_timer.cancel()
-                self._batch_timer = None
-            entries = list(self._pending.values())
-            self._pending.clear()
-        return self._submit_batch_async(entries)
+            if self._pending and not self._batch_timer:
+                self._schedule_flush_locked()
+        return True
+
+    def _schedule_flush_locked(self) -> None:
+        if self._batch_timer:
+            self._batch_timer.cancel()
+        wait_seconds = max(self.delay_seconds, self._BATCH_WINDOW_SECONDS)
+        self._batch_timer = Timer(wait_seconds, self._flush_pending)
+        self._batch_timer.daemon = True
+        self._batch_timer.start()
+        logger.debug(f"入库通知批次已更新，静默 {wait_seconds} 秒后提交")
 
     @staticmethod
     def _normalize_path(path: str) -> str:
@@ -356,16 +357,7 @@ class MediaServerNotifier:
                     "paths": {target_path},
                     "deleted_paths": {target_path} if deleted else set(),
                 }
-            if self._task_batch_depth > 0:
-                logger.debug("入库通知批次已更新，将在当前任务结束后统一提交")
-            else:
-                if self._batch_timer:
-                    self._batch_timer.cancel()
-                wait_seconds = max(self.delay_seconds, self._BATCH_WINDOW_SECONDS)
-                self._batch_timer = Timer(wait_seconds, self._flush_pending)
-                self._batch_timer.daemon = True
-                self._batch_timer.start()
-                logger.debug(f"入库通知批次已更新，静默 {wait_seconds} 秒后提交")
+            self._schedule_flush_locked()
         return True
 
     def _take_pending(self) -> List[Dict[str, Any]]:

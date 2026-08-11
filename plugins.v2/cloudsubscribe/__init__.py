@@ -48,6 +48,7 @@ from .core.services import (
     SyncExecutionService,
     SyncRuntimeService,
 )
+from .core.storage import CloudSubscribeDataStore
 from .drive.alipan import AliPanClient, AliPanDrive, create_alipan_provider
 from .drive.guangya import GuangyaClient, GuangyaDrive, create_guangya_provider
 from .drive.p115 import P115ClientManager, create_p115_provider
@@ -58,7 +59,6 @@ from .handlers import SearchHandler, SyncHandler, SubscribeHandler, WebhookHandl
 from .search.butailing import ButailingClient
 from .search.hdhive import (
     HDHiveOpenAPIClient, HDHiveOpenAPIError,
-    HDHiveTokenStore, HDHiveTokenStoreError,
 )
 from .search.http_client import build_proxy_url, validate_proxy_address
 from .search.juying import JuyingClient
@@ -101,7 +101,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.1.5"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -110,6 +110,34 @@ class CloudSubscribe(_PluginBase):
     plugin_config_prefix = "cloudsubscribe_"
     plugin_order = 21
     auth_level = 1
+
+    def _get_data_store(self) -> CloudSubscribeDataStore:
+        store = self.__dict__.get("_cloudsubscribe_data_store")
+        if store is None:
+            store = CloudSubscribeDataStore(self)
+            self.__dict__["_cloudsubscribe_data_store"] = store
+        return store
+
+    def get_data(self, key: Optional[str] = None, plugin_id: Optional[str] = None) -> Any:
+        """读取插件业务数据与可恢复运行状态，统一使用私有库。"""
+        target_plugin = plugin_id or self.__class__.__name__
+        if target_plugin == self.__class__.__name__ and key:
+            if CloudSubscribeDataStore.handles(key):
+                return self._get_data_store().load(key)
+            return None
+        return super().get_data(key=key, plugin_id=plugin_id)
+
+    def save_data(
+            self, key: str, value: Any, plugin_id: Optional[str] = None
+    ) -> None:
+        """保存插件数据"""
+        target_plugin = plugin_id or self.__class__.__name__
+        if target_plugin == self.__class__.__name__:
+            if CloudSubscribeDataStore.handles(key):
+                self._get_data_store().save(key, value)
+                return
+            raise ValueError(f"未声明的数据键不能写入 PluginData：{key}")
+        super().save_data(key=key, value=value, plugin_id=plugin_id)
 
     def _get_component(self, component_type):
         return get_component(self, component_type, "_plugin_components")
@@ -195,6 +223,7 @@ class CloudSubscribe(_PluginBase):
     _enabled: bool = False
     _show_sidebar_nav: bool = True
     _agent_enabled: bool = True
+    _direct_transfer_enabled: bool = True
     _onlyonce: bool = False
     _cron: str = "0 18-23 * * *"
     _notify: bool = False
@@ -250,6 +279,7 @@ class CloudSubscribe(_PluginBase):
     _juying_enabled: bool = False
     _juying_username: str = ""
     _juying_password: str = ""
+    _juying_checkin_enabled: bool = False
     _juying_result_limit: int = 5
     _juying_request_interval: float = 1.0
     _pinglian_enabled: bool = False
@@ -294,7 +324,6 @@ class CloudSubscribe(_PluginBase):
     _hdhive_access_token: str = ""
     _hdhive_refresh_token: str = ""
     _hdhive_token_expires_at: float = 0
-    _hdhive_token_file: str = ""
     _hdhive_auto_unlock: bool = False
     _hdhive_max_unlock_points: int = 50
     _hdhive_max_points_per_sub: int = 20
@@ -307,6 +336,10 @@ class CloudSubscribe(_PluginBase):
     _dian115_enabled: bool = False
     _dian115_email: str = ""
     _dian115_password: str = ""
+    _dian115_checkin_enabled: bool = False
+    _dian115_checkin_mode: str = "normal"
+    _dian115_lottery_enabled: bool = False
+    _dian115_lottery_count: int = 1
     _dian115_auto_unlock: bool = False
     _dian115_max_unlock_points: int = 50
     _dian115_max_points_per_sub: int = 20
@@ -393,7 +426,6 @@ class CloudSubscribe(_PluginBase):
     _cloud_drive_registry: Optional[CloudDriveRegistry] = None
     _cloud_drive: Optional[CloudDriveProvider] = None
     _hdhive_client: Optional[Any] = None
-    _hdhive_token_store: Optional[Any] = None
 
     # 处理器
     _search_handler: Optional[SearchHandler] = None
@@ -413,6 +445,9 @@ class CloudSubscribe(_PluginBase):
     _sync_last_elapsed_ms: int = 0
     _sync_tasks: Dict[str, Dict[str, Any]] = {}
     _sync_tasks_lock: Optional[RLock] = None
+    _runtime_revision: int = 0
+    _history_revision: int = 0
+    _runtime_revision_lock: Lock = Lock()
     _task_local: Optional[local] = None
     _pending_config: Optional[Dict[str, Any]] = None
     _applied_config: Dict[str, Any] = {}
@@ -460,6 +495,8 @@ class CloudSubscribe(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """宿主加载或重载插件时初始化完整运行环境。"""
+        # 初始化独立数据库并自动迁移、清理旧 PluginData。
+        self._get_data_store().initialize()
         self._apply_plugin_config(config, reset_runtime=True)
 
     def _apply_plugin_config(
@@ -500,6 +537,7 @@ class CloudSubscribe(_PluginBase):
         hot_keys = {
             "show_sidebar_nav",
             "agent_enabled",
+            "direct_transfer_enabled",
             "notify",
             "notification_type",
             "webhook_enabled",
@@ -525,7 +563,11 @@ class CloudSubscribe(_PluginBase):
             if changed_keys <= hot_keys:
                 self._show_sidebar_nav = bool(config.get("show_sidebar_nav", True))
                 self._agent_enabled = bool(config.get("agent_enabled", True))
+                self._direct_transfer_enabled = bool(
+                    config.get("direct_transfer_enabled", True)
+                )
                 self._apply_notification_config(config)
+                self._get_component(MessageRoutingHook).install()
                 self._applied_config = copy.deepcopy(config)
                 from app.core.plugin import PluginManager
                 PluginManager().clear_plugin_agent_tools_cache()
@@ -545,6 +587,9 @@ class CloudSubscribe(_PluginBase):
             self._sync_tasks_lock = RLock()
             self._task_local = local()
             self._sync_tasks = {}
+            with self._runtime_revision_lock:
+                self._runtime_revision = 0
+                self._history_revision = 0
             with self._pending_config_lock:
                 self._pending_config = None
             self._subscribe_search_queue_lock = RLock()
@@ -566,6 +611,9 @@ class CloudSubscribe(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._show_sidebar_nav = bool(config.get("show_sidebar_nav", True))
             self._agent_enabled = bool(config.get("agent_enabled", True))
+            self._direct_transfer_enabled = bool(
+                config.get("direct_transfer_enabled", True)
+            )
 
             self._cron = (config.get("cron", self._cron) or "").strip()
             if self._cron:
@@ -765,6 +813,9 @@ class CloudSubscribe(_PluginBase):
                 config.get("juying_username", "") or ""
             ).strip()
             self._juying_password = str(config.get("juying_password", "") or "")
+            self._juying_checkin_enabled = bool(
+                config.get("juying_checkin_enabled", False)
+            )
             self._juying_result_limit = max(
                 1, min(int(config.get("juying_result_limit", 5) or 5), 20)
             )
@@ -811,7 +862,6 @@ class CloudSubscribe(_PluginBase):
             self._hdhive_access_token = config.get("hdhive_access_token", "")
             self._hdhive_refresh_token = config.get("hdhive_refresh_token", "")
             self._hdhive_token_expires_at = float(config.get("hdhive_token_expires_at", 0) or 0)
-            self._hdhive_token_file = str(config.get("hdhive_token_file", "") or "").strip()
             self._hdhive_auto_unlock = config.get("hdhive_auto_unlock", False)
             self._hdhive_max_unlock_points = int(config.get("hdhive_max_unlock_points", 50) or 50)
             self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
@@ -840,6 +890,20 @@ class CloudSubscribe(_PluginBase):
             self._dian115_enabled = "dian115" in selected_sources
             self._dian115_email = str(config.get("dian115_email", "") or "").strip()
             self._dian115_password = str(config.get("dian115_password", "") or "")
+            self._dian115_checkin_enabled = bool(
+                config.get("dian115_checkin_enabled", False)
+            )
+            self._dian115_checkin_mode = str(
+                config.get("dian115_checkin_mode", "normal") or "normal"
+            ).strip().lower()
+            if self._dian115_checkin_mode not in {"normal", "lucky"}:
+                self._dian115_checkin_mode = "normal"
+            self._dian115_lottery_enabled = bool(
+                config.get("dian115_lottery_enabled", False)
+            )
+            self._dian115_lottery_count = max(
+                1, min(20, int(config.get("dian115_lottery_count", 1) or 1))
+            )
             self._dian115_auto_unlock = bool(
                 config.get("dian115_auto_unlock", False)
             )
@@ -1181,7 +1245,7 @@ class CloudSubscribe(_PluginBase):
             self._seedhub_client = SeedHubClient(base_url=self._seedhub_base_url, proxy=proxy)
         if self._butailing_enabled:
             self._butailing_client = ButailingClient(base_url=self._butailing_base_url, proxy=proxy)
-        if self._juying_enabled:
+        if self._juying_enabled or self._juying_checkin_enabled:
             self._juying_client = JuyingClient(
                 base_url=self._juying_base_url,
                 username=self._juying_username,
@@ -1192,7 +1256,7 @@ class CloudSubscribe(_PluginBase):
                 save_data_func=self.save_data,
             )
             if not self._juying_username or not self._juying_password:
-                logger.warning("聚影已启用但未配置网页登录账号和密码，将无法使用聚影搜索")
+                logger.warning("聚影已启用但未配置网页登录账号和密码，将无法使用搜索或签到")
         if self._pinglian_enabled:
             self._pinglian_client = PinglianClient(
                 base_url=self._pinglian_base_url,
@@ -1248,6 +1312,7 @@ class CloudSubscribe(_PluginBase):
             download_path=self._cross_transfer_download_path,
             download_threads=self._cross_transfer_download_threads,
             max_concurrent=self._cross_transfer_max_concurrent,
+            on_change=self._mark_runtime_changed,
         )
 
         try:
@@ -1427,16 +1492,10 @@ class CloudSubscribe(_PluginBase):
             self._cloud_drive = self._cloud_drive_registry.get("alipan")
 
     def _on_hdhive_token_update(self, tokens: Dict[str, Any]):
-        """Token 刷新后写回来源文件，并同步插件配置。"""
+        """Token 刷新后同步插件配置。"""
         self._hdhive_access_token = str(tokens.get("access_token") or self._hdhive_access_token).strip()
         self._hdhive_refresh_token = str(tokens.get("refresh_token") or self._hdhive_refresh_token).strip()
         self._hdhive_token_expires_at = float(tokens.get("token_expires_at") or self._hdhive_token_expires_at or 0)
-        if self._hdhive_token_store:
-            try:
-                self._hdhive_token_store.write(tokens)
-                logger.info(f"HDHive OpenAPI: 已将刷新后的 Token 写回文件：{self._hdhive_token_file}")
-            except Exception as e:
-                logger.error(f"HDHive OpenAPI: Token 文件写回失败：{e}")
         self._update_plugin_config()
 
     def _init_hdhive_openapi_client(self, proxy=None):
@@ -1449,24 +1508,6 @@ class CloudSubscribe(_PluginBase):
         3. 将回调地址中的 code 参数填入"授权码"并保存，插件自动换取用户 Token
         """
         self._hdhive_client = None
-        self._hdhive_token_store = None
-
-        if self._hdhive_token_file:
-            try:
-                self._hdhive_token_store = HDHiveTokenStore(self._hdhive_token_file)
-                file_tokens = self._hdhive_token_store.load()
-                self._hdhive_access_token = str(file_tokens.get("access_token") or self._hdhive_access_token).strip()
-                self._hdhive_refresh_token = str(file_tokens.get("refresh_token") or self._hdhive_refresh_token).strip()
-                self._hdhive_token_expires_at = float(
-                    file_tokens.get("token_expires_at") or self._hdhive_token_expires_at or 0)
-                self._hdhive_client_id = str(self._hdhive_client_id or file_tokens.get("client_id") or "").strip()
-                self._hdhive_redirect_uri = str(
-                    self._hdhive_redirect_uri or file_tokens.get("redirect_uri") or "").strip()
-                logger.info(f"HDHive OpenAPI: 已从挂载文件加载 Token：{self._hdhive_token_file}")
-            except HDHiveTokenStoreError as e:
-                logger.error(f"HDHive OpenAPI: Token 文件不可用：{e}")
-            except Exception as e:
-                logger.error(f"HDHive OpenAPI: Token 文件解析失败：{e}")
 
         client = HDHiveOpenAPIClient(
             app_secret=self._hdhive_api_key,
@@ -1653,6 +1694,7 @@ class CloudSubscribe(_PluginBase):
             ),
             should_stop=self._stop_requested,
             offline_pending_changed=self._update_offline_monitor,
+            history_changed=self._mark_history_changed,
             file_finalized=self._on_file_finalized,
             task_update=self._update_sync_task,
             task_context=self._current_task_context,
@@ -1686,6 +1728,7 @@ class CloudSubscribe(_PluginBase):
             "enabled": self._enabled,
             "show_sidebar_nav": self._show_sidebar_nav,
             "agent_enabled": self._agent_enabled,
+            "direct_transfer_enabled": self._direct_transfer_enabled,
             "cron": self._cron,
             "notify": self._notify,
             "notification_type": self._notification_type.name,
@@ -1736,6 +1779,7 @@ class CloudSubscribe(_PluginBase):
             "butailing_result_limit": self._butailing_result_limit,
             "juying_username": self._juying_username,
             "juying_password": self._juying_password,
+            "juying_checkin_enabled": self._juying_checkin_enabled,
             "juying_result_limit": self._juying_result_limit,
             "juying_request_interval": self._juying_request_interval,
             "pinglian_username": self._pinglian_username,
@@ -1754,7 +1798,6 @@ class CloudSubscribe(_PluginBase):
             "hdhive_access_token": self._hdhive_access_token,
             "hdhive_refresh_token": self._hdhive_refresh_token,
             "hdhive_token_expires_at": self._hdhive_token_expires_at,
-            "hdhive_token_file": self._hdhive_token_file,
             "hdhive_auto_unlock": self._hdhive_auto_unlock,
             "hdhive_max_unlock_points": self._hdhive_max_unlock_points,
             "hdhive_max_points_per_sub": self._hdhive_max_points_per_sub,
@@ -1768,6 +1811,10 @@ class CloudSubscribe(_PluginBase):
             # Dian115 配置
             "dian115_email": self._dian115_email,
             "dian115_password": self._dian115_password,
+            "dian115_checkin_enabled": self._dian115_checkin_enabled,
+            "dian115_checkin_mode": self._dian115_checkin_mode,
+            "dian115_lottery_enabled": self._dian115_lottery_enabled,
+            "dian115_lottery_count": self._dian115_lottery_count,
             "dian115_auto_unlock": self._dian115_auto_unlock,
             "dian115_max_unlock_points": self._dian115_max_unlock_points,
             "dian115_max_points_per_sub": self._dian115_max_points_per_sub,
@@ -1786,9 +1833,7 @@ class CloudSubscribe(_PluginBase):
             "dian115_request_interval": self._dian115_request_interval,
             "dian115_unlocks_per_minute": self._dian115_unlocks_per_minute,
             "hdhive_torrentclaw_enabled": self._hdhive_torrentclaw_enabled,
-            "hdhive_torrentclaw_subtitle_languages": (
-                self._hdhive_torrentclaw_subtitle_languages
-            ),
+            "hdhive_torrentclaw_subtitle_languages": self._hdhive_torrentclaw_subtitle_languages,
             "subscribe_filter_mode": self._subscribe_filter_mode,
             "exclude_subscribes": self._exclude_subscribes,
             "include_subscribes": self._include_subscribes,
@@ -1947,6 +1992,13 @@ class CloudSubscribe(_PluginBase):
                 self._offline_scheduler = None
         except Exception:
             pass
+
+        try:
+            store = self.__dict__.get("_cloudsubscribe_data_store")
+            if store:
+                store.close()
+        except Exception as error:
+            logger.debug(f"关闭插件独立数据库失败：{error}")
 
     @eventmanager.register(EventType.PluginReload)
     def reload_plugin_api(self, event: Event):
