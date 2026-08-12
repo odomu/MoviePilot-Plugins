@@ -6,27 +6,22 @@
         <div class="checkin-matrix-head checkin-summary-cell">签到状态</div>
         <div class="checkin-matrix-head checkin-summary-cell">签到天数</div>
         <div class="checkin-matrix-head checkin-summary-cell">当前积分</div>
-        <div
-            v-for="day in dateColumns"
-            :key="'head-' + day.key"
-            class="checkin-matrix-head"
-        >
+        <div v-for="day in dateColumns" :key="'head-' + day.key" class="checkin-matrix-head">
           {{ day.label }}
         </div>
 
         <template v-for="provider in providers" :key="provider.key">
           <div class="checkin-provider-cell checkin-matrix-row">
-            <v-icon :icon="provider.icon" size="18" color="primary"/>
+            <v-icon :icon="provider.icon" size="18" color="primary" />
             <div class="checkin-provider-name">{{ provider.name }}</div>
           </div>
 
           <div class="checkin-summary-cell checkin-matrix-row">
             <span
-                v-if="providerStatus(provider)"
-                class="checkin-status-chip"
-                :class="'checkin-status-chip--' + providerStatus(provider).tone"
-            >
-              <v-icon :icon="providerStatus(provider).icon" size="13"/>
+              v-if="providerStatus(provider)"
+              class="checkin-status-chip"
+              :class="'checkin-status-chip--' + providerStatus(provider).tone">
+              <v-icon :icon="providerStatus(provider).icon" size="13" />
               {{ providerStatus(provider).label }}
             </span>
           </div>
@@ -38,37 +33,31 @@
           </div>
 
           <div
-              v-for="day in timelineDays(provider)"
-              :key="provider.key + '-' + day.key"
-              class="checkin-day-cell checkin-matrix-row"
-          >
+            v-for="day in timelineDays(provider)"
+            :key="provider.key + '-' + day.key"
+            class="checkin-day-cell checkin-matrix-row">
             <v-tooltip
-                v-if="day.latest"
-                location="top"
-                :open-delay="180"
-                max-width="260"
-                content-class="checkin-status-tooltip"
-            >
+              v-if="day.latest"
+              location="top"
+              :open-delay="180"
+              max-width="260"
+              content-class="checkin-status-tooltip">
               <template #activator="{ props: tooltipProps }">
                 <span
-                    v-bind="tooltipProps"
-                    class="checkin-status-dot"
-                    :class="[
+                  v-bind="tooltipProps"
+                  class="checkin-status-dot"
+                  :class="[
                     'checkin-status-dot--' + dayNodeStatus(provider, day),
                     {
-                      'checkin-status-dot--clickable': canCheckin(
-                        provider,
-                        day,
-                      ),
+                      'checkin-status-dot--clickable': canCheckin(provider, day),
                     },
                   ]"
-                    :aria-label="dayNodeLabel(provider, day)"
-                    tabindex="0"
-                    @click.stop="checkinFromDay(provider, day)"
-                    @keydown.enter.prevent="checkinFromDay(provider, day)"
-                    @keydown.space.prevent="checkinFromDay(provider, day)"
-                >
-                  <v-icon :icon="dayNodeIcon(provider, day)" size="14"/>
+                  :aria-label="dayNodeLabel(provider, day)"
+                  tabindex="0"
+                  @click.stop="checkinFromDay(provider, day)"
+                  @keydown.enter.prevent="checkinFromDay(provider, day)"
+                  @keydown.space.prevent="checkinFromDay(provider, day)">
+                  <v-icon :icon="dayNodeIcon(provider, day)" size="14" />
                 </span>
               </template>
 
@@ -81,8 +70,8 @@
                 </div>
                 <div class="checkin-tooltip-meta">
                   {{ day.executionLabel }}
-                  <span v-if="day.pointsDetail"> · {{ day.pointsDetail }}</span>
-                  <span v-if="day.lotteryDetail"> · {{ day.lotteryDetail }}</span>
+                  <span v-if="day.pointsDetail">· {{ day.pointsDetail }}</span>
+                  <span v-if="day.lotteryDetail">· {{ day.lotteryDetail }}</span>
                 </div>
                 <div v-if="day.message" class="checkin-tooltip-message">
                   {{ day.message }}
@@ -90,22 +79,21 @@
               </div>
             </v-tooltip>
             <span
-                v-else
-                class="checkin-status-dot"
-                :class="[
+              v-else
+              class="checkin-status-dot"
+              :class="[
                 'checkin-status-dot--' + dayNodeStatus(provider, day),
                 {
                   'checkin-status-dot--clickable': canCheckin(provider, day),
                 },
               ]"
-                :aria-label="dayNodeLabel(provider, day)"
-                :role="canCheckin(provider, day) ? 'button' : undefined"
-                :tabindex="canCheckin(provider, day) ? 0 : undefined"
-                @click="checkinFromDay(provider, day)"
-                @keydown.enter.prevent="checkinFromDay(provider, day)"
-                @keydown.space.prevent="checkinFromDay(provider, day)"
-            >
-              <v-icon :icon="dayNodeIcon(provider, day)" size="12"/>
+              :aria-label="dayNodeLabel(provider, day)"
+              :role="canCheckin(provider, day) ? 'button' : undefined"
+              :tabindex="canCheckin(provider, day) ? 0 : undefined"
+              @click="checkinFromDay(provider, day)"
+              @keydown.enter.prevent="checkinFromDay(provider, day)"
+              @keydown.space.prevent="checkinFromDay(provider, day)">
+              <v-icon :icon="dayNodeIcon(provider, day)" size="12" />
             </span>
           </div>
         </template>
@@ -115,40 +103,19 @@
     <v-dialog v-model="confirmVisible" max-width="420" persistent>
       <v-card rounded="lg">
         <v-card-title class="text-subtitle-1 d-flex align-center ga-2">
-          <v-icon icon="mdi-alert-outline" color="warning"/>
+          <v-icon icon="mdi-alert-outline" color="warning" />
           {{ confirmationTitle }}
         </v-card-title>
         <v-card-text>
-          确认立即执行 {{ pendingProvider?.name || "当前渠道" }}
-          {{ riskyModeLabel(pendingProvider) }}？
-          <v-alert
-              type="warning"
-              variant="tonal"
-              density="compact"
-              class="mt-3"
-          >
-            {{
-              riskWarning(pendingProvider) ||
-              "当前模式可能产生负积分奖励，执行后会直接扣除现有积分。"
-            }}
+          确认立即执行 {{ pendingProvider?.name || "当前渠道" }} {{ riskyModeLabel(pendingProvider) }}？
+          <v-alert type="warning" variant="tonal" density="compact" class="mt-3">
+            {{ riskWarning(pendingProvider) || "当前模式可能产生负积分奖励，执行后会直接扣除现有积分。" }}
           </v-alert>
         </v-card-text>
         <v-card-actions>
-          <v-spacer/>
-          <v-btn
-              variant="text"
-              :disabled="Boolean(runningProvider)"
-              @click="closeConfirmation"
-          >
-            取消
-          </v-btn>
-          <v-btn
-              color="warning"
-              :loading="Boolean(runningProvider)"
-              @click="confirmCheckin"
-          >
-            确认签到
-          </v-btn>
+          <v-spacer />
+          <v-btn variant="text" :disabled="Boolean(runningProvider)" @click="closeConfirmation">取消</v-btn>
+          <v-btn color="warning" :loading="Boolean(runningProvider)" @click="confirmCheckin">确认签到</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -159,243 +126,210 @@
 import {computed, onMounted, reactive, ref, watch} from "vue";
 
 const props = defineProps({
-  api: {type: [Object, Function], required: true},
-  providers: {type: Array, default: () => []},
-  config: {type: Object, required: true},
-});
-const emit = defineEmits(["result"]);
-const histories = reactive({});
-const runningProvider = ref("");
-const confirmVisible = ref(false);
-const pendingProvider = ref(null);
+  api: { type: [Object, Function], required: true },
+  providers: { type: Array, default: () => [] },
+  config: { type: Object, required: true },
+})
+const emit = defineEmits(["result"])
+const histories = reactive({})
+const runningProvider = ref("")
+const confirmVisible = ref(false)
+const pendingProvider = ref(null)
 
-const dateColumns = computed(() => buildDateColumns());
-const confirmationTitle = computed(
-    () => "确认执行" + riskyModeLabel(pendingProvider.value),
-);
+const dateColumns = computed(() => buildDateColumns())
+const confirmationTitle = computed(() => "确认执行" + riskyModeLabel(pendingProvider.value))
 
 function unwrapResponse(raw) {
-  if (raw?.data && typeof raw.data === "object" && "success" in raw.data)
-    return raw.data;
-  return raw || {};
+  if (raw?.data && typeof raw.data === "object" && "success" in raw.data) return raw.data
+  return raw || {}
 }
 
 function localDateKey(value) {
-  const year = value.getFullYear();
-  const month = String(value.getMonth() + 1).padStart(2, "0");
-  const day = String(value.getDate()).padStart(2, "0");
-  return [year, month, day].join("-");
+  const year = value.getFullYear()
+  const month = String(value.getMonth() + 1).padStart(2, "0")
+  const day = String(value.getDate()).padStart(2, "0")
+  return [year, month, day].join("-")
 }
 
 function buildDateColumns() {
-  const today = new Date();
-  return Array.from({length: 7}, (_, index) => {
-    const date = new Date(today);
-    date.setHours(12, 0, 0, 0);
-    date.setDate(today.getDate() - index);
+  const today = new Date()
+  return Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(today)
+    date.setHours(12, 0, 0, 0)
+    date.setDate(today.getDate() - index)
     return {
       key: localDateKey(date),
       label: String(date.getMonth() + 1) + "/" + String(date.getDate()),
       fullLabel:
-          date.toLocaleDateString("zh-CN", {
-            month: "long",
-            day: "numeric",
-            weekday: "short",
-          }) + (index === 0 ? " · 今天" : ""),
+        date.toLocaleDateString("zh-CN", {
+          month: "long",
+          day: "numeric",
+          weekday: "short",
+        }) + (index === 0 ? " · 今天" : ""),
       isToday: index === 0,
-    };
-  });
+    }
+  })
 }
 
 function historyState(provider) {
-  return histories[provider.key] || {total: 0, items: [], error: ""};
+  return histories[provider.key] || { total: 0, items: [], error: "" }
 }
 
 function providerEnabled(provider) {
-  return Boolean(props.config[provider.enabledKey]);
+  return Boolean(props.config[provider.enabledKey])
 }
 
 function providerConfigured(provider) {
   if (provider.key === "hdhive") {
     if (String(props.config.hdhive_query_mode || "web") === "api") {
       return Boolean(
-          String(props.config.hdhive_api_key || "").trim() &&
-          (
-              String(props.config.hdhive_access_token || "").trim() ||
-              String(props.config.hdhive_refresh_token || "").trim()
-          ),
-      );
+        String(props.config.hdhive_api_key || "").trim() &&
+        (String(props.config.hdhive_access_token || "").trim() ||
+          String(props.config.hdhive_refresh_token || "").trim()),
+      )
     }
   }
-  return provider.credentialKeys.every((key) =>
-      Boolean(String(props.config[key] || "").trim()),
-  );
+  return provider.credentialKeys.every((key) => Boolean(String(props.config[key] || "").trim()))
 }
 
 function providerMode(provider) {
-  return String(props.config[provider.modeKey] || "normal");
+  return String(props.config[provider.modeKey] || "normal")
 }
 
 function riskWarning(provider) {
-  if (!provider) return "";
-  return provider.riskWarnings?.[providerMode(provider)] || "";
+  if (!provider) return ""
+  return provider.riskWarnings?.[providerMode(provider)] || ""
 }
 
 function isRiskyMode(provider) {
-  return Boolean(riskWarning(provider));
+  return Boolean(riskWarning(provider))
 }
 
 function riskyModeLabel(provider) {
-  const mode = provider ? providerMode(provider) : "";
-  return mode === "lucky" ? "运气签到" : "赌狗签到";
+  const mode = provider ? providerMode(provider) : ""
+  return mode === "lucky" ? "运气签到" : "赌狗签到"
 }
 
 function latestRecord(provider) {
-  return historyState(provider).items[0] || null;
+  return historyState(provider).items[0] || null
 }
 
 function providerStatus(provider) {
   if (runningProvider.value === provider.key) {
-    return {label: "签到中", tone: "running", icon: "mdi-loading"};
+    return { label: "签到中", tone: "running", icon: "mdi-loading" }
   }
-  const today = dateColumns.value[0]?.key;
+  const today = dateColumns.value[0]?.key
   const record = historyState(provider).items.find((item) => {
-    const parsed = new Date(item.executed_at);
-    return !Number.isNaN(parsed.getTime()) && localDateKey(parsed) === today;
-  });
-  if (!record) return null;
+    const parsed = new Date(item.executed_at)
+    return !Number.isNaN(parsed.getTime()) && localDateKey(parsed) === today
+  })
+  if (!record) return null
   const already =
-      record.success &&
-      [record.status, record.message].some((value) =>
-          String(value || "").includes("已签到"),
-      );
+    record.success && [record.status, record.message].some((value) => String(value || "").includes("已签到"))
   if (already) {
-    return {label: "已签到", tone: "already", icon: "mdi-check-circle"};
+    return { label: "已签到", tone: "already", icon: "mdi-check-circle" }
   }
   if (record.success) {
-    return {label: "签到成功", tone: "success", icon: "mdi-check-circle"};
+    return { label: "签到成功", tone: "success", icon: "mdi-check-circle" }
   }
-  if (
-      record.trigger === "scheduled" &&
-      props.config.checkin_auto_retry !== false
-  ) {
-    return {label: "等待重试", tone: "retry", icon: "mdi-refresh"};
+  if (record.trigger === "scheduled" && props.config.checkin_auto_retry !== false) {
+    return { label: "等待重试", tone: "retry", icon: "mdi-refresh" }
   }
   if (record.trigger === "retry") {
-    return {label: "重试失败", tone: "error", icon: "mdi-alert-circle"};
+    return { label: "重试失败", tone: "error", icon: "mdi-alert-circle" }
   }
-  return {label: "签到失败", tone: "error", icon: "mdi-alert-circle"};
+  return { label: "签到失败", tone: "error", icon: "mdi-alert-circle" }
 }
 
 function latestMetric(provider, key, suffix = "") {
-  const record = latestRecord(provider);
-  if (!record) return "—";
-  const value = formatOptionalNumber(record[key], suffix);
-  return value === "未记录" ? "—" : value;
+  const record = latestRecord(provider)
+  if (!record) return "—"
+  const value = formatOptionalNumber(record[key], suffix)
+  return value === "未记录" ? "—" : value
 }
 
 function canCheckin(provider, day) {
   return (
-      day.isToday &&
-      !["success", "already"].includes(day.status) &&
-      !runningProvider.value &&
-      providerEnabled(provider) &&
-      providerConfigured(provider)
-  );
+    day.isToday &&
+    !["success", "already"].includes(day.status) &&
+    !runningProvider.value &&
+    providerEnabled(provider) &&
+    providerConfigured(provider)
+  )
 }
 
 function dayNodeStatus(provider, day) {
-  if (day.isToday && runningProvider.value === provider.key) return "running";
-  return day.status === "none" ? "empty" : day.status;
+  if (day.isToday && runningProvider.value === provider.key) return "running"
+  return day.status === "none" ? "empty" : day.status
 }
 
 function dayNodeIcon(provider, day) {
-  if (day.isToday && runningProvider.value === provider.key)
-    return "mdi-loading";
-  if (day.isToday && day.status === "none" && canCheckin(provider, day))
-    return "mdi-calendar-plus";
-  return day.icon;
+  if (day.isToday && runningProvider.value === provider.key) return "mdi-loading"
+  if (day.isToday && day.status === "none" && canCheckin(provider, day)) return "mdi-calendar-plus"
+  return day.icon
 }
 
 function dayNodeLabel(provider, day) {
-  if (day.isToday && runningProvider.value === provider.key)
-    return `${provider.name} 正在签到`;
-  return canCheckin(provider, day)
-      ? `${day.ariaLabel}，点击立即签到`
-      : day.ariaLabel;
+  if (day.isToday && runningProvider.value === provider.key) return `${provider.name} 正在签到`
+  return canCheckin(provider, day) ? `${day.ariaLabel}，点击立即签到` : day.ariaLabel
 }
 
 function checkinFromDay(provider, day) {
-  if (canCheckin(provider, day)) requestCheckin(provider);
+  if (canCheckin(provider, day)) requestCheckin(provider)
 }
 
 function timelineDays(provider) {
-  const recordsByDay = new Map();
+  const recordsByDay = new Map()
   for (const item of historyState(provider).items) {
-    const parsed = new Date(item.executed_at);
-    if (Number.isNaN(parsed.getTime())) continue;
-    const key = localDateKey(parsed);
-    if (!recordsByDay.has(key)) recordsByDay.set(key, []);
-    recordsByDay.get(key).push(item);
+    const parsed = new Date(item.executed_at)
+    if (Number.isNaN(parsed.getTime())) continue
+    const key = localDateKey(parsed)
+    if (!recordsByDay.has(key)) recordsByDay.set(key, [])
+    recordsByDay.get(key).push(item)
   }
   return dateColumns.value.map((date) => {
-    const records = recordsByDay.get(date.key) || [];
-    const latest = records[0];
+    const records = recordsByDay.get(date.key) || []
+    const latest = records[0]
     const already = records.some(
-        (item) =>
-            item.success &&
-            [item.status, item.message].some((value) =>
-            String(value || "").includes("已签到"),
-            ),
-    );
-    const success = records.some((item) => item.success);
-    const waitingRetry =
-        latest?.trigger === "scheduled" &&
-        !latest.success &&
-        props.config.checkin_auto_retry !== false;
+      (item) => item.success && [item.status, item.message].some((value) => String(value || "").includes("已签到")),
+    )
+    const success = records.some((item) => item.success)
+    const waitingRetry = latest?.trigger === "scheduled" && !latest.success && props.config.checkin_auto_retry !== false
     const status = already
-        ? "already"
-        : success
-            ? "success"
-            : waitingRetry
-                ? "retry"
-                : records.length
-                    ? "error"
-                    : "none";
+      ? "already"
+      : success
+        ? "success"
+        : waitingRetry
+          ? "retry"
+          : records.length
+            ? "error"
+            : "none"
     let statusLabel = {
       already: "已签到",
       success: "签到成功",
       retry: "等待重试",
       error: "签到失败",
       none: "未执行",
-    }[status];
+    }[status]
     if (latest?.trigger === "retry" && status !== "already") {
-      statusLabel = status === "success" ? "重试成功" : "重试失败";
+      statusLabel = status === "success" ? "重试成功" : "重试失败"
     }
     const pointChanges = records
-        .filter(
-            (item) =>
-                item.points_change !== null &&
-                item.points_change !== undefined &&
-                item.points_change !== "",
-        )
-        .map((item) => Number(item.points_change))
-        .filter((value) => Number.isFinite(value));
-    const pointsChange = pointChanges.length
-        ? pointChanges.reduce((total, value) => total + value, 0)
-        : null;
-    const pointsLabel = formatSignedNumber(pointsChange);
-    const executedAt = latest ? formatTime(latest.executed_at) : "";
-    const trigger = {
-      scheduled: "定时执行",
-      retry: "异常重试",
-      manual: "手动执行",
-    }[latest?.trigger || "manual"] || "手动执行";
+      .filter((item) => item.points_change !== null && item.points_change !== undefined && item.points_change !== "")
+      .map((item) => Number(item.points_change))
+      .filter((value) => Number.isFinite(value))
+    const pointsChange = pointChanges.length ? pointChanges.reduce((total, value) => total + value, 0) : null
+    const pointsLabel = formatSignedNumber(pointsChange)
+    const executedAt = latest ? formatTime(latest.executed_at) : ""
+    const trigger =
+      {
+        scheduled: "定时执行",
+        retry: "异常重试",
+        manual: "手动执行",
+      }[latest?.trigger || "manual"] || "手动执行"
     const executionLabel = latest
-        ? [executedAt, trigger, records.length > 1 ? `${records.length} 次` : ""]
-            .filter(Boolean)
-            .join(" · ")
-        : "";
+      ? [executedAt, trigger, records.length > 1 ? `${records.length} 次` : ""].filter(Boolean).join(" · ")
+      : ""
     return {
       ...date,
       latest,
@@ -410,127 +344,116 @@ function timelineDays(provider) {
       }[status],
       pointsDetail: pointsChange === null ? "" : `积分 ${pointsLabel || "0"}`,
       lotteryDetail: latest?.lottery_target_count
-          ? `转盘 ${latest.lottery_executed || 0}/${latest.lottery_target_count} 次`
-          : "",
+        ? `转盘 ${latest.lottery_executed || 0}/${latest.lottery_target_count} 次`
+        : "",
       executionLabel,
       message: latest && !latest.success ? latest.message || "" : "",
-      ariaLabel: [date.fullLabel, statusLabel, pointsLabel]
-          .filter(Boolean)
-          .join("，"),
-    };
-  });
+      ariaLabel: [date.fullLabel, statusLabel, pointsLabel].filter(Boolean).join("，"),
+    }
+  })
 }
 
 function formatTime(value) {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return "时间未知";
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return "时间未知"
   return parsed.toLocaleTimeString("zh-CN", {
     hour: "2-digit",
     minute: "2-digit",
-  });
+  })
 }
 
 function formatSignedNumber(value) {
-  if (value === null || value === undefined || !Number.isFinite(Number(value)))
-    return "";
-  const normalized = Number(value);
-  return normalized > 0 ? `+${normalized}` : String(normalized);
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return ""
+  const normalized = Number(value)
+  return normalized > 0 ? `+${normalized}` : String(normalized)
 }
 
 function formatOptionalNumber(value, suffix = "") {
-  if (value === null || value === undefined || value === "") return "未记录";
-  const normalized = Number(value);
-  return Number.isFinite(normalized) ? `${normalized}${suffix}` : "未记录";
+  if (value === null || value === undefined || value === "") return "未记录"
+  const normalized = Number(value)
+  return Number.isFinite(normalized) ? `${normalized}${suffix}` : "未记录"
 }
 
 async function loadProviderHistory(provider) {
   try {
     const response = unwrapResponse(
-        await props.api.get(
-            "plugin/CloudSubscribe/checkin/" +
-            encodeURIComponent(provider.key) +
-            "/history?limit=60",
-        ),
-    );
-    if (response.success === false)
-      throw new Error(response.message || "读取签到记录失败");
-    const data = response.data?.data || response.data || {};
+      await props.api.get("plugin/CloudSubscribe/checkin/" + encodeURIComponent(provider.key) + "/history?limit=60"),
+    )
+    if (response.success === false) throw new Error(response.message || "读取签到记录失败")
+    const data = response.data?.data || response.data || {}
     histories[provider.key] = {
       total: Number(data.total || 0),
       items: Array.isArray(data.items) ? data.items : [],
       error: "",
-    };
+    }
   } catch (error) {
     histories[provider.key] = {
       total: 0,
       items: [],
       error: error.message || String(error),
-    };
+    }
   }
 }
 
 async function loadHistories() {
-  await Promise.all(props.providers.map(loadProviderHistory));
+  await Promise.all(props.providers.map(loadProviderHistory))
 }
 
 function requestCheckin(provider) {
-  if (runningProvider.value) return;
+  if (runningProvider.value) return
   if (isRiskyMode(provider)) {
-    pendingProvider.value = provider;
-    confirmVisible.value = true;
-    return;
+    pendingProvider.value = provider
+    confirmVisible.value = true
+    return
   }
-  runCheckin(provider);
+  runCheckin(provider)
 }
 
 function closeConfirmation() {
-  confirmVisible.value = false;
-  pendingProvider.value = null;
+  confirmVisible.value = false
+  pendingProvider.value = null
 }
 
 function confirmCheckin() {
-  const provider = pendingProvider.value;
-  closeConfirmation();
-  if (provider) runCheckin(provider);
+  const provider = pendingProvider.value
+  closeConfirmation()
+  if (provider) runCheckin(provider)
 }
 
 function wait(delay) {
-  return new Promise((resolve) => window.setTimeout(resolve, delay));
+  return new Promise((resolve) => window.setTimeout(resolve, delay))
 }
 
 async function waitForProviderResult(provider, previousRecordId) {
   for (let attempt = 0; attempt < 90; attempt += 1) {
-    await wait(attempt === 0 ? 500 : 2000);
-    await loadProviderHistory(provider);
-    const record = latestRecord(provider);
-    if (record?.id && record.id !== previousRecordId) return record;
+    await wait(attempt === 0 ? 500 : 2000)
+    await loadProviderHistory(provider)
+    const record = latestRecord(provider)
+    if (record?.id && record.id !== previousRecordId) return record
   }
-  return null;
+  return null
 }
 
 async function runCheckin(provider) {
-  if (runningProvider.value) return;
-  runningProvider.value = provider.key;
-  const previousRecordId = latestRecord(provider)?.id || "";
+  if (runningProvider.value) return
+  runningProvider.value = provider.key
+  const previousRecordId = latestRecord(provider)?.id || ""
   try {
     const response = unwrapResponse(
-        await props.api.post(
-            "plugin/CloudSubscribe/checkin/" + encodeURIComponent(provider.key),
-            {
-              mode: providerMode(provider),
-              confirm_risky: isRiskyMode(provider),
-            },
-        ),
-    );
-    let success = response.success !== false;
-    let message = response.message || (success ? "签到完成" : "签到失败");
+      await props.api.post("plugin/CloudSubscribe/checkin/" + encodeURIComponent(provider.key), {
+        mode: providerMode(provider),
+        confirm_risky: isRiskyMode(provider),
+      }),
+    )
+    let success = response.success !== false
+    let message = response.message || (success ? "签到完成" : "签到失败")
     if (success && response.data?.running) {
-      const record = await waitForProviderResult(provider, previousRecordId);
+      const record = await waitForProviderResult(provider, previousRecordId)
       if (record) {
-        success = Boolean(record.success);
-        message = record.message || record.status || message;
+        success = Boolean(record.success)
+        message = record.message || record.status || message
       } else {
-        message = "签到任务已提交，仍在后台执行";
+        message = "签到任务已提交，仍在后台执行"
       }
     }
     emit("result", {
@@ -538,25 +461,22 @@ async function runCheckin(provider) {
       providerName: provider.name,
       success,
       message,
-    });
+    })
   } catch (error) {
     emit("result", {
       providerKey: provider.key,
       providerName: provider.name,
       success: false,
       message: error.message || String(error),
-    });
+    })
   } finally {
-    await loadProviderHistory(provider);
-    runningProvider.value = "";
+    await loadProviderHistory(provider)
+    runningProvider.value = ""
   }
 }
 
-watch(
-    () => props.providers.map((provider) => provider.key).join(","),
-    loadHistories,
-);
-onMounted(loadHistories);
+watch(() => props.providers.map((provider) => provider.key).join(","), loadHistories)
+onMounted(loadHistories)
 </script>
 
 <style scoped>
@@ -678,10 +598,11 @@ onMounted(loadHistories);
   border-radius: 999px;
   cursor: help;
   outline: none;
-  transition: color 0.16s ease,
-  border-color 0.16s ease,
-  background-color 0.16s ease,
-  transform 0.16s ease;
+  transition:
+    color 0.16s ease,
+    border-color 0.16s ease,
+    background-color 0.16s ease,
+    transform 0.16s ease;
 }
 
 .checkin-status-dot:focus-visible {

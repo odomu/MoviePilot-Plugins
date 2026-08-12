@@ -7,7 +7,7 @@ export function createUpgradeSection(options) {
       {
         title: "洗版功能",
         icon: "mdi-source-branch",
-          hint: "候选资源继续使用优先级规则组筛选和排序；插件不附加清晰度规则。",
+        hint: "候选资源继续使用优先级规则组筛选和排序；插件不附加清晰度规则。",
         fields: [
           {
             key: "enable_cloud_upgrade",
@@ -20,7 +20,7 @@ export function createUpgradeSection(options) {
             key: "enable_pt_upgrade",
             label: "启用 PT 洗版",
             type: "switch",
-              hint: "完成 PT 下载和本地整理后，将符合洗版范围及评分条件的文件上传到当前网盘。",
+            hint: "完成 PT 下载和本地整理后，将符合洗版范围及评分条件的文件上传到当前网盘。",
             cols: 4,
           },
           {
@@ -70,5 +70,5 @@ export function createUpgradeSection(options) {
         ],
       },
     ],
-  };
+  }
 }

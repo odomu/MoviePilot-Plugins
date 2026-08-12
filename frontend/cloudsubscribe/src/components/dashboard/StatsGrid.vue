@@ -1,24 +1,20 @@
 <template>
   <div class="stats-grid" aria-label="转存统计">
     <div
-        v-for="(stat, index) in stats"
-        :key="stat.title"
-        :class="[
-          'stat-card',
-          {'stat-card--desktop-only': ['成功', '失败'].includes(stat.title)},
-        ]"
-        :style="{
+      v-for="(stat, index) in stats"
+      :key="stat.title"
+      :class="['stat-card', { 'stat-card--desktop-only': ['成功', '失败'].includes(stat.title) }]"
+      :style="{
         '--stat-color': `var(--v-theme-${stat.color})`,
         '--stat-delay': `${index * 45}ms`,
-      }"
-    >
-      <span class="stat-accent" aria-hidden="true"/>
+      }">
+      <span class="stat-accent" aria-hidden="true" />
       <div class="stat-copy">
         <div class="stat-label">{{ stat.title }}</div>
         <div class="stat-value">{{ stat.value }}</div>
       </div>
       <div class="stat-icon">
-        <v-icon :icon="stat.icon" size="21"/>
+        <v-icon :icon="stat.icon" size="21" />
       </div>
     </div>
   </div>

@@ -9,7 +9,6 @@ from ..http_client import RequestGate, gated_request, normalize_proxies, request
 from ..matching import (
     extract_season,
     extract_year,
-    media_identifier_queries,
     title_matches,
     unique_texts,
 )
@@ -214,43 +213,49 @@ class ButailingClient:
             expected_year: object,
             media_type: str,
             season: Optional[int] = None,
-            tmdb_id: Optional[object] = None,
             douban_id: Optional[object] = None,
             imdb_id: Optional[object] = None,
             limit: int = 20,
     ) -> List[Dict[str, Any]]:
         titles = [str(value).strip() for value in expected_titles if str(value or "").strip()]
         normalized_keywords = unique_texts(keywords)
-        if not titles or not normalized_keywords:
+        expected_douban_id = str(douban_id or "").strip()
+        if not expected_douban_id.isdigit() or int(expected_douban_id) <= 0:
+            expected_douban_id = ""
+        if not expected_douban_id and (not titles or not normalized_keywords):
             return []
         normalized_limit = max(1, min(int(limit or 20), 80))
         year = extract_year(expected_year)
-        identifier_keywords = [
-            query for _, query, _ in media_identifier_queries(
-                tmdb_id=tmdb_id,
-                douban_id=douban_id,
-                imdb_id=imdb_id,
-            )
-        ]
-        search_keywords = unique_texts((*identifier_keywords, *normalized_keywords))
         cache_key = (tuple(normalized_keywords), tuple(titles), year, media_type,
-                     season, tmdb_id, douban_id, imdb_id)
+                     season, expected_douban_id, imdb_id)
         lock = self._search_locks[hash(cache_key) % len(self._search_locks)]
         with lock:
-            selected = None
-            for keyword in search_keywords:
-                rows = self._search_rows(keyword)
+            if expected_douban_id:
+                detail = self._detail(int(expected_douban_id))
                 selected = self._select_row(
-                    rows, titles, year, media_type, season, douban_id, imdb_id
+                    [detail], titles, year, media_type, season,
+                    expected_douban_id, imdb_id,
                 )
-                if selected:
-                    break
-            if not selected:
+                if not selected:
+                    return []
+                selected_douban_id = selected.get("doub_id") or expected_douban_id
+                selected_title = selected.get("title") or (titles[0] if titles else "")
+            else:
+                selected = None
+                for keyword in normalized_keywords:
+                    rows = self._search_rows(keyword)
+                    selected = self._select_row(
+                        rows, titles, year, media_type, season, None, imdb_id
+                    )
+                    if selected:
+                        break
+                if not selected or not selected.get("doub_id"):
+                    return []
+                selected_douban_id = selected["doub_id"]
+                selected_title = selected.get("title") or titles[0]
+                detail = self._detail(int(selected_douban_id))
+            if not detail:
                 return []
-            selected_douban_id = selected.get("doub_id")
-            if not selected_douban_id:
-                return []
-            detail = self._detail(int(selected_douban_id))
             seeds = detail.get("all_seeds") or []
             results = []
             seen = set()
@@ -264,7 +269,7 @@ class ButailingClient:
                 seen.add(key)
                 title = str(seed.get("zname") or "").strip()
                 if not title:
-                    title = f"{selected.get('title') or titles[0]} - 磁力资源 #{index + 1}"
+                    title = f"{selected_title} - 磁力资源 #{index + 1}"
                 results.append({
                     "id": "btl-" + hashlib.sha1(magnet.encode("utf-8")).hexdigest()[:16],
                     "url": magnet,

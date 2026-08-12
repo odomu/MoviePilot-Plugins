@@ -1,78 +1,51 @@
 <template>
   <v-dialog
-      :model-value="modelValue"
-      max-width="820"
-      content-class="offline-dialog-overlay"
-      scrollable
-      @update:model-value="emit('update:modelValue', $event)"
-  >
+    :model-value="modelValue"
+    max-width="820"
+    content-class="offline-dialog-overlay"
+    scrollable
+    @update:model-value="emit('update:modelValue', $event)">
     <v-card class="offline-dialog">
-      <v-card-title
-          class="offline-header d-flex align-center ga-1 px-3 py-2 bg-primary-lighten-5"
-      >
+      <v-card-title class="offline-header d-flex align-center ga-1 px-3 py-2 bg-primary-lighten-5">
         <div class="offline-heading">
-          <v-icon
-              icon="mdi-cloud-download-outline"
-              class="mr-1"
-              color="primary"
-              size="small"
-          />
+          <v-icon icon="mdi-cloud-download-outline" class="mr-1" color="primary" size="small" />
           <span>{{ providerName }}离线任务</span>
           <v-chip size="x-small" variant="tonal" class="ml-1">
             {{ tasks.length }}
           </v-chip>
         </div>
         <div class="offline-header-actions">
-          <v-btn
-              v-if="tasks.length"
-              variant="text"
-              size="small"
-              title="全选或取消全选"
-              @click="toggleSelectAll"
-          >
-            <v-icon :icon="allSelected ? 'mdi-checkbox-marked' : 'mdi-checkbox-blank-outline'"/>
+          <v-btn v-if="tasks.length" variant="text" size="small" title="全选或取消全选" @click="toggleSelectAll">
+            <v-icon :icon="allSelected ? 'mdi-checkbox-marked' : 'mdi-checkbox-blank-outline'" />
             <span class="offline-action-label">{{ allSelected ? "取消全选" : "全选" }}</span>
           </v-btn>
           <v-btn
-              v-if="selectedRetryKeys.length"
-              color="primary"
-              variant="tonal"
-              size="small"
-              title="重试所选任务"
-              :loading="retrying"
-              @click="retryTasks(selectedRetryKeys)"
-          >
-            <v-icon icon="mdi-reload"/>
+            v-if="selectedRetryKeys.length"
+            color="primary"
+            variant="tonal"
+            size="small"
+            title="重试所选任务"
+            :loading="retrying"
+            @click="retryTasks(selectedRetryKeys)">
+            <v-icon icon="mdi-reload" />
             <span class="offline-action-label">重试（{{ selectedRetryKeys.length }}）</span>
           </v-btn>
           <v-btn
-              v-if="selectedKeys.length"
-              color="error"
-              variant="tonal"
-              size="small"
-              title="删除所选任务"
-              @click="askDeleteSelected"
-          >
-            <v-icon icon="mdi-delete-sweep-outline"/>
+            v-if="selectedKeys.length"
+            color="error"
+            variant="tonal"
+            size="small"
+            title="删除所选任务"
+            @click="askDeleteSelected">
+            <v-icon icon="mdi-delete-sweep-outline" />
             <span class="offline-action-label">删除（{{ selectedKeys.length }}）</span>
           </v-btn>
-          <v-btn
-              variant="text"
-              size="small"
-              title="刷新任务"
-              :loading="loading"
-              @click="refreshAll"
-          >
-            <v-icon icon="mdi-refresh"/>
+          <v-btn variant="text" size="small" title="刷新任务" :loading="loading" @click="refreshAll">
+            <v-icon icon="mdi-refresh" />
             <span class="offline-action-label">刷新</span>
           </v-btn>
-          <v-btn
-              variant="text"
-              size="small"
-              title="关闭"
-              @click="emit('update:modelValue', false)"
-          >
-            <v-icon icon="mdi-close"/>
+          <v-btn variant="text" size="small" title="关闭" @click="emit('update:modelValue', false)">
+            <v-icon icon="mdi-close" />
             <span class="offline-action-label">关闭</span>
           </v-btn>
         </div>
@@ -81,93 +54,69 @@
       <v-card-text class="offline-body pa-3">
         <v-sheet v-if="quota.total" class="quota-bar border rounded px-3 py-2 mb-3">
           <div class="d-flex align-center flex-wrap ga-2 text-caption">
-            <v-icon icon="mdi-gauge" color="primary" size="small"/>
+            <v-icon icon="mdi-gauge" color="primary" size="small" />
             <span class="font-weight-medium">离线额度</span>
             <span>剩余 {{ quota.remaining }} / {{ quota.total }}</span>
             <span class="text-medium-emphasis">已用 {{ quota.used }}</span>
             <span v-if="quota.max_size_gb" class="text-medium-emphasis">单任务最大 {{ quota.max_size_gb }} GB</span>
           </div>
-          <v-progress-linear
-              :model-value="quotaPercent"
-              color="primary"
-              height="4"
-              rounded
-              class="mt-2"
-          />
+          <v-progress-linear :model-value="quotaPercent" color="primary" height="4" rounded class="mt-2" />
         </v-sheet>
         <div class="text-caption text-medium-emphasis mb-3">
           最近检查：{{ updatedText }} · 已下载文件最多等待系统处理30分钟
         </div>
 
         <v-alert
-            v-if="error"
-            type="error"
-            variant="tonal"
-            density="compact"
-            closable
-            class="mb-3"
-            @click:close="error = ''"
-        >
+          v-if="error"
+          type="error"
+          variant="tonal"
+          density="compact"
+          closable
+          class="mb-3"
+          @click:close="error = ''">
           {{ error }}
         </v-alert>
 
         <v-alert
-            v-if="success"
-            type="success"
-            variant="tonal"
-            density="compact"
-            closable
-            class="mb-3"
-            @click:close="success = ''"
-        >
+          v-if="success"
+          type="success"
+          variant="tonal"
+          density="compact"
+          closable
+          class="mb-3"
+          @click:close="success = ''">
           {{ success }}
         </v-alert>
 
-        <v-skeleton-loader
-            v-if="loading && !tasks.length"
-            type="list-item-three-line@4"
-        />
+        <v-skeleton-loader v-if="loading && !tasks.length" type="list-item-three-line@4" />
 
-        <div
-            v-else-if="!tasks.length"
-            class="empty-state text-center text-medium-emphasis"
-        >
-          <v-icon icon="mdi-cloud-download-outline" size="44" class="mb-2"/>
+        <div v-else-if="!tasks.length" class="empty-state text-center text-medium-emphasis">
+          <v-icon icon="mdi-cloud-download-outline" size="44" class="mb-2" />
           <div class="text-body-2">暂无离线任务</div>
         </div>
 
         <div v-else class="task-list">
           <v-sheet
-              v-for="(task, index) in tasks"
-              :key="task.id || `${task.name}-${index}`"
-              class="task-item border"
-              color="surface"
-          >
+            v-for="(task, index) in tasks"
+            :key="task.id || `${task.name}-${index}`"
+            class="task-item border"
+            color="surface">
             <div class="task-row">
               <div class="task-leading">
                 <v-checkbox-btn
-                    v-if="taskSelectionKey(task)"
-                    v-model="selectedKeys"
-                    :value="taskSelectionKey(task)"
-                    density="compact"
-                    aria-label="选择离线任务"
-                />
-                <v-icon
-                    :icon="taskIcon(task)"
-                    :color="statusColor(task.state, task.failed)"
-                    size="20"
-                />
+                  v-if="taskSelectionKey(task)"
+                  v-model="selectedKeys"
+                  :value="taskSelectionKey(task)"
+                  density="compact"
+                  aria-label="选择离线任务" />
+                <v-icon :icon="taskIcon(task)" :color="statusColor(task.state, task.failed)" size="20" />
               </div>
               <div class="task-copy">
                 <div class="task-heading">
                   <div class="task-name text-body-2 font-weight-medium">
                     {{ task.target_name || task.name || "未命名任务" }}
                   </div>
-                  <v-chip
-                      :color="statusColor(task.state, task.failed)"
-                      size="x-small"
-                      variant="tonal"
-                  >
+                  <v-chip :color="statusColor(task.state, task.failed)" size="x-small" variant="tonal">
                     {{ taskStatusText(task) }}
                   </v-chip>
                   <span class="task-percent text-caption">
@@ -175,14 +124,13 @@
                   </span>
                 </div>
                 <v-progress-linear
-                    :model-value="progressValue(task)"
-                    :color="statusColor(task.state, task.failed)"
-                    :stream="['queued', 'running', 'retrying', 'processing'].includes(task.state)"
-                    :striped="['queued', 'running', 'retrying', 'processing'].includes(task.state)"
-                    height="4"
-                    rounded
-                    class="my-1"
-                />
+                  :model-value="progressValue(task)"
+                  :color="statusColor(task.state, task.failed)"
+                  :stream="['queued', 'running', 'retrying', 'processing'].includes(task.state)"
+                  :striped="['queued', 'running', 'retrying', 'processing'].includes(task.state)"
+                  height="4"
+                  rounded
+                  class="my-1" />
                 <div class="task-details text-caption text-medium-emphasis">
                   <span>{{ formatSize(task.size) }}</span>
                   <span v-if="task.cloud_dir" class="task-directory">
@@ -193,26 +141,24 @@
               </div>
               <div class="task-actions">
                 <v-btn
-                    v-if="canRetry(task)"
-                    color="primary"
-                    variant="tonal"
-                    size="x-small"
-                    title="立即重试"
-                    :loading="retryingKey === taskRetryKey(task)"
-                    @click="retryTasks([taskRetryKey(task)])"
-                >
-                  <v-icon icon="mdi-reload"/>
+                  v-if="canRetry(task)"
+                  color="primary"
+                  variant="tonal"
+                  size="x-small"
+                  title="立即重试"
+                  :loading="retryingKey === taskRetryKey(task)"
+                  @click="retryTasks([taskRetryKey(task)])">
+                  <v-icon icon="mdi-reload" />
                   <span class="task-action-label">立即重试</span>
                 </v-btn>
                 <v-btn
-                    v-if="taskSelectionKey(task)"
-                    color="error"
-                    variant="text"
-                    size="x-small"
-                    title="删除任务"
-                    @click="askDelete(task)"
-                >
-                  <v-icon icon="mdi-delete-outline"/>
+                  v-if="taskSelectionKey(task)"
+                  color="error"
+                  variant="text"
+                  size="x-small"
+                  title="删除任务"
+                  @click="askDelete(task)">
+                  <v-icon icon="mdi-delete-outline" />
                   <span class="task-action-label">删除任务</span>
                 </v-btn>
               </div>
@@ -230,11 +176,9 @@
         {{ deleteConfirmText }}
       </v-card-text>
       <v-card-actions>
-        <v-spacer/>
+        <v-spacer />
         <v-btn variant="text" @click="confirmVisible = false">取消</v-btn>
-        <v-btn color="error" :loading="deleting" @click="deleteTask">
-          确认删除
-        </v-btn>
+        <v-btn color="error" :loading="deleting" @click="deleteTask">确认删除</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -246,7 +190,7 @@ import {computed, onBeforeUnmount, onMounted, ref, watch} from "vue";
 const props = defineProps({
   modelValue: Boolean,
   api: {type: [Object, Function], required: true},
-});
+})
 const emit = defineEmits(["update:modelValue"]);
 const pluginId = "CloudSubscribe";
 const tasks = ref([]);
@@ -266,43 +210,35 @@ const batchDeleting = ref(false);
 let refreshTimer = null;
 let loadRequest = null;
 
-const updatedText = computed(() =>
-    updatedAt.value
-        ? new Date(updatedAt.value * 1000).toLocaleString()
-        : "尚未检查",
-);
-const selectableKeys = computed(() =>
-    tasks.value.map(taskSelectionKey).filter(Boolean),
-);
-const allSelected = computed(() =>
-    selectableKeys.value.length > 0 && selectableKeys.value.every((key) => selectedKeys.value.includes(key)),
+const updatedText = computed(() => (updatedAt.value ? new Date(updatedAt.value * 1000).toLocaleString() : "尚未检查"));
+const selectableKeys = computed(() => tasks.value.map(taskSelectionKey).filter(Boolean));
+const allSelected = computed(
+  () => selectableKeys.value.length > 0 && selectableKeys.value.every((key) => selectedKeys.value.includes(key)),
 );
 const selectedTasks = computed(() => {
   const keys = new Set(selectedKeys.value);
   return tasks.value.filter((task) => keys.has(taskSelectionKey(task)));
-});
-const selectedHashes = computed(() => selectedTasks.value
-    .map((task) => String(task.id || "").trim())
-    .filter(Boolean),
+})
+const selectedHashes = computed(() => selectedTasks.value.map((task) => String(task.id || "").trim()).filter(Boolean));
+const selectedPendingKeys = computed(() =>
+  selectedTasks.value.map((task) => String(task.pending_key || "").trim()).filter(Boolean),
 );
-const selectedPendingKeys = computed(() => selectedTasks.value
-    .map((task) => String(task.pending_key || "").trim())
-    .filter(Boolean),
+const selectedRetryKeys = computed(() =>
+  selectedKeys.value.filter((key) => {
+    const task = tasks.value.find((item) => taskSelectionKey(item) === key);
+    return task && canRetry(task);
+  }),
 );
-const selectedRetryKeys = computed(() => selectedKeys.value.filter((key) => {
-  const task = tasks.value.find((item) => taskSelectionKey(item) === key);
-  return task && canRetry(task);
-}));
-const quotaPercent = computed(() => quota.value.total
-    ? Math.min(100, Math.max(0, Number(quota.value.used || 0) / Number(quota.value.total) * 100))
-    : 0,
+const quotaPercent = computed(() =>
+  quota.value.total ? Math.min(100, Math.max(0, (Number(quota.value.used || 0) / Number(quota.value.total)) * 100)) : 0,
 );
-const deleteConfirmText = computed(() => batchDeleting.value
+const deleteConfirmText = computed(() =>
+  batchDeleting.value
     ? `确认删除所选 ${selectedKeys.value.length} 个任务？已下载文件会保留。`
     : `确认删除${
         pendingTask.value?.finalize_pending ? "后处理任务" : "离线任务"
     }“${pendingTask.value?.name || "未命名任务"}”？已下载文件会保留。`,
-);
+)
 
 function unwrapResponse(raw) {
   if (raw?.data && typeof raw.data === "object" && "success" in raw.data) {
@@ -324,19 +260,11 @@ function formatPercent(value) {
 }
 
 function formatTime(timestamp) {
-  return Number(timestamp) > 0
-      ? new Date(Number(timestamp) * 1000).toLocaleString()
-      : "未知";
+  return Number(timestamp) > 0 ? new Date(Number(timestamp) * 1000).toLocaleString() : "未知";
 }
 
 function statusColor(state, failed = false) {
-  return failed
-      ? "error"
-      : state === "completed"
-          ? "success"
-          : state === "retrying"
-              ? "warning"
-              : "info";
+  return failed ? "error" : state === "completed" ? "success" : state === "retrying" ? "warning" : "info";
 }
 
 function taskIcon(task) {
@@ -364,28 +292,20 @@ async function load(force = false) {
     error.value = "";
     try {
       const response = unwrapResponse(
-          force
-              ? await props.api.post(`plugin/${pluginId}/offline/refresh`)
-              : await props.api.get(`plugin/${pluginId}/offline`),
-      );
+        force
+          ? await props.api.post(`plugin/${pluginId}/offline/refresh`)
+          : await props.api.get(`plugin/${pluginId}/offline`),
+      )
       if (response.success === false) {
         throw new Error(response.message || "加载失败");
       }
       const snapshot = response.data?.data || response.data || response;
-      tasks.value = Array.isArray(snapshot)
-          ? snapshot
-          : Array.isArray(snapshot?.tasks)
-              ? snapshot.tasks
-              : [];
+      tasks.value = Array.isArray(snapshot) ? snapshot : Array.isArray(snapshot?.tasks) ? snapshot.tasks : [];
       updatedAt.value = Number(snapshot?.updated_at || 0);
       quota.value = snapshot?.quota && typeof snapshot.quota === "object" ? snapshot.quota : {};
       providerName.value = String(snapshot?.provider_name || "网盘");
-      const availableKeys = new Set(
-          tasks.value.map(taskSelectionKey).filter(Boolean),
-      );
-      selectedKeys.value = selectedKeys.value.filter((key) =>
-          availableKeys.has(key),
-      );
+      const availableKeys = new Set(tasks.value.map(taskSelectionKey).filter(Boolean));
+      selectedKeys.value = selectedKeys.value.filter((key) => availableKeys.has(key));
     } catch (loadError) {
       error.value = loadError.message || "加载失败";
     } finally {
@@ -393,7 +313,7 @@ async function load(force = false) {
       loadRequest = null;
       scheduleAutoRefresh();
     }
-  })();
+  })()
   return loadRequest;
 }
 
@@ -403,9 +323,7 @@ async function refreshAll() {
 }
 
 function hasPendingTasks() {
-  return tasks.value.some(
-      (task) => task?.finalize_pending || (!task?.completed && !task?.failed),
-  );
+  return tasks.value.some((task) => task?.finalize_pending || (!task?.completed && !task?.failed));
 }
 
 function scheduleAutoRefresh() {
@@ -415,7 +333,7 @@ function scheduleAutoRefresh() {
   refreshTimer = window.setTimeout(() => {
     refreshTimer = null;
     void load(false);
-  }, delay);
+  }, delay)
 }
 
 function stopAutoRefresh() {
@@ -440,15 +358,11 @@ async function retryTasks(pendingKeys) {
   error.value = "";
   try {
     const response = unwrapResponse(
-        await props.api.post(`plugin/${pluginId}/offline/retry`, {
-          pending_keys: keys
-              .filter((key) => key.startsWith("pending:"))
-              .map((key) => key.slice(8)),
-          task_ids: keys
-              .filter((key) => key.startsWith("offline:"))
-              .map((key) => key.slice(8)),
-        }),
-    );
+      await props.api.post(`plugin/${pluginId}/offline/retry`, {
+        pending_keys: keys.filter((key) => key.startsWith("pending:")).map((key) => key.slice(8)),
+        task_ids: keys.filter((key) => key.startsWith("offline:")).map((key) => key.slice(8)),
+      }),
+    )
     if (response.success === false) {
       throw new Error(response.message || "重试失败");
     }
@@ -467,8 +381,7 @@ function canRetry(task) {
 
 function taskRetryKey(task) {
   if (task?.failed && task?.id) return `offline:${task.id}`;
-  if (task?.finalize_pending && task?.pending_key)
-    return `pending:${task.pending_key}`;
+  if (task?.finalize_pending && task?.pending_key) return `pending:${task.pending_key}`;
   return "";
 }
 
@@ -501,16 +414,16 @@ async function deleteTask() {
   success.value = "";
   try {
     const response = unwrapResponse(
-        batchDeleting.value
-            ? await props.api.post(`plugin/${pluginId}/offline/delete_batch`, {
-              task_ids: selectedHashes.value,
-              pending_keys: selectedPendingKeys.value,
-            })
-            : await props.api.post(`plugin/${pluginId}/offline/delete`, {
-              task_id: pendingTask.value.id,
-              pending_key: pendingTask.value.pending_key,
-            }),
-    );
+      batchDeleting.value
+        ? await props.api.post(`plugin/${pluginId}/offline/delete_batch`, {
+          task_ids: selectedHashes.value,
+          pending_keys: selectedPendingKeys.value,
+        })
+        : await props.api.post(`plugin/${pluginId}/offline/delete`, {
+          task_id: pendingTask.value.id,
+          pending_key: pendingTask.value.pending_key,
+        }),
+    )
     if (response.success === false) {
       throw new Error(response.message || "删除失败");
     }
@@ -528,22 +441,22 @@ async function deleteTask() {
 }
 
 watch(
-    () => props.modelValue,
-    (value) => {
-      if (value) {
-        refreshAll();
-      } else {
-        stopAutoRefresh();
-      }
-    },
-    {immediate: true},
-);
+  () => props.modelValue,
+  (value) => {
+    if (value) {
+      refreshAll();
+    } else {
+      stopAutoRefresh();
+    }
+  },
+  {immediate: true},
+)
 
 onMounted(() => document.addEventListener("visibilitychange", handleVisibilityChange));
 onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopAutoRefresh();
-});
+})
 </script>
 
 <style scoped>

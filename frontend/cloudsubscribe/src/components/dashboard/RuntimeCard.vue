@@ -3,96 +3,79 @@
     <div v-if="tasks.length" class="task-list">
       <div v-for="task in tasks" :key="task.id" class="task-row">
         <v-icon
-            :icon="
+          :icon="
             task.task_kind === 'cross_transfer'
               ? 'mdi-swap-horizontal-bold'
               : task.media_type === '电影'
                 ? 'mdi-movie-outline'
                 : 'mdi-television-classic'
           "
-            :color="taskColor(task.status)"
-            size="small"
-        />
+          :color="taskColor(task.status)"
+          size="small" />
         <div class="task-content">
           <div class="task-line">
-            <span class="task-name text-body-2 font-weight-medium">{{
-                task.title
-              }}</span>
+            <span class="task-name text-body-2 font-weight-medium">{{ task.title }}</span>
             <span v-if="task.season" class="text-caption text-medium-emphasis">
               S{{ String(task.season).padStart(2, "0") }}
             </span>
             <v-chip
-                v-if="
-                task.task_kind === 'pt_upgrade' ||
-                task.task_kind === 'cloud_upgrade'
-              "
-                size="x-small"
-                variant="outlined"
-                :color="task.task_kind === 'pt_upgrade' ? 'warning' : 'primary'"
-            >
+              v-if="task.task_kind === 'pt_upgrade' || task.task_kind === 'cloud_upgrade'"
+              size="x-small"
+              variant="outlined"
+              :color="task.task_kind === 'pt_upgrade' ? 'warning' : 'primary'">
               {{ task.task_kind === "pt_upgrade" ? "PT 洗版" : "网盘洗版" }}
             </v-chip>
-            <v-chip
-                :color="taskColor(task.status)"
-                size="x-small"
-                variant="tonal"
-            >
+            <v-chip :color="taskColor(task.status)" size="x-small" variant="tonal">
               {{ taskStatus(task.status) }}
             </v-chip>
           </div>
           <div class="task-meta">
             <div class="task-phase-wrap">
-              <span class="task-phase text-caption text-medium-emphasis">{{
+              <span class="task-phase text-caption text-medium-emphasis">
+                {{
                   task.status === "postprocessing"
-                      ? postprocessingSummary(task)
-                      : task.task_kind === "cross_transfer"
-                    ? task.error || task.message || task.phase
-                    : task.status === "failed"
-                    ? task.message || task.phase || "处理失败"
-                    : task.phase || "等待调度"
-              }}</span>
+                    ? postprocessingSummary(task)
+                    : task.task_kind === "cross_transfer"
+                      ? task.error || task.message || task.phase
+                      : task.status === "failed"
+                        ? task.message || task.phase || "处理失败"
+                        : task.phase || "等待调度"
+                }}
+              </span>
               <v-btn
-                  v-if="task.status === 'postprocessing'"
-                  class="task-detail-toggle"
-                  :icon="isTaskExpanded(task.id) ? 'mdi-chevron-up' : 'mdi-information-outline'"
-                  variant="text"
-                  size="x-small"
-                  :title="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
-                  :aria-label="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
-                  @click="toggleTaskDetails(task.id)"
-              />
+                v-if="task.status === 'postprocessing'"
+                class="task-detail-toggle"
+                :icon="isTaskExpanded(task.id) ? 'mdi-chevron-up' : 'mdi-information-outline'"
+                variant="text"
+                size="x-small"
+                :title="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
+                :aria-label="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
+                @click="toggleTaskDetails(task.id)" />
             </div>
             <span
-                v-if="
-                (task.transfer_active ||
-                  ['pt_upgrade', 'cross_transfer'].includes(task.task_kind)) &&
+              v-if="
+                (task.transfer_active || ['pt_upgrade', 'cross_transfer'].includes(task.task_kind)) &&
                 displayTotal(task) > 0
               "
-                class="task-transfer text-caption text-medium-emphasis"
-            >
-              {{ formatSize(displayTransferred(task)) }} /
-              {{ formatSize(displayTotal(task)) }} ·
+              class="task-transfer text-caption text-medium-emphasis">
+              {{ formatSize(displayTransferred(task)) }} / {{ formatSize(displayTotal(task)) }} ·
               {{ formatSpeed(task.speed_bytes_per_second || task.upload_speed) }}
             </span>
           </div>
           <v-progress-linear
-              class="task-progress"
-              :model-value="Number(task.progress || 0)"
-              :style="progressStyle(task)"
-              :indeterminate="
+            class="task-progress"
+            :model-value="Number(task.progress || 0)"
+            :style="progressStyle(task)"
+            :indeterminate="
               !task.transfer_active &&
               !['pt_upgrade', 'cross_transfer'].includes(task.task_kind) &&
               ['running', 'stopping', 'postprocessing'].includes(task.status)
             "
-              :color="taskColor(task.status)"
-              height="5"
-              rounded
-          />
+            :color="taskColor(task.status)"
+            height="5"
+            rounded />
           <v-expand-transition>
-            <div
-                v-if="task.status === 'postprocessing' && isTaskExpanded(task.id)"
-                class="task-details text-caption"
-            >
+            <div v-if="task.status === 'postprocessing' && isTaskExpanded(task.id)" class="task-details text-caption">
               <div class="task-detail-row">
                 <span class="task-detail-label">当前阶段</span>
                 <span>{{ task.phase || "等待处理" }}</span>
@@ -109,44 +92,25 @@
           </v-expand-transition>
         </div>
         <v-btn
-            v-if="canStop(task)"
-            icon="mdi-stop-circle-outline"
-            color="warning"
-            variant="text"
-            size="x-small"
-            :loading="task.status === 'stopping'"
-            title="停止此任务"
-            @click="emit('stop-task', task.id)"
-        />
-        <v-icon
-            v-else
-            :icon="resultIcon(task.status, task.task_kind)"
-            :color="taskColor(task.status)"
-            size="small"
-        />
+          v-if="canStop(task)"
+          icon="mdi-stop-circle-outline"
+          color="warning"
+          variant="text"
+          size="x-small"
+          :loading="task.status === 'stopping'"
+          title="停止此任务"
+          @click="emit('stop-task', task.id)" />
+        <v-icon v-else :icon="resultIcon(task.status, task.task_kind)" :color="taskColor(task.status)" size="small" />
       </div>
     </div>
     <div v-else class="idle-state text-medium-emphasis">
-      <v-progress-circular
-          v-if="active"
-          indeterminate
-          size="44"
-          width="3"
-          color="primary"
-      />
-      <v-icon
-          v-else
-          icon="mdi-check-circle-outline"
-          color="success"
-          size="44"
-      />
+      <v-progress-circular v-if="active" indeterminate size="44" width="3" color="primary" />
+      <v-icon v-else icon="mdi-check-circle-outline" color="success" size="44" />
       <div class="text-subtitle-2 font-weight-medium mt-3">
         {{ active ? runtime.task || "正在准备订阅任务" : "当前没有订阅任务" }}
       </div>
       <div class="text-caption mt-1">
-        {{
-          active ? "正在加载订阅任务列表" : runtime.task || "等待下一次订阅搜索"
-        }}
+        {{ active ? "正在加载订阅任务列表" : runtime.task || "等待下一次订阅搜索" }}
       </div>
     </div>
   </div>
@@ -157,22 +121,20 @@ import {computed, ref} from "vue";
 const props = defineProps({
   runtime: {type: Object, required: true},
   active: Boolean,
-});
+})
 const emit = defineEmits(["stop-task"]);
 const active = computed(() => props.active);
 const expandedTaskIds = ref(new Set());
 const tasks = computed(() =>
-    (props.runtime.tasks || []).filter((task) =>
-        task.task_kind === "cross_transfer" ||
-        ["queued", "running", "stopping", "postprocessing"].includes(task.status),
-    ),
-);
+  (props.runtime.tasks || []).filter(
+    (task) =>
+      task.task_kind === "cross_transfer" || ["queued", "running", "stopping", "postprocessing"].includes(task.status),
+  ),
+)
 
 function postprocessingSummary(task) {
   const pendingCount = Number(task?.pending_count || 0);
-  return pendingCount > 0
-      ? `${pendingCount} 个文件待完成后处理`
-      : "正在完成文件后处理";
+  return pendingCount > 0 ? `${pendingCount} 个文件待完成后处理` : "正在完成文件后处理";
 }
 
 function isTaskExpanded(taskId) {
@@ -190,41 +152,39 @@ function toggleTaskDetails(taskId) {
 }
 
 function canStop(task) {
-  return ["queued", "running", "stopping", "postprocessing"].includes(
-      task?.status,
-  );
+  return ["queued", "running", "stopping", "postprocessing"].includes(task?.status);
 }
 
 function taskStatus(status) {
   return (
-      {
-        queued: "等待",
-        running: "运行中",
-        stopping: "停止中",
-        postprocessing: "后处理中",
-        completed: "完成",
-        success: "完成",
-        failed: "失败",
-        stopped: "已停止",
-        canceled: "已取消",
-      }[status] || "未知"
-  );
+    {
+      queued: "等待",
+      running: "运行中",
+      stopping: "停止中",
+      postprocessing: "后处理中",
+      completed: "完成",
+      success: "完成",
+      failed: "失败",
+      stopped: "已停止",
+      canceled: "已取消",
+    }[status] || "未知"
+  )
 }
 
 function taskColor(status) {
   return (
-      {
-        queued: "secondary",
-        running: "info",
-        stopping: "warning",
-        postprocessing: "primary",
-        completed: "success",
-        success: "success",
-        failed: "error",
-        stopped: "warning",
-        canceled: "warning",
-      }[status] || "secondary"
-  );
+    {
+      queued: "secondary",
+      running: "info",
+      stopping: "warning",
+      postprocessing: "primary",
+      completed: "success",
+      success: "success",
+      failed: "error",
+      stopped: "warning",
+      canceled: "warning",
+    }[status] || "secondary"
+  )
 }
 
 const progressColors = [
@@ -233,7 +193,7 @@ const progressColors = [
   {progress: 65, color: [255, 179, 0]},
   {progress: 85, color: [102, 187, 106]},
   {progress: 100, color: [46, 125, 50]},
-];
+]
 
 function progressColor(progress) {
   const value = Math.max(0, Math.min(100, Number(progress || 0)));
@@ -242,9 +202,7 @@ function progressColor(progress) {
   const lower = progressColors[upperIndex - 1];
   const upper = progressColors[upperIndex];
   const ratio = (value - lower.progress) / (upper.progress - lower.progress);
-  const color = lower.color.map((channel, index) =>
-      Math.round(channel + (upper.color[index] - channel) * ratio),
-  );
+  const color = lower.color.map((channel, index) => Math.round(channel + (upper.color[index] - channel) * ratio));
   return `rgb(${color.join(", ")})`;
 }
 
@@ -258,7 +216,7 @@ function progressStyle(task) {
   const progress = Math.max(0, Math.min(100, Number(task?.progress || 0)));
   return {
     "--task-progress-gradient": `linear-gradient(90deg, ${progressColor(progress)}, ${progressColor(Math.min(100, progress + 18))})`,
-  };
+  }
 }
 
 function resultIcon(status, taskKind) {
@@ -269,12 +227,12 @@ function resultIcon(status, taskKind) {
     return "mdi-cloud-upload-outline";
   }
   return status === "postprocessing"
-      ? "mdi-cog-sync-outline"
-      : ["completed", "success"].includes(status)
+    ? "mdi-cog-sync-outline"
+    : ["completed", "success"].includes(status)
       ? "mdi-check-circle"
       : status === "failed"
-              ? "mdi-alert-circle"
-              : "mdi-stop-circle";
+        ? "mdi-alert-circle"
+        : "mdi-stop-circle"
 }
 
 function formatSize(value) {
@@ -293,15 +251,11 @@ function formatSpeed(value) {
 }
 
 function displayTransferred(task) {
-  return Number(task?.stage_total || 0) > 0
-      ? Number(task?.stage_transferred || 0)
-      : Number(task?.transferred || 0);
+  return Number(task?.stage_total || 0) > 0 ? Number(task?.stage_transferred || 0) : Number(task?.transferred || 0);
 }
 
 function displayTotal(task) {
-  return Number(task?.stage_total || 0) > 0
-      ? Number(task?.stage_total || 0)
-      : Number(task?.total || 0);
+  return Number(task?.stage_total || 0) > 0 ? Number(task?.stage_total || 0) : Number(task?.total || 0);
 }
 </script>
 
@@ -419,7 +373,8 @@ function displayTotal(task) {
 
 .task-progress :deep(.v-progress-linear__determinate) {
   background: var(--task-progress-gradient) !important;
-  transition: width 0.35s ease, background 0.35s ease;
+  transition: width 0.35s ease,
+  background 0.35s ease;
 }
 
 .idle-state {

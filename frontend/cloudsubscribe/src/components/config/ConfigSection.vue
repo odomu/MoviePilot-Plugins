@@ -1,82 +1,56 @@
 <template>
   <div class="config-tab-content">
     <v-tabs
-        v-if="section.subtabs?.length"
-        v-model="activeSubtab"
-        color="primary"
-        density="compact"
-        show-arrows
-        class="section-tabs mb-4"
-    >
-      <v-tab
-          v-for="tab in section.subtabs"
-          :key="tab.value"
-          :value="tab.value"
-      >
-        <v-icon :icon="tab.icon" size="small" class="mr-2"/>
+      v-if="section.subtabs?.length"
+      v-model="activeSubtab"
+      color="primary"
+      density="compact"
+      show-arrows
+      class="section-tabs mb-4">
+      <v-tab v-for="tab in section.subtabs" :key="tab.value" :value="tab.value">
+        <v-icon :icon="tab.icon" size="small" class="mr-2" />
         {{ tab.title }}
       </v-tab>
     </v-tabs>
     <div class="config-section-scroll">
       <template v-for="(group, index) in visibleGroups" :key="group.title">
         <section class="config-group">
-        <div v-if="!group.hideHeading" class="group-heading">
-          <v-icon :icon="group.icon" color="primary" size="small"/>
-          <div>
-            <div class="text-subtitle-2 font-weight-medium">
-              {{ group.title }}
-            </div>
-            <div v-if="group.hint" class="text-caption text-medium-emphasis">
-              {{ group.hint }}
+          <div v-if="!group.hideHeading" class="group-heading">
+            <v-icon :icon="group.icon" color="primary" size="small" />
+            <div>
+              <div class="text-subtitle-2 font-weight-medium">
+                {{ group.title }}
+              </div>
+              <div v-if="group.hint" class="text-caption text-medium-emphasis">
+                {{ group.hint }}
+              </div>
             </div>
           </div>
-        </div>
 
-        <v-row dense>
-          <template v-for="field in group.fields" :key="field.key">
-            <v-col
-                v-if="!field.show || field.show(config)"
-                cols="12"
-                :md="field.cols || 6"
-                class="config-field-col"
-            >
-              <AccountInfo
+          <v-row dense>
+            <template v-for="field in group.fields" :key="field.key">
+              <v-col v-if="!field.show || field.show(config)" cols="12" :md="field.cols || 6" class="config-field-col">
+                <AccountInfo
                   v-if="field.type === 'account'"
                   :account="field.data"
                   :compact="Boolean(field.compact)"
                   :loading="refreshingAccounts.includes(field.accountKey)"
                   :refreshable="Boolean(field.accountKey)"
-                  @refresh="emit('refresh-account', field.accountKey)"
-              />
-              <v-alert
-                  v-else-if="field.type === 'info'"
-                  type="info"
-                  variant="tonal"
-                  density="compact"
-              >
-                <div class="text-body-2 font-weight-medium mb-1">
-                  {{ field.label }}
-                </div>
-                <div
-                    v-for="line in field.lines || []"
-                    :key="line"
-                    class="text-caption mb-1"
-                >
-                  • {{ line }}
-                </div>
-              </v-alert>
-              <div
-                  v-else-if="field.type === 'media-library-webhook'"
-                  class="media-library-webhook"
-              >
-                <v-alert
+                  @refresh="emit('refresh-account', field.accountKey)" />
+                <v-alert v-else-if="field.type === 'info'" type="info" variant="tonal" density="compact">
+                  <div class="text-body-2 font-weight-medium mb-1">
+                    {{ field.label }}
+                  </div>
+                  <div v-for="line in field.lines || []" :key="line" class="text-caption mb-1">• {{ line }}</div>
+                </v-alert>
+                <div v-else-if="field.type === 'media-library-webhook'" class="media-library-webhook">
+                  <v-alert
                     v-if="!(field.items || []).length"
                     type="warning"
                     variant="tonal"
                     density="compact"
-                    text="尚未配置 Emby 媒体服务器，暂时无法生成通知地址。"
-                />
-                <v-text-field
+                    text="尚未配置 Emby 媒体服务器，暂时无法生成通知地址。" />
+                  <v-text-field
                     v-for="item in field.items || []"
                     v-else
                     :key="item.value"
@@ -85,58 +59,41 @@
                     readonly
                     density="compact"
                     variant="outlined"
-                    hide-details="auto"
-                >
-                  <template #append-inner>
-                    <div class="media-library-webhook__actions">
-                      <v-btn
+                    hide-details="auto">
+                    <template #append-inner>
+                      <div class="media-library-webhook__actions">
+                        <v-btn
                           icon="mdi-content-copy"
                           variant="text"
                           color="primary"
                           size="small"
                           title="复制 Webhook URL"
-                          @click="emit('copy-text', mediaLibraryWebhookUrl(field, item.value))"
-                      />
-                    </div>
-                  </template>
-                </v-text-field>
-              </div>
-              <v-btn
+                          @click="emit('copy-text', mediaLibraryWebhookUrl(field, item.value))" />
+                      </div>
+                    </template>
+                  </v-text-field>
+                </div>
+                <v-btn
                   v-else-if="field.type === 'test-source'"
                   color="primary"
                   variant="tonal"
                   prepend-icon="mdi-flask-outline"
                   :loading="testingSource === field.source"
                   :disabled="
-                  !isTestSourceConfigured(field.source) ||
-                  (Boolean(testingSource) && testingSource !== field.source)
-                "
+                    !isTestSourceConfigured(field.source) || (Boolean(testingSource) && testingSource !== field.source)
+                  "
                   :title="testSourceTitle(field.source)"
-                  @click="emit('test-source', field.source)"
-              >
-                {{ field.label }}
-              </v-btn>
-              <div
-                  v-else-if="field.type === 'hdhive-oauth'"
-                  class="hdhive-oauth-panel"
-              >
-                <div class="d-flex align-center flex-wrap ga-2 mb-2">
-                  <v-chip
-                      size="small"
-                      variant="tonal"
-                      :color="config.hdhive_access_token ? 'success' : 'warning'"
-                  >
-                    {{
-                      config.hdhive_access_token
-                          ? "已获取用户 Token"
-                          : "尚未完成用户授权"
-                    }}
-                  </v-chip>
-                  <span class="text-caption text-medium-emphasis">
-                    授权范围：query unlock write
-                  </span>
-                </div>
-                <v-text-field
+                  @click="emit('test-source', field.source)">
+                  {{ field.label }}
+                </v-btn>
+                <div v-else-if="field.type === 'hdhive-oauth'" class="hdhive-oauth-panel">
+                  <div class="d-flex align-center flex-wrap ga-2 mb-2">
+                    <v-chip size="small" variant="tonal" :color="config.hdhive_access_token ? 'success' : 'warning'">
+                      {{ config.hdhive_access_token ? "已获取用户 Token" : "尚未完成用户授权" }}
+                    </v-chip>
+                    <span class="text-caption text-medium-emphasis">授权范围：query unlock write</span>
+                  </div>
+                  <v-text-field
                     v-if="config.hdhive_response_mode !== 'postmessage'"
                     v-model="config.hdhive_oauth_callback"
                     label="授权完成后的完整回调 URL"
@@ -146,55 +103,44 @@
                     density="compact"
                     variant="outlined"
                     hide-details="auto"
-                    class="mb-2"
-                />
-                <div class="d-flex flex-wrap ga-2">
-                  <v-btn
+                    class="mb-2" />
+                  <div class="d-flex flex-wrap ga-2">
+                    <v-btn
                       color="primary"
                       variant="tonal"
                       prepend-icon="mdi-open-in-new"
                       :loading="hdhiveOauthAction === 'start'"
-                      :disabled="
-                      Boolean(hdhiveOauthAction) &&
-                      hdhiveOauthAction !== 'start'
-                    "
-                      @click="emit('hdhive-oauth-start')"
-                  >
-                    打开 HDHive 授权页
-                  </v-btn>
-                  <v-btn
+                      :disabled="Boolean(hdhiveOauthAction) && hdhiveOauthAction !== 'start'"
+                      @click="emit('hdhive-oauth-start')">
+                      打开 HDHive 授权页
+                    </v-btn>
+                    <v-btn
                       v-if="config.hdhive_response_mode !== 'postmessage'"
                       color="success"
                       variant="tonal"
                       prepend-icon="mdi-shield-check-outline"
                       :loading="hdhiveOauthAction === 'exchange'"
-                      :disabled="
-                      Boolean(hdhiveOauthAction) ||
-                      !String(config.hdhive_oauth_callback || '').trim()
-                    "
-                      @click="emit('hdhive-oauth-exchange')"
-                  >
-                    校验回调并完成授权
-                  </v-btn>
+                      :disabled="Boolean(hdhiveOauthAction) || !String(config.hdhive_oauth_callback || '').trim()"
+                      @click="emit('hdhive-oauth-exchange')">
+                      校验回调并完成授权
+                    </v-btn>
+                  </div>
                 </div>
-              </div>
-              <CheckinTimeline
+                <CheckinTimeline
                   v-else-if="field.type === 'checkin-timeline'"
                   :api="api"
                   :providers="field.providers"
                   :config="config"
-                  @result="emit('checkin-result', $event)"
-              />
-              <VCronField
+                  @result="emit('checkin-result', $event)" />
+                <VCronField
                   v-else-if="field.type === 'cron'"
                   v-model="config[field.key]"
                   :label="field.label"
                   :hint="field.hint"
                   :placeholder="field.placeholder"
                   :persistent-hint="Boolean(field.hint)"
-                  density="compact"
-              />
-              <v-switch
+                  density="compact" />
+                <v-switch
                   v-else-if="field.type === 'switch'"
                   v-model="config[field.key]"
                   :label="field.label"
@@ -204,24 +150,21 @@
                   color="success"
                   density="compact"
                   hide-details="auto"
-                  class="config-switch"
-              />
-              <div v-else-if="field.type === 'online-documents'" class="online-documents">
-                <div v-if="field.hint" class="text-caption text-medium-emphasis mb-3">{{ field.hint }}</div>
-                <div
+                  class="config-switch" />
+                <div v-else-if="field.type === 'online-documents'" class="online-documents">
+                  <div v-if="field.hint" class="text-caption text-medium-emphasis mb-3">{{ field.hint }}</div>
+                  <div
                     v-for="(document, documentIndex) in onlineDocuments(field.key)"
                     :key="documentIndex"
-                    class="online-document-row"
-                >
-                  <v-text-field
+                    class="online-document-row">
+                    <v-text-field
                       v-model="document.url"
                       label="文档地址"
                       placeholder="https://docs.qq.com/..."
                       density="compact"
                       variant="outlined"
-                      hide-details="auto"
-                  />
-                  <v-select
+                      hide-details="auto" />
+                    <v-select
                       v-model="document.resource_types"
                       label="资源类型"
                       :items="field.items || []"
@@ -230,25 +173,22 @@
                       closable-chips
                       density="compact"
                       variant="outlined"
-                      hide-details="auto"
-                  />
-                  <v-btn
+                      hide-details="auto" />
+                    <v-btn
                       icon="mdi-plus"
                       variant="text"
                       color="primary"
                       title="在下方添加文档"
-                      @click="addOnlineDocument(field.key, documentIndex)"
-                  />
-                  <v-btn
+                      @click="addOnlineDocument(field.key, documentIndex)" />
+                    <v-btn
                       icon="mdi-delete-outline"
                       variant="text"
                       color="error"
                       title="删除此文档"
-                      @click="removeOnlineDocument(field.key, documentIndex)"
-                  />
+                      @click="removeOnlineDocument(field.key, documentIndex)" />
+                  </div>
                 </div>
-              </div>
-              <v-autocomplete
+                <v-autocomplete
                   v-else-if="field.type === 'select' && field.searchable"
                   v-model="config[field.key]"
                   v-model:search="selectSearch[field.key]"
@@ -264,9 +204,8 @@
                   closable-chips
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              />
-              <v-select
+                  hide-details="auto" />
+                <v-select
                   v-else-if="field.type === 'select'"
                   v-model="config[field.key]"
                   :label="field.label"
@@ -279,9 +218,8 @@
                   closable-chips
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              />
-              <v-textarea
+                  hide-details="auto" />
+                <v-textarea
                   v-else-if="field.type === 'textarea'"
                   v-model="config[field.key]"
                   :label="field.label"
@@ -293,9 +231,8 @@
                   rows="2"
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              />
-              <v-combobox
+                  hide-details="auto" />
+                <v-combobox
                   v-else-if="field.type === 'combobox'"
                   v-model="config[field.key]"
                   :label="field.label"
@@ -308,9 +245,8 @@
                   clearable
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              />
-              <v-text-field
+                  hide-details="auto" />
+                <v-text-field
                   v-else-if="field.type === 'cloud-directory'"
                   v-model="config[field.key]"
                   :label="field.label"
@@ -319,22 +255,18 @@
                   :persistent-hint="Boolean(field.hint)"
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              >
-                <template #append-inner>
-                  <v-btn
+                  hide-details="auto">
+                  <template #append-inner>
+                    <v-btn
                       icon="mdi-folder-search-outline"
                       variant="text"
                       color="primary"
                       size="small"
                       title="浏览网盘目录"
-                      @click="
-                      emit('browse-directory', field.key, field.driveProvider)
-                    "
-                  />
-                </template>
-              </v-text-field>
-              <v-text-field
+                      @click="emit('browse-directory', field.key, field.driveProvider)" />
+                  </template>
+                </v-text-field>
+                <v-text-field
                   v-else-if="field.type === 'proxy'"
                   v-model="config[field.key]"
                   :label="field.label"
@@ -344,10 +276,9 @@
                   clearable
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              >
-                <template #append-inner>
-                  <v-btn
+                  hide-details="auto">
+                  <template #append-inner>
+                    <v-btn
                       icon="mdi-lan-connect"
                       variant="text"
                       color="primary"
@@ -355,11 +286,10 @@
                       title="测试代理连通性、延迟和出口"
                       :loading="testingProxy"
                       :disabled="testingProxy || !hasText(config[field.key])"
-                      @click="emit('test-proxy')"
-                  />
-                </template>
-              </v-text-field>
-              <v-text-field
+                      @click="emit('test-proxy')" />
+                  </template>
+                </v-text-field>
+                <v-text-field
                   v-else-if="field.type === 'number'"
                   v-model.number="config[field.key]"
                   :label="field.label"
@@ -373,9 +303,8 @@
                   :persistent-hint="Boolean(field.hint)"
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              />
-              <v-text-field
+                  hide-details="auto" />
+                <v-text-field
                   v-else
                   v-model="config[field.key]"
                   :label="field.label"
@@ -386,26 +315,21 @@
                   :disabled="Boolean(field.disabled?.(config))"
                   density="compact"
                   variant="outlined"
-                  hide-details="auto"
-              >
-                <template v-if="field.scanProvider" #append-inner>
-                  <v-btn
+                  hide-details="auto">
+                  <template v-if="field.scanProvider" #append-inner>
+                    <v-btn
                       icon="mdi-qrcode-scan"
                       variant="text"
                       color="primary"
                       size="small"
                       title="扫码登录"
-                      @click="emit('scan', field.scanProvider)"
-                  />
-                </template>
-              </v-text-field>
-            </v-col>
-          </template>
-        </v-row>
-        <v-divider
-            v-if="index < visibleGroups.length - 1"
-            class="group-divider"
-        />
+                      @click="emit('scan', field.scanProvider)" />
+                  </template>
+                </v-text-field>
+              </v-col>
+            </template>
+          </v-row>
+          <v-divider v-if="index < visibleGroups.length - 1" class="group-divider" />
         </section>
       </template>
     </div>
@@ -418,14 +342,14 @@ import AccountInfo from "./AccountInfo.vue";
 import CheckinTimeline from "./CheckinTimeline.vue";
 
 const props = defineProps({
-  section: {type: Object, required: true},
-  config: {type: Object, required: true},
-  api: {type: [Object, Function], required: true},
-  refreshingAccounts: {type: Array, default: () => []},
-  testingSource: {type: String, default: ""},
-  testingProxy: {type: Boolean, default: false},
-  hdhiveOauthAction: {type: String, default: ""},
-});
+  section: { type: Object, required: true },
+  config: { type: Object, required: true },
+  api: { type: [Object, Function], required: true },
+  refreshingAccounts: { type: Array, default: () => [] },
+  testingSource: { type: String, default: "" },
+  testingProxy: { type: Boolean, default: false },
+  hdhiveOauthAction: { type: String, default: "" },
+})
 const emit = defineEmits([
   "scan",
   "browse-directory",
@@ -436,110 +360,99 @@ const emit = defineEmits([
   "hdhive-oauth-exchange",
   "checkin-result",
   "copy-text",
-]);
+])
 
-const hasText = (value) => Boolean(String(value || "").trim());
+const hasText = (value) => Boolean(String(value || "").trim())
 
 function isTestSourceConfigured(source) {
   if (source === "online_docs") {
-    return Array.isArray(props.config.online_docs) &&
-        props.config.online_docs.some((document) =>
-            hasText(document?.url) &&
-            Array.isArray(document?.resource_types) &&
-            document.resource_types.length,
-        );
+    return (
+      Array.isArray(props.config.online_docs) &&
+      props.config.online_docs.some(
+        (document) =>
+          hasText(document?.url) && Array.isArray(document?.resource_types) && document.resource_types.length,
+      )
+    )
   }
-  if (!Array.isArray(props.config.resource_type_order) || !props.config.resource_type_order.length)
-    return false;
+  if (!Array.isArray(props.config.resource_type_order) || !props.config.resource_type_order.length) return false
   if (source === "pansou") {
-    return hasText(props.config.pansou_url) &&
-        (!props.config.pansou_auth_enabled ||
-            (hasText(props.config.pansou_username) && hasText(props.config.pansou_password)));
+    return (
+      hasText(props.config.pansou_url) &&
+      (!props.config.pansou_auth_enabled ||
+        (hasText(props.config.pansou_username) && hasText(props.config.pansou_password)))
+    )
   }
   if (source === "hdhive") {
     return props.config.hdhive_query_mode === "api"
-        ? hasText(props.config.hdhive_api_key) && hasText(props.config.hdhive_access_token)
-        : hasText(props.config.hdhive_username) && hasText(props.config.hdhive_password);
+      ? hasText(props.config.hdhive_api_key) && hasText(props.config.hdhive_access_token)
+      : hasText(props.config.hdhive_username) && hasText(props.config.hdhive_password)
   }
   const credentials = {
     dian115: ["dian115_email", "dian115_password"],
     juying: ["juying_username", "juying_password"],
     pinglian: ["pinglian_username", "pinglian_password"],
-  }[source];
-  return !credentials || credentials.every((key) => hasText(props.config[key]));
+  }[source]
+  return !credentials || credentials.every((key) => hasText(props.config[key]))
 }
 
 function testSourceTitle(source) {
-  return isTestSourceConfigured(source)
-      ? "测试当前搜索渠道"
-      : "请先完成渠道账号配置并选择资源类型";
+  return isTestSourceConfigured(source) ? "测试当前搜索渠道" : "请先完成渠道账号配置并选择资源类型"
 }
 
 function onlineDocuments(key) {
-  if (!Array.isArray(props.config[key])) props.config[key] = [];
-  return props.config[key];
+  if (!Array.isArray(props.config[key])) props.config[key] = []
+  return props.config[key]
 }
 
 function addOnlineDocument(key, index) {
-  onlineDocuments(key).splice(index + 1, 0, {url: "", resource_types: []});
+  onlineDocuments(key).splice(index + 1, 0, { url: "", resource_types: [] })
 }
 
 function removeOnlineDocument(key, index) {
-  const documents = onlineDocuments(key);
+  const documents = onlineDocuments(key)
   if (documents.length <= 1) {
-    documents.splice(0, 1, {url: "", resource_types: []});
-    return;
+    documents.splice(0, 1, { url: "", resource_types: [] })
+    return
   }
-  documents.splice(index, 1);
+  documents.splice(index, 1)
 }
-const activeSubtab = ref(props.section.subtabs?.[0]?.value || "");
-const selectSearch = ref({});
+const activeSubtab = ref(props.section.subtabs?.[0]?.value || "")
+const selectSearch = ref({})
 
 function normalizeSearchText(value) {
   return String(value ?? "")
-      .normalize("NFKC")
-      .toLocaleLowerCase()
-      .replace(/\s+/g, "");
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/\s+/g, "")
 }
 
 function filteredSelectItems(field) {
-  const items = Array.isArray(field.items) ? field.items : [];
-  const keyword = normalizeSearchText(selectSearch.value[field.key]);
-  if (!keyword) return items;
+  const items = Array.isArray(field.items) ? field.items : []
+  const keyword = normalizeSearchText(selectSearch.value[field.key])
+  if (!keyword) return items
   const selected = new Set(
-      (Array.isArray(props.config[field.key])
-          ? props.config[field.key]
-          : [props.config[field.key]])
-          .filter((value) => value !== undefined && value !== null)
-          .map((value) => String(value)),
-  );
-  return items.filter((item) =>
+    (Array.isArray(props.config[field.key]) ? props.config[field.key] : [props.config[field.key]])
+      .filter((value) => value !== undefined && value !== null)
+      .map((value) => String(value)),
+  )
+  return items.filter(
+    (item) =>
       selected.has(String(item?.value ?? "")) ||
       normalizeSearchText(`${item?.title || ""} ${item?.value || ""}`).includes(keyword),
-  );
+  )
 }
-const availableGroups = computed(() =>
-    props.section.groups.filter(
-    (group) => !group.show || group.show(props.config),
-    ),
-);
+const availableGroups = computed(() => props.section.groups.filter((group) => !group.show || group.show(props.config)))
 const visibleGroups = computed(() => {
-  const leadingGroups = availableGroups.value.filter(
-      (group) => group.beforeTabs,
-  );
+  const leadingGroups = availableGroups.value.filter((group) => group.beforeTabs)
   const tabGroups = availableGroups.value.filter(
-      (group) =>
-          !group.beforeTabs &&
-          (!props.section.subtabs?.length ||
-              !group.tab ||
-              group.tab === activeSubtab.value),
-  );
-  return [...leadingGroups, ...tabGroups];
-});
+    (group) => !group.beforeTabs && (!props.section.subtabs?.length || !group.tab || group.tab === activeSubtab.value),
+  )
+  return [...leadingGroups, ...tabGroups]
+})
 
 function mediaLibraryWebhookUrl(field, serverName) {
-  const relativeUrl = String(field?.urls?.[serverName] || "").trim();
-  return relativeUrl ? new URL(relativeUrl, window.location.origin).toString() : "";
+  const relativeUrl = String(field?.urls?.[serverName] || "").trim()
+  return relativeUrl ? new URL(relativeUrl, window.location.origin).toString() : ""
 }
 </script>
 

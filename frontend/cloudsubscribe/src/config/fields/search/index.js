@@ -18,7 +18,7 @@ export function createSearchSection(resourceTypeItems, options = {}) {
       {value: "common", title: "通用设置", icon: "mdi-tune"},
       {value: "checkin", title: "签到服务", icon: "mdi-calendar-check-outline"},
       {value: "pansou", title: "PanSou", icon: "mdi-magnify-scan"},
-      {value: "hdhive", title: "HDHive", icon: "mdi-hexagon-multiple-outline",},
+      {value: "hdhive", title: "HDHive", icon: "mdi-hexagon-multiple-outline"},
       {value: "dian115", title: "Dian115", icon: "mdi-cloud-search"},
       {value: "juying", title: "聚影", icon: "mdi-movie-search-outline"},
       {value: "pinglian", title: "盘链", icon: "mdi-link-variant"},
@@ -38,5 +38,5 @@ export function createSearchSection(resourceTypeItems, options = {}) {
       ...createPinglianGroups(options),
       ...createOnlineDocsGroups(resourceTypeItems),
     ],
-  };
+  }
 }

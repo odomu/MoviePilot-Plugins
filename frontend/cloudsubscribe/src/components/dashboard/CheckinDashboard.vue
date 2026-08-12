@@ -4,13 +4,10 @@
       <v-card-item class="checkin-dashboard-header">
         <template #prepend>
           <v-avatar color="primary" variant="tonal" size="36">
-            <v-icon icon="mdi-calendar-check-outline" size="20"/>
+            <v-icon icon="mdi-calendar-check-outline" size="20" />
           </v-avatar>
         </template>
-        <v-card-title class="checkin-dashboard-title">{{
-            cardTitle
-          }}
-        </v-card-title>
+        <v-card-title class="checkin-dashboard-title">{{ cardTitle }}</v-card-title>
         <v-card-subtitle>{{ cardSubtitle }}</v-card-subtitle>
         <template #append>
           <v-chip size="x-small" variant="tonal" :color="overallStatus.color">
@@ -21,25 +18,15 @@
 
       <v-card-text class="checkin-dashboard-body">
         <div v-if="loading && !loaded" class="checkin-dashboard-state">
-          <v-progress-circular indeterminate color="primary" size="28"/>
+          <v-progress-circular indeterminate color="primary" size="28" />
         </div>
-        <v-alert
-            v-else-if="error"
-            type="error"
-            variant="tonal"
-            density="compact"
-            class="text-caption"
-        >
+        <v-alert v-else-if="error" type="error" variant="tonal" density="compact" class="text-caption">
           {{ error }}
         </v-alert>
         <template v-else-if="loaded">
           <div class="checkin-summary-line">
             <div>
-              <strong
-              >{{ summary.today_success || 0 }}/{{
-                  summary.ready || 0
-                }}</strong
-              >
+              <strong>{{ summary.today_success || 0 }}/{{ summary.ready || 0 }}</strong>
               <span>今日签到</span>
             </div>
             <small>{{ scheduleText }}</small>
@@ -52,9 +39,7 @@
             </div>
             <div>
               <span>今日成功</span>
-              <strong class="text-success">{{
-                  summary.today_success || 0
-                }}</strong>
+              <strong class="text-success">{{ summary.today_success || 0 }}</strong>
             </div>
             <div>
               <span>今日积分</span>
@@ -71,24 +56,16 @@
           </div>
 
           <div v-if="channels.length" class="checkin-channel-list">
-            <div
-                v-for="channel in channels"
-                :key="channel.provider"
-                class="checkin-channel"
-            >
+            <div v-for="channel in channels" :key="channel.provider" class="checkin-channel">
               <div class="checkin-channel-head">
                 <v-avatar size="28" variant="tonal" color="primary">
-                  <v-icon :icon="providerIcon(channel.provider)" size="16"/>
+                  <v-icon :icon="providerIcon(channel.provider)" size="16" />
                 </v-avatar>
                 <div class="checkin-channel-copy">
                   <strong>{{ channel.provider_name }}</strong>
                   <span>{{ channelMeta(channel) }}</span>
                 </div>
-                <v-chip
-                    size="x-small"
-                    variant="tonal"
-                    :color="statusColor(channel.status?.tone)"
-                >
+                <v-chip size="x-small" variant="tonal" :color="statusColor(channel.status?.tone)">
                   {{ channel.status?.label || "未知" }}
                 </v-chip>
               </div>
@@ -96,49 +73,33 @@
               <div class="checkin-channel-detail">
                 <span>{{ balanceText(channel) }}</span>
                 <span>{{ pointsText(channel) }}</span>
-                <span v-if="lotteryText(channel)">{{
-                    lotteryText(channel)
-                  }}</span>
+                <span v-if="lotteryText(channel)">{{ lotteryText(channel) }}</span>
               </div>
 
               <div class="checkin-mini-timeline">
-                <v-tooltip
-                    v-for="day in displayTimeline(channel)"
-                    :key="day.date"
-                    location="top"
-                >
+                <v-tooltip v-for="day in displayTimeline(channel)" :key="day.date" location="top">
                   <template #activator="{ props: tooltipProps }">
                     <span
-                        v-bind="tooltipProps"
-                        class="checkin-day-dot"
-                        :class="`checkin-day-dot--${day.status || 'pending'}`"
-                    />
+                      v-bind="tooltipProps"
+                      class="checkin-day-dot"
+                      :class="`checkin-day-dot--${day.status || 'pending'}`" />
                   </template>
                   {{ day.date }} · {{ day.label }}
                 </v-tooltip>
               </div>
             </div>
           </div>
-          <div v-else class="checkin-dashboard-empty text-medium-emphasis">
-            暂无签到渠道
-          </div>
+          <div v-else class="checkin-dashboard-empty text-medium-emphasis">暂无签到渠道</div>
         </template>
       </v-card-text>
 
-      <v-divider v-if="allowRefresh"/>
+      <v-divider v-if="allowRefresh" />
       <v-card-actions v-if="allowRefresh" class="checkin-dashboard-actions">
         <span class="text-caption text-disabled">
           {{ refreshedText || "等待更新" }}
         </span>
-        <v-spacer/>
-        <v-btn
-            icon="mdi-refresh"
-            variant="text"
-            size="small"
-            :loading="loading"
-            title="刷新"
-            @click="loadOverview"
-        />
+        <v-spacer />
+        <v-btn icon="mdi-refresh" variant="text" size="small" :loading="loading" title="刷新" @click="loadOverview" />
       </v-card-actions>
     </v-card>
   </div>
@@ -152,7 +113,7 @@ const props = defineProps({
   config: {type: Object, default: () => ({attrs: {}})},
   allowRefresh: {type: Boolean, default: true},
   refreshInterval: {type: Number, default: 0},
-});
+})
 
 const loading = ref(false);
 const loaded = ref(false);
@@ -163,14 +124,12 @@ let refreshTimer = null;
 
 const attrs = computed(() => props.config?.attrs || {});
 const cardTitle = computed(() => attrs.value.title || "签到概览");
-const cardSubtitle = computed(
-    () => attrs.value.subtitle || "多渠道每日签到与积分",
-);
+const cardSubtitle = computed(() => attrs.value.subtitle || "多渠道每日签到与积分");
 const cardFlat = computed(() => attrs.value.border === false);
 const refreshSeconds = computed(() => {
   const value = Number(props.refreshInterval || attrs.value.refresh || 0);
   return Number.isFinite(value) ? value : 0;
-});
+})
 const summary = computed(() => overview.value.summary || {});
 const channels = computed(() => overview.value.channels || []);
 const overallStatus = computed(() => {
@@ -181,21 +140,21 @@ const overallStatus = computed(() => {
     return {label: "今日完成", color: "success"};
   }
   return {label: "待签到", color: "warning"};
-});
+})
 const scheduleText = computed(() => {
   const schedule = overview.value.schedule || {};
   if (!schedule.auto_retry) return "失败后不自动重试";
   return `失败自动重试 ${schedule.retry_count || 0} 次`;
-});
+})
 const refreshedText = computed(() =>
-    refreshedAt.value
-        ? `更新于 ${new Date(refreshedAt.value).toLocaleTimeString("zh-CN", {
-          hour12: false,
-          hour: "2-digit",
-          minute: "2-digit",
-        })}`
-        : "",
-);
+  refreshedAt.value
+    ? `更新于 ${new Date(refreshedAt.value).toLocaleTimeString("zh-CN", {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+    })}`
+    : "",
+)
 
 function signedNumber(value) {
   const number = Number(value || 0);
@@ -211,24 +170,24 @@ function numberTone(value) {
 
 function statusColor(tone) {
   return (
-      {
-        success: "success",
-        error: "error",
-        warning: "warning",
-        pending: "secondary",
-        disabled: "secondary",
-      }[tone] || "secondary"
-  );
+    {
+      success: "success",
+      error: "error",
+      warning: "warning",
+      pending: "secondary",
+      disabled: "secondary",
+    }[tone] || "secondary"
+  )
 }
 
 function providerIcon(provider) {
   return (
-      {
-        hdhive: "mdi-hexagon-multiple-outline",
-        dian115: "mdi-cloud-search",
-        juying: "mdi-movie-check-outline",
-      }[provider] || "mdi-calendar-check-outline"
-  );
+    {
+      hdhive: "mdi-hexagon-multiple-outline",
+      dian115: "mdi-cloud-search",
+      juying: "mdi-movie-check-outline",
+    }[provider] || "mdi-calendar-check-outline"
+  )
 }
 
 function modeLabel(mode) {
@@ -240,12 +199,12 @@ function channelMeta(channel) {
   if (!executedAt) return modeLabel(channel.mode);
   const date = new Date(executedAt);
   const time = Number.isNaN(date.getTime())
-      ? String(executedAt)
-      : date.toLocaleTimeString("zh-CN", {
+    ? String(executedAt)
+    : date.toLocaleTimeString("zh-CN", {
         hour12: false,
         hour: "2-digit",
         minute: "2-digit",
-      });
+    })
   return `${modeLabel(channel.mode)} · ${time}`;
 }
 
@@ -256,9 +215,7 @@ function balanceText(channel) {
 
 function pointsText(channel) {
   const value = channel.today?.points_change;
-  return value === null || value === undefined
-      ? "今日积分 —"
-      : `今日积分 ${signedNumber(value)}`;
+  return value === null || value === undefined ? "今日积分 —" : `今日积分 ${signedNumber(value)}`;
 }
 
 function lotteryText(channel) {
@@ -276,11 +233,8 @@ async function loadOverview() {
   loading.value = true;
   error.value = "";
   try {
-    const result = await props.api.get(
-        "plugin/CloudSubscribe/checkin/overview?days=7",
-    );
-    if (!result?.success)
-      throw new Error(result?.message || "获取签到数据失败");
+    const result = await props.api.get("plugin/CloudSubscribe/checkin/overview?days=7");
+    if (!result?.success) throw new Error(result?.message || "获取签到数据失败");
     overview.value = result.data || {summary: {}, schedule: {}, channels: []};
     loaded.value = true;
     refreshedAt.value = Date.now();
@@ -300,16 +254,15 @@ function clearRefreshTimer() {
 
 function scheduleRefresh() {
   clearRefreshTimer();
-  if (refreshSeconds.value <= 0 || document.visibilityState === "hidden")
-    return;
+  if (refreshSeconds.value <= 0 || document.visibilityState === "hidden") return;
   refreshTimer = window.setTimeout(
-      async () => {
-        refreshTimer = null;
-        await loadOverview();
-        scheduleRefresh();
-      },
-      Math.max(1000, refreshSeconds.value * 1000),
-  );
+    async () => {
+      refreshTimer = null;
+      await loadOverview();
+      scheduleRefresh();
+    },
+    Math.max(1000, refreshSeconds.value * 1000),
+  )
 }
 
 function handleVisibilityChange() {
@@ -325,12 +278,12 @@ watch(refreshSeconds, scheduleRefresh);
 onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
   void loadOverview().finally(scheduleRefresh);
-});
+})
 
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   clearRefreshTimer();
-});
+})
 </script>
 
 <style scoped>

@@ -1,63 +1,43 @@
 <template>
-  <v-sheet
-      :class="['account-info', {'account-info--compact': compact}]"
-      rounded="lg"
-      :aria-busy="loading"
-  >
-    <v-progress-linear
-        v-if="loading"
-        class="account-loading-bar"
-        color="primary"
-        height="2"
-        indeterminate
-    />
+  <v-sheet :class="['account-info', { 'account-info--compact': compact }]" rounded="lg" :aria-busy="loading">
+    <v-progress-linear v-if="loading" class="account-loading-bar" color="primary" height="2" indeterminate />
     <div v-if="loading && !hasLoadedInfo" class="account-skeleton">
-      <v-skeleton-loader type="avatar"/>
+      <v-skeleton-loader type="avatar" />
       <div class="account-skeleton-lines">
-        <v-skeleton-loader type="text"/>
-        <v-skeleton-loader type="text" width="58%"/>
+        <v-skeleton-loader type="text" />
+        <v-skeleton-loader type="text" width="58%" />
       </div>
     </div>
     <div v-else class="account-content">
       <v-avatar :size="compact ? 36 : 42" class="account-avatar">
-        <v-img v-if="user.avatar" :src="user.avatar" :alt="user.name"/>
-        <v-icon v-else icon="mdi-account-circle" :size="compact ? 24 : 28"/>
+        <v-img v-if="user.avatar" :src="user.avatar" :alt="user.name" />
+        <v-icon v-else icon="mdi-account-circle" :size="compact ? 24 : 28" />
       </v-avatar>
       <div class="account-main">
         <div class="account-heading">
           <span class="text-body-2 font-weight-medium account-name">
             {{ account.connected ? user.name || "未知用户" : "账号未连接" }}
           </span>
-          <v-chip
-              v-if="account.connected && user.badge"
-              color="primary"
-              size="x-small"
-              variant="tonal"
-          >
+          <v-chip v-if="account.connected && user.badge" color="primary" size="x-small" variant="tonal">
             {{ user.badge }}
           </v-chip>
           <v-chip
-              v-if="account.connected && user.membership_supported !== false"
-              :color="user.is_vip ? 'amber-darken-2' : 'grey'"
-              size="x-small"
-              variant="tonal"
-          >
+            v-if="account.connected && user.membership_supported !== false"
+            :color="user.is_vip ? 'amber-darken-2' : 'grey'"
+            size="x-small"
+            variant="tonal">
             {{ vipText }}
           </v-chip>
           <v-chip
-              v-if="account.connected && compact && hasPoints"
-              class="account-points-chip"
-              color="info"
-              size="x-small"
-              variant="tonal"
-          >
+            v-if="account.connected && compact && hasPoints"
+            class="account-points-chip"
+            color="info"
+            size="x-small"
+            variant="tonal">
             {{ points.label || "可用积分" }} {{ formattedPoints }}
           </v-chip>
         </div>
-        <div
-            v-if="account.connected && !compact && hasPoints"
-            class="account-points"
-        >
+        <div v-if="account.connected && !compact && hasPoints" class="account-points">
           <span class="text-caption text-medium-emphasis">
             {{ points.label || "可用积分" }}
           </span>
@@ -65,19 +45,12 @@
             {{ formattedPoints }}
           </span>
         </div>
-        <div
-            v-if="account.connected && hasStorageInfo"
-            class="account-storage text-caption text-medium-emphasis"
-        >
+        <div v-if="account.connected && hasStorageInfo" class="account-storage text-caption text-medium-emphasis">
           已用 {{ storage.used || "未知" }} / {{ storage.total || "未知" }}
           <span v-if="storage.remaining">，剩余 {{ storage.remaining }}</span>
         </div>
         <div v-if="account.connected && details.length" class="account-details">
-          <div
-              v-for="item in details"
-              :key="`${item.label}-${item.value}`"
-              class="account-detail"
-          >
+          <div v-for="item in details" :key="`${item.label}-${item.value}`" class="account-detail">
             <span class="account-detail-label">{{ item.label }}</span>
             <span class="account-detail-value">{{ item.value }}</span>
           </div>
@@ -87,18 +60,17 @@
         </div>
       </div>
       <v-btn
-          v-if="refreshable"
-          class="account-refresh"
-          icon="mdi-refresh"
-          color="primary"
-          variant="text"
-          size="small"
-          :loading="loading"
-          :disabled="loading || disabled"
-          title="刷新账户信息"
-          aria-label="刷新账户信息"
-          @click="emit('refresh')"
-      />
+        v-if="refreshable"
+        class="account-refresh"
+        icon="mdi-refresh"
+        color="primary"
+        variant="text"
+        size="small"
+        :loading="loading"
+        :disabled="loading || disabled"
+        title="刷新账户信息"
+        aria-label="刷新账户信息"
+        @click="emit('refresh')" />
     </div>
   </v-sheet>
 </template>
@@ -107,48 +79,34 @@
 import {computed} from "vue";
 
 const props = defineProps({
-  account: {type: Object, default: () => ({})},
-  compact: {type: Boolean, default: false},
-  loading: {type: Boolean, default: false},
-  refreshable: {type: Boolean, default: false},
-  disabled: {type: Boolean, default: false},
-});
-const emit = defineEmits(["refresh"]);
-const user = computed(() => props.account.user || {});
-const storage = computed(() => props.account.storage || {});
-const points = computed(() => props.account.points || {});
-const details = computed(() =>
-    Array.isArray(props.account.details) ? props.account.details : [],
-);
-const hasLoadedInfo = computed(
-    () => Boolean(props.account?.connected || props.account?.refreshed_at),
-);
-const hasPoints = computed(
-    () =>
-        points.value.available !== undefined && points.value.available !== null,
-);
-const hasStorageInfo = computed(
-    () =>
-        Boolean(storage.value.used || storage.value.total || storage.value.remaining),
-);
+  account: { type: Object, default: () => ({}) },
+  compact: { type: Boolean, default: false },
+  loading: { type: Boolean, default: false },
+  refreshable: { type: Boolean, default: false },
+  disabled: { type: Boolean, default: false },
+})
+const emit = defineEmits(["refresh"])
+const user = computed(() => props.account.user || {})
+const storage = computed(() => props.account.storage || {})
+const points = computed(() => props.account.points || {})
+const details = computed(() => (Array.isArray(props.account.details) ? props.account.details : []))
+const hasLoadedInfo = computed(() => Boolean(props.account?.connected || props.account?.refreshed_at))
+const hasPoints = computed(() => points.value.available !== undefined && points.value.available !== null)
+const hasStorageInfo = computed(() => Boolean(storage.value.used || storage.value.total || storage.value.remaining))
 const formattedPoints = computed(() => {
-  const value = Number(points.value.available);
-  return Number.isFinite(value)
-      ? value.toLocaleString("zh-CN")
-      : String(points.value.available || 0);
-});
+  const value = Number(points.value.available)
+  return Number.isFinite(value) ? value.toLocaleString("zh-CN") : String(points.value.available || 0)
+})
 const vipText = computed(() => {
   if (user.value.vip_label) {
     return user.value.vip_expire_date
-        ? `${user.value.vip_label} 至 ${user.value.vip_expire_date}`
-        : user.value.vip_label;
+      ? `${user.value.vip_label} 至 ${user.value.vip_expire_date}`
+      : user.value.vip_label
   }
-  if (!user.value.is_vip) return "非VIP";
-  if (user.value.is_forever_vip) return "永久VIP";
-  return user.value.vip_expire_date
-      ? `VIP 至 ${user.value.vip_expire_date}`
-      : "VIP";
-});
+  if (!user.value.is_vip) return "非VIP"
+  if (user.value.is_forever_vip) return "永久VIP"
+  return user.value.vip_expire_date ? `VIP 至 ${user.value.vip_expire_date}` : "VIP"
+})
 </script>
 
 <style scoped>
@@ -158,8 +116,8 @@ const vipText = computed(() => {
   min-height: 76px;
   padding: 14px 16px;
   border: 1px solid rgba(var(--v-theme-primary), 0.14);
-  background: linear-gradient(135deg, rgba(var(--v-theme-primary), 0.075), transparent 58%),
-  rgb(var(--v-theme-surface));
+  background:
+    linear-gradient(135deg, rgba(var(--v-theme-primary), 0.075), transparent 58%), rgb(var(--v-theme-surface));
   box-shadow: 0 5px 18px rgba(var(--v-theme-on-surface), 0.055);
 }
 

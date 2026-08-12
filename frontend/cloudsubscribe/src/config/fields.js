@@ -7,14 +7,14 @@ import {createTransferSection} from "./fields/transfer.js";
 import {createUpgradeSection} from "./fields/upgrade.js";
 
 export function createConfigSections(options, config = {}) {
-    const cloudDriveItems = createCloudDriveItems(options);
-    const resourceTypeItems = createResourceTypeItems(cloudDriveItems, config);
-    return [
-        createBasicSection(cloudDriveItems),
-        createTransferSection(options),
-        createDriveSection(options),
-        createSearchSection(resourceTypeItems, options),
-        createUpgradeSection(options),
-        createNotifySection(options),
-    ];
+  const cloudDriveItems = createCloudDriveItems(options);
+  const resourceTypeItems = createResourceTypeItems(cloudDriveItems, config);
+  return [
+    createBasicSection(cloudDriveItems),
+    createTransferSection(options),
+    createDriveSection(options),
+    createSearchSection(resourceTypeItems, options),
+    createUpgradeSection(options),
+    createNotifySection(options),
+  ];
 }

@@ -9,7 +9,7 @@ const SOURCE_ITEMS = [
   {title: "不太灵", value: "butailing"},
   {title: "盘链", value: "pinglian"},
   {title: "在线文档", value: "online_docs"},
-];
+]
 
 export function createCommonSearchGroups(resourceTypeItems) {
   return [
@@ -105,5 +105,5 @@ export function createCommonSearchGroups(resourceTypeItems) {
         },
       ],
     },
-  ];
+  ]
 }

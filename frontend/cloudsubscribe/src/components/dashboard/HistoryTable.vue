@@ -3,114 +3,79 @@
     <div class="history-toolbar">
       <div class="history-toolbar-head">
         <div class="history-filter-trigger">
-          <v-menu
-              v-model="filtersVisible"
-              :close-on-content-click="false"
-              location="bottom start"
-              offset="6"
-          >
+          <v-menu v-model="filtersVisible" :close-on-content-click="false" location="bottom start" offset="6">
             <template #activator="{ props: menuProps }">
-              <v-badge
-                  :content="activeFilterCount"
-                  :model-value="activeFilterCount > 0"
-                  color="primary"
-              >
+              <v-badge :content="activeFilterCount" :model-value="activeFilterCount > 0" color="primary">
                 <v-btn
                     v-bind="menuProps"
                     icon="mdi-filter-variant"
                     :color="activeFilterCount ? 'primary' : undefined"
                     variant="text"
                     size="small"
-                    title="筛选历史记录"
-                />
+                    title="筛选历史记录" />
               </v-badge>
             </template>
             <v-card class="history-filter-menu" elevation="8">
               <v-card-title class="history-filter-menu-title">
                 <span>筛选历史记录</span>
-                <v-spacer/>
-                <v-btn
-                    variant="text"
-                    size="small"
-                    :disabled="!activeFilterCount"
-                    @click="clearFilters"
-                >清除
-                </v-btn>
+                <v-spacer />
+                <v-btn variant="text" size="small" :disabled="!activeFilterCount" @click="clearFilters">清除</v-btn>
               </v-card-title>
-              <v-divider/>
+              <v-divider />
               <v-card-text class="history-filter-options">
-                <div
-                    v-if="resourceTypeOptions.length"
-                    class="history-filter-group"
-                >
+                <div v-if="resourceTypeOptions.length" class="history-filter-group">
                   <span class="history-filter-label">资源类型</span>
-                  <v-chip-group
-                      v-model="selectedResourceTypes"
-                      multiple
-                      selected-class="text-primary"
-                  >
+                  <v-chip-group v-model="selectedResourceTypes" multiple selected-class="text-primary">
                     <v-chip
                         v-for="option in resourceTypeOptions"
                         :key="option.value"
                         :value="option.value"
                         size="small"
                         variant="tonal"
-                        filter
-                    >{{ option.title }}
+                        filter>
+                      {{ option.title }}
                     </v-chip>
                   </v-chip-group>
                 </div>
                 <div v-if="sourceOptions.length" class="history-filter-group">
                   <span class="history-filter-label">来源</span>
-                  <v-chip-group
-                      v-model="selectedSources"
-                      multiple
-                      selected-class="text-primary"
-                  >
+                  <v-chip-group v-model="selectedSources" multiple selected-class="text-primary">
                     <v-chip
                         v-for="option in sourceOptions"
                         :key="option.value"
                         :value="option.value"
                         size="small"
                         variant="tonal"
-                        filter
-                    >{{ option.title }}
+                        filter>
+                      {{ option.title }}
                     </v-chip>
                   </v-chip-group>
                 </div>
                 <div class="history-filter-group">
                   <span class="history-filter-label">任务类型</span>
-                  <v-chip-group
-                      v-model="selectedTaskTypes"
-                      multiple
-                      selected-class="text-primary"
-                  >
+                  <v-chip-group v-model="selectedTaskTypes" multiple selected-class="text-primary">
                     <v-chip
                         v-for="option in taskTypeOptions"
                         :key="option.value"
                         :value="option.value"
                         size="small"
                         variant="tonal"
-                        filter
-                    >{{ option.title }}
+                        filter>
+                      {{ option.title }}
                     </v-chip>
                   </v-chip-group>
                 </div>
                 <div class="history-filter-group">
                   <span class="history-filter-label">状态</span>
-                  <v-chip-group
-                      v-model="selectedStatuses"
-                      multiple
-                      selected-class="text-primary"
-                  >
+                  <v-chip-group v-model="selectedStatuses" multiple selected-class="text-primary">
                     <v-chip
                         v-for="status in statusOptions"
                         :key="status"
                         :value="status"
                         size="small"
                         variant="tonal"
-                        filter
-                    >{{ status }}
+                        filter>
+                      {{ status }}
                     </v-chip>
                   </v-chip-group>
                 </div>
@@ -130,15 +95,9 @@
             hide-details
             @keyup.enter="submitSearch"
             @click:prepend-inner="submitSearch"
-            @click:clear="clearSearch"
-        />
+            @click:clear="clearSearch" />
         <div v-else class="history-search-trigger">
-          <v-menu
-              v-model="searchVisible"
-              :close-on-content-click="false"
-              location="bottom start"
-              offset="6"
-          >
+          <v-menu v-model="searchVisible" :close-on-content-click="false" location="bottom start" offset="6">
             <template #activator="{ props: menuProps }">
               <v-btn
                   v-bind="menuProps"
@@ -146,8 +105,7 @@
                   :color="keyword ? 'primary' : undefined"
                   variant="text"
                   size="small"
-                  title="搜索历史记录"
-              />
+                  title="搜索历史记录" />
             </template>
             <v-card class="history-search-menu" elevation="8">
               <v-card-text class="pa-2">
@@ -162,13 +120,12 @@
                     hide-details
                     @keyup.enter="submitSearch"
                     @click:prepend-inner="submitSearch"
-                    @click:clear="clearSearch"
-                />
+                    @click:clear="clearSearch" />
               </v-card-text>
             </v-card>
           </v-menu>
         </div>
-        <v-spacer/>
+        <v-spacer />
         <v-btn
             class="delete-selected-button"
             color="error"
@@ -176,51 +133,37 @@
             size="small"
             :disabled="!deletableSelectedGroups.length"
             :loading="deletingKey === 'batch'"
-            @click.stop="deleteSelected"
-        >
-          <v-icon icon="mdi-delete-outline" class="history-action-icon"/>
+            @click.stop="deleteSelected">
+          <v-icon icon="mdi-delete-outline" class="history-action-icon" />
           <span class="history-action-label">删除所选</span>
         </v-btn>
         <div class="history-actions">
-          <v-btn
-              variant="text"
-              size="small"
-              :loading="loading"
-              title="刷新历史记录"
-              @click.stop="emit('refresh')"
-          >
-            <v-icon icon="mdi-refresh" class="history-action-icon"/>
+          <v-btn variant="text" size="small" :loading="loading" title="刷新历史记录" @click.stop="emit('refresh')">
+            <v-icon icon="mdi-refresh" class="history-action-icon" />
             <span class="history-action-label">刷新</span>
           </v-btn>
-          <v-btn
-              color="error"
-              variant="text"
-              size="small"
-              title="清空历史记录"
-              @click.stop="emit('clear')"
-          >
-            <v-icon icon="mdi-delete-sweep" class="history-action-icon"/>
+          <v-btn color="error" variant="text" size="small" title="清空历史记录" @click.stop="emit('clear')">
+            <v-icon icon="mdi-delete-sweep" class="history-action-icon" />
             <span class="history-action-label">清空历史</span>
           </v-btn>
         </div>
       </div>
-      <v-divider/>
+      <v-divider />
     </div>
 
     <div class="history-content">
       <div
           v-if="loading"
           :class="[
-            'history-loading-mask',
-            {
-              'history-loading-mask--empty': !historyGroups.length,
-              'history-loading-mask--mobile': isMobile,
-              'history-loading-mask--mobile-pagination': isMobile && totalPages > 1,
-            },
-          ]"
-      >
+          'history-loading-mask',
+          {
+            'history-loading-mask--empty': !historyGroups.length,
+            'history-loading-mask--mobile': isMobile,
+            'history-loading-mask--mobile-pagination': isMobile && totalPages > 1,
+          },
+        ]">
         <div class="history-loading-state">
-          <v-progress-circular indeterminate color="primary" size="42" width="4"/>
+          <v-progress-circular indeterminate color="primary" size="42" width="4" />
           <span class="text-body-2">正在加载历史记录...</span>
         </div>
       </div>
@@ -250,17 +193,14 @@
         class="history-table"
         @update:page="changePage"
         @update:items-per-page="changePageSize"
-        @click:row="toggleExpanded"
-    >
-      <template #item.media="{ item }">
-        <div class="media-cell">
-          <span
-              class="media-title font-weight-medium"
-              :title="item.title + (item.year ? ` (${item.year})` : '')"
-          >
-            {{ item.title }}<span v-if="item.year"> ({{ item.year }})</span>
-          </span>
-          <v-btn
+          @click:row="toggleExpanded">
+        <template #item.media="{ item }">
+          <div class="media-cell">
+            <span class="media-title font-weight-medium" :title="item.title + (item.year ? ` (${item.year})` : '')">
+              {{ item.title }}
+              <span v-if="item.year">({{ item.year }})</span>
+            </span>
+            <v-btn
               v-if="mediaDetailLink(item)"
               icon="mdi-open-in-new"
               variant="text"
@@ -268,81 +208,65 @@
               color="primary"
               title="查看媒体详情"
               class="media-link"
-              @click.stop="openMediaDetail(item)"
-          />
-        </div>
-        <div class="media-meta text-caption text-medium-emphasis">
-          {{ item.type }} · {{ item.records.length }} 条记录
-          <span> · {{ formatSize(item.total_size) }}</span>
-        </div>
-      </template>
+              @click.stop="openMediaDetail(item)" />
+          </div>
+          <div class="media-meta text-caption text-medium-emphasis">
+            {{ item.type }} · {{ item.records.length }} 条记录
+            <span>· {{ formatSize(item.total_size) }}</span>
+          </div>
+        </template>
 
-      <template #item.resource_types="{ item }">
-        <div v-if="item.resource_types.length === 1" class="summary-chips">
-          <v-chip
-              size="x-small"
-              variant="tonal"
-              :color="resourceTypeColor(item.resource_types[0])"
-          >
-            {{ resourceTypeLabel(item.resource_types[0]) }}
-          </v-chip>
-        </div>
-        <div v-else class="mixed-resource-types">
-          <v-chip
-              size="x-small"
-              variant="tonal"
-              color="primary"
-              prepend-icon="mdi-layers-triple-outline"
-          >
-            混合
-          </v-chip>
-        </div>
-      </template>
+        <template #item.resource_types="{ item }">
+          <div v-if="item.resource_types.length === 1" class="summary-chips">
+            <v-chip size="x-small" variant="tonal" :color="resourceTypeColor(item.resource_types[0])">
+              {{ resourceTypeLabel(item.resource_types[0]) }}
+            </v-chip>
+          </div>
+          <div v-else class="mixed-resource-types">
+            <v-chip size="x-small" variant="tonal" color="primary" prepend-icon="mdi-layers-triple-outline">
+              混合
+            </v-chip>
+          </div>
+        </template>
 
-      <template #item.sources="{ item }">
-        <div class="source-summary">
-          <v-chip
+        <template #item.sources="{ item }">
+          <div class="source-summary">
+            <v-chip
               v-if="item.source_items.length > 1"
               size="x-small"
               variant="tonal"
               color="primary"
-              prepend-icon="mdi-source-branch"
-          >
-            多渠道
+              prepend-icon="mdi-source-branch">
+              多渠道
+            </v-chip>
+            <span v-else>{{ sourceLabel(item.source_items[0]?.value) }}</span>
+          </div>
+        </template>
+
+        <template #item.resource_links="{ item }">
+          <v-chip v-if="item.resource_link_count" prepend-icon="mdi-link-variant" variant="tonal" size="x-small">
+            {{ item.resource_link_count }} 个
           </v-chip>
-          <span v-else>{{ sourceLabel(item.source_items[0]?.value) }}</span>
-        </div>
-      </template>
+          <span v-else class="text-medium-emphasis">-</span>
+        </template>
 
-      <template #item.resource_links="{ item }">
-        <v-chip
-            v-if="item.resource_link_count"
-            prepend-icon="mdi-link-variant"
-            variant="tonal"
-            size="x-small"
-        >
-          {{ item.resource_link_count }} 个
-        </v-chip>
-        <span v-else class="text-medium-emphasis">-</span>
-      </template>
+        <template #item.summary="{ item }">
+          <div class="summary-counts">
+            <span class="text-success">成功 {{ item.success_count }}</span>
+            <span class="summary-separator">/</span>
+            <span class="text-warning">待完成 {{ item.pending_count }}</span>
+            <span class="summary-separator">/</span>
+            <span class="text-error">失败 {{ item.failed_count }}</span>
+          </div>
+        </template>
 
-      <template #item.summary="{ item }">
-        <div class="summary-counts">
-          <span class="text-success">成功 {{ item.success_count }}</span>
-          <span class="summary-separator">/</span>
-          <span class="text-warning">待完成 {{ item.pending_count }}</span>
-          <span class="summary-separator">/</span>
-          <span class="text-error">失败 {{ item.failed_count }}</span>
-        </div>
-      </template>
+        <template #item.latest_time="{ item }">
+          <span class="latest-time">{{ item.latest_time || "-" }}</span>
+        </template>
 
-      <template #item.latest_time="{ item }">
-        <span class="latest-time">{{ item.latest_time || "-" }}</span>
-      </template>
-
-      <template #item.actions="{ item }">
-        <div class="summary-actions">
-          <v-btn
+        <template #item.actions="{ item }">
+          <div class="summary-actions">
+            <v-btn
               v-if="canUpgradeGroup(item)"
               icon="mdi-auto-fix"
               color="warning"
@@ -350,9 +274,8 @@
               size="x-small"
               :loading="upgradingKey === historyUpgradeGroupKey(item)"
               :title="item.type === '电影' ? '洗版此电影' : '洗版整个剧集列表'"
-              @click.stop="upgradeGroup(item)"
-          />
-          <v-btn
+              @click.stop="upgradeGroup(item)" />
+            <v-btn
               v-if="item.notification_record"
               icon="mdi-bell-ring-outline"
               color="primary"
@@ -360,400 +283,78 @@
               size="x-small"
               :loading="notifyingKey === historyRetryKey(item.notification_record)"
               :title="'补发' + notificationSummaryTitle(item) + '汇总通知'"
-              @click.stop="emit('notify', {
-                record: item.notification_record,
-                summaryTitle: notificationSummaryTitle(item),
-              })"
-          />
-          <v-btn
+              @click.stop="
+                emit('notify', {
+                  record: item.notification_record,
+                  summaryTitle: notificationSummaryTitle(item),
+                })
+              " />
+            <v-btn
               v-if="playItemId(item)"
               icon="mdi-play-circle-outline"
               color="success"
               variant="text"
               size="x-small"
               title="在 Emby 中播放"
-              @click.stop="emit('play', playItemId(item))"
-          />
-        </div>
-      </template>
+              @click.stop="emit('play', playItemId(item))" />
+          </div>
+        </template>
 
-      <template #expanded-row="{ columns, item }">
-        <tr class="detail-row">
-          <td :colspan="columns.length" class="pa-0">
-            <v-table density="compact" class="detail-table">
-              <thead>
-              <tr>
-                <th>名称</th>
-                <th>类型</th>
-                <th>格式</th>
-                <th>来源</th>
-                <th>资源</th>
-                <th>大小</th>
-                <th>状态</th>
-                <th>时间</th>
-                <th class="action-column">操作</th>
-              </tr>
-              </thead>
-              <tbody>
-              <tr
-                  v-for="(record, index) in item.records"
-                  :key="recordKey(record, index)"
-              >
-                <td>
-                  <div class="d-flex align-center ga-1">
-                    <span
-                        class="record-name"
-                        :title="record.display_name || '-'"
-                    >
-                      {{ record.display_name || "-" }}
-                    </span>
-                    <v-chip
-                        v-if="record.upgrade"
-                        size="x-small"
-                        color="warning"
-                        variant="tonal"
-                    >
-                      洗版
-                      <v-tooltip activator="parent" location="top">
-                        {{ record.upgrade_version_info }}
-                      </v-tooltip>
+        <template #expanded-row="{ columns, item }">
+          <tr class="detail-row">
+            <td :colspan="columns.length" class="pa-0">
+              <v-table density="compact" class="detail-table">
+                <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>类型</th>
+                  <th>格式</th>
+                  <th>来源</th>
+                  <th>资源</th>
+                  <th>大小</th>
+                  <th>状态</th>
+                  <th>时间</th>
+                  <th class="action-column">操作</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr v-for="(record, index) in item.records" :key="recordKey(record, index)">
+                  <td>
+                    <div class="d-flex align-center ga-1">
+                        <span class="record-name" :title="record.display_name || '-'">
+                          {{ record.display_name || "-" }}
+                        </span>
+                      <v-chip v-if="record.upgrade" size="x-small" color="warning" variant="tonal">
+                        洗版
+                        <v-tooltip activator="parent" location="top">
+                          {{ record.upgrade_version_info }}
+                        </v-tooltip>
+                      </v-chip>
+                      <v-chip v-if="record.is_cross_transfer" size="x-small" color="info" variant="tonal">
+                        跨盘
+                        <v-tooltip activator="parent" location="top">
+                          {{ record.cross_transfer_title }}
+                        </v-tooltip>
+                      </v-chip>
+                    </div>
+                    <div
+                        v-if="record.type !== '电影'"
+                        class="record-file-name text-caption text-medium-emphasis"
+                        :title="record.title || item.title || '-'">
+                      {{ record.title || item.title || "-" }}
+                    </div>
+                  </td>
+                  <td>
+                    <v-chip size="x-small" variant="tonal" :color="resourceTypeColor(resourceType(record))">
+                      {{ resourceTypeLabel(resourceType(record)) }}
                     </v-chip>
-                    <v-chip
-                        v-if="record.is_cross_transfer"
-                        size="x-small"
-                        color="info"
-                        variant="tonal"
-                    >
-                      跨盘
-                      <v-tooltip activator="parent" location="top">
-                        {{ record.cross_transfer_title }}
-                      </v-tooltip>
+                  </td>
+                  <td>
+                    <v-chip size="x-small" variant="tonal">
+                      {{ record.file_extension || "-" }}
                     </v-chip>
-                  </div>
-                  <div
-                      v-if="record.type !== '电影'"
-                      class="record-file-name text-caption text-medium-emphasis"
-                      :title="record.title || item.title || '-'"
-                  >
-                    {{ record.title || item.title || "-" }}
-                  </div>
-                </td>
-                <td>
-                  <v-chip
-                      size="x-small"
-                      variant="tonal"
-                      :color="resourceTypeColor(resourceType(record))"
-                  >
-                    {{ resourceTypeLabel(resourceType(record)) }}
-                  </v-chip>
-                </td>
-                <td>
-                  <v-chip size="x-small" variant="tonal">
-                    {{ record.file_extension || "-" }}
-                  </v-chip>
-                </td>
-                <td>
-                  <a
-                      v-if="record.source_link"
-                      :href="record.source_link"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      class="source-link"
-                      title="打开来源详情页"
-                      @click.stop
-                  >
-                    {{ sourceLabel(record.source) }}
-                    <v-icon icon="mdi-open-in-new" size="x-small"/>
-                  </a>
-                  <span v-else>{{ sourceLabel(record.source) }}</span>
-                </td>
-                <td>
-                  <a
-                      v-if="record.resource_link"
-                      :href="record.resource_link"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      class="source-link"
-                      title="打开资源链接"
-                      @click.stop
-                  >
-                    打开
-                    <v-icon icon="mdi-open-in-new" size="x-small"/>
-                  </a>
-                  <span v-else>-</span>
-                </td>
-                <td class="text-no-wrap">
-                  {{ formatSize(record.file_size) }}
-                </td>
-                <td>
-                  <v-chip
-                      :color="statusColor(record.status)"
-                      size="x-small"
-                      variant="tonal"
-                  >
-                    {{ record.status }}
-                  </v-chip>
-                </td>
-                <td class="text-no-wrap">{{ record.time || "-" }}</td>
-                <td class="action-column">
-                  <div class="action-buttons">
-                    <v-btn
-                        v-if="canUpgradeRecord(record)"
-                        icon="mdi-auto-fix"
-                        color="warning"
-                        variant="text"
-                        size="x-small"
-                        :loading="upgradingKey === historyUpgradeRecordKey(record)"
-                        title="洗版此集"
-                        @click.stop="upgradeRecord(record)"
-                    />
-                    <v-btn
-                        icon="mdi-reload"
-                        color="primary"
-                        variant="text"
-                        size="x-small"
-                        :disabled="!canRetryRecord(record)"
-                        :loading="retryingKey === historyRetryKey(record)"
-                        :title="retryTitle(record)"
-                        @click.stop="emit('retry', record)"
-                    />
-                    <v-btn
-                        icon="mdi-delete-outline"
-                        color="error"
-                        variant="text"
-                        size="x-small"
-                        :disabled="!canDeleteRecord(record)"
-                        :loading="deletingKey === historyRetryKey(record)"
-                        :title="deleteTitle(record)"
-                        @click.stop="emit('delete', record)"
-                    />
-                  </div>
-                </td>
-              </tr>
-              </tbody>
-            </v-table>
-          </td>
-        </tr>
-      </template>
-
-      </v-data-table-server>
-
-      <div v-else class="history-mobile-list">
-      <div class="history-mobile-scroll">
-        <div
-            v-if="!loading && !historyGroups.length"
-            class="history-mobile-empty text-body-2 text-medium-emphasis"
-        >
-          暂无符合条件的转存记录
-        </div>
-        <v-expansion-panels
-            v-else
-            v-model="expanded"
-            multiple
-            variant="accordion"
-            class="history-mobile-panels"
-        >
-          <v-expansion-panel
-              v-for="item in historyGroups"
-              :key="item.group_key"
-              :value="item.group_key"
-              :class="[
-              'history-mobile-panel',
-              { 'history-group-selected': isGroupSelected(item) },
-            ]"
-          >
-            <v-expansion-panel-title class="history-mobile-title">
-              <v-checkbox-btn
-                  :model-value="isGroupSelected(item)"
-                  :disabled="!item.selectable"
-                  density="compact"
-                  color="primary"
-                  :aria-label="`选择 ${item.title}`"
-                  @click.stop
-                  @update:model-value="selectGroup(item, $event)"
-              />
-              <div class="history-mobile-summary">
-                <div class="history-mobile-media-line">
-                  <span class="history-mobile-media-title font-weight-medium">
-                    {{
-                      item.title
-                    }}<span v-if="item.year" class="text-medium-emphasis">
-                      ({{ item.year }})</span
-                  >
-                  </span>
-                  <div class="history-mobile-summary-actions">
-                    <v-btn
-                        v-if="canUpgradeGroup(item)"
-                        icon="mdi-auto-fix"
-                        color="warning"
-                        variant="text"
-                        size="x-small"
-                        :loading="upgradingKey === historyUpgradeGroupKey(item)"
-                        :title="item.type === '电影' ? '洗版此电影' : '洗版整个剧集列表'"
-                        @click.stop="upgradeGroup(item)"
-                    />
-                    <v-btn
-                        v-if="item.notification_record"
-                        icon="mdi-bell-ring-outline"
-                        color="primary"
-                        variant="text"
-                        size="x-small"
-                        :loading="notifyingKey === historyRetryKey(item.notification_record)"
-                        :title="'补发' + notificationSummaryTitle(item) + '汇总通知'"
-                        @click.stop="emit('notify', {
-                          record: item.notification_record,
-                          summaryTitle: notificationSummaryTitle(item),
-                        })"
-                    />
-                    <v-btn
-                        v-if="playItemId(item)"
-                        icon="mdi-play-circle-outline"
-                        color="success"
-                        variant="text"
-                        size="x-small"
-                        title="在 Emby 中播放"
-                        @click.stop="emit('play', playItemId(item))"
-                    />
-                    <v-btn
-                        v-if="mediaDetailLink(item)"
-                        icon="mdi-open-in-new"
-                        variant="text"
-                        size="x-small"
-                        color="primary"
-                        title="查看媒体详情"
-                        @click.stop="openMediaDetail(item)"
-                    />
-                  </div>
-                </div>
-                <div class="history-mobile-summary-footer">
-                  <div class="history-mobile-tags">
-                    <v-chip
-                        v-if="item.resource_types.length === 1"
-                        :color="resourceTypeColor(item.resource_types[0])"
-                        size="x-small"
-                        variant="tonal"
-                    >{{ resourceTypeLabel(item.resource_types[0]) }}
-                    </v-chip>
-                    <v-chip
-                        v-else
-                        color="primary"
-                        size="x-small"
-                        variant="tonal"
-                        prepend-icon="mdi-layers-triple-outline"
-                    >混合
-                    </v-chip>
-                    <span class="text-caption text-success">
-                      成功 {{ item.success_count }} 条
-                    </span>
-                    <span
-                        v-if="item.pending_count"
-                        class="text-caption text-warning"
-                    >
-                      待完成 {{ item.pending_count }}
-                    </span>
-                    <span
-                        v-if="item.failed_count"
-                        class="text-caption text-error"
-                    >
-                      失败 {{ item.failed_count }}
-                    </span>
-                  </div>
-                  <span
-                      class="history-mobile-summary-time text-caption text-medium-emphasis"
-                  >
-                    {{ item.latest_time || "-" }}
-                  </span>
-                </div>
-              </div>
-            </v-expansion-panel-title>
-            <v-expansion-panel-text class="history-mobile-details">
-              <div
-                  v-for="(record, index) in item.records"
-                  :key="recordKey(record, index)"
-                  class="history-mobile-record"
-              >
-                <div class="history-mobile-record-head">
-                  <span
-                      class="record-name"
-                      :title="record.display_name || '-'"
-                  >
-                    {{ record.display_name || "-" }}
-                  </span>
-                  <v-chip
-                      v-if="record.upgrade"
-                      size="x-small"
-                      color="warning"
-                      variant="tonal"
-                  >
-                    洗版
-                    <v-tooltip activator="parent" location="top">
-                      {{ record.upgrade_version_info }}
-                    </v-tooltip>
-                  </v-chip>
-                  <v-chip
-                      v-if="record.is_cross_transfer"
-                      size="x-small"
-                      color="info"
-                      variant="tonal"
-                  >
-                    跨盘
-                    <v-tooltip activator="parent" location="top">
-                      {{ record.cross_transfer_title }}
-                    </v-tooltip>
-                  </v-chip>
-                  <v-chip
-                      :color="statusColor(record.status)"
-                      size="x-small"
-                      variant="tonal"
-                  >{{ record.status }}
-                  </v-chip
-                  >
-                  <v-spacer/>
-                  <div class="action-buttons history-mobile-actions">
-                    <v-btn
-                        v-if="canUpgradeRecord(record)"
-                        icon="mdi-auto-fix"
-                        color="warning"
-                        variant="text"
-                        size="x-small"
-                        :loading="upgradingKey === historyUpgradeRecordKey(record)"
-                        title="洗版此集"
-                        @click.stop="upgradeRecord(record)"
-                    />
-                    <v-btn
-                        icon="mdi-reload"
-                        color="primary"
-                        variant="text"
-                        size="x-small"
-                        :disabled="!canRetryRecord(record)"
-                        :loading="retryingKey === historyRetryKey(record)"
-                        :title="retryTitle(record)"
-                        @click.stop="emit('retry', record)"
-                    />
-                    <v-btn
-                        icon="mdi-delete-outline"
-                        color="error"
-                        variant="text"
-                        size="x-small"
-                        :disabled="!canDeleteRecord(record)"
-                        :loading="deletingKey === historyRetryKey(record)"
-                        :title="deleteTitle(record)"
-                        @click.stop="emit('delete', record)"
-                    />
-                  </div>
-                </div>
-                <div
-                    v-if="record.type !== '电影'"
-                    class="history-mobile-file text-caption text-medium-emphasis"
-                    :title="record.title || item.title || '-'"
-                >
-                  {{ record.title || item.title || "-" }}
-                </div>
-                <div class="history-mobile-record-footer">
-                  <div
-                      class="history-mobile-record-meta text-caption text-medium-emphasis"
-                  >
-                    <span>{{ resourceTypeLabel(resourceType(record)) }}</span>
+                  </td>
+                  <td>
                     <a
                         v-if="record.source_link"
                         :href="record.source_link"
@@ -761,10 +362,13 @@
                         rel="noopener noreferrer"
                         class="source-link"
                         title="打开来源详情页"
-                        @click.stop
-                    >{{ sourceLabel(record.source) }}</a
-                    >
+                        @click.stop>
+                      {{ sourceLabel(record.source) }}
+                      <v-icon icon="mdi-open-in-new" size="x-small" />
+                    </a>
                     <span v-else>{{ sourceLabel(record.source) }}</span>
+                  </td>
+                  <td>
                     <a
                         v-if="record.resource_link"
                         :href="record.resource_link"
@@ -772,33 +376,262 @@
                         rel="noopener noreferrer"
                         class="source-link"
                         title="打开资源链接"
-                        aria-label="打开资源链接"
-                        @click.stop
-                    >
-                      <v-icon icon="mdi-link-variant" size="x-small"/>
-                    </a
-                    >
-                    <span>{{ formatSize(record.file_size) }}</span>
+                        @click.stop>
+                      打开
+                      <v-icon icon="mdi-open-in-new" size="x-small" />
+                    </a>
+                    <span v-else>-</span>
+                  </td>
+                  <td class="text-no-wrap">
+                    {{ formatSize(record.file_size) }}
+                  </td>
+                  <td>
+                    <v-chip :color="statusColor(record.status)" size="x-small" variant="tonal">
+                      {{ record.status }}
+                    </v-chip>
+                  </td>
+                  <td class="text-no-wrap">{{ record.time || "-" }}</td>
+                  <td class="action-column">
+                    <div class="action-buttons">
+                      <v-btn
+                          v-if="canUpgradeRecord(record)"
+                          icon="mdi-auto-fix"
+                          color="warning"
+                          variant="text"
+                          size="x-small"
+                          :loading="upgradingKey === historyUpgradeRecordKey(record)"
+                          title="洗版此集"
+                          @click.stop="upgradeRecord(record)" />
+                      <v-btn
+                          icon="mdi-reload"
+                          color="primary"
+                          variant="text"
+                          size="x-small"
+                          :disabled="!canRetryRecord(record)"
+                          :loading="retryingKey === historyRetryKey(record)"
+                          :title="retryTitle(record)"
+                          @click.stop="emit('retry', record)" />
+                      <v-btn
+                          icon="mdi-delete-outline"
+                          color="error"
+                          variant="text"
+                          size="x-small"
+                          :disabled="!canDeleteRecord(record)"
+                          :loading="deletingKey === historyRetryKey(record)"
+                          :title="deleteTitle(record)"
+                          @click.stop="emit('delete', record)" />
+                    </div>
+                  </td>
+                </tr>
+                </tbody>
+              </v-table>
+            </td>
+          </tr>
+        </template>
+      </v-data-table-server>
+
+      <div v-else class="history-mobile-list">
+        <div class="history-mobile-scroll">
+          <div v-if="!loading && !historyGroups.length" class="history-mobile-empty text-body-2 text-medium-emphasis">
+            暂无符合条件的转存记录
+          </div>
+          <v-expansion-panels v-else v-model="expanded" multiple variant="accordion" class="history-mobile-panels">
+            <v-expansion-panel
+              v-for="item in historyGroups"
+              :key="item.group_key"
+              :value="item.group_key"
+              :class="['history-mobile-panel', { 'history-group-selected': isGroupSelected(item) }]">
+              <v-expansion-panel-title class="history-mobile-title">
+                <v-checkbox-btn
+                  :model-value="isGroupSelected(item)"
+                  :disabled="!item.selectable"
+                  density="compact"
+                  color="primary"
+                  :aria-label="`选择 ${item.title}`"
+                  @click.stop
+                  @update:model-value="selectGroup(item, $event)" />
+                <div class="history-mobile-summary">
+                  <div class="history-mobile-media-line">
+                    <span class="history-mobile-media-title font-weight-medium">
+                      {{ item.title }}
+                      <span v-if="item.year" class="text-medium-emphasis">({{ item.year }})</span>
+                    </span>
+                    <div class="history-mobile-summary-actions">
+                      <v-btn
+                        v-if="canUpgradeGroup(item)"
+                        icon="mdi-auto-fix"
+                        color="warning"
+                        variant="text"
+                        size="x-small"
+                        :loading="upgradingKey === historyUpgradeGroupKey(item)"
+                        :title="item.type === '电影' ? '洗版此电影' : '洗版整个剧集列表'"
+                        @click.stop="upgradeGroup(item)" />
+                      <v-btn
+                        v-if="item.notification_record"
+                        icon="mdi-bell-ring-outline"
+                        color="primary"
+                        variant="text"
+                        size="x-small"
+                        :loading="notifyingKey === historyRetryKey(item.notification_record)"
+                        :title="'补发' + notificationSummaryTitle(item) + '汇总通知'"
+                        @click.stop="
+                          emit('notify', {
+                            record: item.notification_record,
+                            summaryTitle: notificationSummaryTitle(item),
+                          })
+                        " />
+                      <v-btn
+                        v-if="playItemId(item)"
+                        icon="mdi-play-circle-outline"
+                        color="success"
+                        variant="text"
+                        size="x-small"
+                        title="在 Emby 中播放"
+                        @click.stop="emit('play', playItemId(item))" />
+                      <v-btn
+                        v-if="mediaDetailLink(item)"
+                        icon="mdi-open-in-new"
+                        variant="text"
+                        size="x-small"
+                        color="primary"
+                        title="查看媒体详情"
+                        @click.stop="openMediaDetail(item)" />
+                    </div>
                   </div>
-                  <span
-                      class="history-mobile-record-time text-caption text-medium-emphasis"
-                  >{{ record.time || "-" }}</span
-                  >
+                  <div class="history-mobile-summary-footer">
+                    <div class="history-mobile-tags">
+                      <v-chip
+                        v-if="item.resource_types.length === 1"
+                        :color="resourceTypeColor(item.resource_types[0])"
+                        size="x-small"
+                        variant="tonal">
+                        {{ resourceTypeLabel(item.resource_types[0]) }}
+                      </v-chip>
+                      <v-chip
+                        v-else
+                        color="primary"
+                        size="x-small"
+                        variant="tonal"
+                        prepend-icon="mdi-layers-triple-outline">
+                        混合
+                      </v-chip>
+                      <span class="text-caption text-success">成功 {{ item.success_count }} 条</span>
+                      <span v-if="item.pending_count" class="text-caption text-warning">
+                        待完成 {{ item.pending_count }}
+                      </span>
+                      <span v-if="item.failed_count" class="text-caption text-error">失败 {{ item.failed_count }}</span>
+                    </div>
+                    <span class="history-mobile-summary-time text-caption text-medium-emphasis">
+                      {{ item.latest_time || "-" }}
+                    </span>
+                  </div>
                 </div>
-              </div>
-            </v-expansion-panel-text>
-          </v-expansion-panel>
-        </v-expansion-panels>
-      </div>
-      <v-pagination
+              </v-expansion-panel-title>
+              <v-expansion-panel-text class="history-mobile-details">
+                <div
+                  v-for="(record, index) in item.records"
+                  :key="recordKey(record, index)"
+                  class="history-mobile-record">
+                  <div class="history-mobile-record-head">
+                    <span class="record-name" :title="record.display_name || '-'">
+                      {{ record.display_name || "-" }}
+                    </span>
+                    <v-chip v-if="record.upgrade" size="x-small" color="warning" variant="tonal">
+                      洗版
+                      <v-tooltip activator="parent" location="top">
+                        {{ record.upgrade_version_info }}
+                      </v-tooltip>
+                    </v-chip>
+                    <v-chip v-if="record.is_cross_transfer" size="x-small" color="info" variant="tonal">
+                      跨盘
+                      <v-tooltip activator="parent" location="top">
+                        {{ record.cross_transfer_title }}
+                      </v-tooltip>
+                    </v-chip>
+                    <v-chip :color="statusColor(record.status)" size="x-small" variant="tonal">
+                      {{ record.status }}
+                    </v-chip>
+                    <v-spacer />
+                    <div class="action-buttons history-mobile-actions">
+                      <v-btn
+                        v-if="canUpgradeRecord(record)"
+                        icon="mdi-auto-fix"
+                        color="warning"
+                        variant="text"
+                        size="x-small"
+                        :loading="upgradingKey === historyUpgradeRecordKey(record)"
+                        title="洗版此集"
+                        @click.stop="upgradeRecord(record)" />
+                      <v-btn
+                        icon="mdi-reload"
+                        color="primary"
+                        variant="text"
+                        size="x-small"
+                        :disabled="!canRetryRecord(record)"
+                        :loading="retryingKey === historyRetryKey(record)"
+                        :title="retryTitle(record)"
+                        @click.stop="emit('retry', record)" />
+                      <v-btn
+                        icon="mdi-delete-outline"
+                        color="error"
+                        variant="text"
+                        size="x-small"
+                        :disabled="!canDeleteRecord(record)"
+                        :loading="deletingKey === historyRetryKey(record)"
+                        :title="deleteTitle(record)"
+                        @click.stop="emit('delete', record)" />
+                    </div>
+                  </div>
+                  <div
+                    v-if="record.type !== '电影'"
+                    class="history-mobile-file text-caption text-medium-emphasis"
+                    :title="record.title || item.title || '-'">
+                    {{ record.title || item.title || "-" }}
+                  </div>
+                  <div class="history-mobile-record-footer">
+                    <div class="history-mobile-record-meta text-caption text-medium-emphasis">
+                      <span>{{ resourceTypeLabel(resourceType(record)) }}</span>
+                      <a
+                        v-if="record.source_link"
+                        :href="record.source_link"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="source-link"
+                        title="打开来源详情页"
+                        @click.stop>
+                        {{ sourceLabel(record.source) }}
+                      </a>
+                      <span v-else>{{ sourceLabel(record.source) }}</span>
+                      <a
+                        v-if="record.resource_link"
+                        :href="record.resource_link"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="source-link"
+                        title="打开资源链接"
+                        aria-label="打开资源链接"
+                        @click.stop>
+                        <v-icon icon="mdi-link-variant" size="x-small" />
+                      </a>
+                      <span>{{ formatSize(record.file_size) }}</span>
+                    </div>
+                    <span class="history-mobile-record-time text-caption text-medium-emphasis">
+                      {{ record.time || "-" }}
+                    </span>
+                  </div>
+                </div>
+              </v-expansion-panel-text>
+            </v-expansion-panel>
+          </v-expansion-panels>
+        </div>
+        <v-pagination
           v-if="totalPages > 1"
           :model-value="page"
           :length="totalPages"
           :total-visible="5"
           density="compact"
           class="history-mobile-pagination"
-          @update:model-value="changePage"
-      />
+          @update:model-value="changePage" />
       </div>
     </div>
   </div>
@@ -821,7 +654,7 @@ const props = defineProps({
   deletingKey: {type: String, default: ""},
   notifyingKey: {type: String, default: ""},
   upgradingKey: {type: String, default: ""},
-});
+})
 const emit = defineEmits([
   "refresh",
   "clear",
@@ -834,7 +667,7 @@ const emit = defineEmits([
   "play",
   "open-media",
   "query-change",
-]);
+])
 const display = useDisplay();
 const isMobile = computed(() => display.xs.value);
 const keyword = ref("");
@@ -860,17 +693,17 @@ const sourceNames = {
   online_docs: "在线文档",
   manual: "手动添加",
   unknown: "未知",
-};
+}
 const statusOptions = ["处理中", "下载中", "成功", "失败"];
 const taskTypeOptions = [
   {title: "跨盘", value: "cross_transfer"},
   {title: "洗版", value: "upgrade"},
-];
+]
 const pageSizes = [
   {value: 10, title: "10"},
   {value: 20, title: "20"},
   {value: 50, title: "50"},
-];
+]
 const headers = [
   {title: "媒体", key: "media", sortable: false, width: "25%"},
   {title: "类型", key: "resource_types", sortable: false, width: "8%"},
@@ -880,19 +713,17 @@ const headers = [
   {title: "时间", key: "latest_time", width: 172},
   {title: "", key: "actions", sortable: false, width: 112},
   {title: "", key: "data-table-expand", width: 44},
-];
+]
 
 const resourceTypeOptions = computed(() =>
     uniqueOptions(props.filterOptions?.resourceTypes || []).map((value) => ({
       title: resourceTypeLabel(value),
       value,
     })),
-);
+)
 const sourceOptions = computed(() =>
-    uniqueOptions(props.filterOptions?.sources || []).map(
-        (value) => ({title: sourceLabel(value), value}),
-    ),
-);
+    uniqueOptions(props.filterOptions?.sources || []).map((value) => ({title: sourceLabel(value), value})),
+)
 
 function notificationSummaryTitle(item) {
   const title = String(item?.title || "未知媒体").trim();
@@ -900,28 +731,20 @@ function notificationSummaryTitle(item) {
   return year ? title + "（" + year + "）" : title;
 }
 
-const historyGroups = computed(() =>
-    Array.isArray(props.items) ? props.items : [],
-);
+const historyGroups = computed(() => (Array.isArray(props.items) ? props.items : []));
 const activeFilterCount = computed(
     () =>
         selectedResourceTypes.value.length +
         selectedSources.value.length +
         selectedTaskTypes.value.length +
         selectedStatuses.value.length,
-);
+)
 const selectedGroups = computed(() => {
   const keys = new Set(selectedGroupKeys.value);
-  return historyGroups.value.filter(
-      (group) => keys.has(group.group_key),
-  );
-});
-const deletableSelectedGroups = computed(() =>
-    selectedGroups.value.filter((group) => group.deletable),
-);
-const groupedItemKeys = computed(
-    () => new Set(historyGroups.value.map((group) => group.group_key)),
-);
+  return historyGroups.value.filter((group) => keys.has(group.group_key));
+})
+const deletableSelectedGroups = computed(() => selectedGroups.value.filter((group) => group.deletable));
+const groupedItemKeys = computed(() => new Set(historyGroups.value.map((group) => group.group_key)));
 
 function emitQueryChange(overrides = {}) {
   const query = {
@@ -933,7 +756,7 @@ function emitQueryChange(overrides = {}) {
     taskTypes: [...selectedTaskTypes.value],
     statuses: [...selectedStatuses.value],
     ...overrides,
-  };
+  }
   const signature = JSON.stringify(query);
   if (signature === lastQuerySignature) return;
   lastQuerySignature = signature;
@@ -950,7 +773,7 @@ function changePageSize(value) {
   emitQueryChange({
     page: 1,
     pageSize: Math.min(50, Math.max(1, Number(value) || 10)),
-  });
+  })
 }
 
 function submitSearch() {
@@ -969,8 +792,10 @@ function clearSearch() {
 watch(
     [selectedResourceTypes, selectedSources, selectedTaskTypes, selectedStatuses],
     () => emitQueryChange({page: 1}),
-    {deep: true},
-);
+    {
+      deep: true,
+    },
+)
 
 watch(
     () => props.page,
@@ -978,13 +803,11 @@ watch(
       expanded.value = [];
       selectedGroupKeys.value = [];
     },
-);
+)
 
 watch(groupedItemKeys, (keys) => {
-  selectedGroupKeys.value = selectedGroupKeys.value.filter((key) =>
-      keys.has(key),
-  );
-});
+  selectedGroupKeys.value = selectedGroupKeys.value.filter((key) => keys.has(key));
+})
 
 watch(
     selectedGroups,
@@ -992,9 +815,9 @@ watch(
       emit("selection-change", {
         groupCount: groups.length,
         subscribeIds: uniqueOptions(
-            groups.flatMap((group) =>
-                group.records.map((record) => Number(record.subscribe_id || 0)),
-            ).filter((value) => value > 0),
+            groups
+                .flatMap((group) => group.records.map((record) => Number(record.subscribe_id || 0)))
+                .filter((value) => value > 0),
         ),
         targets: groups.map((group) => ({
           tmdb_id: Number(group.tmdb_id || 0),
@@ -1006,7 +829,7 @@ watch(
       });
     },
     {immediate: true},
-);
+)
 
 function uniqueOptions(values) {
   return [...new Set(values.filter(Boolean))];
@@ -1016,10 +839,8 @@ function normalizeSource(value) {
   const normalized =
       String(value || "unknown")
           .trim()
-          .toLowerCase() || "unknown";
-  return ["manual", "手动添加", "手动资源"].includes(normalized)
-      ? "manual"
-      : normalized;
+          .toLowerCase() || "unknown"
+  return ["manual", "手动添加", "手动资源"].includes(normalized) ? "manual" : normalized;
 }
 
 function sourceLabel(value) {
@@ -1031,33 +852,31 @@ function resourceType(item) {
   if (typeof item === "string") return item.trim().toLowerCase();
   const configured = String(item?.resource_type || "")
       .trim()
-      .toLowerCase();
+      .toLowerCase()
   return configured || "unknown";
 }
 
 function resourceTypeLabel(value) {
   const normalized = resourceType(value);
-  return {
-    "115": "115网盘",
-    "123": "123网盘",
-    quark: "夸克网盘",
-    guangya: "光鸭网盘",
-    tianyi: "天翼云盘",
-    alipan: "阿里云盘",
-    aliyun: "阿里云盘",
-    ed2k: "ED2K",
-    magnet: "Magnet",
-    unknown: "未知",
-  }[normalized] || normalized.toUpperCase();
+  return (
+      {
+        115: "115网盘",
+        123: "123网盘",
+        quark: "夸克网盘",
+        guangya: "光鸭网盘",
+        tianyi: "天翼云盘",
+        alipan: "阿里云盘",
+        aliyun: "阿里云盘",
+        ed2k: "ED2K",
+        magnet: "Magnet",
+        unknown: "未知",
+      }[normalized] || normalized.toUpperCase()
+  );
 }
 
 function resourceTypeColor(value) {
   const normalized = resourceType(value);
-  return normalized === "ed2k"
-      ? "warning"
-      : normalized === "magnet"
-          ? "purple"
-          : "info";
+  return normalized === "ed2k" ? "warning" : normalized === "magnet" ? "purple" : "info";
 }
 
 function mediaDetailLink(item) {
@@ -1067,7 +886,7 @@ function mediaDetailLink(item) {
     `title=${encodeURIComponent(item.title || "")}`,
     `year=${encodeURIComponent(item.year || "")}`,
     `type=${encodeURIComponent(item.type || "")}`,
-  ].join("&");
+  ].join("&")
 }
 
 function openMediaDetail(item) {
@@ -1080,19 +899,14 @@ function playItemId(item) {
 }
 
 function statusColor(status) {
-  return status === "成功"
-      ? "success"
-      : ["处理中", "下载中"].includes(status)
-          ? "info"
-          : "error";
+  return status === "成功" ? "success" : ["处理中", "下载中"].includes(status) ? "info" : "error";
 }
 
 function formatSize(bytes) {
   let value = Number(bytes || 0);
   if (!value) return "-";
   for (const unit of ["B", "KB", "MB", "GB", "TB"]) {
-    if (value < 1024 || unit === "TB")
-      return `${value.toFixed(value >= 100 ? 0 : 1)} ${unit}`;
+    if (value < 1024 || unit === "TB") return `${value.toFixed(value >= 100 ? 0 : 1)} ${unit}`;
     value /= 1024;
   }
   return "-";
@@ -1105,17 +919,11 @@ function toggleExpanded(event, row) {
   if (!key) return;
   expanded.value = expanded.value.includes(key)
       ? expanded.value.filter((value) => value !== key)
-      : [...expanded.value, key];
+      : [...expanded.value, key]
 }
 
 function recordKey(record, index) {
-  return [
-    record.time,
-    record.file_name,
-    record.season,
-    record.episode,
-    index,
-  ].join(":");
+  return [record.time, record.file_name, record.season, record.episode, index].join(":");
 }
 
 function historyRetryKey(record) {
@@ -1132,17 +940,12 @@ function historyUpgradeRecordKey(record) {
 
 function canUpgradeRecord(record) {
   return (
-      record?.type !== "电影" &&
-      record?.status === "成功" &&
-      !record?.finalize_key &&
-      Number(record?.episode || 0) > 0
-  );
+      record?.type !== "电影" && record?.status === "成功" && !record?.finalize_key && Number(record?.episode || 0) > 0
+  )
 }
 
 function canUpgradeGroup(group) {
-  return (group?.records || []).some(
-      (record) => record?.status === "成功" && !record?.finalize_key,
-  );
+  return (group?.records || []).some((record) => record?.status === "成功" && !record?.finalize_key);
 }
 
 function upgradeRecord(record) {
@@ -1151,7 +954,7 @@ function upgradeRecord(record) {
     scope: "record",
     records: [record],
     key: historyUpgradeRecordKey(record),
-  });
+  })
 }
 
 function upgradeGroup(group) {
@@ -1165,11 +968,9 @@ function upgradeGroup(group) {
       media_type: group.type === "电影" ? "movie" : "tv",
       season: group.seasons.length === 1 ? group.seasons[0] : null,
     },
-    records: group.records.filter(
-        (record) => record?.status === "成功" && !record?.finalize_key,
-    ),
+    records: group.records.filter((record) => record?.status === "成功" && !record?.finalize_key),
     key: historyUpgradeGroupKey(group),
-  });
+  })
 }
 
 function isGroupSelected(group) {
@@ -1189,7 +990,7 @@ function deleteSelected() {
   emit("delete-groups", {
     groupCount: deletableSelectedGroups.value.length,
     records: deletableSelectedGroups.value.flatMap((group) => group.records),
-  });
+  })
 }
 
 function clearFilters() {

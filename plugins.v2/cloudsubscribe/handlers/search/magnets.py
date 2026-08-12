@@ -1,5 +1,6 @@
 """SeedHub、不太灵与聚影资源搜索。"""
 
+import re
 from typing import Any, Dict, List, Optional
 
 from app.log import logger
@@ -17,6 +18,8 @@ from ...utils import parse_magnet_metadata
 
 class ExternalResourceSearchService(OwnerDelegator):
     """适配外部资源服务并统一输出 CloudSubscribe 候选。"""
+
+    _BUTAILING_TITLE_SEPARATOR = re.compile(r"[：:～~]")
 
     @staticmethod
     def _media_titles(mediainfo: MediaInfo) -> List[str]:
@@ -41,7 +44,18 @@ class ExternalResourceSearchService(OwnerDelegator):
 
     @staticmethod
     def _butailing_keywords(titles: List[str]) -> List[str]:
-        return unique_texts(titles)
+        keywords = []
+        for title in titles:
+            text = str(title or "").strip()
+            if not text:
+                continue
+            short_title = ExternalResourceSearchService._BUTAILING_TITLE_SEPARATOR.split(
+                text, maxsplit=1
+            )[0].strip()
+            if len(short_title) >= 2 and short_title != text:
+                keywords.append(short_title)
+            keywords.append(text)
+        return unique_texts(keywords)
 
     def _normalize_magnets(
             self,
@@ -138,10 +152,6 @@ class ExternalResourceSearchService(OwnerDelegator):
         if not self._butailing_client:
             return []
         titles = self._media_titles(mediainfo)
-        tmdb_id = (
-                getattr(mediainfo, "tmdb_id", None)
-                or getattr(subscribe, "tmdbid", None)
-        )
         douban_id = (
             getattr(mediainfo, "douban_id", None)
             or getattr(subscribe, "doubanid", None)
@@ -157,7 +167,6 @@ class ExternalResourceSearchService(OwnerDelegator):
                 expected_year=getattr(mediainfo, "year", None),
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
-                tmdb_id=tmdb_id,
                 douban_id=douban_id,
                 imdb_id=imdb_id,
                 limit=(

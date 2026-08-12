@@ -4,14 +4,13 @@
       :api="api"
       :config="config"
       :allow-refresh="allowRefresh"
-      :refresh-interval="refreshInterval"
-  />
+      :refresh-interval="refreshInterval" />
   <div v-else ref="widgetRef" class="cloud-dashboard">
     <v-card :flat="cardFlat" :loading="loading" class="dashboard-card">
       <v-card-item class="dashboard-header">
         <template #prepend>
           <v-avatar color="primary" variant="tonal" size="36">
-            <v-icon icon="mdi-cloud-sync-outline" size="20"/>
+            <v-icon icon="mdi-cloud-sync-outline" size="20" />
           </v-avatar>
         </template>
         <v-card-title class="dashboard-title">{{ cardTitle }}</v-card-title>
@@ -20,32 +19,19 @@
 
       <v-card-text class="dashboard-body">
         <div v-if="loading && !loaded" class="dashboard-state">
-          <v-progress-circular indeterminate color="primary" size="28"/>
+          <v-progress-circular indeterminate color="primary" size="28" />
         </div>
-        <v-alert
-            v-else-if="error"
-            type="error"
-            variant="tonal"
-            density="compact"
-            class="text-caption"
-        >
+        <v-alert v-else-if="error" type="error" variant="tonal" density="compact" class="text-caption">
           {{ error }}
         </v-alert>
         <template v-else-if="loaded">
           <div class="runtime-line">
-            <span
-                class="runtime-mark"
-                :class="`runtime-mark--${statusColor}`"
-            />
+            <span class="runtime-mark" :class="`runtime-mark--${statusColor}`" />
             <div class="runtime-copy">
               <strong>{{ statusText }}</strong>
-              <span>{{
-                  overview.runtime?.task || "当前没有订阅处理任务"
-                }}</span>
+              <span>{{ overview.runtime?.task || "当前没有订阅处理任务" }}</span>
             </div>
-            <v-chip size="x-small" variant="tonal">
-              {{ activeTaskCount }} 个任务
-            </v-chip>
+            <v-chip size="x-small" variant="tonal">{{ activeTaskCount }} 个任务</v-chip>
           </div>
 
           <div class="metric-grid">
@@ -60,38 +46,24 @@
           <div v-if="recentHistory.length" class="recent-list">
             <div v-for="item in recentHistory" :key="historyKey(item)">
               <v-icon
-                  :icon="
-                  item.status === '成功'
-                    ? 'mdi-check-circle-outline'
-                    : 'mdi-alert-circle-outline'
-                "
+                  :icon="item.status === '成功' ? 'mdi-check-circle-outline' : 'mdi-alert-circle-outline'"
                   :color="item.status === '成功' ? 'success' : 'error'"
-                  size="16"
-              />
+                  size="16" />
               <span>{{ item.title || item.file_name || "未知媒体" }}</span>
               <small>{{ item.time || "" }}</small>
             </div>
           </div>
-          <div v-else class="dashboard-empty text-medium-emphasis">
-            暂无转存记录
-          </div>
+          <div v-else class="dashboard-empty text-medium-emphasis">暂无转存记录</div>
         </template>
       </v-card-text>
 
-      <v-divider v-if="allowRefresh"/>
+      <v-divider v-if="allowRefresh" />
       <v-card-actions v-if="allowRefresh" class="dashboard-actions">
         <span class="text-caption text-disabled">
           {{ refreshedText || "等待更新" }}
         </span>
-        <v-spacer/>
-        <v-btn
-            icon="mdi-refresh"
-            variant="text"
-            size="small"
-            :loading="loading"
-            title="刷新"
-            @click="loadOverview"
-        />
+        <v-spacer />
+        <v-btn icon="mdi-refresh" variant="text" size="small" :loading="loading" title="刷新" @click="loadOverview" />
       </v-card-actions>
     </v-card>
   </div>
@@ -107,7 +79,7 @@ const props = defineProps({
   config: {type: Object, default: () => ({attrs: {}})},
   allowRefresh: {type: Boolean, default: true},
   refreshInterval: {type: Number, default: 0},
-});
+})
 
 const loading = ref(false);
 const loaded = ref(false);
@@ -120,42 +92,36 @@ let runtimeStreamFailures = 0;
 let runtimeStreamDisabled = false;
 
 const attrs = computed(() => props.config?.attrs || {});
-const dashboardType = computed(
-    () => props.config?.key || attrs.value.dashboard || "overview",
-);
+const dashboardType = computed(() => props.config?.key || attrs.value.dashboard || "overview");
 const isCheckinDashboard = computed(() => dashboardType.value === "checkin");
 const cardTitle = computed(() => attrs.value.title || "网盘订阅助手");
-const cardSubtitle = computed(
-    () => attrs.value.subtitle || "订阅任务与转存概览",
-);
+const cardSubtitle = computed(() => attrs.value.subtitle || "订阅任务与转存概览");
 const cardFlat = computed(() => attrs.value.border === false);
 const refreshSeconds = computed(() => {
   const value = Number(props.refreshInterval || attrs.value.refresh || 0);
   return Number.isFinite(value) ? value : 0;
-});
-const recentHistory = computed(() =>
-    (overview.value.recent_history || []).slice(0, 3),
-);
+})
+const recentHistory = computed(() => (overview.value.recent_history || []).slice(0, 3));
 const activeTaskCount = computed(
     () =>
         (overview.value.runtime?.tasks || []).filter((task) =>
             ["queued", "running", "stopping", "postprocessing"].includes(task.status),
         ).length,
-);
+)
 const statusColor = computed(() =>
     ["starting", "running"].includes(overview.value.runtime?.status)
         ? "primary"
         : overview.value.runtime?.status === "stopping"
             ? "warning"
             : "success",
-);
+)
 const statusText = computed(() =>
     ["starting", "running"].includes(overview.value.runtime?.status)
         ? "正在运行"
         : overview.value.runtime?.status === "stopping"
             ? "正在停止"
             : "当前空闲",
-);
+)
 const refreshedText = computed(() =>
     refreshedAt.value
         ? `更新于 ${new Date(refreshedAt.value).toLocaleTimeString("zh-CN", {
@@ -164,7 +130,7 @@ const refreshedText = computed(() =>
           minute: "2-digit",
         })}`
         : "",
-);
+)
 
 function historyKey(item) {
   return [item.time, item.file_name, item.share_url].join("|");
@@ -175,14 +141,12 @@ async function loadOverview() {
   loading.value = true;
   error.value = "";
   try {
-    const result = await props.api.get(
-        "plugin/CloudSubscribe/overview?include_runtime=false",
-    );
+    const result = await props.api.get("plugin/CloudSubscribe/overview?include_runtime=false");
     if (!result?.success) throw new Error(result?.message || "获取数据失败");
     overview.value = {
       ...overview.value,
       ...(result.data || {}),
-    };
+    }
     loaded.value = true;
     refreshedAt.value = Date.now();
   } catch (e) {
@@ -195,10 +159,8 @@ async function loadOverview() {
 function runtimeIsActive(value) {
   return (
       ["starting", "running", "stopping"].includes(value?.status) ||
-      (value?.tasks || []).some((task) =>
-          ["queued", "running", "stopping", "postprocessing"].includes(task.status),
-      )
-  );
+      (value?.tasks || []).some((task) => ["queued", "running", "stopping", "postprocessing"].includes(task.status))
+  )
 }
 
 function isPageVisible() {
@@ -234,12 +196,11 @@ function scheduleFallbackRefresh(delay = refreshSeconds.value * 1000) {
         scheduleFallbackRefresh();
       },
       Math.max(1000, Number(delay) || 0),
-  );
+  )
 }
 
 function openRuntimeStream() {
-  if (runtimeStreamDisabled || runtimeStream || refreshSeconds.value <= 0)
-    return false;
+  if (runtimeStreamDisabled || runtimeStream || refreshSeconds.value <= 0) return false;
   const source = connectRuntimeStream("CloudSubscribe", {
     onOpen() {
       runtimeStreamFailures = 0;
@@ -259,7 +220,7 @@ function openRuntimeStream() {
       runtimeStreamDisabled = true;
       scheduleFallbackRefresh(1000);
     },
-  });
+  })
   if (!source) return false;
   runtimeStream = source;
   return true;
@@ -267,8 +228,7 @@ function openRuntimeStream() {
 
 function startAutoRefresh() {
   stopAutoRefresh();
-  if (isCheckinDashboard.value || refreshSeconds.value <= 0 || !isPageVisible())
-    return;
+  if (isCheckinDashboard.value || refreshSeconds.value <= 0 || !isPageVisible()) return;
   if (!openRuntimeStream()) scheduleFallbackRefresh();
 }
 
@@ -287,18 +247,18 @@ watch(refreshSeconds, () => {
   runtimeStreamDisabled = false;
   runtimeStreamFailures = 0;
   startAutoRefresh();
-});
+})
 
 onMounted(() => {
   if (isCheckinDashboard.value) return;
   document.addEventListener("visibilitychange", handleVisibilityChange);
   void loadOverview().finally(startAutoRefresh);
-});
+})
 
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopAutoRefresh();
-});
+})
 </script>
 
 <style scoped>
