@@ -65,7 +65,6 @@ class PanSouSearchService(OwnerDelegator):
             filter_config={} if test_mode else self._pansou_filter,
             refresh=self._pansou_refresh,
             concurrency=self._pansou_concurrency,
-            test_mode=test_mode,
         )
 
         search_prefix = (
@@ -135,7 +134,7 @@ class PanSouSearchService(OwnerDelegator):
             if test_mode
                or resource.get("resource_type") != "magnet"
                or resource.get("magnet_metadata")
-            if test_mode or self._pansou_media_type_matches(resource, media_type)
+            if self._pansou_media_type_matches(resource, media_type)
         ]
         logger.debug(
             f"{search_prefix} 查询完成：原始条目={int(search_results.get('raw_count') or 0)}，"

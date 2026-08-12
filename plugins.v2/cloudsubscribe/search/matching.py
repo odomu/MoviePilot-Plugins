@@ -2,18 +2,28 @@
 
 import html
 import re
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import unicodedata
 
 _TITLE_SEPARATOR_RE = re.compile(
-    r"[\s\u3000\-_:：·•丨｜|¦.,，。!！?？'\"“”‘’()（）\[\]【】/\\]+"
+    r"[\s\u3000\-_:：~～·•丨｜|¦.,，。!！?？'\"“”‘’()（）\[\]【】/\\]+"
+)
+_ROMAN_SEASON_PATTERN = re.compile(
+    r"(?i)(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])"
+    r"[\s\u3000._-]*(VIII|VII|VI|IV|III|II|IX|X|V|I)"
+    r"(?=$|[\s\u3000._:：~～-])"
 )
 _SEASON_PATTERNS = (
     re.compile(r"(?i)\bS(?:eason)?[ ._-]*0*(\d{1,3})\b"),
     re.compile(r"(?i)\bSeason[ ._-]*0*(\d{1,3})\b"),
+    _ROMAN_SEASON_PATTERN,
     re.compile(r"第\s*([零〇一二两三四五六七八九十百\d]{1,6})\s*季"),
 )
+_ROMAN_NUMBERS = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+    "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
+}
 
 
 def unique_texts(
@@ -30,6 +40,28 @@ def unique_texts(
         if text and text not in seen:
             seen.add(text)
             result.append(text)
+    return result
+
+
+def media_identifier_queries(
+        tmdb_id: object = None,
+        douban_id: object = None,
+        imdb_id: object = None,
+) -> List[Tuple[str, str, str]]:
+    """按统一优先级返回可用的媒体 ID 查询：TMDB、豆瓣、IMDb。"""
+    result = []
+    seen = set()
+    for label, value, response_field in (
+            ("TMDB", tmdb_id, "tmdb_id"),
+            ("豆瓣", douban_id, "douban_id"),
+            ("IMDb", imdb_id, "imdb_id"),
+    ):
+        query = str(value or "").strip()
+        normalized = query.casefold()
+        if not query or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append((label, query, response_field))
     return result
 
 
@@ -83,6 +115,8 @@ def extract_season(value: object) -> Optional[int]:
             continue
         if index < 2:
             return int(matched.group(1))
+        if pattern is _ROMAN_SEASON_PATTERN:
+            return _ROMAN_NUMBERS.get(matched.group(1).upper())
         return _chinese_number(matched.group(1))
     return None
 

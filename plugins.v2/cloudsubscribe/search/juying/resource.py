@@ -8,7 +8,13 @@ from urllib.parse import urlparse
 from app.log import logger
 
 from .client import JuyingClient, JuyingError
-from ..matching import extract_season, extract_year, normalize_title, title_matches
+from ..matching import (
+    extract_season,
+    extract_year,
+    media_identifier_queries,
+    normalize_title,
+    title_matches,
+)
 from ..types import (
     RESOURCE_TYPE_ORDER,
     SUPPORTED_RESOURCE_TYPES,
@@ -84,9 +90,51 @@ class JuyingResourceService:
         return best[2] if best is not None else None
 
     def _find_movie(self, title: str, alternative_titles: List[str], year: str,
-                    media_type: str, tmdb_id: Optional[int]):
+                    media_type: str, tmdb_id: Optional[object],
+                    douban_id: Optional[object], imdb_id: Optional[object]):
         titles = list(dict.fromkeys(str(value).strip() for value in [title, *alternative_titles]
                                     if str(value or "").strip()))
+        identifier_queries = media_identifier_queries(
+            tmdb_id=tmdb_id,
+            douban_id=douban_id,
+            imdb_id=imdb_id,
+        )
+        for label, query, response_field in identifier_queries:
+            normalized_query = query.casefold()
+            payload = self._client.request_json(
+                "GET",
+                "/api/app/movies/",
+                params={
+                    "q": query,
+                    "page": 1,
+                    "page_size": 24,
+                    "exact": 1,
+                    "count": 1,
+                },
+            )
+            rows = [
+                row for row in (payload.get("results") or [])
+                if isinstance(row, dict)
+            ]
+            if not rows:
+                continue
+            selected = next(
+                (
+                    row for row in rows
+                    if str(row.get(response_field) or "").strip().casefold()
+                       == normalized_query
+                ),
+                None,
+            )
+            if not selected:
+                logger.debug(f"[JUYING] {label} ID 查询未返回精确匹配：{query}")
+                continue
+            logger.debug(
+                f"[JUYING] {label} ID 精确命中媒体："
+                f"{selected.get('title') or selected.get('id') or query}"
+            )
+            return selected
+
         attempted = set()
         for query in titles:
             for query_year in ([year, ""] if year else [""]):
@@ -155,15 +203,15 @@ class JuyingResourceService:
         return f"{text}GB" if re.fullmatch(r"\d+(?:\.\d+)?", text) else text
 
     def _load_search_context(self, title: str, alternative_titles: List[str], year: str,
-                             media_type: str, tmdb_id: Optional[int], season: Optional[int],
+                             media_type: str, tmdb_id: Optional[object],
+                             douban_id: Optional[object], imdb_id: Optional[object],
+                             season: Optional[int],
                              force: bool = False,
-                             filter_season: bool = True,
-                             test_mode: bool = False,
-                             result_limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        cache_key = (media_type, tmdb_id or 0, normalize_title(title),
+                             filter_season: bool = True) -> List[Dict[str, Any]]:
+        cache_key = (media_type, tmdb_id or 0, str(douban_id or ""),
+                     str(imdb_id or "").casefold(), normalize_title(title),
                      tuple(normalize_title(item) for item in alternative_titles), year,
-                     season or 0, bool(filter_season), bool(test_mode),
-                     int(result_limit or 0))
+                     season or 0, bool(filter_season))
         cache_key = normalize_platform_cache_key(cache_key)
         if not force:
             cached = self._search_cache.get(cache_key)
@@ -171,7 +219,8 @@ class JuyingResourceService:
                 logger.debug(f"[JUYING] 资源搜索缓存命中，候选 {len(cached)} 个")
                 return [dict(item) for item in cached]
         movie = self._find_movie(
-            title, alternative_titles, year, media_type, tmdb_id,
+            title, alternative_titles, year, media_type,
+            tmdb_id, douban_id, imdb_id,
         )
         if not movie:
             self._search_cache.set(cache_key, [])
@@ -182,9 +231,9 @@ class JuyingResourceService:
             return []
         source_url = f"{self._client.base_url}/movie/{movie_id}"
         context = {"title": title, "alternative_titles": alternative_titles, "year": year,
-                   "media_type": media_type, "tmdb_id": tmdb_id, "season": season,
-                   "filter_season": filter_season, "test_mode": test_mode,
-                   "result_limit": result_limit}
+                   "media_type": media_type, "tmdb_id": tmdb_id,
+                   "douban_id": douban_id, "imdb_id": imdb_id, "season": season,
+                   "filter_season": filter_season}
         public_rows = []
         for row in self._load_resources(movie_id):
             resource_type = self._resource_type(row)
@@ -311,7 +360,9 @@ class JuyingResourceService:
             return self._resolve_resource(str(resource_id or "").strip())
 
     def search(self, title: str, alternative_titles: Iterable[str], year: object,
-               media_type: str, tmdb_id: Optional[int], season: Optional[int],
+               media_type: str, tmdb_id: Optional[object],
+               douban_id: Optional[object], imdb_id: Optional[object],
+               season: Optional[int],
                resource_type_order: Iterable[str], limit: int = 5,
                test_mode: bool = False) -> List[Dict[str, Any]]:
         normalized_limit = max(1, min(int(limit or 5), 80))
@@ -330,10 +381,8 @@ class JuyingResourceService:
         with self._lock:
             rows = self._load_search_context(str(title or "").strip(), alternatives,
                                              extract_year(year), "tv" if media_type == "tv" else "movie",
-                                             tmdb_id, season,
-                                             filter_season=not test_mode,
-                                             test_mode=test_mode,
-                                             result_limit=normalized_limit)
+                                             tmdb_id, douban_id, imdb_id, season,
+                                             filter_season=not test_mode)
             order_map = {value: index for index, value in enumerate(allowed_order)}
             fallback_order = len(allowed_order)
             rows.sort(

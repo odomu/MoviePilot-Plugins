@@ -73,7 +73,6 @@ class SourceDispatchService(OwnerDelegator):
                 season,
                 subscribe=subscribe,
                 raise_errors=test_mode,
-                test_mode=test_mode,
                 result_limit=result_limit,
             )
         if source == "juying":
@@ -81,6 +80,7 @@ class SourceDispatchService(OwnerDelegator):
                 mediainfo,
                 media_type,
                 season,
+                subscribe=subscribe,
                 raise_errors=test_mode,
                 test_mode=test_mode,
                 result_limit=result_limit,
@@ -139,8 +139,8 @@ class SourceDispatchService(OwnerDelegator):
             target_episodes=target_episodes,
         )
 
-    def test_source_result_limit(self, source: str) -> int:
-        """搜索测试固定返回 10 条，不读取正式搜索的候选上限配置。"""
+    def test_source_result_limit(self) -> int:
+        """搜索测试固定展示 10 条，不读取正式搜索的候选上限配置。"""
         return self._TEST_RESULT_LIMIT
 
     def resolve_juying_resource(self, resource_id: str) -> Dict[str, Any]:
@@ -148,6 +148,18 @@ class SourceDispatchService(OwnerDelegator):
         if not self._juying_resources:
             raise ValueError("聚影搜索客户端未配置")
         return self._juying_resources.resolve_resource(resource_id)
+
+    def resolve_seedhub_resource(self, **kwargs) -> Dict[str, Any]:
+        """按需解析搜索测试选中的 SeedHub 候选。"""
+        if not self._seedhub_client:
+            raise ValueError("SeedHub 搜索客户端未配置")
+        return self._seedhub_client.resolve_resource(**kwargs)
+
+    def resolve_pinglian_resource(self, **kwargs) -> Dict[str, Any]:
+        """按需解析搜索测试选中的盘链候选。"""
+        if not self._pinglian_client:
+            raise ValueError("盘链搜索客户端未配置")
+        return self._pinglian_client.resolve_resource(**kwargs)
 
     def test_source(
             self,
@@ -175,14 +187,13 @@ class SourceDispatchService(OwnerDelegator):
         }.get(source)
         if client:
             client.clear_cache()
-        source_result_limit = self.test_source_result_limit(source)
         results = self._run_source_search(
             source, mediainfo, media_type, season, test_mode=True,
-            result_limit=source_result_limit,
+            result_limit=self._TEST_RESULT_LIMIT,
         ) or []
         for result in results:
             result.setdefault("source", source)
-        return list(results)[:source_result_limit]
+        return list(results)[:self._TEST_RESULT_LIMIT]
 
     def search_single_source(
             self,

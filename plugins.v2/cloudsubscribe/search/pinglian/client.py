@@ -403,17 +403,7 @@ class PinglianClient:
         return best[2] if best is not None else None
 
     @staticmethod
-    def _first_video(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        return next(
-            (
-                dict(row) for row in rows
-                if isinstance(row, dict) and str(row.get("vod_id") or "").strip()
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _append_password(resource_type: str, target: str, password: str) -> str:
+    def _append_password(resource_type: str, target: str, password: str) -> str | bytes:
         password = str(password or "").strip()
         if not password:
             return target
@@ -449,6 +439,24 @@ class PinglianClient:
         if actual_type != expected_type:
             raise PinglianError("盘链资源跳转类型异常", "pinglian_invalid_link")
         return target
+
+    def resolve_resource(
+            self, token: str, resource_type: str, password: str = ""
+    ) -> Dict[str, str | bytes]:
+        """解析测试列表中用户选中的单条盘链资源。"""
+        token = str(token or "").strip()
+        expected_type = normalize_resource_type(resource_type)
+        if (
+                not token or len(token) > 512
+                or any(character.isspace() for character in token)
+                or expected_type not in SUPPORTED_RESOURCE_TYPES
+        ):
+            raise PinglianError("盘链资源标识无效", "pinglian_invalid_token")
+        target = self._resolve_token(token, expected_type)
+        return {
+            "url": self._append_password(expected_type, target, password),
+            "resource_type": expected_type,
+        }
 
     def get_account_info(self) -> Dict[str, Any]:
         """从个人中心读取账户、会员和金币信息。"""
@@ -515,10 +523,7 @@ class PinglianClient:
                 logger.debug(
                     f"{prefix} get_videos：关键词={keyword}，条目={len(rows)}"
                 )
-                video = (
-                    self._first_video(rows) if test_mode
-                    else self._select_video(rows, titles, expected_year)
-                )
+                video = self._select_video(rows, titles, expected_year)
                 if video:
                     selected_keyword = keyword
                     break
@@ -622,6 +627,23 @@ class PinglianClient:
                         logger.debug(f"{prefix} 跳过类型不匹配的直链")
                         continue
                     direct_count += 1
+                elif test_mode:
+                    results.append({
+                        "title": str(row.get("title") or "盘链资源").strip(),
+                        "description": str(row.get("source") or "").strip(),
+                        "url": "",
+                        "resource_type": resource_type,
+                        "pan_type": resource_type,
+                        "update_time": str(row.get("time") or ""),
+                        "source": "pinglian",
+                        "source_service": "pinglian",
+                        "source_url": source_url,
+                        "pinglian_resource_id": str(row.get("id") or ""),
+                        "pinglian_token": token,
+                        "pinglian_password": str(row.get("password") or ""),
+                        "pending_resolution": True,
+                    })
+                    continue
                 else:
                     try:
                         target = self._resolve_token(token, resource_type)

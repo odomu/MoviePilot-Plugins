@@ -1120,6 +1120,8 @@ class HistoryService(OwnerDelegator):
         if repaired:
             logger.info(f"已自动修复 {repaired} 条 STRM 已存在但状态未完成的历史记录")
             self._record_platform_transfer_histories(repaired_records)
+            if self._history_changed:
+                self._history_changed()
         return repaired
 
     def _pending_history_record(self, pending_key: str) -> Optional[Dict[str, Any]]:
@@ -1400,6 +1402,8 @@ class HistoryService(OwnerDelegator):
             if changed:
                 self._save_data("history", history)
         self._record_platform_transfer_histories(platform_records)
+        if changed and self._history_changed:
+            self._history_changed()
 
     def get_pending_finalize_tasks(self) -> List[Dict[str, Any]]:
         """返回等待115文件就绪、重命名或生成STRM的持久任务。"""

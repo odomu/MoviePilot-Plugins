@@ -6,7 +6,13 @@ import time
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..http_client import RequestGate, gated_request, normalize_proxies, requests
-from ..matching import extract_season, extract_year, title_matches, unique_texts
+from ..matching import (
+    extract_season,
+    extract_year,
+    media_identifier_queries,
+    title_matches,
+    unique_texts,
+)
 from ...utils.cache import create_platform_ttl_cache
 
 
@@ -28,6 +34,7 @@ class ButailingClient:
             identity: str = _DEFAULT_IDENTITY,
             proxy: Any = None,
             request_timeout: int = 30,
+            request_interval: float = 0.3,
     ):
         self.base_url = str(base_url or self._DEFAULT_BASE_URL).rstrip("/") + "/"
         self._app_id = str(app_id or self._DEFAULT_APP_ID)
@@ -46,7 +53,7 @@ class ButailingClient:
         self._request_gate = RequestGate.shared(
             "不太灵",
             f"{cache_identity}|{self._proxies}",
-            request_interval=0.3,
+            request_interval=request_interval,
             minimum_interval=0.2,
             serial_requests=False,
         )
@@ -132,10 +139,14 @@ class ButailingClient:
             expected_year: str,
             media_type: str,
             season: Optional[int],
-            douban_id: Optional[int],
+            douban_id: Optional[object],
+            imdb_id: Optional[object] = None,
     ) -> Optional[Dict[str, Any]]:
         target_type = 2 if media_type == "tv" else 1
-        best = None
+        expected_douban_id = str(douban_id or "").strip()
+        expected_imdb_id = str(imdb_id or "").strip().casefold()
+        best_title_match = None
+        best_external_id_match = None
         for index, row in enumerate(rows):
             try:
                 row_type = int(row.get("type") or 0)
@@ -144,12 +155,21 @@ class ButailingClient:
             if row_type != target_type:
                 continue
             candidate_titles = self._candidate_titles(row)
-            exact_douban = bool(
-                douban_id and str(row.get("doub_id") or "") == str(douban_id)
+            exact_external_id = bool(
+                expected_douban_id
+                and expected_douban_id in {
+                    str(row.get("doub_id") or "").strip(),
+                    str(row.get("idcode") or "").strip(),
+                }
+            ) or bool(
+                expected_imdb_id
+                and str(row.get("IMDB_number") or "").strip().casefold()
+                == expected_imdb_id
             )
-            if not exact_douban and not any(
-                    title_matches(value, expected_titles) for value in candidate_titles
-            ):
+            matched_title = any(
+                title_matches(value, expected_titles) for value in candidate_titles
+            )
+            if not exact_external_id and not matched_title:
                 continue
             candidate_season = next(
                 (value for value in map(extract_season, candidate_titles) if value),
@@ -157,11 +177,14 @@ class ButailingClient:
             )
             if season and candidate_season and candidate_season != season:
                 continue
+            if season and season > 1 and candidate_season is None:
+                # 系列级 ID 和作品标题常指向第一季，不能据此把无季号条目当成续季。
+                continue
             candidate_year = extract_year(row.get("years") or row.get("release"))
             if media_type == "movie" and expected_year:
                 if not candidate_year or candidate_year != expected_year:
                     continue
-            score = 1000 if exact_douban else 100
+            score = 1000 if exact_external_id else 100
             if candidate_year and candidate_year == expected_year:
                 score += 40
             if season and candidate_season == season:
@@ -169,9 +192,20 @@ class ButailingClient:
             elif season and candidate_season is None:
                 score += 10
             ranked = (score, -index, row)
-            if best is None or (score, -index) > (best[0], best[1]):
-                best = ranked
-        return best[2] if best is not None else None
+            if exact_external_id:
+                if (
+                        best_external_id_match is None
+                        or (score, -index) > best_external_id_match[:2]
+                ):
+                    best_external_id_match = ranked
+            elif matched_title:
+                if (
+                        best_title_match is None
+                        or (score, -index) > best_title_match[:2]
+                ):
+                    best_title_match = ranked
+        best = best_external_id_match or best_title_match
+        return best[2] if best else None
 
     def search(
             self,
@@ -180,9 +214,10 @@ class ButailingClient:
             expected_year: object,
             media_type: str,
             season: Optional[int] = None,
-            douban_id: Optional[int] = None,
+            tmdb_id: Optional[object] = None,
+            douban_id: Optional[object] = None,
+            imdb_id: Optional[object] = None,
             limit: int = 20,
-            test_mode: bool = False,
     ) -> List[Dict[str, Any]]:
         titles = [str(value).strip() for value in expected_titles if str(value or "").strip()]
         normalized_keywords = unique_texts(keywords)
@@ -190,15 +225,23 @@ class ButailingClient:
             return []
         normalized_limit = max(1, min(int(limit or 20), 80))
         year = extract_year(expected_year)
+        identifier_keywords = [
+            query for _, query, _ in media_identifier_queries(
+                tmdb_id=tmdb_id,
+                douban_id=douban_id,
+                imdb_id=imdb_id,
+            )
+        ]
+        search_keywords = unique_texts((*identifier_keywords, *normalized_keywords))
         cache_key = (tuple(normalized_keywords), tuple(titles), year, media_type,
-                     season, douban_id, bool(test_mode))
+                     season, tmdb_id, douban_id, imdb_id)
         lock = self._search_locks[hash(cache_key) % len(self._search_locks)]
         with lock:
             selected = None
-            for keyword in normalized_keywords:
+            for keyword in search_keywords:
                 rows = self._search_rows(keyword)
                 selected = self._select_row(
-                    rows, titles, year, media_type, season, douban_id
+                    rows, titles, year, media_type, season, douban_id, imdb_id
                 )
                 if selected:
                     break

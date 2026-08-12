@@ -179,14 +179,17 @@
                 class="source-test-error mt-3"
             >
               {{ testError }}
-              <span v-if="testElapsed != null">（耗时 {{ formatElapsed(testElapsed) }}）</span>
+              <span v-if="testElapsed != null"
+              >（耗时 {{ formatElapsed(testElapsed) }}）</span
+              >
             </v-alert>
             <div
                 v-if="tmdbSearched && !testSubmitted"
                 class="source-test-tmdb mt-3"
             >
               <div class="text-caption text-medium-emphasis mb-2">
-                选择 TMDB 条目后将立即测试 {{ sourceNames[sourceTest.source] }}
+                选择平台媒体条目后将一次读取完整媒体 ID，并立即测试
+                {{ sourceNames[sourceTest.source] }}
               </div>
               <div v-if="testingSource" class="source-test-loading">
                 <v-progress-circular
@@ -251,31 +254,37 @@
                   </v-list-item>
                 </v-list>
                 <v-alert v-else type="info" variant="tonal" density="compact">
-                  TMDB 未找到匹配条目
+                  平台未找到匹配媒体条目
                 </v-alert>
               </div>
             </div>
             <div v-if="testSubmitted" class="source-test-result">
               <div class="source-test-summary">
                 <div class="source-test-summary__line">
-                  <span class="source-test-summary__context">
-                    {{ testResult.media || "搜索结果" }}
-                  </span>
                   <span>
-                    本次获取 <strong>{{ testResult.count || 0 }}</strong> 个搜索结果
+                    本次获取
+                    <strong>{{ testResult.count || 0 }}</strong> 个搜索结果
                   </span>
                   <span>
                     当前展示
-                    <strong>{{ testResult.displayed_count ?? (testResult.items || []).length }}</strong>
+                    <strong>{{
+                        testResult.displayed_count ??
+                        (testResult.items || []).length
+                      }}</strong>
                     个
                   </span>
                   <span v-if="testResult.elapsed_seconds != null">
-                    耗时 <strong>{{ formatElapsed(testResult.elapsed_seconds) }}</strong>
+                    耗时
+                    <strong>{{
+                        formatElapsed(testResult.elapsed_seconds)
+                      }}</strong>
                   </span>
                 </div>
               </div>
               <div class="source-test-notice text-medium-emphasis mb-3">
-                搜索测试固定最多获取并展示 {{ testResult.display_limit }} 个候选，不受正式搜索候选上限配置影响
+                搜索测试固定最多展示
+                {{ testResult.display_limit }}
+                个候选，不受正式搜索候选上限配置影响
               </div>
               <v-tabs
                   v-if="testResourceTabs.length > 1"
@@ -322,7 +331,9 @@
                             :rel="
                             item.source_url ? 'noopener noreferrer' : undefined
                           "
-                            :title="item.source_url ? '打开来源资源页' : undefined"
+                            :title="
+                            item.source_url ? '打开来源资源页' : undefined
+                          "
                         >
                           {{
                             item.source_name ||
@@ -369,8 +380,13 @@
                               size="x-small"
                               variant="text"
                               title="获取资源链接"
-                              :loading="accessingResource === previewResourceKey(item)"
-                              :disabled="Boolean(previewingUrl) || Boolean(accessingResource)"
+                              :loading="
+                              accessingResource === previewResourceKey(item)
+                            "
+                              :disabled="
+                              Boolean(previewingUrl) ||
+                              Boolean(accessingResource)
+                            "
                               @click="accessResource(item)"
                           />
                           <v-btn
@@ -378,11 +394,21 @@
                               icon="mdi-eye-outline"
                               size="x-small"
                               variant="text"
-                              :title="String(item?.source || '').toLowerCase() === 'hdhive'
-                                ? (item?.is_unlocked ? '预览已解锁分享内容' : '只读预览资源内容')
-                                : '预览资源内容'"
-                              :loading="previewingUrl === previewResourceKey(item)"
-                              :disabled="Boolean(previewingUrl) || Boolean(accessingResource)"
+                              :title="
+                              String(item?.source || '').toLowerCase() ===
+                              'hdhive'
+                                ? item?.is_unlocked
+                                  ? '预览已解锁分享内容'
+                                  : '只读预览资源内容'
+                                : '预览资源内容'
+                            "
+                              :loading="
+                              previewingUrl === previewResourceKey(item)
+                            "
+                              :disabled="
+                              Boolean(previewingUrl) ||
+                              Boolean(accessingResource)
+                            "
                               @click="previewResource(item)"
                           />
                           <v-btn
@@ -457,62 +483,140 @@
               title="复制网盘链接"
               @click="copyText(previewMeta.share_url, '网盘链接')"
           />
-          <v-btn icon="mdi-close" size="small" variant="text" title="关闭" @click="previewVisible = false"/>
+          <v-btn
+              icon="mdi-close"
+              size="small"
+              variant="text"
+              title="关闭"
+              @click="previewVisible = false"
+          />
         </v-card-title>
         <v-card-text class="source-preview-body">
           <div
-              v-if="previewMeta.display_name || previewMeta.info_hash || previewMeta.size || previewMeta.provider_name || previewMeta.share_url"
-              class="source-preview-meta text-caption text-medium-emphasis">
-            <span v-if="previewMeta.provider_name">网盘: {{ previewMeta.provider_name }}</span>
-            <span v-if="previewMeta.resource_type_name">类型: {{ previewMeta.resource_type_name }}</span>
-            <span v-if="previewMeta.display_name" class="source-preview-meta__title">标题: {{
-                previewMeta.display_name
-              }}</span>
-            <span v-if="previewMeta.info_hash">Info Hash: {{ previewMeta.info_hash }}</span>
-            <span v-if="previewMeta.size">总大小: {{ formatPreviewSize(previewMeta.size) }}</span>
+              v-if="
+              previewMeta.display_name ||
+              previewMeta.info_hash ||
+              previewMeta.size ||
+              previewMeta.provider_name ||
+              previewMeta.share_url
+            "
+              class="source-preview-meta text-caption text-medium-emphasis"
+          >
+            <span v-if="previewMeta.provider_name"
+            >网盘: {{ previewMeta.provider_name }}</span
+            >
+            <span v-if="previewMeta.resource_type_name"
+            >类型: {{ previewMeta.resource_type_name }}</span
+            >
+            <span
+                v-if="previewMeta.display_name"
+                class="source-preview-meta__title"
+            >标题: {{ previewMeta.display_name }}</span
+            >
+            <span v-if="previewMeta.info_hash"
+            >Info Hash: {{ previewMeta.info_hash }}</span
+            >
+            <span v-if="previewMeta.size"
+            >总大小: {{ formatPreviewSize(previewMeta.size) }}</span
+            >
             <span>当前层项目数: {{ previewItems.length }}</span>
           </div>
-          <div v-if="previewBreadcrumbs.length > 1" class="source-preview-breadcrumbs">
-            <template v-for="(breadcrumb, index) in previewBreadcrumbs" :key="`${breadcrumb.id}-${index}`">
+          <div
+              v-if="previewBreadcrumbs.length > 1"
+              class="source-preview-breadcrumbs"
+          >
+            <template
+                v-for="(breadcrumb, index) in previewBreadcrumbs"
+                :key="`${breadcrumb.id}-${index}`"
+            >
               <v-icon v-if="index" icon="mdi-chevron-right" size="small"/>
-              <v-btn size="small" variant="text" :disabled="previewLoading || index === previewBreadcrumbs.length - 1"
-                     @click="openPreviewBreadcrumb(index)">
+              <v-btn
+                  size="small"
+                  variant="text"
+                  :disabled="
+                  previewLoading || index === previewBreadcrumbs.length - 1
+                "
+                  @click="openPreviewBreadcrumb(index)"
+              >
                 {{ breadcrumb.name }}
               </v-btn>
             </template>
           </div>
           <div v-if="previewLoading" class="source-preview-loading">
-            <v-progress-circular indeterminate color="primary" size="44" width="4"/>
+            <v-progress-circular
+                indeterminate
+                color="primary"
+                size="44"
+                width="4"
+            />
           </div>
-          <v-alert v-if="previewError" type="error" variant="tonal" density="compact" class="my-3">
+          <v-alert
+              v-if="previewError"
+              type="error"
+              variant="tonal"
+              density="compact"
+              class="my-3"
+          >
             {{ previewError }}
           </v-alert>
-          <div v-else-if="!previewLoading && previewItems.length" class="source-preview-list-scroll">
+          <div
+              v-else-if="!previewLoading && previewItems.length"
+              class="source-preview-list-scroll"
+          >
             <v-list density="compact" lines="one" class="source-preview-list">
-              <template v-for="(file, index) in previewItems" :key="`${file.name}-${index}`">
-                <v-list-item class="source-preview-file" :class="{'source-preview-file--directory': file.can_enter}"
-                             @click="file.can_enter && openPreviewFolder(file)">
+              <template
+                  v-for="(file, index) in previewItems"
+                  :key="`${file.name}-${index}`"
+              >
+                <v-list-item
+                    class="source-preview-file"
+                    :class="{ 'source-preview-file--directory': file.can_enter }"
+                    @click="file.can_enter && openPreviewFolder(file)"
+                >
                   <template #prepend>
                     <v-icon :icon="previewFileIcon(file)"/>
                   </template>
-                  <v-list-item-title class="source-preview-file-name" :title="file.name">
-                    <span v-if="file.is_dir" class="source-preview-file-stem">{{ file.name }}</span>
-                    <template v-else><span class="source-preview-file-stem">{{ previewFileStem(file.name) }}</span><span
-                        class="source-preview-file-extension">{{ previewFileExtension(file.name) }}</span></template>
+                  <v-list-item-title
+                      class="source-preview-file-name"
+                      :title="file.name"
+                  >
+                    <span v-if="file.is_dir" class="source-preview-file-stem">{{
+                        file.name
+                      }}</span>
+                    <template v-else
+                    ><span class="source-preview-file-stem">{{
+                        previewFileStem(file.name)
+                      }}</span
+                    ><span class="source-preview-file-extension">{{
+                        previewFileExtension(file.name)
+                      }}</span></template
+                    >
                   </v-list-item-title>
                   <template #append>
-                <span v-if="formatPreviewSize(file.size)"
-                      class="source-preview-file-size text-caption text-medium-emphasis">
+                    <span
+                        v-if="formatPreviewSize(file.size)"
+                        class="source-preview-file-size text-caption text-medium-emphasis"
+                    >
                   {{ formatPreviewSize(file.size) }}
                 </span>
-                    <v-icon v-if="file.can_enter" icon="mdi-chevron-right" size="small" class="ml-2"/>
+                    <v-icon
+                        v-if="file.can_enter"
+                        icon="mdi-chevron-right"
+                        size="small"
+                        class="ml-2"
+                    />
                   </template>
                 </v-list-item>
                 <v-divider v-if="index < previewItems.length - 1"/>
               </template>
             </v-list>
           </div>
-          <v-alert v-else-if="!previewLoading && !previewError" type="info" variant="tonal" density="compact">
+          <v-alert
+              v-else-if="!previewLoading && !previewError"
+              type="info"
+              variant="tonal"
+              density="compact"
+          >
             当前目录为空
           </v-alert>
         </v-card-text>
@@ -525,19 +629,42 @@
           解锁资源
         </v-card-title>
         <v-card-text>
-          <p class="mb-3">确认消耗 {{ Number(unlockItem?.unlock_points || 0) }} 积分解锁此资源？</p>
-          <div class="text-body-2 text-medium-emphasis text-truncate" :title="unlockItem?.title || ''">
+          <p class="mb-3">
+            确认消耗
+            {{ Number(unlockItem?.unlock_points || 0) }} 积分解锁此资源？
+          </p>
+          <div
+              class="text-body-2 text-medium-emphasis text-truncate"
+              :title="unlockItem?.title || ''"
+          >
             {{ unlockItem?.title || "未命名资源" }}
           </div>
-          <v-alert v-if="unlockError" type="error" variant="tonal" density="compact" class="mt-4">
+          <v-alert
+              v-if="unlockError"
+              type="error"
+              variant="tonal"
+              density="compact"
+              class="mt-4"
+          >
             {{ unlockError }}
           </v-alert>
         </v-card-text>
         <v-card-actions>
           <v-spacer/>
-          <v-btn variant="text" :disabled="unlocking" @click="unlockVisible = false">取消</v-btn>
-          <v-btn color="warning" variant="flat" prepend-icon="mdi-lock-open-outline" :loading="unlocking"
-                 @click="unlockResource">确认解锁
+          <v-btn
+              variant="text"
+              :disabled="unlocking"
+              @click="unlockVisible = false"
+          >取消
+          </v-btn
+          >
+          <v-btn
+              color="warning"
+              variant="flat"
+              prepend-icon="mdi-lock-open-outline"
+              :loading="unlocking"
+              @click="unlockResource"
+          >确认解锁
           </v-btn>
         </v-card-actions>
       </v-card>
@@ -644,6 +771,7 @@ const qrVisible = ref(false),
     previewSource = ref(""),
     previewJuyingResourceId = ref(""),
     previewHdhiveSlug = ref(""),
+    previewPendingResource = ref({}),
     previewHdhiveUnlocked = ref(false),
     previewTargetSeason = ref(null),
     previewTargetEpisodes = ref([]),
@@ -746,8 +874,16 @@ const sourceTestConfigKeys = {
     "juying_result_limit",
     "juying_request_interval",
   ],
-  seedhub: ["seedhub_result_limit"],
-  butailing: ["butailing_result_limit"],
+  seedhub: [
+    "seedhub_result_limit",
+    "seedhub_request_interval",
+    "seedhub_timeout",
+  ],
+  butailing: [
+    "butailing_result_limit",
+    "butailing_request_interval",
+    "butailing_timeout",
+  ],
   pinglian: [
     "pinglian_username",
     "pinglian_password",
@@ -918,7 +1054,10 @@ function formatPreviewSize(value) {
   const size = Number(value || 0);
   if (!Number.isFinite(size) || size <= 0) return "";
   const units = ["B", "KB", "MB", "GB", "TB"];
-  const index = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+  const index = Math.min(
+      Math.floor(Math.log(size) / Math.log(1024)),
+      units.length - 1,
+  );
   return `${(size / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
@@ -930,7 +1069,8 @@ function formatElapsed(value) {
 function previewFileIcon(file) {
   if (file?.is_dir) return "mdi-folder-outline";
   const name = String(file?.name || "").toLowerCase();
-  if (/\.(mkv|mp4|avi|ts|m2ts|mov|wmv|webm)$/.test(name)) return "mdi-filmstrip";
+  if (/\.(mkv|mp4|avi|ts|m2ts|mov|wmv|webm)$/.test(name))
+    return "mdi-filmstrip";
   if (/\.(srt|ass|ssa|sup|vtt)$/.test(name)) return "mdi-subtitles-outline";
   if (/\.(zip|rar|7z|tar|gz)$/.test(name)) return "mdi-archive-outline";
   return "mdi-file-outline";
@@ -952,15 +1092,14 @@ function previewFileStem(value) {
 
 function canPreviewResource(item) {
   const source = String(item?.source || "").toLowerCase();
-  const hdhivePreview = source === "hdhive" && Boolean(
-      item?.slug && item?.resource_type,
-  );
+  const hdhivePreview =
+      source === "hdhive" && Boolean(item?.slug && item?.resource_type);
   return Boolean(
-      item?.can_preview && (
-          item?.url ||
+      item?.can_preview &&
+      (item?.url ||
           (source === "juying" && item?.juying_resource_id) ||
-          hdhivePreview
-      ),
+          hdhivePreview ||
+          (item?.pending_resolution && ["seedhub", "pinglian"].includes(source))),
   );
 }
 
@@ -980,17 +1119,27 @@ function previewResourceKey(item) {
   if (source === "juying" && resourceId) return `${source}:${resourceId}`;
   return String(
       item?.url ||
-      `${source}:${item?.resource_type || ""}:${item?.slug || item?.id || ""}`,
+      `${source}:${item?.resource_type || ""}:${
+          item?.slug ||
+          item?.seedhub_seed_id ||
+          item?.seedhub_path ||
+          item?.pinglian_resource_id ||
+          item?.id ||
+          ""
+      }`,
   );
 }
 
 async function requestResourceUrl(item) {
-  const response = unwrapResponse(await api.post("plugin/CloudSubscribe/search/unlock", {
-    source: item.source || sourceTest.source,
-    item,
-    config: sourceTestConfig(item.source || sourceTest.source),
-  }));
-  if (response.success === false) throw new Error(response.message || "资源链接获取失败");
+  const response = unwrapResponse(
+      await api.post("plugin/CloudSubscribe/search/unlock", {
+        source: item.source || sourceTest.source,
+        item,
+        config: sourceTestConfig(item.source || sourceTest.source),
+      }),
+  );
+  if (response.success === false)
+    throw new Error(response.message || "资源链接获取失败");
   const data = response.data?.data || response.data || {};
   if (!data.url) throw new Error(response.message || "资源链接获取失败");
   item.url = data.url;
@@ -1033,6 +1182,15 @@ async function previewResource(item) {
   previewSource.value = String(item.source || "").toLowerCase();
   previewJuyingResourceId.value = String(item.juying_resource_id || "");
   previewHdhiveSlug.value = String(item.slug || "");
+  previewPendingResource.value = {
+    pending_resolution: Boolean(item.pending_resolution),
+    seedhub_kind: String(item.seedhub_kind || ""),
+    seedhub_seed_id: String(item.seedhub_seed_id || ""),
+    seedhub_path: String(item.seedhub_path || ""),
+    seedhub_host: String(item.seedhub_host || ""),
+    pinglian_token: String(item.pinglian_token || ""),
+    pinglian_password: String(item.pinglian_password || ""),
+  };
   previewHdhiveUnlocked.value = Boolean(item.is_unlocked);
   previewTargetSeason.value = item.target_season ?? null;
   previewTargetEpisodes.value = Array.isArray(item.target_episodes)
@@ -1053,41 +1211,67 @@ async function previewResource(item) {
     item.need_access = false;
     item.need_unlock = false;
     item.is_unlocked = true;
+    item.pending_resolution = false;
   }
   if (requestId === previewRequestId) previewingUrl.value = "";
 }
 
-async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++previewRequestId) {
-  const pendingJuying = previewSource.value === "juying" && previewJuyingResourceId.value;
-  const pendingHdhive = previewSource.value === "hdhive" &&
-      previewHdhiveSlug.value && !previewShareUrl.value;
-  if (!previewShareUrl.value && !pendingJuying && !pendingHdhive) return;
+async function loadPreviewDirectory(
+    parentId,
+    breadcrumbs,
+    requestId = ++previewRequestId,
+) {
+  const pendingJuying =
+      previewSource.value === "juying" && previewJuyingResourceId.value;
+  const pendingHdhive =
+      previewSource.value === "hdhive" &&
+      previewHdhiveSlug.value &&
+      !previewShareUrl.value;
+  const pendingSourceResource =
+      ["seedhub", "pinglian"].includes(previewSource.value) &&
+      previewPendingResource.value.pending_resolution &&
+      !previewShareUrl.value;
+  if (
+      !previewShareUrl.value &&
+      !pendingJuying &&
+      !pendingHdhive &&
+      !pendingSourceResource
+  )
+    return;
   const resourceType = previewResourceType.value;
   const shareUrl = previewShareUrl.value;
   previewLoading.value = true;
   previewError.value = "";
   try {
-    const response = unwrapResponse(await api.post("plugin/CloudSubscribe/search/preview", {
-      resource_type: resourceType,
-      url: shareUrl,
-      parent_id: parentId || "",
-      source: previewSource.value,
-      juying_resource_id: previewJuyingResourceId.value,
-      slug: previewHdhiveSlug.value,
-      is_unlocked: previewHdhiveUnlocked.value,
-      target_season: previewTargetSeason.value,
-      target_episodes: previewTargetEpisodes.value,
-      config: pendingJuying
-          ? sourceTestConfig("juying")
-          : pendingHdhive ? sourceTestConfig("hdhive") : undefined,
-    }));
+    const response = unwrapResponse(
+        await api.post("plugin/CloudSubscribe/search/preview", {
+          resource_type: resourceType,
+          url: shareUrl,
+          parent_id: parentId || "",
+          source: previewSource.value,
+          juying_resource_id: previewJuyingResourceId.value,
+          slug: previewHdhiveSlug.value,
+          is_unlocked: previewHdhiveUnlocked.value,
+          target_season: previewTargetSeason.value,
+          target_episodes: previewTargetEpisodes.value,
+          ...previewPendingResource.value,
+          config:
+              pendingJuying || pendingHdhive || pendingSourceResource
+                  ? sourceTestConfig(previewSource.value)
+                  : undefined,
+        }),
+    );
     if (requestId !== previewRequestId || !previewVisible.value) return;
-    if (response.success === false) throw new Error(response.message || "资源预览失败");
+    if (response.success === false)
+      throw new Error(response.message || "资源预览失败");
     const data = response.data?.data || response.data || {};
     if (data.resource_type) {
       previewResourceType.value = String(data.resource_type).toLowerCase();
     }
-    if (data.share_url) previewShareUrl.value = String(data.share_url);
+    if (data.share_url) {
+      previewShareUrl.value = String(data.share_url);
+      previewPendingResource.value.pending_resolution = false;
+    }
     previewItems.value = Array.isArray(data.items) ? data.items : [];
     previewMeta.value = {
       provider_name: String(data.provider_name || ""),
@@ -1101,7 +1285,8 @@ async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++preview
   } catch (error) {
     if (requestId !== previewRequestId || !previewVisible.value) return;
     previewItems.value = [];
-    previewError.value = error?.response?.data?.message || error.message || String(error);
+    previewError.value =
+        error?.response?.data?.message || error.message || String(error);
   } finally {
     if (requestId === previewRequestId) previewLoading.value = false;
   }
@@ -1140,9 +1325,12 @@ async function unlockResource() {
     const message = await requestResourceUrl(item);
     unlockVisible.value = false;
     shouldPreview = canPreviewResource(item);
-    notify(shouldPreview ? `${message}，正在打开预览` : `${message}，现在可以复制`);
+    notify(
+        shouldPreview ? `${message}，正在打开预览` : `${message}，现在可以复制`,
+    );
   } catch (error) {
-    unlockError.value = error?.response?.data?.message || error.message || String(error);
+    unlockError.value =
+        error?.response?.data?.message || error.message || String(error);
   } finally {
     unlocking.value = false;
   }
@@ -1227,7 +1415,9 @@ function optionScopeForTab(tab = activeTab.value) {
 }
 
 async function loadOptions(scope = "base", {force = false} = {}) {
-  const normalizedScope = String(scope || "base").trim().toLowerCase();
+  const normalizedScope = String(scope || "base")
+      .trim()
+      .toLowerCase();
   if (!force && loadedOptionScopes.has(normalizedScope)) return;
   if (optionScopeRequests.has(normalizedScope)) {
     return optionScopeRequests.get(normalizedScope);
@@ -1261,7 +1451,8 @@ async function refreshAccount(accountKey, {silent = false} = {}) {
   const normalizedKey = String(accountKey || "")
       .trim()
       .toLowerCase();
-  if (!normalizedKey || refreshingAccounts.value.includes(normalizedKey)) return;
+  if (!normalizedKey || refreshingAccounts.value.includes(normalizedKey))
+    return;
   refreshingAccounts.value = [...refreshingAccounts.value, normalizedKey];
   try {
     const response = unwrapResponse(
@@ -1499,6 +1690,11 @@ async function testSource(candidate) {
           original_title: candidate.original_title || "",
           year: candidate.year || null,
           tmdb_id: candidate.tmdb_id,
+          imdb_id: candidate.imdb_id || null,
+          tvdb_id: candidate.tvdb_id || null,
+          douban_id: candidate.douban_id || null,
+          bangumi_id: candidate.bangumi_id || null,
+          anilist_id: candidate.anilist_id || null,
           media_type: candidate.media_type,
           season: candidate.media_type === "tv" ? sourceTest.season : null,
           config: sourceTestConfig(sourceTest.source),
@@ -1549,27 +1745,25 @@ onBeforeUnmount(() => {
   if (hdhiveOauthWindow && !hdhiveOauthWindow.closed) hdhiveOauthWindow.close();
 });
 
-watch(
-    previewVisible,
-    (visible) => {
-      if (visible) return;
-      previewRequestId += 1;
-      previewingUrl.value = "";
-      previewLoading.value = false;
-      previewError.value = "";
-      previewItems.value = [];
-      previewMeta.value = {};
-      previewBreadcrumbs.value = [];
-      previewResourceType.value = "";
-      previewShareUrl.value = "";
-      previewSource.value = "";
-      previewJuyingResourceId.value = "";
-      previewHdhiveSlug.value = "";
-      previewHdhiveUnlocked.value = false;
-      previewTargetSeason.value = null;
-      previewTargetEpisodes.value = [];
-    },
-);
+watch(previewVisible, (visible) => {
+  if (visible) return;
+  previewRequestId += 1;
+  previewingUrl.value = "";
+  previewLoading.value = false;
+  previewError.value = "";
+  previewItems.value = [];
+  previewMeta.value = {};
+  previewBreadcrumbs.value = [];
+  previewResourceType.value = "";
+  previewShareUrl.value = "";
+  previewSource.value = "";
+  previewJuyingResourceId.value = "";
+  previewHdhiveSlug.value = "";
+  previewPendingResource.value = {};
+  previewHdhiveUnlocked.value = false;
+  previewTargetSeason.value = null;
+  previewTargetEpisodes.value = [];
+});
 
 watch(
     () => props.initialConfig,
@@ -1591,10 +1785,12 @@ watch(
           provider === previousProvider &&
           crossTransfer === previousCrossTransfer &&
           drives === previousDrives
-      ) return;
+      )
+        return;
       const supported = new Set(
-          createResourceTypeItems(options.cloudDrives, config)
-              .map((item) => item.value),
+          createResourceTypeItems(options.cloudDrives, config).map(
+              (item) => item.value,
+          ),
       );
       config.resource_type_order = (config.resource_type_order || []).filter(
           (value) => supported.has(value),
@@ -1794,10 +1990,6 @@ watch(
   margin-bottom: 8px;
   border-left: 3px solid rgb(var(--v-theme-primary));
   background: rgba(var(--v-theme-primary), 0.07);
-}
-
-.source-test-summary__context {
-  color: rgba(var(--v-theme-on-surface), 0.72);
 }
 
 .source-test-summary__line {

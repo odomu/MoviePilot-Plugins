@@ -1,4 +1,4 @@
-"""搜索源测试与 TMDB 候选查询 API。"""
+"""搜索源测试与平台媒体候选查询 API。"""
 
 import ast
 import ipaddress
@@ -41,6 +41,10 @@ class SearchApi(OwnerDelegator):
     _PROXY_TEST_URL = "https://www.cloudflare.com/cdn-cgi/trace"
     _SEARCH_TEST_DISPLAY_LIMIT = 10
     _TEST_HDHIVE_CLIENT_LIMIT = 4
+    _TEST_MEDIA_ID_FIELDS = (
+        "tmdb_id", "imdb_id", "tvdb_id", "douban_id",
+        "bangumi_id", "anilist_id",
+    )
     _SEARCH_TEST_CONFIG_FIELDS = {
         "pansou": frozenset({
             "pansou_url", "pansou_username", "pansou_password",
@@ -68,8 +72,14 @@ class SearchApi(OwnerDelegator):
             "juying_username", "juying_password", "juying_result_limit",
             "juying_request_interval",
         }),
-        "seedhub": frozenset({"seedhub_result_limit"}),
-        "butailing": frozenset({"butailing_result_limit"}),
+        "seedhub": frozenset({
+            "seedhub_base_url", "seedhub_result_limit", "seedhub_request_interval",
+            "seedhub_timeout",
+        }),
+        "butailing": frozenset({
+            "butailing_base_url", "butailing_result_limit", "butailing_request_interval",
+            "butailing_timeout",
+        }),
         "pinglian": frozenset({
             "pinglian_username", "pinglian_password", "pinglian_result_limit",
             "pinglian_request_interval", "pinglian_timeout",
@@ -243,6 +253,18 @@ class SearchApi(OwnerDelegator):
         is_unlocked = bool(payload.get("is_unlocked"))
         parent_id = str(payload.get("parent_id") or "").strip()
         pending_juying = source == "juying" and bool(juying_resource_id)
+        pending_seedhub = (
+                source == "seedhub"
+                and not url
+                and bool(payload.get("pending_resolution"))
+                and bool(payload.get("seedhub_kind"))
+        )
+        pending_pinglian = (
+                source == "pinglian"
+                and not url
+                and bool(payload.get("pending_resolution"))
+                and bool(payload.get("pinglian_token"))
+        )
         valid_hdhive_url = bool(
             url and "\\" not in url
             and resource_type_from_url(url) == resource_type
@@ -252,7 +274,10 @@ class SearchApi(OwnerDelegator):
                 and bool(slug)
                 and (not url or (is_unlocked and not valid_hdhive_url))
         )
-        if (not url and not pending_juying and not pending_hdhive) or len(url) > 8192:
+        if (
+                not url and not pending_juying and not pending_hdhive
+                and not pending_seedhub and not pending_pinglian
+        ) or len(url) > 8192:
             return {"success": False, "message": "资源链接无效"}
         if pending_juying and (
                 len(juying_resource_id) > 32
@@ -261,12 +286,42 @@ class SearchApi(OwnerDelegator):
             return {"success": False, "message": "聚影资源标识无效"}
         if len(parent_id) > 256:
             return {"success": False, "message": "目录标识无效"}
+        if (pending_seedhub or pending_pinglian) and parent_id:
+            return {"success": False, "message": "待解析资源不支持目录导航"}
         if pending_hdhive and (
                 resource_type not in HDHIVE_DETAIL_RESOURCE_TYPES
                 or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", slug)
         ):
             return {"success": False, "message": "HDHive 资源标识或类型无效"}
         try:
+            if pending_seedhub or pending_pinglian:
+                handler = self._build_test_search_handler(
+                    source,
+                    self._test_search_config(source, payload.get("config")),
+                )
+                try:
+                    if pending_seedhub:
+                        resolved = handler.resolve_seedhub_resource(
+                            kind=str(payload.get("seedhub_kind") or ""),
+                            resource_type=resource_type,
+                            seed_id=str(payload.get("seedhub_seed_id") or ""),
+                            path=str(payload.get("seedhub_path") or ""),
+                            host=str(payload.get("seedhub_host") or ""),
+                        )
+                    else:
+                        resolved = handler.resolve_pinglian_resource(
+                            token=str(payload.get("pinglian_token") or ""),
+                            resource_type=resource_type,
+                            password=str(payload.get("pinglian_password") or ""),
+                        )
+                finally:
+                    handler.close(release_cache=False)
+                url = str(resolved.get("url") or "").strip()
+                resource_type = normalize_resource_type(
+                    resolved.get("resource_type")
+                )
+                if not url:
+                    raise RuntimeError("资源链接解析失败")
             if pending_hdhive:
                 url = ""
                 if parent_id:
@@ -618,11 +673,25 @@ class SearchApi(OwnerDelegator):
                 save_data_func=self.save_data,
             )
 
-        seedhub_client = SeedHubClient(base_url=str(config.get("seedhub_base_url") or ""),
-                                       proxy=proxy) if source == "seedhub" else None
+        seedhub_client = SeedHubClient(
+            base_url=str(config.get("seedhub_base_url") or ""),
+            proxy=proxy,
+            request_timeout=int(config.get("seedhub_timeout", 20) or 20),
+            request_interval=float(
+                config.get("seedhub_request_interval", 1) or 1
+            ),
+        ) if source == "seedhub" else None
         butailing_client = (
-            ButailingClient(base_url=str(config.get("butailing_base_url") or ""),
-                            proxy=proxy) if source == "butailing" else None
+            ButailingClient(
+                base_url=str(config.get("butailing_base_url") or ""),
+                proxy=proxy,
+                request_timeout=int(
+                    config.get("butailing_timeout", 30) or 30
+                ),
+                request_interval=float(
+                    config.get("butailing_request_interval", 1) or 1
+                ),
+            ) if source == "butailing" else None
         )
         juying_client = None
         if source == "juying":
@@ -785,6 +854,11 @@ class SearchApi(OwnerDelegator):
             seen.add(identity)
             items.append({
                 "tmdb_id": tmdb_id,
+                "imdb_id": getattr(candidate, "imdb_id", None),
+                "tvdb_id": getattr(candidate, "tvdb_id", None),
+                "douban_id": getattr(candidate, "douban_id", None),
+                "bangumi_id": getattr(candidate, "bangumi_id", None),
+                "anilist_id": getattr(candidate, "anilist_id", None),
                 "media_type": media_type,
                 "media_type_name": "电影" if media_type == "movie" else "电视剧",
                 "title": str(getattr(candidate, "title", None) or title),
@@ -802,6 +876,58 @@ class SearchApi(OwnerDelegator):
             "message": f"TMDB 找到 {len(items)} 个候选",
             "data": {"items": items},
         }
+
+    def _resolve_test_media(
+            self,
+            payload: Dict[str, Any],
+            title: str,
+            original_title: str,
+            year: Optional[int],
+            media_type: MediaType,
+            tmdb_id: int,
+            season: Optional[int],
+    ) -> MediaInfo:
+        """通过平台识别一次取得测试搜索所需的完整媒体 ID。"""
+        meta = MetaInfo(title)
+        meta.type = media_type
+        meta.year = year
+        if season is not None:
+            meta.begin_season = season
+        try:
+            mediainfo = self.chain.recognize_media(
+                meta=meta,
+                mtype=media_type,
+                tmdbid=tmdb_id,
+                cache=True,
+            )
+        except Exception as error:
+            logger.debug(f"测试搜索读取平台媒体信息失败，使用页面候选：{error}")
+            mediainfo = None
+        if not mediainfo:
+            mediainfo = MediaInfo(
+                type=media_type,
+                title=title,
+                year=str(year) if year is not None else None,
+            )
+
+        mediainfo.type = getattr(mediainfo, "type", None) or media_type
+        mediainfo.title = getattr(mediainfo, "title", None) or title
+        mediainfo.year = (
+                getattr(mediainfo, "year", None)
+                or (str(year) if year is not None else None)
+        )
+        mediainfo.tmdb_id = getattr(mediainfo, "tmdb_id", None) or tmdb_id
+        mediainfo.original_title = (
+                getattr(mediainfo, "original_title", None) or original_title
+        )
+        for media_field in self._TEST_MEDIA_ID_FIELDS:
+            if getattr(mediainfo, media_field, None) not in (None, ""):
+                continue
+            value = payload.get(media_field)
+            if value not in (None, ""):
+                setattr(mediainfo, media_field, value)
+
+        return mediainfo
 
     def api_vue_test_search_source(self, payload: Dict[str, Any]) -> dict:
         """使用页面输入执行隔离的单来源搜索，不触发下载、转存或历史写入。"""
@@ -847,13 +973,20 @@ class SearchApi(OwnerDelegator):
             return {"success": False, "message": "季号必须在 1 到 999 之间"}
         config = self._test_search_config(source, payload.get("config"))
         original_title = str(payload.get("original_title") or "").strip()[:200]
-        mediainfo = MediaInfo(
-            type=media_type,
+        mediainfo = self._resolve_test_media(
+            payload=payload,
             title=title,
-            year=str(year) if year is not None else None,
+            original_title=original_title,
+            year=year,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            season=season,
         )
-        mediainfo.tmdb_id = tmdb_id
-        mediainfo.original_title = original_title
+        media_ids = {
+            field: getattr(mediainfo, field, None)
+            for field in self._TEST_MEDIA_ID_FIELDS
+            if getattr(mediainfo, field, None) not in (None, "")
+        }
 
         test_started = time.monotonic()
 
@@ -863,7 +996,7 @@ class SearchApi(OwnerDelegator):
                 handler = self._build_test_search_handler(
                     source, config
                 )
-                source_result_limit = handler.test_source_result_limit(source)
+                source_result_limit = handler.test_source_result_limit()
                 results = handler.test_source(
                     source=source,
                     mediainfo=mediainfo,
@@ -884,7 +1017,8 @@ class SearchApi(OwnerDelegator):
             logger.debug(
                 f"[{title}{f' S{season:02d}' if season else ''}]"
                 f"[{source.upper()}] 开始只读渠道测试："
-                f"TMDB ID={tmdb_id}，类型={media_type_value}"
+                f"媒体 ID={media_ids}，"
+                f"类型={media_type_value}"
             )
             results, source_result_limit = run_test()
         except Exception as error:
@@ -1031,6 +1165,17 @@ class SearchApi(OwnerDelegator):
                 "juying_resource_id": str(
                     item.get("juying_resource_id") or ""
                 ).strip(),
+                "pending_resolution": bool(item.get("pending_resolution")),
+                "seedhub_kind": str(item.get("seedhub_kind") or "").strip(),
+                "seedhub_seed_id": str(
+                    item.get("seedhub_seed_id") or ""
+                ).strip(),
+                "seedhub_path": str(item.get("seedhub_path") or "").strip(),
+                "seedhub_host": str(item.get("seedhub_host") or "").strip(),
+                "pinglian_token": str(item.get("pinglian_token") or "").strip(),
+                "pinglian_password": str(
+                    item.get("pinglian_password") or ""
+                ),
                 "can_preview": resource_type in PREVIEW_RESOURCE_TYPES,
             })
             resource_type_counts[resource_type] = (
@@ -1042,6 +1187,7 @@ class SearchApi(OwnerDelegator):
             "data": {
                 "source": source,
                 "source_name": source_names[source],
+                "media_ids": media_ids,
                 "media": (
                     f"{getattr(mediainfo, 'title', None) or title}"
                     f"{f' ({getattr(mediainfo, 'year', None)})' if getattr(mediainfo, 'year', None) else ''}"

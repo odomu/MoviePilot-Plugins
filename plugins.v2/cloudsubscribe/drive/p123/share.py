@@ -34,7 +34,9 @@ class P123ShareService:
         if not value:
             return {}
         match = re.search(
-            r"(?:https?://(?:[^/]*\.)?(?:123pan\.com|123684\.com|123865\.com)/s/"
+            r"(?:https?://(?:[^/]*\.)?"
+            r"(?:123pan\.(?:com|cn)|123684\.com|123685\.com|123865\.com|"
+            r"123912\.com|123592\.com)/(?:s|123pan)/"
             r"|123://share/)([\w-]+)",
             value,
             re.I,

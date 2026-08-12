@@ -97,11 +97,11 @@ class CloudSubscribe(_PluginBase):
     # 插件名称
     plugin_name = "网盘订阅助手"
     # 插件描述
-    plugin_desc = "结合订阅功能，自动搜索网盘资源并同步缺失的电影和剧集。"
+    plugin_desc = "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -274,8 +274,12 @@ class CloudSubscribe(_PluginBase):
     _pansou_timeout: int = 30
     _seedhub_enabled: bool = False
     _seedhub_result_limit: int = 20
+    _seedhub_request_interval: float = 1.0
+    _seedhub_timeout: int = 20
     _butailing_enabled: bool = False
     _butailing_result_limit: int = 20
+    _butailing_request_interval: float = 1.0
+    _butailing_timeout: int = 30
     _juying_enabled: bool = False
     _juying_username: str = ""
     _juying_password: str = ""
@@ -804,9 +808,21 @@ class CloudSubscribe(_PluginBase):
             self._seedhub_result_limit = max(
                 1, min(int(config.get("seedhub_result_limit", 20) or 20), 80)
             )
+            self._seedhub_request_interval = max(
+                1.0, min(float(config.get("seedhub_request_interval", 1) or 1), 10.0)
+            )
+            self._seedhub_timeout = max(
+                5, min(int(config.get("seedhub_timeout", 20) or 20), 60)
+            )
             self._butailing_enabled = "butailing" in selected_sources
             self._butailing_result_limit = max(
                 1, min(int(config.get("butailing_result_limit", 20) or 20), 80)
+            )
+            self._butailing_request_interval = max(
+                1.0, min(float(config.get("butailing_request_interval", 1) or 1), 10.0)
+            )
+            self._butailing_timeout = max(
+                5, min(int(config.get("butailing_timeout", 30) or 30), 60)
             )
             self._juying_enabled = "juying" in selected_sources
             self._juying_username = str(
@@ -1242,9 +1258,19 @@ class CloudSubscribe(_PluginBase):
             )
 
         if self._seedhub_enabled:
-            self._seedhub_client = SeedHubClient(base_url=self._seedhub_base_url, proxy=proxy)
+            self._seedhub_client = SeedHubClient(
+                base_url=self._seedhub_base_url,
+                proxy=proxy,
+                request_timeout=self._seedhub_timeout,
+                request_interval=self._seedhub_request_interval,
+            )
         if self._butailing_enabled:
-            self._butailing_client = ButailingClient(base_url=self._butailing_base_url, proxy=proxy)
+            self._butailing_client = ButailingClient(
+                base_url=self._butailing_base_url,
+                proxy=proxy,
+                request_timeout=self._butailing_timeout,
+                request_interval=self._butailing_request_interval,
+            )
         if self._juying_enabled or self._juying_checkin_enabled:
             self._juying_client = JuyingClient(
                 base_url=self._juying_base_url,
@@ -1776,7 +1802,11 @@ class CloudSubscribe(_PluginBase):
             "pansou_refresh": self._pansou_refresh,
             "pansou_timeout": self._pansou_timeout,
             "seedhub_result_limit": self._seedhub_result_limit,
+            "seedhub_request_interval": self._seedhub_request_interval,
+            "seedhub_timeout": self._seedhub_timeout,
             "butailing_result_limit": self._butailing_result_limit,
+            "butailing_request_interval": self._butailing_request_interval,
+            "butailing_timeout": self._butailing_timeout,
             "juying_username": self._juying_username,
             "juying_password": self._juying_password,
             "juying_checkin_enabled": self._juying_checkin_enabled,

@@ -963,8 +963,13 @@ class SyncHandler:
             )
             return False
 
+        identity_update = {
+            "tmdbid": tmdb_id,
+            "media_source": "themoviedb",
+            "media_id": str(tmdb_id),
+        }
         try:
-            updated = SubscribeOper().update(subscribe_id, {"tmdbid": tmdb_id})
+            updated = SubscribeOper().update(subscribe_id, identity_update)
         except Exception as error:
             logger.warning(
                 f"订阅 TMDB ID 自动回填失败："
@@ -975,9 +980,10 @@ class SyncHandler:
             logger.warning(f"订阅 TMDB ID 自动回填失败：订阅 {subscribe_id} 不存在")
             return False
 
-        setattr(subscribe, "tmdbid", tmdb_id)
+        for field, value in identity_update.items():
+            setattr(subscribe, field, value)
         logger.info(
-            f"订阅 TMDB ID 已自动回填："
+            f"订阅 TMDB 身份已自动回填："
             f"{getattr(subscribe, 'name', '')} -> {tmdb_id}"
         )
         return True

@@ -197,7 +197,6 @@ class HDHiveSearchService(OwnerDelegator):
             hdhive_media_type,
             tmdb_id=tmdb_id,
             season=season,
-            subscribe=subscribe,
             test_mode=test_mode,
             result_limit=result_limit,
         )
@@ -317,7 +316,7 @@ class HDHiveSearchService(OwnerDelegator):
     def _search_hdhive_api(
             self, mediainfo: MediaInfo, hdhive_media_type: str,
             tmdb_id: Optional[int] = None, season: Optional[int] = None,
-            subscribe: Any = None, test_mode: bool = False,
+            test_mode: bool = False,
             result_limit: Optional[int] = None,
     ) -> Optional[List[Dict]]:
         """

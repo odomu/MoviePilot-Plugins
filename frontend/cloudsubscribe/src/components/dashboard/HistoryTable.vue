@@ -433,9 +433,9 @@
                   <div
                       v-if="record.type !== '电影'"
                       class="record-file-name text-caption text-medium-emphasis"
-                      :title="record.display_file_name || '-'"
+                      :title="record.title || item.title || '-'"
                   >
-                    {{ record.display_file_name || "-" }}
+                    {{ record.title || item.title || "-" }}
                   </div>
                 </td>
                 <td>
@@ -745,9 +745,9 @@
                 <div
                     v-if="record.type !== '电影'"
                     class="history-mobile-file text-caption text-medium-emphasis"
-                    :title="record.display_file_name || '-'"
+                    :title="record.title || item.title || '-'"
                 >
-                  {{ record.display_file_name || "-" }}
+                  {{ record.title || item.title || "-" }}
                 </div>
                 <div class="history-mobile-record-footer">
                   <div

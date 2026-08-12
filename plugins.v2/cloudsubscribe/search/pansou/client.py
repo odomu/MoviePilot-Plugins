@@ -22,6 +22,7 @@ class PanSouClient:
     MAX_RAW_RESULTS = 100
     _SESSION_DATA_KEY = "pansou_auth_session"
     _LOGIN_LOCK = threading.RLock()
+
     @staticmethod
     def _sanitize_json_strings(value: Any) -> Any:
         if isinstance(value, str):
@@ -341,7 +342,6 @@ class PanSouClient:
             filter_config: Optional[Dict[str, List[str]]] = None,
             refresh: bool = False,
             concurrency: Optional[int] = None,
-            test_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         搜索网盘资源
@@ -495,11 +495,8 @@ class PanSouClient:
             # 按网盘类型分组
             grouped_results = {}
             allowed_types = set(effective_cloud_types)
-            accepted_count = 0
 
             for item in results_list:
-                if test_mode and accepted_count >= limit:
-                    break
                 item_title = re.sub(r'<[^>]+>', '', item.get("title", ""))
                 links = item.get("links", [])
                 update_time = item.get("datetime", "")
@@ -509,8 +506,6 @@ class PanSouClient:
                 tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
 
                 for link in links:
-                    if test_mode and accepted_count >= limit:
-                        break
                     title = re.sub(
                         r'<[^>]+>', '', str(link.get("work_title") or item_title)
                     ).strip()
@@ -519,15 +514,14 @@ class PanSouClient:
                         for value in (expected_titles or [])
                         if str(value or "").strip()
                     ))
-                    if not test_mode and (
-                            not self._title_matches_search_key(keyword, title)
+                    if (not self._title_matches_search_key(keyword, title)
                             and not any(
-                        self._title_matches_search_key(value, title)
-                        for value in media_titles
-                    )
+                                self._title_matches_search_key(value, title)
+                                for value in media_titles
+                            )
                     ):
                         continue
-                    if not test_mode and media_titles and not self._title_matches_media(
+                    if media_titles and not self._title_matches_media(
                             media_titles,
                             expected_year,
                             title,
@@ -578,7 +572,6 @@ class PanSouClient:
                         link_item["password"] = pwd
 
                     grouped_results[type_display].append(link_item)
-                    accepted_count += 1
 
             # 按时间倒序排序
             for pan_type in grouped_results:

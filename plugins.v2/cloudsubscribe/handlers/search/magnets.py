@@ -98,6 +98,7 @@ class ExternalResourceSearchService(OwnerDelegator):
         if not self._seedhub_client:
             return []
         titles = self._media_titles(mediainfo)
+        douban_id = getattr(mediainfo, "douban_id", None)
         try:
             resources = self._seedhub_client.search(
                 keywords=self._seedhub_keywords(
@@ -107,6 +108,7 @@ class ExternalResourceSearchService(OwnerDelegator):
                 expected_year=getattr(mediainfo, "year", None),
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
+                douban_id=douban_id,
                 limit=(
                     result_limit or self._seedhub_result_limit
                     if test_mode else self._seedhub_result_limit
@@ -129,7 +131,6 @@ class ExternalResourceSearchService(OwnerDelegator):
             season: Optional[int],
             subscribe: Any = None,
             raise_errors: bool = False,
-            test_mode: bool = False,
             result_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         label = self._search_label(mediainfo, media_type, season)
@@ -137,9 +138,17 @@ class ExternalResourceSearchService(OwnerDelegator):
         if not self._butailing_client:
             return []
         titles = self._media_titles(mediainfo)
+        tmdb_id = (
+                getattr(mediainfo, "tmdb_id", None)
+                or getattr(subscribe, "tmdbid", None)
+        )
         douban_id = (
             getattr(mediainfo, "douban_id", None)
             or getattr(subscribe, "doubanid", None)
+        )
+        imdb_id = (
+                getattr(mediainfo, "imdb_id", None)
+                or getattr(subscribe, "imdbid", None)
         )
         try:
             resources = self._butailing_client.search(
@@ -148,12 +157,14 @@ class ExternalResourceSearchService(OwnerDelegator):
                 expected_year=getattr(mediainfo, "year", None),
                 media_type="tv" if media_type == MediaType.TV else "movie",
                 season=season,
+                tmdb_id=tmdb_id,
                 douban_id=douban_id,
+                imdb_id=imdb_id,
                 limit=(
-                    result_limit or self._butailing_result_limit
-                    if test_mode else self._butailing_result_limit
+                    result_limit
+                    if result_limit is not None
+                    else self._butailing_result_limit
                 ),
-                test_mode=test_mode,
             )
         except ButailingError as error:
             logger.warning(f"{prefix} 搜索失败：{error}")
@@ -169,6 +180,7 @@ class ExternalResourceSearchService(OwnerDelegator):
             mediainfo: MediaInfo,
             media_type: MediaType,
             season: Optional[int],
+            subscribe: Any = None,
             raise_errors: bool = False,
             test_mode: bool = False,
             result_limit: Optional[int] = None,
@@ -178,13 +190,27 @@ class ExternalResourceSearchService(OwnerDelegator):
         if not self._juying_resources:
             return []
         titles = self._media_titles(mediainfo)
+        tmdb_id = (
+                getattr(mediainfo, "tmdb_id", None)
+                or getattr(subscribe, "tmdbid", None)
+        )
+        douban_id = (
+                getattr(mediainfo, "douban_id", None)
+                or getattr(subscribe, "doubanid", None)
+        )
+        imdb_id = (
+                getattr(mediainfo, "imdb_id", None)
+                or getattr(subscribe, "imdbid", None)
+        )
         try:
             resources = self._juying_resources.search(
                 title=titles[0] if titles else "",
                 alternative_titles=titles[1:],
                 year=getattr(mediainfo, "year", None),
                 media_type="tv" if media_type == MediaType.TV else "movie",
-                tmdb_id=getattr(mediainfo, "tmdb_id", None),
+                tmdb_id=tmdb_id,
+                douban_id=douban_id,
+                imdb_id=imdb_id,
                 season=season,
                 resource_type_order=self._juying_resource_types,
                 limit=(
