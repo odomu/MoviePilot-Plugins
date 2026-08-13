@@ -221,6 +221,9 @@ class UpgradeBaselineService(OwnerDelegator):
                     pass
             candidates.setdefault(int(episode), []).append({
                 "file_name": media_file.name,
+                "rule_title": str(
+                    media_item.get("rule_title") or media_file.name
+                ).strip(),
                 "file_size": file_size,
                 "source": "Emby媒体库",
             })
@@ -230,11 +233,14 @@ class UpgradeBaselineService(OwnerDelegator):
         for episode, items in candidates.items():
             scored = []
             for item in items:
-                score_key = (item["file_name"], int(item["file_size"] or 0))
+                rule_title = str(
+                    item.get("rule_title") or item["file_name"]
+                ).strip()
+                score_key = (rule_title, int(item["file_size"] or 0))
                 score = score_cache.get(score_key)
                 if score is None:
                     score = self._get_mp_rule_score(
-                        item["file_name"], item["file_size"], subscribe, season, mediainfo
+                        rule_title, item["file_size"], subscribe, season, mediainfo
                     )
                     score_cache[score_key] = score
                 scored.append({**item, "score": score, "rule_score": score})

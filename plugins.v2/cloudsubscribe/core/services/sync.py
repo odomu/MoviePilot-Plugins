@@ -24,7 +24,8 @@ class SyncExecutionService(OwnerDelegator):
     """执行订阅同步并维护全局执行边界。"""
 
     _SUBSCRIBE_SEARCH_BATCH_SECONDS = 1.0
-    _SUBSCRIBE_SEARCH_DEBOUNCE_SECONDS = 60.0
+    # 防止平台短时间重复回调；完成后不应阻塞正常的手动重试一分钟。
+    _SUBSCRIBE_SEARCH_DEBOUNCE_SECONDS = 5.0
 
     @staticmethod
     def _history_group_key(
@@ -237,7 +238,12 @@ class SyncExecutionService(OwnerDelegator):
                 *self._subscribe_search_pending,
             })
             media_key = media_keys[subscribe_id]
-            debounce_key = (media_key, normalized_state)
+            debounce_subject = (
+                ("ALL",)
+                if subscribe_id is None
+                else ("SUBSCRIBE", str(subscribe_id))
+            )
+            debounce_key = (debounce_subject, normalized_state)
             recent = self._subscribe_search_recent
             expired_before = now - self._SUBSCRIBE_SEARCH_DEBOUNCE_SECONDS
             self._subscribe_search_recent = {
@@ -254,7 +260,13 @@ class SyncExecutionService(OwnerDelegator):
                 for queued_id in self._subscribe_search_pending
                 if media_keys[queued_id] == media_key
             ), None)
-            if debounce_key in self._subscribe_search_recent:
+            recent_subjects = {
+                key[0] for key in self._subscribe_search_recent
+            }
+            if (
+                    debounce_key in self._subscribe_search_recent
+                    or debounce_subject in recent_subjects
+            ):
                 queue_state = "防抖合并"
                 queued = False
             elif None in self._subscribe_search_active or media_key in active_media_keys:
@@ -356,9 +368,12 @@ class SyncExecutionService(OwnerDelegator):
                 )
                 with self._subscribe_search_queue_lock:
                     completed_at = time.monotonic()
-                    media_keys = self._subscribe_search_media_keys(batch)
                     for queued_id, queued_state in batch.items():
-                        recent_key = media_keys[queued_id]
+                        recent_key = (
+                            ("ALL",)
+                            if queued_id is None
+                            else ("SUBSCRIBE", str(queued_id))
+                        )
                         self._subscribe_search_recent[(recent_key, queued_state)] = completed_at
                     self._subscribe_search_active = {}
         finally:

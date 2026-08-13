@@ -109,9 +109,12 @@ class MovieSyncProcessor(OwnerDelegator):
                 ):
                     media_file = Path(str(media_item.get("path") or ""))
                     media_size = self._resource_size_bytes(media_item.get("size"))
+                    rule_title = str(
+                        media_item.get("rule_title") or media_file.name
+                    ).strip()
                     emby_has_size = emby_has_size or media_size > 0
                     emby_score = self._get_mp_rule_score(
-                        media_file.name, media_size, subscribe, 0, mediainfo
+                        rule_title, media_size, subscribe, 0, mediainfo
                     )
                     if media_size:
                         movie_history_size = media_size
@@ -120,7 +123,8 @@ class MovieSyncProcessor(OwnerDelegator):
                     if media_size or emby_score > 0:
                         logger.info(
                             f"电影 {subscribe.name} 洗版基线采用 Emby 媒体："
-                            f"{media_file.name}，评分 {emby_score}，{format_size(media_size)}"
+                            f"{media_file.name}，媒体详情 {rule_title}，"
+                            f"评分 {emby_score}，{format_size(media_size)}"
                         )
                 existing_movie = self._timed_sync_call(
                     "cloud_scan",
@@ -170,23 +174,6 @@ class MovieSyncProcessor(OwnerDelegator):
                     if manual_upgrade:
                         return transferred_count
 
-            if movie_history_score >= 0 and not is_best_version:
-                if transient_target:
-                    logger.debug(f"电影 {subscribe.name} 已有成功转存历史，无需重复处理")
-                    return transferred_count
-                self._set_task_phase(subscribe, "同步历史完成状态", 95)
-                self._subscribe_handler.check_and_finish_subscribe(
-                    subscribe=subscribe,
-                    mediainfo=mediainfo,
-                    success_episodes=[1],
-                )
-                if track_points and hasattr(self._search_handler, "clear_sub_points"):
-                    self._search_handler.clear_sub_points(sub_key)
-                logger.debug(
-                    f"电影 {subscribe.name} 已有成功转存历史，"
-                    f"已同步订阅进度与完成状态"
-                )
-                return transferred_count
             if not manual_resources:
                 release_date = self._calendar_date(mediainfo.release_date)
                 if release_date and release_date > datetime.date.today():

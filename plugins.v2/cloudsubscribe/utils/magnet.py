@@ -142,15 +142,19 @@ def parse_magnet_metadata(
     torrent_files = []
     torrent_file_entries = []
     metadata_source = "uri" if magnet.dn else ""
-    if fetch_info and not magnet.dn:
+    if fetch_info:
         fetched = _fetch_torrent_metadata(
             info_hash,
             timeout,
             str(metadata_url_template or DEFAULT_METADATA_URL_TEMPLATE),
         )
         if fetched:
-            magnet.dn = fetched["display_name"]
-            magnet.xl = fetched["size"] or None
+            if fetched["display_name"]:
+                magnet.dn = fetched["display_name"]
+            if fetched["size"]:
+                # 已校验 InfoHash 的 torrent 元数据优先于 URI 中可能缺失
+                # 或不可信的 xl 参数。
+                magnet.xl = fetched["size"]
             torrent_files = fetched["torrent_files"]
             torrent_file_entries = fetched.get("torrent_file_entries") or []
             metadata_source = fetched["metadata_source"]

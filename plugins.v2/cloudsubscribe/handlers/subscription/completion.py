@@ -20,8 +20,15 @@ from app.schemas.types import MediaType, SystemConfigKey
 class SubscribeCompletionChain(SubscribeChain):
     """逐字段渲染完成通知，避免媒体文本中的引号破坏模板 JSON。"""
 
-    def post_message(self, message=None, meta=None, mediainfo=None,
-                     torrentinfo=None, transferinfo=None, **kwargs):
+    def post_message(
+            self,
+            message=None,
+            meta=None,
+            mediainfo=None,
+            torrentinfo=None,
+            transferinfo=None,
+            **kwargs
+    ):
         if message and not (message.title or message.text) and message.ctype:
             try:
                 templates = SystemConfigOper().get(SystemConfigKey.NotificationTemplates) or {}

@@ -19,6 +19,32 @@ class EmbyMediaResolver:
     """读取 Emby 中已入库剧集的实际文件路径，供洗版建立现有版本基线。"""
 
     @staticmethod
+    def _stream_rule_title(path: str, source: Dict[str, Any]) -> str:
+        """把 Emby 媒体流详情转换为 MoviePilot 规则可识别的标题。"""
+        streams = source.get("MediaStreams") or []
+        video = next((
+            value for value in streams
+            if isinstance(value, dict) and value.get("Type") == "Video"
+        ), {})
+        audio = next((
+            value for value in streams
+            if isinstance(value, dict) and value.get("Type") == "Audio"
+        ), {})
+        values = [Path(str(path or "")).stem]
+        values.extend((
+            source.get("Container"),
+            video.get("DisplayTitle") or video.get("Title"),
+            video.get("Codec"),
+            video.get("VideoRangeType") or video.get("VideoRange"),
+            f"{video.get('BitDepth')}bit" if video.get("BitDepth") else "",
+            audio.get("DisplayTitle") or audio.get("Title"),
+            audio.get("Codec"),
+        ))
+        return " ".join(dict.fromkeys(
+            str(value).strip() for value in values if str(value or "").strip()
+        ))
+
+    @staticmethod
     def _item_media(service, item_id: str) -> Dict[str, Any]:
         """直接读取 Emby 项目详情中的路径和真实媒体大小。"""
         instance = service.instance
@@ -36,14 +62,25 @@ class EmbyMediaResolver:
         data = response.json() or {}
         media_sources = data.get("MediaSources") or []
         source = next((value for value in media_sources if isinstance(value, dict)), {})
+        source = {
+            **data,
+            **source,
+            "MediaStreams": (
+                source.get("MediaStreams") or data.get("MediaStreams") or []
+            ),
+        }
         try:
             size = max(0, int(data.get("Size") or source.get("Size") or 0))
         except (TypeError, ValueError):
             size = 0
+        path = str(data.get("Path") or source.get("Path") or "").strip()
         return {
-            "path": str(data.get("Path") or source.get("Path") or "").strip(),
+            "path": path,
             "size": size,
             "item_id": str(item_id),
+            "rule_title": EmbyMediaResolver._stream_rule_title(path, source),
+            "container": str(source.get("Container") or "").strip(),
+            "media_streams": list(source.get("MediaStreams") or []),
         }
 
     @staticmethod
