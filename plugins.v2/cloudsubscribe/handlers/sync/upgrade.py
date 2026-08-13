@@ -338,22 +338,44 @@ class UpgradeService(OwnerDelegator):
                         continue
 
                     if self._is_magnet_url(share_url):
+                        provider_name = self._prepare_magnet_resource(
+                            resource, share_url
+                        )
                         if not self._validate_resource_url(
                                 share_url,
                                 resource_label="Magnet 链接",
                                 log_prefix=upgrade_log_prefix,
                         ):
                             continue
-                        provider_name = str(
-                            (resource.get("magnet_metadata") or {}).get("display_name")
-                            or resource_title
-                        ).strip()
+                        provider_name = provider_name or resource_title
+                        title_seasons = self._magnet_title_seasons(resource)
+                        if title_seasons and season not in title_seasons:
+                            logger.debug(
+                                f"{upgrade_log_prefix} Magnet 标题预过滤排除："
+                                f"标题季数={','.join(f'S{value:02d}' for value in sorted(title_seasons))}，"
+                                f"目标季数=S{season:02d}，标题={provider_name}"
+                            )
+                            continue
+                        target_episodes = []
+                        title_episodes = self._magnet_title_episodes(resource, season)
+                        if title_episodes:
+                            target_episodes = sorted(
+                                set(episodes_to_search) & title_episodes
+                            )
+                            if not target_episodes:
+                                logger.debug(
+                                    f"{upgrade_log_prefix} Magnet 标题预过滤排除："
+                                    f"标题集数={self._format_episode_ranges(title_episodes)}，"
+                                    f"目标集数={self._format_episode_ranges(set(episodes_to_search))}，"
+                                    f"标题={provider_name}"
+                                )
+                                continue
                         _, provider_score = self._search_handler.select_file_candidate(
                             [{"name": provider_name, "size": 0}],
                             mediainfo,
                             subscribe,
                         )
-                        target_episodes = sorted(
+                        target_episodes = target_episodes or sorted(
                             set(episodes_to_search)
                             & self._resource_preview_episodes(resource, season)
                         ) or sorted(episodes_to_search)
@@ -401,20 +423,18 @@ class UpgradeService(OwnerDelegator):
                         if not pending_key:
                             self._release_transfer_slots(1)
                             continue
-                        history.append(self._build_transfer_history_item(
+                        self._append_magnet_pending_history(
+                            history=history,
                             mediainfo=mediainfo,
                             subscribe=subscribe,
-                            status="下载中",
                             share_url=share_url,
-                            file_name=provider_name,
-                            source_file_name=provider_name,
                             cloud_dir=self._cloud_transfer_path.rstrip("/") or "/",
                             resource=resource,
                             season=season,
                             target_episodes=target_episodes,
                             upgrade=bool(upgrade_baseline),
                             finalize_key=pending_key,
-                        ))
+                        )
                         episodes_to_search = [
                             episode for episode in episodes_to_search
                             if episode not in target_episode_set

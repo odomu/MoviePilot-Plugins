@@ -20,7 +20,6 @@ from ...core.transfer import LocalRapidUploadAdapter
 @dataclass
 class P123Drive:
     client: P123ClientManager
-    metadata_url_template: str
     page_size: int = 100
 
     def close(self) -> None:
@@ -41,9 +40,7 @@ class P123PlaybackReference:
 def create_p123_provider(drive: P123Drive) -> CloudDriveProvider:
     files = P123FileService(drive.client, drive.page_size)
     share = P123ShareService(drive.client, files)
-    offline = P123OfflineService(
-        drive.client, files, drive.metadata_url_template
-    )
+    offline = P123OfflineService(drive.client, files)
     upload = P123UploadService(drive.client, files)
     playback_reference = P123PlaybackReference()
     return CloudDriveProvider(

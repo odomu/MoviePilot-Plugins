@@ -53,13 +53,15 @@ class PlatformRuleService(OwnerDelegator):
             subscribe: Any = None,
             season: Optional[int] = None,
             target_episodes: Optional[List[int]] = None,
+            prefiltered: bool = False,
     ) -> List[Dict]:
         """使用平台规则组筛选并按平台优先级排序。"""
         if not resources:
             return []
-        resources = self._prefilter_resource_order(
-            resources, season=season, target_episodes=target_episodes
-        )
+        if not prefiltered:
+            resources = self._prefilter_resource_order(
+                resources, season=season, target_episodes=target_episodes
+            )
         try:
             rule_groups = self._platform_rule_groups(subscribe)
             if not rule_groups:

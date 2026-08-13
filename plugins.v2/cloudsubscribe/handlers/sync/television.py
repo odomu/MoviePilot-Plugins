@@ -10,7 +10,6 @@ from app.utils.string import StringUtils
 
 from ..notification import EmbyMediaResolver
 from ...core import OwnerDelegator
-from ...utils import MediaFileParser
 
 
 class TelevisionSyncProcessor(OwnerDelegator):
@@ -418,30 +417,56 @@ class TelevisionSyncProcessor(OwnerDelegator):
                     try:
                         missing_episode_set = set(missing_episodes)
                         if self._is_magnet_url(share_url):
+                            magnet_title = self._prepare_magnet_resource(
+                                resource, share_url
+                            )
+                            title_seasons = self._magnet_title_seasons(resource)
+                            if title_seasons and season not in title_seasons:
+                                logger.debug(
+                                    f"Magnet 标题预过滤排除：标题季数="
+                                    f"{','.join(f'S{value:02d}' for value in sorted(title_seasons))}，"
+                                    f"目标季数=S{season:02d}，"
+                                    f"标题={magnet_title or resource_title}"
+                                )
+                                continue
+                            title_episodes = self._magnet_title_episodes(
+                                resource, season
+                            )
+                            if title_episodes:
+                                target_episode_set = (
+                                        missing_episode_set & title_episodes
+                                )
+                                if not target_episode_set:
+                                    logger.debug(
+                                        f"Magnet 标题预过滤排除：标题集数="
+                                        f"{self._format_episode_ranges(title_episodes)}，"
+                                        f"当前缺集={self._format_episode_ranges(missing_episode_set)}，"
+                                        f"标题={magnet_title or resource_title}"
+                                    )
+                                    continue
+                                target_episodes = sorted(target_episode_set)
+                            else:
+                                preview_episodes = self._resource_preview_episodes(
+                                    resource, season
+                                )
+                                target_episode_set = (
+                                    missing_episode_set & preview_episodes
+                                    if preview_episodes else missing_episode_set
+                                )
+                                target_episodes = sorted(target_episode_set)
+
                             if not self._validate_resource_url(
                                     share_url,
                                     resource_label="Magnet 链接",
                                     log_prefix=search_prefix,
                             ):
                                 continue
-                            preview_episodes = self._resource_preview_episodes(resource, season)
-                            if not preview_episodes:
-                                parsed_season_episode = MediaFileParser.extract_season_episode(
-                                    resource_title
-                                )
-                                if (
-                                        parsed_season_episode
-                                        and parsed_season_episode[0] == int(season)
-                                ):
-                                    preview_episodes = {parsed_season_episode[1]}
-                            target_episode_set = (
-                                missing_episode_set & preview_episodes
-                                if preview_episodes else missing_episode_set
-                            )
-                            target_episodes = sorted(target_episode_set)
                             if not target_episodes:
-                                logger.info(
-                                    f"Magnet 提供者元数据未覆盖当前缺集：{resource_title}"
+                                logger.debug(
+                                    f"Magnet 预览集数未覆盖当前缺集：预览="
+                                    f"{self._format_episode_ranges(preview_episodes)}，"
+                                    f"当前缺集={self._format_episode_ranges(missing_episode_set)}，"
+                                    f"标题={magnet_title or resource_title}"
                                 )
                                 continue
                             if not self._reserve_transfer_slots(1):
@@ -463,22 +488,20 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 (resource.get("magnet_metadata") or {}).get("display_name")
                                 or resource_title
                             ).strip()
-                            history.append(self._build_transfer_history_item(
+                            self._append_magnet_pending_history(
+                                history=history,
                                 mediainfo=mediainfo,
                                 subscribe=subscribe,
-                                status="下载中",
                                 share_url=share_url,
-                                file_name=provider_name,
-                                source_file_name=provider_name,
                                 cloud_dir=self._cloud_transfer_path.rstrip('/') or "/",
                                 resource=resource,
                                 season=season,
                                 target_episodes=target_episodes,
                                 finalize_key=pending_key,
-                            ))
+                            )
                             logger.info(
                                 f"Magnet 已进入下载后真实文件匹配：{provider_name}，"
-                                f"目标 {self._format_episode_ranges(target_episode_set)}"
+                                f"目标 {self._format_episode_ranges(set(target_episodes))}"
                             )
                             continue
                         share_files = []

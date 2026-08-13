@@ -589,6 +589,12 @@ class SearchHandler:
             ),
         }
 
+    def clear_points_history(self) -> Dict[str, int]:
+        """清空 HDHive 和 Dian115 的持久化积分消费历史。"""
+        hdhive = self._hdhive_budget.clear_history()
+        dian115 = self._dian115_budget.clear_history()
+        return {"hdhive": hdhive, "dian115": dian115}
+
     @staticmethod
     def _clear_client_cache(client: Any) -> int:
         if not client or not hasattr(client, "clear_cache"):
@@ -848,17 +854,22 @@ class SearchHandler:
             resources: List[Dict],
             season: Optional[int] = None,
             target_episodes: Optional[List[int]] = None,
+            log_prefix: str = "",
     ) -> List[Dict]:
         """按类型、可用性、HDHive 官组、集数覆盖和积分筛选排序。"""
         targets = positive_ints(target_episodes)
         prepared = []
+        unsupported_type_count = 0
+        uncovered_count = 0
         for item in resources:
             resource_type = self._resource_type(item)
             type_order = self._resource_type_order_map.get(resource_type)
             if type_order is None:
+                unsupported_type_count += 1
                 continue
             coverage = self._resource_target_coverage(item, season, targets)
             if coverage[0] >= 3:
+                uncovered_count += 1
                 continue
             sort_key = (
                 type_order,
@@ -871,6 +882,16 @@ class SearchHandler:
             )
             prepared.append((sort_key, item))
         prepared.sort(key=lambda pair: pair[0])
+        if log_prefix and (unsupported_type_count or uncovered_count):
+            details = []
+            if unsupported_type_count:
+                details.append(f"类型不支持={unsupported_type_count}")
+            if uncovered_count:
+                details.append(f"明确未覆盖目标集数={uncovered_count}")
+            logger.debug(
+                f"{log_prefix} 搜索候选预过滤：{len(resources)} -> {len(prepared)}，"
+                + "，".join(details)
+            )
         return [item for _, item in prepared]
 
     def _hdhive_update_sort_key(self, resource: Dict[str, Any]) -> tuple:

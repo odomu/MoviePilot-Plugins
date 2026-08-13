@@ -13,7 +13,12 @@ from ..services.runtime import sync_lock
 class HistoryApi(OwnerDelegator):
     """提供历史记录清理、删除和补发通知接口。"""
 
-    def api_clear_history(self, apikey: str, force: bool = False) -> dict:
+    def api_clear_history(
+            self,
+            apikey: str,
+            force: bool = False,
+            clear_points_history: bool = False,
+    ) -> dict:
         if apikey != settings.API_TOKEN:
             return {"success": False, "message": "API密钥错误"}
         if not self._sync_handler:
@@ -25,6 +30,10 @@ class HistoryApi(OwnerDelegator):
             }
         try:
             result = self._sync_handler.clear_deletable_history(force=force)
+            if clear_points_history and self._search_handler:
+                result["points_history"] = (
+                    self._search_handler.clear_points_history()
+                )
         except Exception as error:
             logger.error(f"清空历史记录异常：{error}")
             return {"success": False, "message": str(error)}
@@ -37,6 +46,12 @@ class HistoryApi(OwnerDelegator):
         message = f"已清理 {result['deleted']} 条历史记录"
         if result["retained"]:
             message += f"，保留 {result['retained']} 条处理中记录"
+        points = result.get("points_history") or {}
+        if points:
+            message += (
+                f"；已清理积分消费记录 HDHive={int(points.get('hdhive') or 0)}、"
+                f"Dian115={int(points.get('dian115') or 0)}"
+            )
         return {"success": True, "message": message, "data": result}
 
     def api_delete_history(self, apikey: str, identity: Dict[str, Any]) -> dict:

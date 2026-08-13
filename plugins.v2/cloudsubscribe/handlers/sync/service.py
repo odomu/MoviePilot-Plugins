@@ -1646,21 +1646,118 @@ class SyncHandler:
     ) -> str:
         """提交 Magnet 到隔离目录；下载完成后再按真实文件树匹配。"""
         info_hash = self._offline_hash(share_url)
+        magnet_title = self._prepare_magnet_resource(resource, share_url)
         metadata = resource.get("magnet_metadata") or {}
-        if not metadata.get("metadata_available"):
+        title_seasons = self._magnet_title_seasons(resource)
+        if season is not None and title_seasons and int(season) not in title_seasons:
+            logger.debug(
+                "Magnet 标题预过滤排除，未请求远端内容元数据："
+                f"标题季数={','.join(f'S{value:02d}' for value in sorted(title_seasons))}，"
+                f"目标季数=S{int(season):02d}，标题={magnet_title or info_hash}"
+            )
+            return ""
+        title_episodes = self._magnet_title_episodes(
+            resource, int(season or 1)
+        )
+        preview_episodes = (
+                title_episodes
+                or self._resource_preview_episodes(resource, int(season or 1))
+        )
+        target_episode_set = {
+            int(value) for value in (target_episodes or []) if int(value) > 0
+        }
+        if season is not None and target_episode_set and title_episodes:
+            confirmed_targets = target_episode_set & title_episodes
+            if not confirmed_targets:
+                logger.debug(
+                    "Magnet 标题预过滤排除，未请求远端内容元数据："
+                    f"标题集数={self._format_episode_ranges(title_episodes)}，"
+                    f"目标集数={self._format_episode_ranges(target_episode_set)}，"
+                    f"标题={magnet_title or info_hash}"
+                )
+                return ""
+            target_episodes[:] = sorted(confirmed_targets)
+            logger.debug(
+                "Magnet 标题预过滤命中，跳过远端内容元数据获取："
+                f"标题集数={self._format_episode_ranges(title_episodes)}，"
+                f"目标集数={self._format_episode_ranges(target_episode_set)}，"
+                f"标题={magnet_title or info_hash}"
+            )
+        if (
+                not title_episodes
+                and not preview_episodes
+                and not metadata.get("torrent_files")
+        ):
+            logger.debug(
+                "Magnet 标题未识别明确集数，开始获取远端内容元数据："
+                f"{magnet_title or info_hash}"
+            )
             magnet_info = self._offline_download.parse_magnet_link(
                 share_url, fetch_metadata=True
             )
-            metadata = (magnet_info or {}).get("metadata") or {}
-            if metadata:
+            fetched_metadata = (magnet_info or {}).get("metadata") or {}
+            if fetched_metadata:
+                metadata = {
+                    **metadata,
+                    **{
+                        key: value for key, value in fetched_metadata.items()
+                        if value not in (None, "", [], {})
+                    },
+                }
                 resource["magnet_metadata"] = metadata
+                magnet_title = self._prepare_magnet_resource(resource, share_url)
+                title_seasons = self._magnet_title_seasons(resource)
+                if (
+                        season is not None
+                        and title_seasons
+                        and int(season) not in title_seasons
+                ):
+                    logger.debug(
+                        "Magnet 远端内容元数据季数不匹配，已跳过："
+                        f"内容季数={','.join(f'S{value:02d}' for value in sorted(title_seasons))}，"
+                        f"目标季数=S{int(season):02d}，标题={magnet_title or info_hash}"
+                    )
+                    return ""
+                title_episodes = self._magnet_title_episodes(
+                    resource, int(season or 1)
+                )
+                metadata_preview = metadata.get("preview_episodes") or {}
+                if metadata_preview:
+                    resource["preview_episodes"] = metadata_preview
+                preview_episodes = (
+                        title_episodes
+                        or self._resource_preview_episodes(
+                    resource, int(season or 1)
+                )
+                )
         if (
                 not info_hash
                 or not self._get_data
-                or not bool(metadata.get("metadata_available"))
+                or (
+                not bool(metadata.get("metadata_available"))
+                and not bool(title_episodes)
+                and not bool(preview_episodes)
+        )
         ):
-            logger.warning("Magnet 未取得内容元数据，拒绝提交网盘离线下载")
+            logger.debug(
+                "Magnet 标题和远端内容元数据均未提供可确认内容，已跳过："
+                f"{magnet_title or info_hash}"
+            )
             return ""
+        if season is not None and target_episodes:
+            target_episode_set = {
+                int(value) for value in target_episodes if int(value) > 0
+            }
+            confirmed_targets = target_episode_set & preview_episodes
+            if not confirmed_targets:
+                logger.debug(
+                    "Magnet 内容确认未覆盖目标集数，已跳过网盘离线下载候选："
+                    f"内容集数={self._format_episode_ranges(preview_episodes)}，"
+                    f"目标集数={self._format_episode_ranges(target_episode_set)}，"
+                    f"标题={magnet_title or info_hash}"
+                )
+                return ""
+            target_episodes[:] = sorted(confirmed_targets)
         subscribe_id = int(getattr(subscribe, "id", 0) or 0)
         pending_key = f"magnet:{info_hash}:{subscribe_id}"
         staging_dir = f"{self._cloud_transfer_path.rstrip('/')}"

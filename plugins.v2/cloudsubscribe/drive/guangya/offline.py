@@ -19,10 +19,9 @@ _ED2K_RE = re.compile(
 class GuangyaOfflineService:
     """封装光鸭离线接口、链接解析和任务提交。"""
 
-    def __init__(self, client: Any, files: Any, metadata_url_template: str):
+    def __init__(self, client: Any, files: Any):
         self.client = client
         self._files = files
-        self.metadata_url_template = metadata_url_template
 
     def create_cloud_task(self, url: str, parent_id: str = "") -> Dict[str, Any]:
         return self.client.request(
@@ -92,7 +91,6 @@ class GuangyaOfflineService:
         metadata = parse_magnet_metadata(
             url,
             fetch_info=fetch_metadata,
-            metadata_url_template=self.metadata_url_template,
         )
         if not metadata:
             return {}

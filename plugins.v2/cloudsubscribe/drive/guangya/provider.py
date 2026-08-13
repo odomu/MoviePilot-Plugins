@@ -22,7 +22,6 @@ from ...core.transfer import LocalRapidUploadAdapter
 @dataclass
 class GuangyaDrive:
     client: GuangyaClient
-    metadata_url_template: str
     page_size: int = 100
 
     def close(self) -> None:
@@ -41,9 +40,7 @@ class GuangyaPlaybackReference:
 
 def create_guangya_provider(drive: GuangyaDrive) -> CloudDriveProvider:
     files = GuangyaFileService(drive.client, drive.page_size)
-    offline = GuangyaOfflineService(
-        drive.client, files, drive.metadata_url_template
-    )
+    offline = GuangyaOfflineService(drive.client, files)
     share = GuangyaShareService(drive.client, files, offline)
     upload = GuangyaUploadService(drive.client, files)
     playback_reference = GuangyaPlaybackReference()

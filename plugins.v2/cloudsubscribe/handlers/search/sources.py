@@ -7,8 +7,6 @@ from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
 from ...core import OwnerDelegator
-from ...search.types import RESOURCE_TYPE_ORDER
-from ...utils import parse_magnet_metadata
 
 
 class PanSouSearchService(OwnerDelegator):
@@ -52,10 +50,7 @@ class PanSouSearchService(OwnerDelegator):
             keyword=keyword,
             cloud_types=[
                 "aliyun" if value == "alipan" else value
-                for value in (
-                    RESOURCE_TYPE_ORDER
-                    if test_mode else self._resource_type_order_config
-                )
+                for value in self._resource_type_order_config
             ],
             channels=[] if test_mode else self._pansou_channels,
             plugins=[] if test_mode else self._pansou_plugins,
@@ -108,26 +103,7 @@ class PanSouSearchService(OwnerDelegator):
                 if self._pansou_resource_type(item)
                    in self._resource_type_order_config
             ]
-        magnet_results = [
-            item for item in candidates if self._pansou_resource_type(item) == "magnet"
-        ]
-        for resource in magnet_results:
-            provider_text = " ".join(
-                str(resource.get(key) or "").strip()
-                for key in ("title", "description")
-                if str(resource.get(key) or "").strip()
-            )
-            metadata = parse_magnet_metadata(resource.get("url", ""), provider_text)
-            if not metadata:
-                continue
-            resource["magnet_metadata"] = metadata
-            resource["info_hash"] = metadata["info_hash"]
-            if metadata["display_name"]:
-                resource["magnet_name"] = metadata["display_name"]
-            if metadata["size"] and not resource.get("size"):
-                resource["size"] = metadata["size"]
-            if metadata["preview_episodes"]:
-                resource["preview_episodes"] = metadata["preview_episodes"]
+        candidates = self._normalize_magnets(candidates, "pansou")
         usable = [
             resource
             for resource in candidates

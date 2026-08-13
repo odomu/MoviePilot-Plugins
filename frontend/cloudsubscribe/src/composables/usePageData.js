@@ -158,9 +158,10 @@ export function useHistoryPageData(api, notify, pluginId = "CloudSubscribe") {
     return loadPage();
   }
 
-  async function clearHistory(force = false) {
+  async function clearHistory(force = false, clearPointsHistory = false) {
     const result = await api.post(`plugin/${pluginId}/history/clear`, {
       force: Boolean(force),
+      clear_points_history: Boolean(clearPointsHistory),
     });
     if (!result?.success) throw new Error(result?.message || "清空失败");
     await Promise.all([loadPage(false), loadSummary(false)]);

@@ -115,6 +115,20 @@ class PointBudgetLedger:
             self._save_history(history)
             return True
 
+    def clear_history(self) -> int:
+        """清空当前渠道的全部订阅消费记录并返回删除条数。"""
+        with self.lock:
+            history = self._load_history()
+            count = len(history)
+            if count:
+                self._save_history({})
+            self._task_spent = 0
+            self._local.key = ""
+            self._local.spent = 0
+            if self._unlocked_cache is not None:
+                self._unlocked_cache.clear()
+            return count
+
     def can_spend(self, points: Any) -> bool:
         status = self.status(points)
         return bool(status and status.allowed)

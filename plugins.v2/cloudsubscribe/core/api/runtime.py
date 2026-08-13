@@ -115,6 +115,7 @@ class RuntimeApi(OwnerDelegator):
         return self.api_clear_history(
             settings.API_TOKEN,
             force=(payload or {}).get("force") is True,
+            clear_points_history=(payload or {}).get("clear_points_history") is True,
         )
 
     def api_vue_delete_history(self, payload: Dict[str, Any]) -> dict:

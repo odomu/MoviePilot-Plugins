@@ -71,7 +71,10 @@ class ExternalResourceSearchService(OwnerDelegator):
                 continue
             provider_text = " ".join(
                 str(resource.get(key) or "").strip()
-                for key in ("title", "quality")
+                for key in (
+                    "title", "description", "name", "raw_title",
+                    "release_name", "quality",
+                )
                 if str(resource.get(key) or "").strip()
             )
             metadata = parse_magnet_metadata(url, provider_text)

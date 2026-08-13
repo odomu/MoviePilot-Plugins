@@ -18,7 +18,6 @@ from .share import ShareService
 from .upload import P115UploadService
 from ..common import DriveRateLimiter, create_directory_path_cache
 from ...core import get_component, resolve_component
-from ...utils import DEFAULT_METADATA_URL_TEMPLATE
 from ...utils.cache import create_platform_ttl_cache
 
 try:
@@ -246,7 +245,6 @@ class P115ClientManager:
             timeout_enabled: bool = True,
             default_timeout: Optional[Dict[str, float]] = None,
             slow_timeout: Optional[Dict[str, float]] = None,
-            magnet_metadata_url_template: str = DEFAULT_METADATA_URL_TEMPLATE,
     ):
         """
         初始化115客户端
@@ -256,10 +254,6 @@ class P115ClientManager:
         :param min_interval: API 请求最小间隔（秒），默认 1.5
         :param path_cache_ttl: 路径缓存过期时间（秒），默认 3600
         """
-        self._magnet_metadata_url_template = str(
-            magnet_metadata_url_template or DEFAULT_METADATA_URL_TEMPLATE
-        )
-
         self.cookies = cookies
         cache_scope = hashlib.sha1(cookies.encode("utf-8")).hexdigest()[:12]
         self.user_agent = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"

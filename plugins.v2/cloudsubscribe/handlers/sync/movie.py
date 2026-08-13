@@ -332,14 +332,14 @@ class MovieSyncProcessor(OwnerDelegator):
 
                 try:
                     if self._is_magnet_url(share_url):
+                        provider_name = self._prepare_magnet_resource(
+                            resource, share_url
+                        )
                         if not self._validate_resource_url(
                                 share_url, resource_label="Magnet 链接"
                         ):
                             continue
-                        provider_name = str(
-                            (resource.get("magnet_metadata") or {}).get("display_name")
-                            or resource_title
-                        ).strip()
+                        provider_name = provider_name or resource_title
                         matched, current_score = self._search_handler.select_file_candidate(
                             [{"name": provider_name, "size": resource.get("size") or 0}],
                             mediainfo,
@@ -384,19 +384,17 @@ class MovieSyncProcessor(OwnerDelegator):
                         if not pending_key:
                             self._release_transfer_slots(1)
                             continue
-                        history.append(self._build_transfer_history_item(
+                        self._append_magnet_pending_history(
+                            history=history,
                             mediainfo=mediainfo,
                             subscribe=subscribe,
-                            status="下载中",
                             share_url=share_url,
-                            file_name=provider_name,
-                            source_file_name=provider_name,
                             cloud_dir=self._cloud_transfer_path.rstrip('/') or "/",
                             resource=resource,
                             rule_score=current_score,
                             upgrade=magnet_upgrade,
                             finalize_key=pending_key,
-                        ))
+                        )
                         movie_transferred = True
                         logger.info(f"Magnet 已进入下载后真实文件匹配：{provider_name}")
                         continue

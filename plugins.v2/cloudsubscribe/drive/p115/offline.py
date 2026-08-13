@@ -482,7 +482,6 @@ class OfflineDownloadService(OwnerDelegator):
         metadata = parse_magnet_metadata(
             url,
             fetch_info=fetch_metadata,
-            metadata_url_template=self._magnet_metadata_url_template,
         )
         if not metadata:
             return None

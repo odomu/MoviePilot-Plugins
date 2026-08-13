@@ -227,6 +227,12 @@
             density="compact"
             hide-details
             class="mt-3" />
+          <v-checkbox
+            v-model="clearPointsHistory"
+            label="同时清空 HDHive/Dian115 已花费积分记录"
+            color="warning"
+            density="compact"
+            hide-details />
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -331,6 +337,7 @@ const configData = ref({})
 const clearVisible = ref(false)
 const clearing = ref(false)
 const forceClearHistory = ref(false)
+const clearPointsHistory = ref(false);
 const cacheVisible = ref(false)
 const clearingCache = ref(false)
 const retryingHistoryKey = ref("")
@@ -546,15 +553,19 @@ async function playHistory(itemId) {
 
 function openClearHistory() {
   forceClearHistory.value = false
+  clearPointsHistory.value = false;
   clearVisible.value = true
 }
 
 async function clearHistory() {
   clearing.value = true
   try {
-    const message = await clearHistoryRequest(forceClearHistory.value)
+    const message = await clearHistoryRequest(
+      forceClearHistory.value, clearPointsHistory.value,
+    );
     clearVisible.value = false
     forceClearHistory.value = false
+    clearPointsHistory.value = false;
     notify(message)
   } catch (e) {
     notify(e.message || "清空失败", "error")

@@ -155,7 +155,6 @@ class QRCodeService(OwnerDelegator):
             manager = P115ClientManager(
                 cookies=cookies,
                 share_cache_ttl_minutes=self._search_cache_ttl_minutes,
-                magnet_metadata_url_template=self._magnet_metadata_url_template,
                 **self._p115_timeout_kwargs(),
             )
             if not manager.check_login():

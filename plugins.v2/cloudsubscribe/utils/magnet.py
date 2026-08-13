@@ -3,6 +3,8 @@
 import base64
 import hashlib
 import io
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -12,14 +14,32 @@ from app.core.metainfo import MetaInfo
 from torf import Magnet, Torrent, TorfError
 
 from .cache import create_platform_ttl_cache
+from .file_parser import MediaFileParser
 
 _TORRENT_CACHE_TTL = 30 * 60
 DEFAULT_METADATA_URL_TEMPLATE = "https://itorrents.org/torrent/{info_hash}.torrent"
+_metadata_url_template = DEFAULT_METADATA_URL_TEMPLATE
+_TORRENT_REQUEST_INTERVAL = 1.0
+_TORRENT_REQUEST_LOCK = threading.Lock()
+_TORRENT_LAST_REQUEST_AT = 0.0
 _TORRENT_METADATA_CACHE = create_platform_ttl_cache(
     "magnet:metadata",
     maxsize=256,
     ttl=_TORRENT_CACHE_TTL,
 )
+
+
+def configure_magnet_metadata_url(url_template: str) -> str:
+    """配置统一的 torrent 元数据地址模板。"""
+    global _metadata_url_template
+    value = str(url_template or "").strip()
+    if (
+            "{info_hash}" not in value
+            or not value.lower().startswith(("http://", "https://"))
+    ):
+        value = DEFAULT_METADATA_URL_TEMPLATE
+    _metadata_url_template = value
+    return value
 
 
 def clear_magnet_metadata_cache() -> int:
@@ -37,15 +57,21 @@ def _extract_preview_episodes(
     """使用元数据识别汇总资源包含的季集。"""
     episodes: Dict[str, set] = {}
     resource_seasons = [1]
-    resource_title = display_name or provider_text
-    if resource_title:
+    resource_texts = list(dict.fromkeys(
+        text for text in (
+            str(display_name or "").strip(),
+            str(provider_text or "").strip(),
+        ) if text
+    ))
+    for resource_title in resource_texts:
         resource_meta = MetaInfo(
             title=resource_title,
-            subtitle=provider_text if display_name and provider_text else None,
         )
-        resource_seasons = resource_meta.season_list or [1]
+        parsed_seasons = resource_meta.season_list or resource_seasons
+        if resource_meta.season_list:
+            resource_seasons = resource_meta.season_list
         if resource_meta.episode_list:
-            for season in resource_seasons:
+            for season in parsed_seasons:
                 episodes.setdefault(str(season), set()).update(resource_meta.episode_list)
 
     for file in torrent_files:
@@ -76,6 +102,14 @@ def _fetch_torrent_metadata(
     cached = _TORRENT_METADATA_CACHE.get(cache_key)
     if isinstance(cached, dict):
         return dict(cached)
+    global _TORRENT_LAST_REQUEST_AT
+    with _TORRENT_REQUEST_LOCK:
+        wait_seconds = _TORRENT_REQUEST_INTERVAL - (
+                time.monotonic() - _TORRENT_LAST_REQUEST_AT
+        )
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        _TORRENT_LAST_REQUEST_AT = time.monotonic()
     metadata: Dict[str, Any] = {}
     try:
         with httpx.stream(
@@ -99,10 +133,21 @@ def _fetch_torrent_metadata(
         torrent = Torrent.read_stream(io.BytesIO(payload), validate=True)
         if str(torrent.infohash or "").upper() != info_hash:
             raise ValueError("torrent 元数据 Info Hash 不匹配")
-        file_entries = [
-            {"path": str(file), "size": int(getattr(file, "size", 0) or 0)}
-            for file in torrent.files
-        ]
+        file_entries = []
+        seen_paths = set()
+        for file in torrent.files:
+            path = str(file).replace("\\", "/").strip("/")
+            path_key = path.casefold()
+            if not path or path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            season_episode = MediaFileParser.extract_season_episode(Path(path).name)
+            file_entries.append({
+                "path": path,
+                "size": int(getattr(file, "size", 0) or 0),
+                "season": season_episode[0] if season_episode else 0,
+                "episode": season_episode[1] if season_episode else 0,
+            })
         filepaths = [entry["path"] for entry in file_entries]
         if not filepaths and torrent.name:
             filepaths = [str(torrent.name)]
@@ -124,7 +169,6 @@ def parse_magnet_metadata(
         provider_text: str = "",
         fetch_info: bool = False,
         timeout: float = 8,
-        metadata_url_template: str = DEFAULT_METADATA_URL_TEMPLATE,
 ) -> Dict[str, Any]:
     """解析 URI 和提供者文本；可按需短时获取完整 torrent 元数据。"""
     try:
@@ -146,7 +190,7 @@ def parse_magnet_metadata(
         fetched = _fetch_torrent_metadata(
             info_hash,
             timeout,
-            str(metadata_url_template or DEFAULT_METADATA_URL_TEMPLATE),
+            _metadata_url_template,
         )
         if fetched:
             if fetched["display_name"]:

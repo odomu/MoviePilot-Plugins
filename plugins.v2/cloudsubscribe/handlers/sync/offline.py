@@ -20,6 +20,26 @@ from ...utils import MediaFileParser
 class OfflineTaskService(OwnerDelegator):
     """监控待处理文件并完成重命名、STRM和历史状态更新。"""
 
+    def _cleanup_failed_offline_task(
+            self, item: Dict[str, Any], reason: str
+    ) -> None:
+        """失败后删除对应离线任务及其源文件，不清空共享隔离目录。"""
+        task_id = str(item.get("task_id") or "").strip().upper()
+        if not task_id or not self._offline_tasks:
+            return
+        try:
+            deleted = self._offline_tasks.delete_offline_task(
+                task_id, delete_source_file=True
+            )
+            if deleted:
+                logger.debug(
+                    f"Magnet 匹配失败，已删除离线任务及下载文件：{task_id}，原因：{reason}"
+                )
+        except Exception as error:
+            logger.warning(
+                f"Magnet 匹配失败后清理下载文件失败：{task_id}，{error}"
+            )
+
     @staticmethod
     def _upgrade_backup_name(file_name: str, task_id: str) -> str:
         """仅在原文件名后追加短任务 ID，避免隐藏文件和冗长标记。"""
@@ -690,6 +710,7 @@ class OfflineTaskService(OwnerDelegator):
                     task_done = bool(task and task.get("completed"))
                     if task and bool(task.get("failed")):
                         reason = "Magnet 离线下载失败"
+                        self._cleanup_failed_offline_task(item, reason)
                         self._mark_offline_history_status(pending_key, "失败", reason)
                         pending.pop(pending_key, None)
                         failed += 1
@@ -697,6 +718,7 @@ class OfflineTaskService(OwnerDelegator):
                     if not task_done:
                         if now - created_at >= self._OFFLINE_TIMEOUT:
                             reason = "Magnet 离线下载超过 30 分钟未完成，已退出"
+                            self._cleanup_failed_offline_task(item, reason)
                             self._mark_offline_history_status(pending_key, "失败", reason)
                             pending.pop(pending_key, None)
                             failed += 1
@@ -1066,6 +1088,7 @@ class OfflineTaskService(OwnerDelegator):
         """读取完成后的真实文件树，只移动实际匹配的媒体文件。"""
         mediainfo, media_data = self._restore_pending_media_context(item, pending_key)
         if not mediainfo:
+            self._cleanup_failed_offline_task(item, "媒体元数据不存在")
             return []
         subscribe_id = int(item.get("subscribe_id") or 0)
         subscribe = (
@@ -1081,6 +1104,7 @@ class OfflineTaskService(OwnerDelegator):
         if not subscribe and item.get("transient_target"):
             subscribe = SimpleNamespace(**(item.get("target_subscribe") or {}))
         if not subscribe:
+            self._cleanup_failed_offline_task(item, "订阅已不存在")
             self._mark_offline_history_status(
                 pending_key, "失败", "Magnet 下载完成时订阅已不存在"
             )
@@ -1139,6 +1163,7 @@ class OfflineTaskService(OwnerDelegator):
         if not matched:
             reason = "Magnet 下载完成，但真实文件名未匹配当前订阅"
             logger.warning(f"{reason}：{item.get('file_name')}")
+            self._cleanup_failed_offline_task(item, reason)
             self._mark_offline_history_status(pending_key, "失败", reason)
             return []
 

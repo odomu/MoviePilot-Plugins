@@ -424,7 +424,11 @@ class SearchApi(OwnerDelegator):
                     for entry in (metadata.get("torrent_file_entries") or [])
                 ]
                 if not files:
-                    raise RuntimeError("暂未获取到该磁力链接的 torrent 元数据")
+                    raise RuntimeError(
+                        "暂未获取到该磁力链接的 torrent 元数据"
+                        f"（Info Hash: {metadata.get('info_hash') or '未知'}；"
+                        "元数据地址未返回有效 torrent）"
+                    )
                 return {
                     "success": True,
                     "message": f"读取到 {len(files)} 个文件",

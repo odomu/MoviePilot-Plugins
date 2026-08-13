@@ -66,6 +66,7 @@ from .search.online_docs import OnlineDocumentClient
 from .search.pansou import PanSouClient
 from .search.pinglian import PinglianClient
 from .search.seedhub import SeedHubClient
+from .utils import configure_magnet_metadata_url
 
 _COMPONENT_TYPES = (
     PageApi,
@@ -101,7 +102,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -556,13 +557,13 @@ class CloudSubscribe(_PluginBase):
             "platform_media_sync_enabled",
             "platform_deep_delete_enabled",
         }
+        changed_keys = set()
         if not reset_runtime and self._applied_config:
             changed_keys = {
                 key for key in set(self._applied_config) | set(config)
                 if self._applied_config.get(key) != config.get(key)
             }
             if not changed_keys:
-                logger.info("插件配置未变化，无需重建服务")
                 return
             if changed_keys <= hot_keys:
                 self._show_sidebar_nav = bool(config.get("show_sidebar_nav", True))
@@ -774,21 +775,14 @@ class CloudSubscribe(_PluginBase):
             ))
             self._resource_type_order = resource_order
             self._pansou_cloud_types = list(resource_order)
-            metadata_url_template = str(config.get(
+            configured_metadata_url = str(config.get(
                 "magnet_metadata_url_template",
                 "https://itorrents.org/torrent/{info_hash}.torrent",
             ) or "").strip()
-            try:
-                if "{info_hash}" not in metadata_url_template:
-                    raise ValueError("缺少 {info_hash} 占位符")
-                probe_url = metadata_url_template.format(info_hash="0" * 40)
-                if not probe_url.lower().startswith(("http://", "https://")):
-                    raise ValueError("只允许 HTTP 或 HTTPS 地址")
-                self._magnet_metadata_url_template = metadata_url_template
-            except (KeyError, ValueError, IndexError):
-                self._magnet_metadata_url_template = (
-                    "https://itorrents.org/torrent/{info_hash}.torrent"
-                )
+            self._magnet_metadata_url_template = configure_magnet_metadata_url(
+                configured_metadata_url
+            )
+            if self._magnet_metadata_url_template != configured_metadata_url:
                 logger.warning("Magnet元数据地址模板无效，已恢复默认iTorrents地址")
             try:
                 self._pansou_concurrency = (
@@ -1123,7 +1117,14 @@ class CloudSubscribe(_PluginBase):
             len(self._sync_handler.get_pending_finalize_tasks())
             if self._sync_handler else 0
         )
-        if not reset_runtime:
+        service_config_keys = {
+            "enabled", "cron", "checkin_cron", "checkin_auto_retry",
+            "checkin_retry_count", "takeover_new_subscribes",
+            "block_start_time", "block_end_time", "block_system_subscribe",
+            "platform_download_policy", "block_platform_downloads",
+            "takeover_platform_downloads",
+        }
+        if reset_runtime or changed_keys & service_config_keys:
             self._refresh_platform_services()
         self._install_subscribe_search_takeover()
         self._get_component(MessageRoutingHook).install()
@@ -1318,7 +1319,6 @@ class CloudSubscribe(_PluginBase):
         self._p115_manager = P115ClientManager(
             cookies=self._cookies,
             share_cache_ttl_minutes=self._search_cache_ttl_minutes,
-            magnet_metadata_url_template=self._magnet_metadata_url_template,
             **self._p115_timeout_kwargs(),
         )
         if (
@@ -1411,7 +1411,6 @@ class CloudSubscribe(_PluginBase):
                 token=self._p123_token,
                 timeout=self._p123_request_timeout,
             ),
-            metadata_url_template=self._magnet_metadata_url_template,
         )
         if self._cloud_drive_registry is None:
             self._cloud_drive_registry = CloudDriveRegistry()
@@ -1463,7 +1462,6 @@ class CloudSubscribe(_PluginBase):
         self._guangya_device_id = client.device_id
         self._guangya_drive = GuangyaDrive(
             client=client,
-            metadata_url_template=self._magnet_metadata_url_template,
         )
         if self._cloud_drive_registry is None:
             self._cloud_drive_registry = CloudDriveRegistry()

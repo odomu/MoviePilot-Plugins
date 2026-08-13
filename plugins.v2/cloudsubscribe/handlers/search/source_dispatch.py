@@ -117,6 +117,7 @@ class SourceDispatchService(OwnerDelegator):
             results: List[Dict],
             source: str,
             mediainfo: MediaInfo,
+            media_type: MediaType,
             subscribe: Any,
             season: Optional[int],
             target_episodes: Optional[List[int]],
@@ -125,7 +126,11 @@ class SourceDispatchService(OwnerDelegator):
         for result in results:
             result.setdefault("source", source)
         ordered = self._prefilter_resource_order(
-            results, season=season, target_episodes=target_episodes
+            results,
+            season=season,
+            target_episodes=target_episodes,
+            log_prefix=f"[{self._search_label(mediainfo, media_type, season)}]"
+                       f"[{source.upper()}]",
         )
         if source == "hdhive":
             return sorted(ordered, key=self._hdhive_update_sort_key)
@@ -137,6 +142,7 @@ class SourceDispatchService(OwnerDelegator):
             subscribe,
             season=season,
             target_episodes=target_episodes,
+            prefiltered=True,
         )
 
     def test_source_result_limit(self) -> int:
@@ -228,6 +234,7 @@ class SourceDispatchService(OwnerDelegator):
                 results,
                 source,
                 mediainfo,
+                media_type,
                 subscribe,
                 season,
                 target_episodes,
@@ -261,6 +268,7 @@ class SourceDispatchService(OwnerDelegator):
             results,
             source,
             mediainfo,
+            media_type,
             subscribe,
             season,
             target_episodes,

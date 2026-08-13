@@ -1,6 +1,7 @@
 """候选资源解析、校验与网盘 Provider 路由。"""
 
 import copy
+import re
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from app.log import logger
@@ -12,11 +13,16 @@ from ...core import (
     OwnerDelegator,
 )
 from ...search.types import normalize_resource_type, resource_type_from_url
-from ...utils import MediaFileParser
+from ...utils import MediaFileParser, parse_magnet_metadata
 
 
 class ResourceTransferService(OwnerDelegator):
     """统一搜索候选到网盘转存能力之间的适配。"""
+
+    _TITLE_SEASON_PATTERN = re.compile(
+        r"(?<![A-Za-z0-9])[Ss]\s*0*(\d{1,3})(?!\d)|"
+        r"第\s*0*(\d{1,3})\s*季"
+    )
 
     @staticmethod
     def _resource_preview_episodes(
@@ -34,6 +40,255 @@ class ResourceTransferService(OwnerDelegator):
             except (TypeError, ValueError):
                 continue
         return episodes
+
+    @staticmethod
+    def _resource_title_episodes(title: str, season: int) -> Set[int]:
+        """从资源标题读取明确的单集信息，不为汇总标题猜测集数。"""
+        text = str(title or "").strip()
+        if not text:
+            return set()
+        episodes: Set[int] = set()
+        season_number = int(season or 1)
+        season_pattern = re.compile(
+            r"[Ss](\d{1,2})[Ee]\s*0*(\d{1,4})"
+            r"(?:\s*[-~～–—至到]\s*[Ee]?\s*0*(\d{1,4}))?"
+        )
+        for match in season_pattern.finditer(text):
+            if int(match.group(1)) != season_number:
+                continue
+            start = int(match.group(2))
+            end = int(match.group(3) or start)
+            if start <= end and end - start <= 999:
+                episodes.update(range(start, end + 1))
+
+        # 防止 S02E08-E09 的尾部 E09 被当成无季号表达式再次命中。
+        unscoped_text = season_pattern.sub(
+            lambda match: " " * len(match.group(0)), text
+        )
+        for pattern in (
+                re.compile(
+                    r"(?<!\d)第\s*0*(\d{1,4})"
+                    r"(?:\s*[-~～–—至到]\s*0*(\d{1,4}))?\s*集"
+                ),
+                re.compile(
+                    r"(?<![A-Za-z0-9])[Ee][Pp]?\s*0*(\d{1,4})"
+                    r"(?:\s*[-~～–—至到]\s*[EePp]?\s*0*(\d{1,4}))?(?!\d)"
+                ),
+        ):
+            for match in pattern.finditer(unscoped_text):
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if end < start or end - start > 999:
+                    continue
+                episodes.update(range(start, end + 1))
+        return {episode for episode in episodes if episode > 0}
+
+    @classmethod
+    def _resource_title_seasons(cls, title: str) -> Set[int]:
+        """提取标题中明确声明的季号。"""
+        seasons = set()
+        for match in cls._TITLE_SEASON_PATTERN.finditer(str(title or "")):
+            value = match.group(1) or match.group(2)
+            if value and int(value) > 0:
+                seasons.add(int(value))
+        return seasons
+
+    @staticmethod
+    def _magnet_resource_title(resource: Dict[str, Any]) -> str:
+        """合并所有来源可能携带的 Magnet 发布标题。"""
+        metadata = resource.get("magnet_metadata") or {}
+        values = (
+            resource.get("title"),
+            resource.get("description"),
+            resource.get("name"),
+            resource.get("raw_title"),
+            resource.get("rawTitle"),
+            resource.get("release_name"),
+            resource.get("magnet_name"),
+            resource.get("magnet_uri_name"),
+            resource.get("torrent_name"),
+            metadata.get("display_name"),
+        )
+        return " ".join(dict.fromkeys(
+            str(value or "").strip() for value in values if str(value or "").strip()
+        ))
+
+    @classmethod
+    def _prepare_magnet_resource(
+            cls, resource: Dict[str, Any], share_url: str
+    ) -> str:
+        """统一补全 Magnet URI 展示名和轻量集数预览，不请求远端 torrent 元数据。"""
+        metadata = dict(resource.get("magnet_metadata") or {})
+        provider_text = cls._magnet_resource_title(resource)
+        parsed = parse_magnet_metadata(share_url, provider_text=provider_text)
+        if parsed:
+            for key, value in parsed.items():
+                if value and not metadata.get(key):
+                    metadata[key] = value
+            if metadata:
+                resource["magnet_metadata"] = metadata
+            if parsed.get("display_name"):
+                resource["magnet_uri_name"] = parsed["display_name"]
+                if not resource.get("magnet_name"):
+                    resource["magnet_name"] = parsed["display_name"]
+            if parsed.get("preview_episodes") and not resource.get("preview_episodes"):
+                resource["preview_episodes"] = parsed["preview_episodes"]
+        return cls._magnet_resource_title(resource)
+
+    @classmethod
+    def _magnet_title_episodes(
+            cls, resource: Dict[str, Any], season: int
+    ) -> Set[int]:
+        """从统一标题和来源结构化集数字段提取明确集数。"""
+        episodes = cls._resource_title_episodes(
+            cls._magnet_resource_title(resource), season
+        )
+        season_value = resource.get("season")
+        try:
+            season_matches = season_value in (None, "") or int(season_value) == int(season)
+        except (TypeError, ValueError):
+            season_matches = False
+        if season_matches:
+            episode_values = resource.get("episodes")
+            if not isinstance(episode_values, (list, tuple, set)):
+                episode_values = [episode_values or resource.get("episode")]
+            for value in episode_values:
+                try:
+                    episode = int(value)
+                except (TypeError, ValueError):
+                    episodes.update(
+                        cls._resource_title_episodes(f"E{value}", season)
+                    )
+                else:
+                    if episode > 0:
+                        episodes.add(episode)
+            try:
+                start = int(resource.get("episode_start") or 0)
+                end = int(resource.get("episode_end") or start)
+            except (TypeError, ValueError):
+                start = end = 0
+            if 0 < start <= end and end - start <= 999:
+                episodes.update(range(start, end + 1))
+        return episodes
+
+    @classmethod
+    def _magnet_title_seasons(cls, resource: Dict[str, Any]) -> Set[int]:
+        """从统一标题和来源结构化字段提取明确季号。"""
+        seasons = cls._resource_title_seasons(
+            cls._magnet_resource_title(resource)
+        )
+        try:
+            structured = int(resource.get("season") or 0)
+        except (TypeError, ValueError):
+            structured = 0
+        if structured > 0:
+            seasons.add(structured)
+        return seasons
+
+    @staticmethod
+    def _magnet_history_entries(
+            resource: Dict[str, Any],
+            season: Optional[int] = None,
+            target_episodes: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """从已校验 torrent 元数据生成历史占位文件，禁止使用发布标题猜测。"""
+        metadata = resource.get("magnet_metadata") or {}
+        target_set = {
+            int(value) for value in (target_episodes or []) if int(value) > 0
+        }
+        entries = []
+        seen = set()
+        for source in metadata.get("torrent_file_entries") or []:
+            path = str(source.get("path") or "").replace("\\", "/").strip("/")
+            file_name = path.rsplit("/", 1)[-1]
+            if not MediaFileParser.is_video(file_name):
+                continue
+            try:
+                entry_season = int(source.get("season") or 0)
+                episode = int(source.get("episode") or 0)
+            except (TypeError, ValueError):
+                continue
+            if season is None and not entry_season and not episode:
+                entries.append({
+                    "file_name": file_name,
+                    "file_size": max(0, int(source.get("size") or 0)),
+                    "season": 0,
+                    "episode": 0,
+                })
+                continue
+            if season is not None and entry_season != int(season):
+                continue
+            if target_set and episode not in target_set:
+                continue
+            identity = (entry_season, episode, file_name.casefold())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            entries.append({
+                "file_name": file_name,
+                "file_size": max(0, int(source.get("size") or 0)),
+                "season": entry_season,
+                "episode": episode,
+            })
+        return entries
+
+    def _append_magnet_pending_history(
+            self,
+            history: List[Dict[str, Any]],
+            mediainfo: Any,
+            subscribe: Any,
+            share_url: str,
+            cloud_dir: str,
+            resource: Dict[str, Any],
+            finalize_key: str,
+            season: Optional[int] = None,
+            target_episodes: Optional[List[int]] = None,
+            **fields: Any,
+    ) -> int:
+        """按 torrent 真实媒体文件追加待完成历史，并避免同任务重复记录。"""
+        entries = self._magnet_history_entries(resource, season, target_episodes)
+        if not entries:
+            return 0
+        existing = {
+            (
+                str(item.get("finalize_key") or ""),
+                int(item.get("season") or 0),
+                int(item.get("episode") or 0),
+            )
+            for item in history
+            if isinstance(item, dict)
+        }
+        appended = 0
+        for entry in entries:
+            identity = (
+                finalize_key,
+                int(entry.get("season") or 0),
+                int(entry.get("episode") or 0),
+            )
+            if identity in existing:
+                continue
+            record_fields = dict(fields)
+            record_fields.update({
+                "file_size": entry["file_size"],
+                "season": entry["season"],
+                "episode": entry["episode"],
+                "target_episodes": [entry["episode"]],
+                "finalize_key": finalize_key,
+            })
+            history.append(self._build_transfer_history_item(
+                mediainfo=mediainfo,
+                subscribe=subscribe,
+                status="下载中",
+                share_url=share_url,
+                file_name=entry["file_name"],
+                source_file_name=entry["file_name"],
+                cloud_dir=cloud_dir,
+                resource=resource,
+                **record_fields,
+            ))
+            existing.add(identity)
+            appended += 1
+        return appended
 
     @staticmethod
     def _resource_history_meta(

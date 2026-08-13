@@ -25,10 +25,9 @@ class P123OfflineService:
 
     CACHE_TTL = 60
 
-    def __init__(self, client: Any, files: Any, metadata_url_template: str):
+    def __init__(self, client: Any, files: Any):
         self.client = client
         self._files = files
-        self.metadata_url_template = metadata_url_template
         self._lock = RLock()
         self._tasks: list[Dict[str, Any]] = []
         self._updated_at = 0.0
@@ -66,7 +65,6 @@ class P123OfflineService:
         metadata = parse_magnet_metadata(
             url,
             fetch_info=fetch_metadata,
-            metadata_url_template=self.metadata_url_template,
         )
         if not metadata:
             return {}

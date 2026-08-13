@@ -546,6 +546,7 @@ class PinglianClient:
             candidates = []
             raw_link_count = 0
             type_counts: Dict[str, int] = {}
+            filtered_type_counts: Dict[str, int] = {}
             for group_key, group in groups.items():
                 for row in (group.get("links") or []) if isinstance(group, dict) else []:
                     raw_link_count += 1
@@ -567,6 +568,9 @@ class PinglianClient:
                             or (not direct_target and not token)
                     ):
                         continue
+                    filtered_type_counts[resource_type] = (
+                            filtered_type_counts.get(resource_type, 0) + 1
+                    )
                     candidates.append((
                         type_order[resource_type], row, resource_type,
                         direct_target, token,
@@ -575,6 +579,7 @@ class PinglianClient:
             logger.debug(
                 f"{prefix} search_pan_links：分组={len(groups)}，"
                 f"原始链接={raw_link_count}，类型={'/'.join(f'{k}={v}' for k, v in type_counts.items()) or '无'}，"
+                f"已选类型候选={'/'.join(f'{k}={v}' for k, v in filtered_type_counts.items()) or '无'}，"
                 f"可用候选={len(candidates)}"
             )
 
