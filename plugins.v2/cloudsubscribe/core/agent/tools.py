@@ -82,7 +82,7 @@ class CloudSubscribeLinksTool(MoviePilotTool):
     ]
     description: str = (
         "校验并提交用户直接提供的115分享、ED2K或Magnet链接。订阅不存在或未指定时，"
-        "使用媒体名称快速识别 TMDB；只有一个候选会直接进入完整转存流程，多个候选会"
+        "优先定位唯一匹配订阅；没有订阅时使用媒体名称快速识别 TMDB；只有一个候选会直接进入完整转存流程，多个候选会"
         "返回 selection_id，此时应让用户选择媒体类型和 TMDB ID 后再次调用本工具。"
         "仅处理用户明确提供的链接；"
         "搜索工具返回的候选必须改用 cloudsubscribe_select_resources，禁止复制或改写候选链接。"
@@ -100,8 +100,7 @@ class CloudSubscribeLinksTool(MoviePilotTool):
             title: Optional[str] = None,
             media_type: Optional[str] = None,
             season: Optional[int] = None,
-            episode_start: Optional[int] = None,
-            episode_end: Optional[int] = None,
+            seasons: Optional[list[int]] = None,
             selection_id: Optional[str] = None,
             tmdb_id: Optional[int] = None,
             **kwargs,
@@ -115,6 +114,8 @@ class CloudSubscribeLinksTool(MoviePilotTool):
             return "媒体类型仅支持 movie（电影）或 tv（电视剧）"
         if selection_id and (not tmdb_id or media_type not in {"movie", "tv"}):
             return "选择 TMDB 候选时请同时提供 selection_id、media_type 和 tmdb_id"
+        if season is not None and seasons:
+            return "season 与 seasons 只能提供一个"
         result = await self.run_blocking(
             "storage",
             plugin.submit_platform_links,
@@ -123,8 +124,7 @@ class CloudSubscribeLinksTool(MoviePilotTool):
             title=title or "",
             media_type=media_type or "",
             season=season,
-            episode_start=episode_start,
-            episode_end=episode_end,
+            seasons=seasons,
             selection_id=selection_id or "",
             tmdb_id=tmdb_id,
             selection_scope=f"agent:{self._session_id}",

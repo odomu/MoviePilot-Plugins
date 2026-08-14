@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import threading
 from dataclasses import dataclass
@@ -13,6 +12,9 @@ from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from app.log import logger
+
+from .action import ServerActionProtocol, ServerActionResponse
+from .parser import decode_embedded_text, response_body, response_text
 
 BASE_URL = "https://hdhive.com"
 ALPHABET = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -467,15 +469,13 @@ class HDHiveCaptchaSolver:
     def __init__(
             self,
             request: Callable[..., Any],
+            server_actions: ServerActionProtocol,
             recognizer: Optional[HDHiveCaptchaRecognizer] = None,
     ):
         self._request = request
+        self._server_actions = server_actions
         self._recognizer = recognizer or HDHiveCaptchaRecognizer()
         self._action_cache: dict[str, dict[str, str]] = {}
-
-    @staticmethod
-    def _body(response) -> bytes:
-        return bytes(getattr(response, "content", b"") or b"")
 
     @classmethod
     def challenge_url(cls, response) -> str:
@@ -512,8 +512,7 @@ class HDHiveCaptchaSolver:
                     and UUID_RE.fullmatch(challenge_id)
             ):
                 return f"{BASE_URL}{CHALLENGE_PATH}?challenge={challenge_id}"
-        text = cls._body(response).decode("utf-8", errors="replace")
-        normalized = text.replace(r"\u0026", "&").replace(r"\u002F", "/")
+        normalized = decode_embedded_text(response_text(response))
         redirect = NEXT_REDIRECT_RE.search(normalized)
         if redirect:
             candidate = cls._valid_challenge_url(
@@ -562,14 +561,8 @@ class HDHiveCaptchaSolver:
 
     @staticmethod
     def _extract_gif(payload: bytes) -> bytes:
-        text = payload.decode("utf-8", errors="replace")
-        normalized = (
-            text.replace(r"\u002b", "+")
-            .replace(r"\u002B", "+")
-            .replace(r"\u002f", "/")
-            .replace(r"\u002F", "/")
-            .replace(r"\u003d", "=")
-            .replace(r"\u003D", "=")
+        normalized = decode_embedded_text(
+            payload.decode("utf-8", errors="replace")
         )
         match = GIF_RE.search(normalized)
         if not match:
@@ -600,14 +593,17 @@ class HDHiveCaptchaSolver:
             requested_path: str,
             response=None,
     ) -> CaptchaChallenge:
-        payload = self._body(response) if response is not None else b""
-        if not payload or not GIF_RE.search(payload.decode("utf-8", errors="ignore")):
+        payload = response_body(response) if response is not None else b""
+        page_text = decode_embedded_text(
+            payload.decode("utf-8", errors="ignore")
+        ) if payload else ""
+        if not payload or not GIF_RE.search(page_text):
             response = self._request(
                 "GET",
                 self._relative_url(challenge_url),
                 headers={"accept": "text/html,application/xhtml+xml"},
             )
-            payload = self._body(response)
+            payload = response_body(response)
             challenge_url = self.challenge_url(response) or challenge_url
         parsed = urlsplit(challenge_url)
         challenge_id = parse_qs(parsed.query).get("challenge", [""])[0]
@@ -627,7 +623,9 @@ class HDHiveCaptchaSolver:
         return CaptchaChallenge(challenge_id, challenge_url, return_to, payload)
 
     def _actions(self, challenge: CaptchaChallenge) -> dict[str, str]:
-        text = challenge.page.decode("utf-8", errors="replace")
+        text = decode_embedded_text(
+            challenge.page.decode("utf-8", errors="replace")
+        )
         chunk_match = PAGE_CHUNK_RE.search(text)
         if not chunk_match:
             raise HDHiveCaptchaError(
@@ -638,7 +636,7 @@ class HDHiveCaptchaSolver:
         if chunk in self._action_cache:
             return self._action_cache[chunk]
         response = self._request("GET", f"/_next/{chunk}")
-        javascript = self._body(response).decode("utf-8", errors="replace")
+        javascript = response_text(response)
         actions = {name: action_id for action_id, name in ACTION_RE.findall(javascript)}
         required = {"refreshAbuseChallenge", "verifyAbuseChallenge"}
         if not required.issubset(actions):
@@ -651,34 +649,20 @@ class HDHiveCaptchaSolver:
         return actions
 
     @staticmethod
-    def _result(payload: bytes) -> ActionResult:
-        text = payload.decode("utf-8", errors="replace")
-        envelope = None
-        for line in text.splitlines():
-            if re.match(r"^[0-9a-f]+:\{", line, re.I):
-                try:
-                    candidate = json.loads(line.split(":", 1)[1])
-                except (json.JSONDecodeError, IndexError):
-                    continue
-                if isinstance(candidate, dict) and (
-                        "response" in candidate or "error" in candidate
-                ):
-                    envelope = candidate
-                    break
-        if envelope:
-            response = envelope.get("response") or {}
-            error = envelope.get("error") or {}
-            data = response.get("data") or error.get("data") or {}
+    def _result(response: ServerActionResponse) -> ActionResult:
+        if response.payload:
+            data = response.data
             remaining = data.get("remaining_attempts")
             return ActionResult(
-                success=bool(response.get("success")),
-                code=str(error.get("code") or ""),
-                message=str(error.get("message") or response.get("message") or ""),
+                success=response.success,
+                code=response.code,
+                message=response.message,
                 remaining_attempts=(
                     int(remaining) if isinstance(remaining, (int, float)) else None
                 ),
                 clearance_seconds=int(data.get("clearance_seconds") or 0),
             )
+        text = response.text
         code_match = re.search(r'"code"\s*:\s*"([A-Z0-9_]+)"', text)
         if re.search(r'"success"\s*:\s*true', text, re.I):
             return ActionResult(success=True)
@@ -694,30 +678,21 @@ class HDHiveCaptchaSolver:
             action: str,
             arguments: list[str],
     ) -> tuple[ActionResult, bytes]:
-        response = self._request(
-            "POST",
+        response = self._server_actions.post(
+            self._request,
             self._relative_url(challenge.url),
-            headers={
-                "accept": "text/x-component",
-                "content-type": "text/plain;charset=UTF-8",
-                "next-action": action,
-                "next-router-state-tree": ROUTER_STATE,
-                "next-url": challenge.return_to,
-                "origin": BASE_URL,
-                "referer": challenge.url,
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            },
-            data=json.dumps(arguments, separators=(",", ":")),
+            action,
+            arguments,
+            referer=challenge.url,
+            router_state=ROUTER_STATE,
+            next_url=challenge.return_to,
         )
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
+        if response.status_code >= 400:
             raise HDHiveCaptchaError(
                 f"HDHive 验证码提交失败（HTTP {response.status_code}）",
                 code="captcha_request_failed",
             )
-        payload = self._body(response)
-        return self._result(payload), payload
+        return self._result(response), response.body
 
     def _refresh(self, challenge: CaptchaChallenge) -> CaptchaChallenge:
         actions = self._actions(challenge)

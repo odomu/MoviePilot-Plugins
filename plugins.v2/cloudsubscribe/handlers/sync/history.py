@@ -320,6 +320,7 @@ class HistoryService(OwnerDelegator):
         resource_type = str(record.get("resource_type") or "").strip().lower()
         return {
             "115": "115资源",
+            "cloud": "网盘路径",
             "ed2k": "ED2K",
             "magnet": "Magnet",
         }.get(resource_type, "网盘订阅助手")
@@ -1233,7 +1234,7 @@ class HistoryService(OwnerDelegator):
                 f"STRM 已生成但缺少媒体信息，无法发送入库通知：{strm_path}"
             )
 
-        if finish_subscription:
+        if finish_subscription and not item.get("transient_target"):
             self._finish_pending_subscription(
                 item, media_data or {}, mediainfo=mediainfo
             )
@@ -1516,7 +1517,7 @@ class HistoryService(OwnerDelegator):
             "exclude": None,
             "note": [],
             "episode_priority": {},
-            "best_version": True,
+            "best_version": False,
             "state": "N",
         }
 
@@ -1542,12 +1543,12 @@ class HistoryService(OwnerDelegator):
 
         season = max(1, int(media.get("season") or 1)) if media_type == MediaType.TV else None
         selected_episodes = sorted({
-            int(value) for value in (episodes or set()) if int(value) > 0
+            int(value)
+            for value in (
+                episodes if episodes is not None else media.get("episodes") or []
+            )
+            if int(value) > 0
         })
-        if media_type == MediaType.TV and not selected_episodes:
-            start_episode = max(1, int(media.get("episode_start") or 1))
-            end_episode = max(start_episode, int(media.get("episode_end") or start_episode))
-            selected_episodes = list(range(start_episode, end_episode + 1))
 
         target_data = self._transient_target_defaults()
         target_data.update({
@@ -1559,7 +1560,7 @@ class HistoryService(OwnerDelegator):
             "doubanid": media.get("douban_id") or media.get("doubanid"),
             "season": season,
             "start_episode": min(selected_episodes) if selected_episodes else 1,
-            "total_episode": max(selected_episodes) if selected_episodes else 1,
+            "total_episode": max(selected_episodes) if selected_episodes else 0,
             "lack_episode": len(selected_episodes) if media_type == MediaType.TV else 0,
             "episode_group": media.get("episode_group"),
             "_transient_target": True,

@@ -204,6 +204,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "按指定订阅手动添加资源链接",
             },
             {
+                "path": "/sync/manual/resolve",
+                "endpoint": self.api_vue_resolve_manual_links,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "识别手动资源对应的订阅或 TMDB 媒体",
+            },
+            {
                 "path": "/sync/stop",
                 "endpoint": self.api_vue_stop_sync,
                 "methods": ["POST"],

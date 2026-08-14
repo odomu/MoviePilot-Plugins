@@ -5,6 +5,7 @@
 import copy
 import datetime
 import re
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event as ThreadEvent, Lock, RLock, local
 from typing import Optional, Any, List, Dict, Tuple, Callable
 
@@ -102,7 +103,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -357,7 +358,7 @@ class CloudSubscribe(_PluginBase):
     _takeover_new_subscribes: bool = False
     _platform_download_policy: str = "block"
 
-    _max_transfer_per_sync: int = 50
+    _transfer_task_batch_size: int = 50
     _cross_transfer_enabled: bool = False
     _cross_transfer_media_types: list = ["movie", "tv"]
     _cross_transfer_download_path: str = ""
@@ -463,6 +464,10 @@ class CloudSubscribe(_PluginBase):
     _subscribe_search_queue_shutdown: Optional[ThreadEvent] = None
     _subscribe_search_coordinator_running: bool = False
     _subscribe_search_queue_revision: int = 0
+    _sync_queue_executor: Optional[ThreadPoolExecutor] = None
+    _sync_queue_lock: Optional[RLock] = None
+    _sync_queue_pending: int = 0
+    _sync_queue_tasks: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _cron_is_valid(cron_expr: str) -> bool:
@@ -604,6 +609,13 @@ class CloudSubscribe(_PluginBase):
             self._subscribe_search_queue_shutdown = ThreadEvent()
             self._subscribe_search_coordinator_running = False
             self._subscribe_search_queue_revision = 0
+            self._sync_queue_lock = RLock()
+            self._sync_queue_pending = 0
+            self._sync_queue_tasks = {}
+            self._sync_queue_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cloudsubscribe-sync-queue",
+            )
             self._subscribe_search_originals = {}
             self._platform_search_originals = {}
         else:
@@ -611,6 +623,15 @@ class CloudSubscribe(_PluginBase):
                 self._sync_tasks_lock = RLock()
             if self._task_local is None:
                 self._task_local = local()
+            if self._sync_queue_lock is None:
+                self._sync_queue_lock = RLock()
+            if "_sync_queue_tasks" not in self.__dict__:
+                self._sync_queue_tasks = {}
+            if self._sync_queue_executor is None:
+                self._sync_queue_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="cloudsubscribe-sync-queue",
+                )
 
         if config:
             self._enabled = config.get("enabled", False)
@@ -746,11 +767,11 @@ class CloudSubscribe(_PluginBase):
             raw_doc_urls = config.get("online_docs") or config.get("online_docs_urls") or []
             if isinstance(raw_doc_urls, str):
                 raw_doc_urls = re.split(r"[,，\n]+", raw_doc_urls)
+            elif not isinstance(raw_doc_urls, (list, tuple)):
+                raw_doc_urls = [raw_doc_urls]
             self._online_docs_resource_types = [str(value).strip().lower() for value in
                                                 (config.get("online_docs_resource_types") or []) if str(value).strip()]
-            self._online_docs = OnlineDocumentClient._normalize_documents(
-                raw_doc_urls, self._online_docs_resource_types
-            )
+            self._online_docs = list(raw_doc_urls)
             self._pansou_username = config.get("pansou_username", "")
             self._pansou_password = config.get("pansou_password", "")
             self._pansou_auth_enabled = config.get("pansou_auth_enabled", False)
@@ -924,7 +945,9 @@ class CloudSubscribe(_PluginBase):
                 0, int(config.get("dian115_max_points_per_sub", 20) or 0)
             )
 
-            self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
+            self._transfer_task_batch_size = int(
+                config.get("transfer_task_batch_size", 50) or 50
+            )
             self._cross_transfer_enabled = bool(config.get("cross_transfer_enabled", False))
             raw_cross_types = config.get("cross_transfer_media_types", ["movie", "tv"])
             if isinstance(raw_cross_types, str):
@@ -1667,7 +1690,9 @@ class CloudSubscribe(_PluginBase):
             should_stop=self._stop_requested,
         )
         # 积分花费属于业务状态，不是可丢弃的搜索缓存。
-        self._search_handler.set_data_funcs(self.get_data, self.save_data)
+        self._search_handler.configure_point_storage(
+            self.get_data, self.save_data
+        )
         self._sync_handler = SyncHandler(
             cloud_drive=self._cloud_drive,
             search_handler=self._search_handler,
@@ -1683,7 +1708,7 @@ class CloudSubscribe(_PluginBase):
                 "tianyi": self._tianyi_transfer_path,
                 "alipan": self._alipan_transfer_path,
             },
-            max_transfer_per_sync=self._max_transfer_per_sync,
+            transfer_task_batch_size=self._transfer_task_batch_size,
             cross_transfer_enabled=self._cross_transfer_enabled,
             cross_transfer_media_types=self._cross_transfer_media_types,
             cloud_drive_registry=self._cloud_drive_registry,
@@ -1871,7 +1896,7 @@ class CloudSubscribe(_PluginBase):
             "block_start_time": self._block_start_time,
             "block_end_time": self._block_end_time,
             "upgrade_subscribe_ids": self._upgrade_subscribe_ids,
-            "max_transfer_per_sync": self._max_transfer_per_sync,
+            "transfer_task_batch_size": self._transfer_task_batch_size,
             "cross_transfer_enabled": self._cross_transfer_enabled,
             "cross_transfer_media_types": self._cross_transfer_media_types,
             "cross_transfer_download_path": self._cross_transfer_download_path,
@@ -1927,6 +1952,14 @@ class CloudSubscribe(_PluginBase):
         """停止服务"""
         if not preserve_subscribe_queue and self._subscribe_search_queue_lock is not None:
             self.cancel_pending_subscribe_searches(shutdown=True)
+            executor = self._sync_queue_executor
+            self._sync_queue_executor = None
+            if self._sync_queue_lock is not None:
+                with self._sync_queue_lock:
+                    self._sync_queue_tasks.clear()
+                    self._sync_queue_pending = 0
+            if executor:
+                executor.shutdown(wait=False, cancel_futures=True)
         if self._stop_event:
             self._stop_event.set()
         if self._sync_tasks_lock is not None:

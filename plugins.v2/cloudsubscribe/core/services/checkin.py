@@ -23,7 +23,6 @@ class CheckinProvider:
 
     key: str
     name: str
-    client_getter: str
     credential_attrs: Tuple[str, ...]
     error_types: Tuple[Type[Exception], ...]
     modes: Tuple[str, ...]
@@ -42,7 +41,6 @@ class CheckinService(OwnerDelegator):
         "hdhive": CheckinProvider(
             key="hdhive",
             name="HDHive",
-            client_getter="get_hdhive_web_client",
             credential_attrs=("_hdhive_username", "_hdhive_password"),
             error_types=(HDHiveWebError, HDHiveOpenAPIError),
             modes=("normal", "gambler"),
@@ -52,7 +50,6 @@ class CheckinService(OwnerDelegator):
         "dian115": CheckinProvider(
             key="dian115",
             name="Dian115",
-            client_getter="get_dian115_client",
             credential_attrs=("_dian115_email", "_dian115_password"),
             error_types=(Dian115Error,),
             modes=("normal", "lucky"),
@@ -65,7 +62,6 @@ class CheckinService(OwnerDelegator):
         "juying": CheckinProvider(
             key="juying",
             name="聚影",
-            client_getter="get_juying_client",
             credential_attrs=("_juying_username", "_juying_password"),
             error_types=(JuyingError,),
             modes=("normal",),
@@ -130,8 +126,7 @@ class CheckinService(OwnerDelegator):
                     "HDHive OpenAPI 应用配置或用户授权不完整",
                 )
             return client
-        client_getter = getattr(self._search_handler, provider.client_getter)
-        return client_getter()
+        return self._search_handler.get_source_client(provider.key)
 
     def _refresh_checkin_account(
             self,

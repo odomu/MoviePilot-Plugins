@@ -366,9 +366,15 @@ class PluginEventHandler(OwnerDelegator):
                     "tv": "电视剧",
                 }.get(media.get("media_type"), "媒体")
                 year = f" ({media.get('year')})" if media.get("year") else ""
+                seasons = [
+                    int(value) for value in media.get("seasons") or []
+                    if str(value).isdigit() and int(value) > 0
+                ]
+                if not seasons and media.get("season"):
+                    seasons = [int(media.get("season"))]
                 season = (
-                    f" · S{int(media.get('season')):02d}"
-                    if media.get("season") else ""
+                    " · " + "/".join(f"S{value:02d}" for value in sorted(set(seasons)))
+                    if seasons else ""
                 )
                 lines.append(
                     f"已识别：{media.get('title') or '未知媒体'}{year} · "

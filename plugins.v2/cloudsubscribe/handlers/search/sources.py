@@ -6,11 +6,30 @@ from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
-from ...core import OwnerDelegator
+from ...core import OwnerDelegator, SearchQuery
+from ...search.magnet import clear_cache, normalize_magnets
 
 
 class PanSouSearchService(OwnerDelegator):
     """提供 PanSou 搜索实现。"""
+
+    def search(self, query: SearchQuery) -> List[Dict]:
+        """将统一查询参数适配为 PanSou 的电影或剧集搜索。"""
+        if query.media_type == MediaType.MOVIE:
+            return self._search_pansou_movie(
+                query.mediainfo,
+                test_mode=query.test_mode,
+                result_limit=query.result_limit,
+            )
+        return self._search_pansou_tv(
+            query.mediainfo,
+            query.season,
+            test_mode=query.test_mode,
+            result_limit=query.result_limit,
+        )
+
+    def clear_cache(self) -> int:
+        return clear_cache(self._pansou_client)
 
     @staticmethod
     def _pansou_resource_type(resource: Dict[str, Any]) -> str:
@@ -46,7 +65,7 @@ class PanSouSearchService(OwnerDelegator):
             max(1, int(result_limit or self._pansou_result_limit))
             if test_mode else self._pansou_result_limit
         )
-        search_results = self._pansou_client.search(
+        search_results = self._pansou_client.request_search(
             keyword=keyword,
             cloud_types=[
                 "aliyun" if value == "alipan" else value
@@ -103,7 +122,7 @@ class PanSouSearchService(OwnerDelegator):
                 if self._pansou_resource_type(item)
                    in self._resource_type_order_config
             ]
-        candidates = self._normalize_magnets(candidates, "pansou")
+        candidates = normalize_magnets(candidates, "pansou")
         usable = [
             resource
             for resource in candidates

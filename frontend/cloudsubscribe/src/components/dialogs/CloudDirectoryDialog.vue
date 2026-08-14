@@ -1,65 +1,71 @@
 <template>
-  <v-dialog v-model="visible" max-width="560">
+  <v-dialog v-model="visible" :max-width="providerItems.length > 1 ? 760 : 560">
     <v-card class="directory-card">
       <v-card-title class="directory-title px-3 py-2 bg-primary-lighten-5">
         <v-icon icon="mdi-folder-network" color="primary" class="mr-2" />
-        <span>选择网盘转存路径</span>
+        <span>{{ title }}</span>
       </v-card-title>
       <v-card-text class="px-3 py-2">
-        <div v-if="loading" class="directory-loading">
-          <v-progress-circular indeterminate color="primary" />
-        </div>
-        <div v-else>
-          <v-text-field
-            v-model="currentPath"
-            label="当前路径"
-            variant="outlined"
-            density="compact"
-            class="mb-2"
-            hide-details
-            @keyup.enter="loadDirectories(currentPath)" />
-          <div class="directory-actions mb-2">
-            <v-btn
-              prepend-icon="mdi-folder-plus"
-              variant="tonal"
-              size="small"
-              :disabled="loading || createLoading"
-              @click="openCreateDirectoryDialog">
-              新建文件夹
-            </v-btn>
-            <v-btn
-              prepend-icon="mdi-refresh"
-              variant="text"
-              size="small"
-              :disabled="loading || createLoading"
-              @click="refreshDirectories">
-              刷新
-            </v-btn>
-          </div>
-          <v-list class="directory-list border rounded">
-            <v-list-item v-if="currentPath !== '/'" class="py-1" @click="loadDirectories(parentPath)">
-              <template #prepend>
-                <v-icon icon="mdi-arrow-up" size="small" class="mr-2" color="grey" />
-              </template>
-              <v-list-item-title class="text-body-2">上级目录</v-list-item-title>
-              <v-list-item-subtitle>..</v-list-item-subtitle>
-            </v-list-item>
-
+        <div class="directory-browser" :class="{ 'has-providers': providerItems.length > 1 }">
+          <v-list v-if="providerItems.length > 1" nav density="compact" class="provider-list border rounded">
+            <v-list-subheader>网盘</v-list-subheader>
             <v-list-item
-              v-for="directory in directories"
-              :key="directory.id || directory.path"
-              class="py-1"
-              @click="loadDirectories(directory.path)">
+              v-for="item in providerItems"
+              :key="item.value"
+              :active="selectedProvider === item.value"
+              color="primary"
+              :disabled="loading"
+              @click="selectProvider(item.value)">
               <template #prepend>
-                <v-icon icon="mdi-folder" size="small" class="mr-2" color="amber-darken-2" />
+                <v-icon icon="mdi-cloud-outline" size="small" />
               </template>
-              <v-list-item-title class="text-body-2">{{ directory.name }}</v-list-item-title>
-            </v-list-item>
-
-            <v-list-item v-if="!directories.length" class="py-2 text-center">
-              <v-list-item-title class="text-body-2 text-grey">该目录为空或没有子文件夹</v-list-item-title>
+              <v-list-item-title>{{ item.title }}</v-list-item-title>
+              <v-list-item-subtitle>
+                {{ item.value === (targetProvider || provider) ? "目标网盘" : "跨盘转存" }}
+              </v-list-item-subtitle>
             </v-list-item>
           </v-list>
+          <div class="directory-pane">
+            <v-text-field
+              v-model="currentPath"
+              label="当前路径"
+              variant="outlined"
+              density="compact"
+              class="mb-2"
+              hide-details
+              :disabled="loading"
+              @keyup.enter="loadDirectories(currentPath)" />
+            <div class="directory-actions mb-2">
+              <v-btn
+                v-if="allowCreate"
+                prepend-icon="mdi-folder-plus"
+                variant="tonal"
+                size="small"
+                :disabled="loading || createLoading"
+                @click="openCreateDirectoryDialog">
+                新建文件夹
+              </v-btn>
+              <v-btn
+                prepend-icon="mdi-refresh"
+                variant="text"
+                size="small"
+                :disabled="loading || createLoading"
+                @click="refreshDirectories">
+                刷新
+              </v-btn>
+            </div>
+            <div v-if="loading && !treeRoot.loaded" class="directory-loading">
+              <v-progress-circular indeterminate color="primary" />
+            </div>
+            <div v-else class="directory-list border rounded">
+              <CloudDirectoryTreeNode
+                :node="treeRoot"
+                :selected-path="currentPath"
+                :disabled="loading || createLoading"
+                @select="selectTreeNode"
+                @toggle="toggleTreeNode" />
+            </div>
+          </div>
         </div>
         <v-alert v-if="errorMessage" type="error" density="compact" variant="tonal" class="mt-2 text-caption">
           {{ errorMessage }}
@@ -103,33 +109,50 @@
 
 <script setup>
 import {computed, ref, watch} from "vue";
+import CloudDirectoryTreeNode from "./CloudDirectoryTreeNode.vue";
 
 const props = defineProps({
   modelValue: {type: Boolean, default: false},
   api: {type: [Object, Function], required: true},
   provider: {type: String, default: ""},
+  targetProvider: {type: String, default: ""},
   initialPath: {type: String, default: "/"},
   pluginId: {type: String, default: "CloudSubscribe"},
+  title: {type: String, default: "选择网盘转存路径"},
+  allowCreate: {type: Boolean, default: true},
+  providers: {type: Array, default: () => []},
 })
 const emit = defineEmits(["update:modelValue", "select"]);
 const currentPath = ref("/");
-const directories = ref([]);
+const selectedProvider = ref("");
 const loading = ref(false);
 const errorMessage = ref("");
-const lastRequestedPath = ref("");
 const createDirectoryVisible = ref(false);
 const newDirectoryName = ref("");
 const createDirectoryError = ref("");
 const createLoading = ref(false);
 
+function directoryNode(source = {}, fallbackPath = "/") {
+  return {
+    id: String(source.id || source.path || fallbackPath),
+    name: String(source.name || (fallbackPath === "/" ? "根目录" : fallbackPath.split("/").pop())),
+    path: String(source.path || fallbackPath),
+    children: [],
+    expanded: fallbackPath === "/",
+    loaded: false,
+    loading: false,
+  };
+}
+
+const treeRoot = ref(directoryNode({}, "/"));
+
 const visible = computed({
   get: () => props.modelValue,
   set: (value) => emit("update:modelValue", value),
 })
-const parentPath = computed(() => {
-  const parts = currentPath.value.split("/").filter(Boolean);
-  parts.pop();
-  return parts.length ? `/${parts.join("/")}` : "/";
+const providerItems = computed(() => {
+  if (Array.isArray(props.providers) && props.providers.length) return props.providers;
+  return props.provider ? [{title: props.provider, value: props.provider}] : [];
 })
 
 function unwrap(raw) {
@@ -137,42 +160,99 @@ function unwrap(raw) {
   return raw || {};
 }
 
-async function loadDirectories(path, force = false) {
-  if (loading.value) return;
-  const normalized = String(path || "/").trim() || "/";
-  if (!force && lastRequestedPath.value === normalized) return;
+function normalizePath(path) {
+  const parts = String(path || "/").replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts.length ? `/${parts.join("/")}` : "/";
+}
+
+function findTreeNode(path, node = treeRoot.value) {
+  const normalized = normalizePath(path);
+  if (node.path === normalized) return node;
+  for (const child of node.children) {
+    const matched = findTreeNode(normalized, child);
+    if (matched) return matched;
+  }
+  return null;
+}
+
+function ensureTreePath(path) {
+  const normalized = normalizePath(path);
+  let node = treeRoot.value;
+  let current = "";
+  for (const part of normalized.split("/").filter(Boolean)) {
+    current = `${current}/${part}`;
+    let child = node.children.find((item) => item.path === current);
+    if (!child) {
+      child = directoryNode({name: part, path: current}, current);
+      node.children.push(child);
+    }
+    node.expanded = true;
+    node = child;
+  }
+  return node;
+}
+
+async function loadTreeNode(node, force = false) {
+  if (!node || node.loading || (!force && node.loaded)) return;
   loading.value = true;
+  node.loading = true;
   errorMessage.value = "";
   try {
-    lastRequestedPath.value = normalized;
     const query = new URLSearchParams({
-      path: normalized,
-      provider: props.provider || "",
+      path: node.path,
+      provider: selectedProvider.value || props.provider || "",
     })
     if (force) query.set("refresh", "true");
     const response = unwrap(await props.api.get(`plugin/${props.pluginId}/cloud/directories?${query}`));
     if (response.success === false) throw new Error(response.message || "读取目录失败");
     const data = response.data?.data || response.data || response;
-    currentPath.value = data.path || normalized;
-    directories.value = Array.isArray(data.directories)
-      ? [...data.directories].sort((left, right) =>
-          String(left.name || "").localeCompare(String(right.name || ""), undefined, {
-            numeric: true,
-            sensitivity: "base",
-          }),
-        )
-      : []
+    const previous = new Map(node.children.map((item) => [item.path, item]));
+    node.children = (Array.isArray(data.directories) ? data.directories : [])
+      .sort((left, right) => String(left.name || "").localeCompare(String(right.name || ""), undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }))
+      .map((item) => previous.get(item.path) || directoryNode(item, item.path));
+    node.loaded = true;
   } catch (error) {
-    directories.value = [];
     errorMessage.value = error.message || String(error);
-    lastRequestedPath.value = "";
   } finally {
+    node.loading = false;
     loading.value = false;
   }
 }
 
+async function loadDirectories(path, force = false) {
+  const normalized = normalizePath(path);
+  if (!treeRoot.value.loaded) await loadTreeNode(treeRoot.value);
+  const node = findTreeNode(normalized) || ensureTreePath(normalized);
+  currentPath.value = normalized;
+  node.expanded = true;
+  await loadTreeNode(node, force);
+}
+
 function refreshDirectories() {
-  loadDirectories(currentPath.value, true);
+  const node = findTreeNode(currentPath.value) || treeRoot.value;
+  loadTreeNode(node, true);
+}
+
+function selectTreeNode(node) {
+  currentPath.value = normalizePath(node?.path);
+}
+
+async function toggleTreeNode(node) {
+  if (!node || node.loading) return;
+  node.expanded = !node.expanded;
+  if (node.expanded) await loadTreeNode(node);
+}
+
+function selectProvider(provider) {
+  const value = String(provider || "").trim();
+  if (!value || value === selectedProvider.value || loading.value) return;
+  selectedProvider.value = value;
+  currentPath.value = "/";
+  treeRoot.value = directoryNode({}, "/");
+  loadDirectories("/");
 }
 
 function openCreateDirectoryDialog() {
@@ -201,7 +281,7 @@ async function createDirectory() {
       await props.api.post(`plugin/${props.pluginId}/cloud/directories/create`, {
         path: directoryPath,
         name: folderName,
-        provider: props.provider || "",
+        provider: selectedProvider.value || props.provider || "",
       }),
     );
     if (response.success === false) throw new Error(response.message || "创建文件夹失败");
@@ -216,17 +296,22 @@ async function createDirectory() {
 }
 
 function selectDirectory() {
-  emit("select", currentPath.value || "/");
+  emit(
+    "select",
+    currentPath.value || "/",
+    selectedProvider.value || props.provider || "",
+  );
 }
 
 watch(
   () => props.modelValue,
   (value) => {
     if (value) {
+      selectedProvider.value = String(
+        props.provider || providerItems.value[0]?.value || "",
+      ).trim();
       currentPath.value = String(props.initialPath || "/").trim() || "/";
-      // 弹窗组件通常保持挂载，首次打开时请求缓存的初始路径也必须执行。
-      // 清掉上次请求标记，避免 loadDirectories 将首次加载误判为重复请求。
-      lastRequestedPath.value = "";
+      treeRoot.value = directoryNode({}, "/");
       loadDirectories(currentPath.value);
     } else {
       createDirectoryVisible.value = false;
@@ -253,6 +338,26 @@ watch(
   overflow-y: auto;
 }
 
+.directory-browser {
+  display: grid;
+  min-width: 0;
+}
+
+.directory-browser.has-providers {
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.provider-list,
+.directory-pane {
+  min-width: 0;
+}
+
+.provider-list {
+  height: min(446px, calc(72vh - 112px));
+  overflow-y: auto;
+}
+
 .directory-actions {
   display: flex;
   gap: 8px;
@@ -263,5 +368,16 @@ watch(
   min-height: min(390px, calc(72vh - 168px));
   align-items: center;
   justify-content: center;
+}
+
+@media (max-width: 600px) {
+  .directory-browser.has-providers {
+    grid-template-columns: 132px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .provider-list :deep(.v-list-item) {
+    padding-inline: 8px;
+  }
 }
 </style>

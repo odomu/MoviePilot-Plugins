@@ -14,7 +14,7 @@ from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 from app.utils.string import StringUtils
 
-from .. import OwnerDelegator
+from .. import OwnerDelegator, SearchCapability
 from ..cloud import CloudDriveCapability
 from ..config import UIConfig
 from ...search.hdhive import HDHIVE_DETAIL_RESOURCE_TYPES
@@ -244,12 +244,16 @@ class SearchApi(OwnerDelegator):
         """只读获取测试资源的文件列表。"""
         payload = dict(payload or {})
         source = str(payload.get("source") or "").strip().lower()
+        provider_data = (
+            dict(payload.get("provider_data") or {})
+            if isinstance(payload.get("provider_data"), dict) else {}
+        )
         juying_resource_id = str(
-            payload.get("juying_resource_id") or ""
+            provider_data.get("resource_id") or ""
         ).strip()
         resource_type = normalize_resource_type(payload.get("resource_type"))
         url = str(payload.get("url") or "").strip()
-        slug = str(payload.get("slug") or "").strip()
+        resource_ref = str(payload.get("resource_ref") or "").strip()
         is_unlocked = bool(payload.get("is_unlocked"))
         parent_id = str(payload.get("parent_id") or "").strip()
         pending_juying = source == "juying" and bool(juying_resource_id)
@@ -257,13 +261,13 @@ class SearchApi(OwnerDelegator):
                 source == "seedhub"
                 and not url
                 and bool(payload.get("pending_resolution"))
-                and bool(payload.get("seedhub_kind"))
+                and bool(provider_data.get("kind"))
         )
         pending_pinglian = (
                 source == "pinglian"
                 and not url
                 and bool(payload.get("pending_resolution"))
-                and bool(payload.get("pinglian_token"))
+                and bool(provider_data.get("token"))
         )
         valid_hdhive_url = bool(
             url and "\\" not in url
@@ -271,7 +275,7 @@ class SearchApi(OwnerDelegator):
         )
         pending_hdhive = (
                 source == "hdhive"
-                and bool(slug)
+                and bool(resource_ref)
                 and (not url or (is_unlocked and not valid_hdhive_url))
         )
         if (
@@ -290,7 +294,7 @@ class SearchApi(OwnerDelegator):
             return {"success": False, "message": "待解析资源不支持目录导航"}
         if pending_hdhive and (
                 resource_type not in HDHIVE_DETAIL_RESOURCE_TYPES
-                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", slug)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", resource_ref)
         ):
             return {"success": False, "message": "HDHive 资源标识或类型无效"}
         try:
@@ -300,20 +304,24 @@ class SearchApi(OwnerDelegator):
                     self._test_search_config(source, payload.get("config")),
                 )
                 try:
-                    if pending_seedhub:
-                        resolved = handler.resolve_seedhub_resource(
-                            kind=str(payload.get("seedhub_kind") or ""),
-                            resource_type=resource_type,
-                            seed_id=str(payload.get("seedhub_seed_id") or ""),
-                            path=str(payload.get("seedhub_path") or ""),
-                            host=str(payload.get("seedhub_host") or ""),
-                        )
-                    else:
-                        resolved = handler.resolve_pinglian_resource(
-                            token=str(payload.get("pinglian_token") or ""),
-                            resource_type=resource_type,
-                            password=str(payload.get("pinglian_password") or ""),
-                        )
+                    resolve_args = (
+                        {
+                            "kind": str(provider_data.get("kind") or ""),
+                            "resource_type": resource_type,
+                            "seed_id": str(provider_data.get("seed_id") or ""),
+                            "path": str(provider_data.get("path") or ""),
+                            "host": str(provider_data.get("host") or ""),
+                        }
+                        if pending_seedhub
+                        else {
+                            "token": str(provider_data.get("token") or ""),
+                            "resource_type": resource_type,
+                            "password": str(provider_data.get("password") or ""),
+                        }
+                    )
+                    resolved = handler.resolve_source_resource(
+                        source, **resolve_args
+                    )
                 finally:
                     handler.close(release_cache=False)
                 url = str(resolved.get("url") or "").strip()
@@ -334,31 +342,31 @@ class SearchApi(OwnerDelegator):
                     self._test_search_config("hdhive", payload.get("config")),
                 )
                 try:
+                    candidate = {
+                        "resource_ref": resource_ref,
+                        "resource_type": resource_type,
+                        "unlock_points": 0,
+                        "is_unlocked": is_unlocked,
+                        "target_season": payload.get("target_season"),
+                        "target_episodes": payload.get("target_episodes"),
+                        "supports_file_preview": payload.get(
+                            "supports_file_preview"
+                        ),
+                        "provider_data": dict(
+                            payload.get("provider_data") or {}
+                        ),
+                        "search_label": (
+                            "测试已解锁预览" if is_unlocked else "测试只读预览"
+                        ),
+                    }
                     if is_unlocked:
-                        url = handler.unlock_hdhive_resource(
-                            slug=slug,
-                            unlock_points=0,
-                            resource_type=resource_type,
-                            is_unlocked=True,
-                            target_season=payload.get("target_season"),
-                            target_episodes=payload.get("target_episodes"),
-                            supports_file_preview=payload.get(
-                                "supports_file_preview"
-                            ),
-                            detail_path=str(payload.get("detail_path") or ""),
+                        url = handler.unlock_resource(
+                            "hdhive", candidate,
                             search_label="测试已解锁预览",
                         )
                     else:
-                        preview = handler.preview_hdhive_resource(
-                            slug=slug,
-                            resource_type=resource_type,
-                            target_season=payload.get("target_season"),
-                            target_episodes=payload.get("target_episodes"),
-                            supports_file_preview=payload.get(
-                                "supports_file_preview"
-                            ),
-                            detail_path=str(payload.get("detail_path") or ""),
-                            search_label="测试只读预览",
+                        preview = handler.preview_resource(
+                            "hdhive", candidate
                         )
                 finally:
                     handler.close(release_cache=False)
@@ -405,7 +413,9 @@ class SearchApi(OwnerDelegator):
                     self._test_search_config("juying", payload.get("config")),
                 )
                 try:
-                    resolved = handler.resolve_juying_resource(juying_resource_id)
+                    resolved = handler.resolve_source_resource(
+                        "juying", resource_id=juying_resource_id
+                    )
                 finally:
                     handler.close(release_cache=False)
                 url = str(resolved.get("url") or "").strip()
@@ -498,10 +508,13 @@ class SearchApi(OwnerDelegator):
                     free_hdhive_access or zero_point_hdhive_unlock
             ):
                 return {"success": False, "message": "该资源不需要积分解锁"}
-            slug = str(item.get("slug") or item.get("id") or "").strip()
+            resource_ref = str(
+                item.get("resource_ref") or item.get("id") or ""
+            ).strip()
             resource_type = normalize_resource_type(item.get("resource_type"))
             if source == "hdhive" and (
-                    not slug or resource_type not in HDHIVE_DETAIL_RESOURCE_TYPES
+                    not resource_ref
+                    or resource_type not in HDHIVE_DETAIL_RESOURCE_TYPES
             ):
                 return {"success": False, "message": "HDHive 资源标识或类型无效"}
             handler = self._build_test_search_handler(
@@ -512,22 +525,18 @@ class SearchApi(OwnerDelegator):
                 ),
             )
             try:
-                if source == "hdhive":
-                    url = handler.unlock_hdhive_resource(
-                        slug, points, resource_type,
-                        str(item.get("media_page_url") or ""),
-                        is_unlocked=bool(item.get("is_unlocked")),
-                        target_season=item.get("target_season"),
-                        target_episodes=item.get("target_episodes"),
-                        supports_file_preview=item.get("supports_file_preview"),
-                        detail_path=str(item.get("detail_path") or ""),
-                    )
-                elif source == "dian115":
-                    url = handler.unlock_dian115_resource(
-                        int(item.get("share_id") or 0), int(item.get("resource_id") or 0), points,
-                    )
-                else:
+                if not handler.supports(
+                        source, SearchCapability.RESOURCE_UNLOCK
+                ):
                     return {"success": False, "message": "当前搜索源不支持积分解锁"}
+                candidate = dict(item)
+                candidate.update({
+                    "resource_ref": resource_ref,
+                    "resource_type": resource_type,
+                    "unlock_points": points,
+                    "provider_data": dict(item.get("provider_data") or {}),
+                })
+                url = handler.unlock_resource(source, candidate)
             finally:
                 handler.close(release_cache=False)
             if not url:
@@ -821,14 +830,20 @@ class SearchApi(OwnerDelegator):
                 (lambda: time.monotonic() >= deadline) if deadline else None
             ),
         )
-        handler.set_data_funcs(self.get_data, self.save_data)
+        handler.configure_point_storage(self.get_data, self.save_data)
         return handler
 
     def api_vue_search_tmdb_candidates(self, payload: Dict[str, Any]) -> dict:
-        """按标题返回可供用户选择的 TMDB 电影和电视剧候选。"""
+        """按标题查询 TMDB 候选；指定电视剧 ID 时同时返回真实季。"""
+        payload = dict(payload or {})
         title = str((payload or {}).get("title") or "").strip()
         if not title or len(title) > 100:
             return {"success": False, "message": "请输入 1 到 100 个字符的媒体名称"}
+        try:
+            requested_tmdb_id = int(payload.get("tmdb_id") or 0)
+        except (TypeError, ValueError):
+            requested_tmdb_id = 0
+        requested_media_type = str(payload.get("media_type") or "").strip().lower()
         try:
             meta = MetaInfo(title)
             candidates = self.chain.search_medias(
@@ -855,6 +870,10 @@ class SearchApi(OwnerDelegator):
             identity = (media_type, tmdb_id)
             if not media_type or tmdb_id <= 0 or identity in seen:
                 continue
+            if requested_tmdb_id > 0 and tmdb_id != requested_tmdb_id:
+                continue
+            if requested_media_type in {"movie", "tv"} and media_type != requested_media_type:
+                continue
             seen.add(identity)
             items.append({
                 "tmdb_id": tmdb_id,
@@ -875,11 +894,57 @@ class SearchApi(OwnerDelegator):
             })
             if len(items) >= 20:
                 break
+        seasons = []
+        if len(items) == 1 and items[0]["media_type"] == "tv" and requested_tmdb_id > 0:
+            seasons = self._resolve_tmdb_seasons({**payload, **items[0]})
+            items[0]["seasons"] = seasons
         return {
             "success": True,
             "message": f"TMDB 找到 {len(items)} 个候选",
-            "data": {"items": items},
+            "data": {"items": items, "seasons": seasons},
         }
+
+    def _resolve_tmdb_seasons(self, payload: Dict[str, Any]) -> List[int]:
+        """读取指定 TMDB 电视剧的真实季号，排除特别篇。"""
+        payload = dict(payload or {})
+        try:
+            tmdb_id = int(payload.get("tmdb_id") or 0)
+        except (TypeError, ValueError):
+            tmdb_id = 0
+        title = str(payload.get("title") or "").strip()
+        if tmdb_id <= 0 or not title:
+            return []
+        try:
+            year = int(payload.get("year")) if str(payload.get("year") or "").strip() else None
+        except (TypeError, ValueError):
+            year = None
+        mediainfo = self._resolve_test_media(
+            payload=payload,
+            title=title,
+            original_title=str(payload.get("original_title") or ""),
+            year=year,
+            media_type=MediaType.TV,
+            tmdb_id=tmdb_id,
+            season=None,
+        )
+        seasons = set()
+        raw_seasons = getattr(mediainfo, "seasons", None) or {}
+        values = raw_seasons.keys() if isinstance(raw_seasons, dict) else raw_seasons
+        for value in values or []:
+            if isinstance(value, dict):
+                value = value.get("season_number") or value.get("season")
+            else:
+                value = getattr(value, "season_number", value)
+            try:
+                season = int(value)
+            except (TypeError, ValueError):
+                continue
+            if season > 0:
+                seasons.add(season)
+        if not seasons:
+            total = int(getattr(mediainfo, "number_of_seasons", 0) or 0)
+            seasons.update(range(1, total + 1))
+        return sorted(seasons)
 
     def _resolve_test_media(
             self,
@@ -1018,12 +1083,6 @@ class SearchApi(OwnerDelegator):
                         )
 
         try:
-            logger.debug(
-                f"[{title}{f' S{season:02d}' if season else ''}]"
-                f"[{source.upper()}] 开始只读渠道测试："
-                f"媒体 ID={media_ids}，"
-                f"类型={media_type_value}"
-            )
             results, source_result_limit = run_test()
         except Exception as error:
             logger.warning(
@@ -1056,13 +1115,6 @@ class SearchApi(OwnerDelegator):
             results, self._SEARCH_TEST_DISPLAY_LIMIT
         )
         displayed_result_count = len(results or [])
-        logger.debug(
-            f"[{title}{f' S{season:02d}' if season else ''}]"
-            f"[{source.upper()}] 只读渠道测试完成："
-            f"候选总数={total_result_count}，展示={displayed_result_count}，"
-            f"耗时={time.monotonic() - test_started:.2f}s"
-        )
-
         items = []
         resource_type_counts: Dict[str, int] = {}
 
@@ -1135,6 +1187,7 @@ class SearchApi(OwnerDelegator):
                 unlock_points = max(0, int(item.get("unlock_points") or 0))
             except (TypeError, ValueError):
                 unlock_points = 0
+            provider_data = dict(item.get("provider_data") or {})
             items.append({
                 "title": str(item.get("title") or "未命名资源"),
                 "source": str(item.get("source") or source),
@@ -1154,9 +1207,8 @@ class SearchApi(OwnerDelegator):
                     item.get("url") or item.get("share_url")
                     or ""
                 ).strip(),
-                "slug": str(item.get("slug") or "").strip(),
-                "share_id": item.get("share_id") or item.get("id") or 0,
-                "resource_id": item.get("resource_id") or 0,
+                "resource_ref": str(item.get("resource_ref") or "").strip(),
+                "provider_data": provider_data,
                 "media_page_url": str(item.get("media_page_url") or "").strip(),
                 "unlock_points": unlock_points,
                 "need_unlock": bool(item.get("need_unlock")),
@@ -1166,20 +1218,7 @@ class SearchApi(OwnerDelegator):
                 "target_season": item.get("target_season"),
                 "target_episodes": item.get("target_episodes") or [],
                 "preview_episodes": item.get("preview_episodes") or {},
-                "juying_resource_id": str(
-                    item.get("juying_resource_id") or ""
-                ).strip(),
                 "pending_resolution": bool(item.get("pending_resolution")),
-                "seedhub_kind": str(item.get("seedhub_kind") or "").strip(),
-                "seedhub_seed_id": str(
-                    item.get("seedhub_seed_id") or ""
-                ).strip(),
-                "seedhub_path": str(item.get("seedhub_path") or "").strip(),
-                "seedhub_host": str(item.get("seedhub_host") or "").strip(),
-                "pinglian_token": str(item.get("pinglian_token") or "").strip(),
-                "pinglian_password": str(
-                    item.get("pinglian_password") or ""
-                ),
                 "can_preview": resource_type in PREVIEW_RESOURCE_TYPES,
             })
             resource_type_counts[resource_type] = (

@@ -276,11 +276,18 @@ class SubtitleService(OwnerDelegator):
             for item in flattened
         )
         video_name = str(video_file.get("name") or "")
+        video_cloud_path = str(video_file.get("cloud_path") or "").rstrip("/")
         matched = []
         seen = set()
         for item in flattened:
             subtitle_name = str(item.get("name") or "")
             if not MediaFileParser.is_subtitle(subtitle_name):
+                continue
+            if (
+                    video_cloud_path
+                    and str(item.get("cloud_path") or "").rstrip("/")
+                    != video_cloud_path
+            ):
                 continue
             if not self._subtitle_matches_video(
                     video_name,
@@ -341,23 +348,34 @@ class SubtitleService(OwnerDelegator):
                 "file_size": int(subtitle.get("size") or 0),
                 "transferred": False,
             }
-            try:
-                record["transferred"] = bool(self._timed_sync_call(
-                    "share_transfer",
-                    self._transfer_file,
-                    item_url,
-                    subtitle,
-                    self._cloud_transfer_path,
-                    target_name,
-                    subtitle.get("sha1") or "",
-                    media_type=media_type,
-                ))
-                if subtitle.get("staging_name"):
-                    record["staging_name"] = str(subtitle["staging_name"])
-            except Exception as error:
-                logger.warning(f"字幕转存暂未完成，将由后处理重试：{source_name}，{error}")
+            direct_cloud_resource = (
+                    self._is_cloud_resource_url(item_url)
+                    and self._is_direct_cloud_resource_url(item_url)
+            )
+            if direct_cloud_resource:
+                record["transferred"] = True
+            else:
+                try:
+                    record["transferred"] = bool(self._timed_sync_call(
+                        "share_transfer",
+                        self._transfer_file,
+                        item_url,
+                        subtitle,
+                        self._cloud_transfer_path,
+                        target_name,
+                        subtitle.get("sha1") or "",
+                        media_type=media_type,
+                    ))
+                    if subtitle.get("staging_name"):
+                        record["staging_name"] = str(subtitle["staging_name"])
+                except Exception as error:
+                    logger.warning(f"字幕转存暂未完成，将由后处理重试：{source_name}，{error}")
             if record["transferred"]:
-                logger.debug(f"字幕已进入转存暂存目录，待最终命名：{source_name} -> {target_name}")
+                logger.debug(
+                    f"字幕已登记网盘内整理，待最终命名：{source_name} -> {target_name}"
+                    if direct_cloud_resource
+                    else f"字幕已进入转存暂存目录，待最终命名：{source_name} -> {target_name}"
+                )
             if subtitle_id:
                 transferred_ids.add(subtitle_id)
             records.append(record)

@@ -83,6 +83,9 @@ class PageApi(OwnerDelegator):
                     "total": page_result["total"],
                     "total_pages": page_result["total_pages"],
                     "filter_options": page_result["filter_options"],
+                    "enable_cloud_upgrade": bool(
+                        getattr(self, "_enable_cloud_upgrade", False)
+                    ),
                 },
                 "emby_play_items": self._history_emby_play_items(page_history),
             },
@@ -114,10 +117,52 @@ class PageApi(OwnerDelegator):
             return copy.deepcopy(cached)
 
         if normalized_scope == "subscriptions":
+            providers = (
+                self._cloud_drive_registry.available()
+                if self._cloud_drive_registry else []
+            )
+            target_key = str(
+                getattr(self._cloud_drive, "key", "")
+                or getattr(self, "_cloud_drive_key", "")
+            ).strip().lower()
+            target_accepts_cross_transfer = bool(
+                self._cloud_drive
+                and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
+                and self._cloud_drive.supports(CloudDriveCapability.FILE_QUERY)
+            )
+            cloud_drives = []
+            for provider in providers:
+                if not provider.supports(CloudDriveCapability.DIRECTORY_READ):
+                    continue
+                direct = provider.key == target_key
+                cross = bool(
+                    not direct
+                    and bool(getattr(self, "_cross_transfer_enabled", False))
+                    and target_accepts_cross_transfer
+                    and provider.supports(CloudDriveCapability.FILE_QUERY)
+                    and provider.supports(CloudDriveCapability.FILE_DOWNLOAD)
+                )
+                if not direct and not cross:
+                    continue
+                cloud_drives.append({
+                    "title": provider.name,
+                    "value": provider.key,
+                    "mode": "direct" if direct else "cross",
+                })
             result = {
                 "success": True,
                 "data": {
                     "subscribes": UIConfig.get_subscribe_options_grouped(),
+                    "cloud_drives": cloud_drives,
+                    "target_cloud_drive": target_key,
+                    "enable_cloud_upgrade": bool(
+                        getattr(self, "_enable_cloud_upgrade", False)
+                    ),
+                    "cross_transfer_media_types": sorted(
+                        str(value) for value in getattr(
+                            self, "_cross_transfer_media_types", set()
+                        )
+                    ),
                 },
             }
             _UI_OPTIONS_CACHE.set(cache_key, copy.deepcopy(result))

@@ -62,9 +62,17 @@ class MediaFileParser:
         return int(match.group(1)), int(match.group(2))
 
     @classmethod
-    def iter_files(cls, files: list) -> Iterator[Any]:
+    def iter_files(cls, files: list, parent_path: str = "") -> Iterator[Any]:
         for item in files or []:
+            name = str(item.get("name") or item.get("file_name") or "").strip()
+            relative_path = "/".join(
+                value for value in (parent_path.strip("/"), name) if value
+            )
             if item.get("is_dir"):
-                yield from cls.iter_files(item.get("children") or [])
+                yield from cls.iter_files(
+                    item.get("children") or [], relative_path
+                )
             else:
+                if relative_path:
+                    item.setdefault("_relative_path", relative_path)
                 yield item

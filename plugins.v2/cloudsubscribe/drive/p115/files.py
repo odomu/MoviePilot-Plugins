@@ -204,7 +204,7 @@ class P115FileService(OwnerDelegator):
     DIRECTORY_PAGE_SIZE = 1000
     MUTATION_BATCH_SIZE = 1000
 
-    def _iter_directory(self, cid: Any):
+    def _iter_directory(self, cid: Any, ensure_file: Optional[bool] = None):
         """按页读取一个115目录，并让工具层处理字段标准化和响应校验。"""
         return self.rate_limiter.call(
             iterdir,
@@ -213,6 +213,7 @@ class P115FileService(OwnerDelegator):
             page_size=self.DIRECTORY_PAGE_SIZE,
             show_dir=1,
             fc_mix=0,
+            ensure_file=ensure_file,
             app="web",
             cooldown=self.rate_limiter.min_interval,
             max_workers=0,
@@ -221,13 +222,8 @@ class P115FileService(OwnerDelegator):
         )
 
     def _list_child_directories(self, cid: Any) -> List[dict]:
-        """利用目录置顶顺序只读取目录段，避免为路径解析扫描全部文件。"""
-        directories = []
-        for item in self._iter_directory(cid):
-            if not item.get("is_dir"):
-                break
-            directories.append(item)
-        return directories
+        """只读取目录项；115 目录与文件可能混合排序，不能依赖“目录置顶”提前停止。"""
+        return list(self._iter_directory(cid, ensure_file=False))
 
     def _rename_items(self, pairs: List[Tuple[Any, str]]) -> Set[str]:
         if not pairs:
@@ -275,7 +271,10 @@ class P115FileService(OwnerDelegator):
     def _resolve_pid_by_path(
             self, path: str, create: bool
     ) -> Tuple[bool, int]:
-        """逐级解析目录；返回检查是否成功以及目录 CID。"""
+        """按路径解析目录 CID；优先服务端一次解析，失败回退逐级定位。
+
+        返回 (检查是否成功, 目录CID)；CID 为 -1 表示确认目录不存在。
+        """
         if not self.client:
             return False, -1
         raw_path = str(path or "").replace("\\", "/")
@@ -290,6 +289,61 @@ class P115FileService(OwnerDelegator):
         if cached_cid is not None:
             return True, int(cached_cid)
 
+        directory_id = self._resolve_directory_id_api(normalized, create)
+        if directory_id is None:
+            logger.debug(f"115 路径一次解析不可用，回退逐级定位：{normalized}")
+            return self._resolve_pid_by_path_walk(normalized, create)
+        if directory_id == -1:
+            if create:
+                logger.debug(f"115 路径一次解析未创建目录，回退逐级创建：{normalized}")
+                return self._resolve_pid_by_path_walk(normalized, create)
+            return True, -1
+        self.path_cache.set(normalized, directory_id)
+        return True, directory_id
+
+    def _resolve_directory_id_api(
+            self, normalized: str, create: bool
+    ) -> Optional[int]:
+        """调用 115 服务端 files/getid 一次解析目录；不可用时返回 None。
+
+        返回目录 CID；-1 表示目录不存在，None 表示接口不可用或解析失败。
+        """
+        try:
+            if create:
+                response = self._rate_limited_call(
+                    self.client.fs_dir_getid2,
+                    {"path": normalized, "is_create": 1},
+                )
+                raw_id = (response.get("data") or {}).get("file_id")
+            else:
+                response = self._rate_limited_call(
+                    self.client.fs_dir_getid,
+                    {"path": normalized},
+                )
+                raw_id = response.get("id")
+        except Exception as error:
+            logger.warning(f"115 路径一次解析异常 {normalized}: {error}")
+            return None
+
+        if not response or not response.get("state"):
+            logger.warning(
+                f"115 路径一次解析失败 {normalized}: "
+                f"{(response or {}).get('error') or (response or {}).get('message') or ''}"
+            )
+            return None
+
+        if raw_id in (None, "", 0, "0"):
+            return -1
+        try:
+            return int(raw_id)
+        except (TypeError, ValueError):
+            logger.warning(f"115 目录ID解析失败：{normalized} -> {raw_id!r}")
+            return None
+
+    def _resolve_pid_by_path_walk(
+            self, normalized: str, create: bool
+    ) -> Tuple[bool, int]:
+        """逐级列举目录定位 CID，作为服务端一次解析的兜底。"""
         parent_id = 0
         current_path = ""
         for part in (part for part in normalized.split("/") if part):

@@ -1,6 +1,5 @@
 """HDHive WebAPI 登录、授权与受控请求客户端。"""
 
-import base64
 import hashlib
 import json
 import os
@@ -11,13 +10,18 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urljoin, urlsplit
 
+from app.core.config import settings
 from app.log import logger
 
+from .action import (
+    ServerActionProtocol,
+    ServerActionResponse,
+)
 from .captcha import HDHiveCaptchaError, HDHiveCaptchaSolver
+from .parser import response_body, response_text
 from .security import HDHiveSecurityProtocol
 from ...http_client import (
     CURL_CFFI_AVAILABLE,
@@ -44,9 +48,12 @@ class HDHiveClient:
     """维护网页登录 Cookie、安全会话和统一请求限速。"""
 
     BASE_URL = "https://hdhive.com"
-    _SESSION_FILE = Path("/config/cache/cloudsubscribe/hdhive-curl-session.json")
+    _SESSION_FILE = (
+            settings.PLUGIN_DATA_PATH
+            / "CloudSubscribe"
+            / "hdhive-curl-session.json"
+    )
     _SESSION_FILE_LOCK = threading.RLock()
-    _LOGIN_ACTION_TTL = 60 * 60
     _RISK_COOLDOWN_SECONDS = 60
     _SOFT_RISK_COOLDOWN_SECONDS = 10 * 60
     _SERVER_ERROR_COOLDOWN_SECONDS = 5
@@ -58,37 +65,6 @@ class HDHiveClient:
     _UNLOCK_READY_ATS: Dict[str, float] = {}
     _RISK_COOLDOWNS: Dict[str, tuple] = {}
     _RISK_COOLDOWN_CACHE_TTL = 10 * 60
-    _LOGIN_CHUNK_RE = re.compile(
-        r"static/chunks/app/\(auth\)/login/page-[^\\\"']+\.js"
-    )
-    _LOGIN_ACTION_RE = re.compile(
-        r"createServerReference\)\(\"([0-9a-f]{40,64})\".{0,200}?\"login\"",
-        re.S,
-    )
-    _RESOURCE_PAGE_CHUNK_RE = re.compile(
-        r"static/chunks/app/\(no-layout\)/resource/[^\"']+/page-[A-Za-z0-9]+\.js"
-    )
-    _UNLOCK_ACTION_RE = re.compile(
-        r"createServerReference\)\(\"([0-9a-f]{40,64})\""
-        r".{0,240}?\"unlockResource\"",
-        re.S,
-    )
-    _HONEYPOT_TOKEN_RE = re.compile(
-        r'"honeypotToken"\s*:\s*("(?:\\.|[^"\\])*")'
-    )
-    _BIND_SECRET_RE = re.compile(
-        r'[\\"]bindSecret[\\"]\s*:\s*[\\"]([^\\"]+)', re.I
-    )
-    _SIGNED_RESPONSE_PATHS = {
-        "/api/customer/user/current",
-        "/api/customer/points-logs",
-        "/api/customer/user/checkin",
-    }
-    _SECURITY_RETRY_CODES = {
-        "invalid_session", "missing_signature", "signature_invalid",
-        "session_user_mismatch",
-    }
-
     def __init__(
             self,
             username: str,
@@ -132,15 +108,15 @@ class HDHiveClient:
             "user-agent": self._user_agent,
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         })
+        self._server_actions = ServerActionProtocol(
+            self._session.cookies,
+            error_factory=HDHiveWebError,
+            warning=logger.warning,
+        )
         self._lock = threading.RLock()
         self._authenticated = False
-        self._login_action = ""
-        self._login_action_expires_at = 0.0
-        self._unlock_actions: Dict[str, str] = {}
         self._security = HDHiveSecurityProtocol()
-        self._security_expires_at = 0.0
         self._bind_secret = ""
-        self._clock_offset_ms = 0
         self._request_gate = RequestGate.shared(
             "HDHive WebAPI",
             self._session_key,
@@ -155,7 +131,10 @@ class HDHiveClient:
             max_requests_per_window=self._MAX_REQUESTS_PER_MINUTE,
             request_window_seconds=60.0,
         )
-        self._captcha = HDHiveCaptchaSolver(self._raw_request)
+        self._captcha = HDHiveCaptchaSolver(
+            self._raw_request,
+            server_actions=self._server_actions,
+        )
         self._load_cookies()
 
     @property
@@ -199,24 +178,12 @@ class HDHiveClient:
             self._save_cookies()
             self._session.close()
 
-    @staticmethod
-    def _response_text(response) -> str:
-        try:
-            return response.content.decode("utf-8")
-        except (AttributeError, UnicodeDecodeError):
-            return str(response.text or "")
-
-    @staticmethod
-    def response_text(response) -> str:
-        """安全读取响应正文，供资源协议层使用。"""
-        return HDHiveClient._response_text(response)
-
     @classmethod
     def _body_cooldown_seconds(cls, response) -> int:
         """从 429 文本中提取站点给出的中文冷却秒数。"""
         if int(getattr(response, "status_code", 0) or 0) != 429:
             return 0
-        text = cls._response_text(response)[:4096]
+        text = response_text(response)[:4096]
         match = re.search(r"(?:冷却|重试|限制)[^0-9]{0,24}(\d+)\s*秒", text)
         if not match:
             return 0
@@ -383,85 +350,28 @@ class HDHiveClient:
             ):
                 yield
 
-    def _login_action_id(self, force: bool = False) -> str:
-        now = time.monotonic()
-        if not force and self._login_action and self._login_action_expires_at > now:
-            return self._login_action
-        login_response = self._raw_request("GET", "/login")
-        if login_response.status_code != 200:
-            raise HDHiveWebError(
-                f"HDHive 登录页请求失败（HTTP {login_response.status_code}）",
-                code="login_page_failed",
-                status_code=login_response.status_code,
-            )
-        chunk_match = self._LOGIN_CHUNK_RE.search(
-            self._response_text(login_response)
-        )
-        if not chunk_match:
-            raise HDHiveWebError(
-                "HDHive 登录页未返回客户端登录模块", code="schema_changed"
-            )
-        chunk_response = self._raw_request(
-            "GET", f"/_next/{chunk_match.group(0)}"
-        )
-        action_match = self._LOGIN_ACTION_RE.search(
-            self._response_text(chunk_response)
-        )
-        if not action_match:
-            raise HDHiveWebError(
-                "HDHive 登录 Server Action 未找到", code="schema_changed"
-            )
-        self._login_action = action_match.group(1)
-        self._login_action_expires_at = now + self._LOGIN_ACTION_TTL
-        return self._login_action
-
     def _login(self, refresh_action: bool = False) -> None:
         if not self.is_configured:
             raise HDHiveWebError("HDHive 未配置用户名或密码", code="not_configured")
-        action_id = self._login_action_id(force=refresh_action)
-        encoded_password = base64.b64encode(
-            self._password.encode("utf-8")
-        ).decode("ascii")
-        response = self._raw_request(
-            "POST",
-            "/login",
-            headers={
-                "accept": "text/x-component",
-                "content-type": "text/plain;charset=UTF-8",
-                "next-action": action_id,
-                "next-url": "/",
-                "origin": self.BASE_URL,
-                "referer": f"{self.BASE_URL}/login",
-            },
-            data=json.dumps([{
-                "username": self._username,
-                "password": encoded_password,
-                "password_transport": "base64",
-            }, "/"], ensure_ascii=False, separators=(",", ":")),
+        response = self._server_actions.login(
+            self._raw_request,
+            self._username,
+            self._password,
+            base_url=self.BASE_URL,
+            refresh_action=refresh_action,
         )
-        response_text = self._response_text(response)
-        if response.status_code == 404 and not refresh_action:
-            self._login_action = ""
-            self._login_action_expires_at = 0.0
-            self._login(refresh_action=True)
-            return
         if response.status_code != 200 or not self._has_login_cookie():
-            message_match = re.search(
-                r'\"error\"\s*:\s*\{.*?\"message\"\s*:\s*\"([^\"]+)',
-                response_text,
-                re.S,
-            )
-            message = message_match.group(1) if message_match else "登录失败"
+            message = response.message or "登录失败"
             raise HDHiveWebError(
                 f"HDHive {message}（HTTP {response.status_code}）",
                 code="login_failed",
                 status_code=response.status_code,
             )
         self._authenticated = True
-        bind_match = self._BIND_SECRET_RE.search(response_text)
-        if bind_match:
-            self._bind_secret = bind_match.group(1).replace(r"\u003d", "=")
-            self._security_expires_at = 0.0
+        bind_secret = self._server_actions.bind_secret(response)
+        if bind_secret:
+            self._bind_secret = bind_secret
+            self._security.invalidate()
         self._save_cookies()
 
     def _login_with_sequence(self) -> None:
@@ -539,10 +449,8 @@ class HDHiveClient:
 
     def request(self, method: str, path: str, **kwargs):
         """执行已登录请求；认证失效时自动重新登录一次。"""
-        response_handler: Optional[Callable] = kwargs.pop("response_handler", None)
         with self._lock:
-            response = self._authenticated_request(method, path, **kwargs)
-            return response_handler(response) if response_handler else response
+            return self._authenticated_request(method, path, **kwargs)
 
     def _user_id(self) -> str:
         try:
@@ -552,17 +460,14 @@ class HDHiveClient:
 
     def _ensure_security_session(self, force: bool = False) -> None:
         self._ensure_authenticated()
-        if (
-                not force
-                and self._security.cid
-                and self._security_expires_at - 60 > time.time()
-        ):
+        if not force and self._security.ready():
             return
         started = time.monotonic()
-        client_public_key = self._security.begin_handshake()
-        fingerprint = hashlib.sha256(
-            f"{self._user_agent}|{self._languages}".encode("utf-8")
-        ).hexdigest()
+        body = self._security.handshake_body(
+            self._user_agent,
+            self._languages,
+            self._bind_secret,
+        )
         response = self._raw_request(
             "POST",
             "/api/public/security/session/handshake",
@@ -572,12 +477,7 @@ class HDHiveClient:
                 "origin": self.BASE_URL,
                 "referer": f"{self.BASE_URL}/",
             },
-            data=json.dumps({
-                "client_pub": base64.b64encode(client_public_key).decode("ascii"),
-                "ua_fingerprint": fingerprint,
-                "ts": int(time.time() * 1000) + self._clock_offset_ms,
-                "bind_token": self._bind_secret,
-            }, ensure_ascii=False, separators=(",", ":")),
+            data=body,
         )
         try:
             payload = response.json()
@@ -598,11 +498,7 @@ class HDHiveClient:
                 status_code=response.status_code,
             )
         try:
-            server_public_key = base64.b64decode(str(data.get("server_pub") or ""))
-            self._security.finalize_handshake(
-                str(data.get("cid") or ""), server_public_key
-            )
-            self._security_expires_at = float(data.get("expires_at") or 0)
+            self._security.accept_handshake(data)
             logger.debug(
                 "HDHive 安全会话握手完成："
                 f"耗时={time.monotonic() - started:.2f}s"
@@ -620,24 +516,7 @@ class HDHiveClient:
             raise HDHiveWebError(
                 "HDHive 服务端时间响应无效", code="clock_sync_failed"
             ) from error
-        self._clock_offset_ms = server_time - int(time.time() * 1000)
-
-    @classmethod
-    def _requires_signed_response(cls, path: str) -> bool:
-        normalized_path = urlsplit(path).path
-        if normalized_path in cls._SIGNED_RESPONSE_PATHS:
-            return True
-        return cls._is_unlock_path(normalized_path)
-
-    @staticmethod
-    def _is_unlock_path(path: str) -> bool:
-        path = urlsplit(path).path
-        return bool(re.fullmatch(
-            r"/api/customer/(?:resources|music_resources)/[^/]+/unlock",
-            path,
-        ) or re.fullmatch(
-            r"/api/customer/tv-follow/packs/[^/]+/unlock", path
-        ))
+        self._security.sync_time(server_time)
 
     def _unlock_lock(self) -> threading.RLock:
         with self._UNLOCK_STATE_LOCK:
@@ -731,7 +610,7 @@ class HDHiveClient:
             retry_captcha: bool = True,
             canonical_path: str = "",
     ):
-        if self._is_unlock_path(path):
+        if self._security.is_unlock_path(path):
             with self._unlock_lock():
                 self._wait_for_unlock_slot()
                 return self._signed_request_once(
@@ -765,20 +644,11 @@ class HDHiveClient:
     ):
         self._ensure_security_session()
         signed_path = str(canonical_path or urlsplit(path).path or "/")
-        timestamp = str(int(time.time() * 1000) + self._clock_offset_ms)
-        nonce = self._security.nonce()
-        signature = self._security.sign_request(
-            method, signed_path, timestamp, nonce, body, self._user_id()
-        )
         request_headers = dict(headers or {})
-        request_headers.update({
-            "X-HDH-Cid": self._security.cid,
-            "X-HDH-TS": timestamp,
-            "X-HDH-Nonce": nonce,
-            "X-HDH-Sig": signature,
-            "X-HDH-Kid": self._security.KID,
-        })
-        is_unlock = self._is_unlock_path(path)
+        request_headers.update(self._security.request_headers(
+            method, signed_path, body, self._user_id()
+        ))
+        is_unlock = self._security.is_unlock_path(path)
         try:
             response = self._raw_request(
                 method, path, headers=request_headers, data=body or None
@@ -829,20 +699,23 @@ class HDHiveClient:
                 )
                 setattr(retried, "hdhive_captcha_verified", True)
                 return retried
-        response_body = bytes(response.content or b"")
+        body_bytes = response_body(response)
         response_signature = str(response.headers.get("X-HDH-RSig") or "")
         if response_signature:
             if not self._security.verify_response(
                     signed_path,
                     response.status_code,
                     str(response.headers.get("X-HDH-RTS") or ""),
-                    response_body,
+                    body_bytes,
                     response_signature,
             ):
                 raise HDHiveWebError(
                     "HDHive 响应签名校验失败", code="response_signature_invalid"
                 )
-        elif response.status_code != 401 and self._requires_signed_response(path):
+        elif (
+                response.status_code != 401
+                and self._security.requires_signed_response(signed_path)
+        ):
             if response.status_code >= 400:
                 try:
                     payload = response.json()
@@ -875,7 +748,7 @@ class HDHiveClient:
                 status_code=response.status_code,
             )
         if response.status_code == 401 and retry:
-            error_code = self._security_error_code(response)
+            error_code = self._security.response_error_code(response)
             if self._prepare_security_retry(error_code):
                 return self._signed_request(
                     method,
@@ -888,28 +761,15 @@ class HDHiveClient:
                 )
         return response
 
-    @staticmethod
-    def _security_error_code(response) -> str:
-        if int(getattr(response, "status_code", 0) or 0) != 401:
-            return ""
-        try:
-            error_payload = response.json()
-        except ValueError:
-            error_payload = {}
-        if not isinstance(error_payload, dict):
-            return ""
-        return str(
-            error_payload.get("code") or error_payload.get("error_code") or ""
-        )
-
     def _prepare_security_retry(self, error_code: str) -> bool:
-        if error_code in self._SECURITY_RETRY_CODES:
+        action = self._security.retry_action(error_code)
+        if action == "handshake":
             self._ensure_security_session(force=True)
             return True
-        if error_code == "stale_ts":
+        if action == "clock":
             self._sync_security_time()
             return True
-        return error_code == "replay"
+        return action == "retry"
 
     def signed_request(
             self,
@@ -917,130 +777,61 @@ class HDHiveClient:
             path: str,
             body: bytes = b"",
             headers: Optional[Dict[str, str]] = None,
-            response_handler: Optional[Callable] = None,
             canonical_path: str = "",
     ):
         """执行带 HDHive 安全会话签名的授权请求。"""
         with self._lock:
-            response = self._signed_request(
+            return self._signed_request(
                 method,
                 path,
                 body=body,
                 headers=headers,
                 canonical_path=canonical_path,
             )
-            return response_handler(response) if response_handler else response
-
-    @classmethod
-    def _resource_action_context(cls, response) -> tuple[str, str]:
-        """从详情页 RSC 数据中读取蜜罐字段值和页面 chunk。"""
-        text = cls._response_text(response)
-        normalized = text.replace(r'\"', '"')
-        token_match = cls._HONEYPOT_TOKEN_RE.search(normalized)
-        chunk_match = cls._RESOURCE_PAGE_CHUNK_RE.search(text)
-        if not token_match:
-            raise HDHiveWebError(
-                "HDHive 资源页未返回 honeypotToken 字段",
-                code="action_proof_missing",
-            )
-        if not chunk_match:
-            raise HDHiveWebError(
-                "HDHive 资源页未返回解锁客户端模块",
-                code="schema_changed",
-            )
-        try:
-            token = str(json.loads(token_match.group(1)) or "")
-        except (TypeError, ValueError) as error:
-            raise HDHiveWebError(
-                "HDHive honeypotToken 字段格式异常",
-                code="action_proof_invalid",
-            ) from error
-        logger.debug(
-            "HDHive 资源页 Action 上下文就绪："
-            f"honeypot长度={len(token)}，"
-            f"chunk={chunk_match.group(0).rsplit('/', 1)[-1]}"
-        )
-        return token, chunk_match.group(0)
-
-    def _unlock_action_id(self, chunk: str) -> str:
-        action_id = self._unlock_actions.get(chunk)
-        if action_id:
-            return action_id
-        response = self._authenticated_request("GET", f"/_next/{chunk}")
-        match = self._UNLOCK_ACTION_RE.search(self._response_text(response))
-        if not match:
-            raise HDHiveWebError(
-                "HDHive 解锁 Server Action 未找到",
-                code="schema_changed",
-            )
-        action_id = match.group(1)
-        self._unlock_actions = {chunk: action_id}
-        logger.debug("HDHive 解锁 Server Action 已解析")
-        return action_id
 
     def web_unlock_request(
             self,
             resource_page_path: str,
             slug: str,
             page_headers: Optional[Dict[str, str]] = None,
-            response_handler: Optional[Callable] = None,
-    ):
+    ) -> ServerActionResponse:
         """严格按网页的详情页 + unlockResource Server Action 顺序解锁。"""
         try:
             with self._unlock_lock():
                 with self._lock:
                     self._wait_for_unlock_slot()
                     started = time.monotonic()
-                    posted = False
-                    try:
-                        # 页面发布新 chunk 时会额外读取一次模块，始终按上限预留。
-                        with self._request_gate.immediate_sequence(
-                                request_count=3,
-                                cancel_check=self._stop_requested,
-                                fail_on_cooldown=True,
-                        ):
-                            page_response = self._authenticated_request(
-                                "GET",
-                                resource_page_path,
-                                headers=page_headers or {},
-                            )
-                            honeypot_token, chunk = self._resource_action_context(
-                                page_response
-                            )
-                            action_id = self._unlock_action_id(chunk)
-                            posted = True
-                            response = self._authenticated_request(
-                                "POST",
-                                resource_page_path,
-                                headers={
-                                    "accept": "text/x-component",
-                                    "content-type": "text/plain;charset=UTF-8",
-                                    "next-action": action_id,
-                                    "next-url": resource_page_path,
-                                    "origin": self.BASE_URL,
-                                    "referer": (
-                                        f"{self.BASE_URL}{resource_page_path}"
-                                    ),
-                                    "sec-fetch-dest": "empty",
-                                    "sec-fetch-mode": "cors",
-                                    "sec-fetch-site": "same-origin",
-                                },
-                                data=json.dumps(
-                                    [slug, honeypot_token],
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ),
-                            )
-                        logger.debug(
-                            "HDHive 网页解锁序列完成：详情页 HTTP "
-                            f"{getattr(page_response, 'status_code', 0)}，"
-                            f"Action HTTP {getattr(response, 'status_code', 0)}，"
-                            f"耗时 {(time.monotonic() - started):.2f}s"
+                    # 页面发布新 chunk 时会额外读取一次模块，始终按上限预留。
+                    with self._request_gate.immediate_sequence(
+                            request_count=3,
+                            cancel_check=self._stop_requested,
+                            fail_on_cooldown=True,
+                    ):
+                        (
+                            page_response,
+                            response,
+                            honeypot_token,
+                            chunk,
+                        ) = self._server_actions.unlock(
+                            self._authenticated_request,
+                            resource_page_path,
+                            slug,
+                            page_headers=page_headers,
+                            base_url=self.BASE_URL,
+                            on_submit=self._record_unlock_attempt,
                         )
-                    finally:
-                        if posted:
-                            self._record_unlock_attempt()
-                    return response_handler(response) if response_handler else response
+                        logger.debug(
+                            "HDHive 资源页 Action 上下文就绪："
+                            f"honeypot长度={len(honeypot_token)}，"
+                            f"chunk={chunk.rsplit('/', 1)[-1]}"
+                        )
+                    logger.debug(
+                        "HDHive 网页解锁序列完成：详情页 HTTP "
+                        f"{getattr(page_response, 'status_code', 0)}，"
+                        f"Action HTTP {response.status_code}，"
+                        f"耗时 {(time.monotonic() - started):.2f}s"
+                    )
+                    return response
         except RequestGateCooldown as error:
             raise HDHiveWebError(
                 "HDHive WebAPI 处于风控冷却期，跳过解锁"
@@ -1101,34 +892,6 @@ class HDHiveClient:
                 getattr(response, "hdhive_captcha_verified", False)
             ),
         }
-
-    @staticmethod
-    def _checkin_message(payload: Dict[str, Any]) -> str:
-        data = payload.get("data") if isinstance(payload, dict) else None
-        error = payload.get("error") if isinstance(payload, dict) else None
-        candidates = (
-            data.get("message") if isinstance(data, dict) else "",
-            data.get("description") if isinstance(data, dict) else "",
-            data.get("detail") if isinstance(data, dict) else "",
-            payload.get("message") if isinstance(payload, dict) else "",
-            payload.get("description") if isinstance(payload, dict) else "",
-            payload.get("detail") if isinstance(payload, dict) else "",
-            error.get("message") if isinstance(error, dict) else "",
-            error.get("description") if isinstance(error, dict) else "",
-            error.get("detail") if isinstance(error, dict) else "",
-            error if isinstance(error, str) else "",
-        )
-        return next((str(value).strip() for value in candidates if value), "")
-
-    @staticmethod
-    def _checkin_error_code(payload: Dict[str, Any]) -> str:
-        error = payload.get("error") if isinstance(payload, dict) else None
-        return str(
-            payload.get("code")
-            or payload.get("error_code")
-            or (error.get("code") if isinstance(error, dict) else "")
-            or ""
-        ).strip()
 
     @staticmethod
     def _points_log_items(payload: Any) -> List[Dict[str, Any]]:
@@ -1235,26 +998,15 @@ class HDHiveClient:
         )
 
     def checkin(self, is_gambler: bool = False) -> Dict[str, Any]:
-        """执行无浏览器签到，并返回签到前后的积分与累计天数。"""
-        request_body = json.dumps(
-            {"is_gambler": True} if is_gambler else {},
-            separators=(",", ":"),
-        ).encode("utf-8")
-        with self.related_requests(3):
+        """通过网页 Server Action 签到，并返回前后积分与累计天数。"""
+        with self.related_requests(5):
             before = self.get_account_info()
             response = None
-            payload: Dict[str, Any] = {}
             try:
-                response = self.signed_request(
-                    "POST",
-                    "/api/customer/user/checkin",
-                    body=request_body,
-                    headers={
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                        "origin": self.BASE_URL,
-                        "referer": f"{self.BASE_URL}/user/{self._user_id()}",
-                    },
+                response = self._server_actions.checkin(
+                    self._authenticated_request,
+                    bool(is_gambler),
+                    base_url=self.BASE_URL,
                 )
             except HDHiveWebError as error:
                 if error.status_code != 400 or not self.has_checked_in_today():
@@ -1266,25 +1018,11 @@ class HDHiveClient:
                 already_checked_in = True
                 success = True
             else:
-                try:
-                    payload = response.json()
-                except ValueError as error:
-                    raise HDHiveWebError(
-                        "HDHive 签到接口返回格式异常",
-                        code="schema_changed",
-                        status_code=response.status_code,
-                    ) from error
-                if not isinstance(payload, dict):
-                    raise HDHiveWebError(
-                        "HDHive 签到接口返回格式异常",
-                        code="schema_changed",
-                        status_code=response.status_code,
-                    )
-                status_code = int(response.status_code or 0)
-                message = self._checkin_message(payload)
-                error_code = self._checkin_error_code(payload)
-                data = payload.get("data")
-                data = data if isinstance(data, dict) else {}
+                status_code = response.status_code
+                message = response.message
+                error_code = response.code
+                payload = response.payload or {}
+                data = response.data
                 already_checked_in = bool(
                     data.get("already_checked_in")
                     or any(marker in message for marker in (
@@ -1295,12 +1033,6 @@ class HDHiveClient:
                     }
                 )
                 checked_in_value = data.get("checked_in")
-                if (
-                        status_code < 400
-                        and checked_in_value is False
-                        and not already_checked_in
-                ):
-                    already_checked_in = True
                 success = bool(
                     already_checked_in
                     or (
@@ -1338,6 +1070,7 @@ class HDHiveClient:
                 else f"签到失败（HTTP {status_code}）"
             ),
             "is_gambler": bool(is_gambler),
+            "signin_points": 0 if already_checked_in else points_change,
             "points_change": points_change,
             "points_before": points_before,
             "points_after": points_after,
@@ -1353,9 +1086,10 @@ class HDHiveClient:
         }
 
     def _load_cookies(self) -> None:
+        session_file = self._SESSION_FILE
         with self._SESSION_FILE_LOCK:
             try:
-                payload = json.loads(self._SESSION_FILE.read_text(encoding="utf-8"))
+                payload = json.loads(session_file.read_text(encoding="utf-8"))
                 account = payload.get("accounts", {}).get(self._session_key) or {}
                 if isinstance(account, list):
                     cookies = account
@@ -1367,6 +1101,10 @@ class HDHiveClient:
         now = time.time()
         for cookie in cookies:
             if not isinstance(cookie, dict):
+                continue
+            if not self._server_actions.is_persistent_cookie(
+                    str(cookie.get("name") or "")
+            ):
                 continue
             expires = float(cookie.get("expires") or 0)
             if expires > 0 and expires <= now:
@@ -1385,9 +1123,12 @@ class HDHiveClient:
         self._authenticated = self._has_login_cookie()
 
     def _save_cookies(self) -> None:
+        session_file = self._SESSION_FILE
         cookies = []
         try:
             for cookie in self._session.cookies.jar:
+                if not self._server_actions.is_persistent_cookie(cookie.name):
+                    continue
                 cookies.append({
                     "name": cookie.name,
                     "value": cookie.value,
@@ -1401,7 +1142,7 @@ class HDHiveClient:
         with self._SESSION_FILE_LOCK:
             payload: Dict[str, Any] = {"version": 1, "accounts": {}}
             try:
-                current = json.loads(self._SESSION_FILE.read_text(encoding="utf-8"))
+                current = json.loads(session_file.read_text(encoding="utf-8"))
                 if isinstance(current, dict) and isinstance(current.get("accounts"), dict):
                     payload = current
             except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -1412,13 +1153,13 @@ class HDHiveClient:
                 "bind_secret": self._bind_secret,
             }
             try:
-                self._SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-                temp_file = self._SESSION_FILE.with_suffix(".tmp")
+                session_file.parent.mkdir(parents=True, exist_ok=True)
+                temp_file = session_file.with_suffix(".tmp")
                 temp_file.write_text(
                     json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                     encoding="utf-8",
                 )
                 os.chmod(temp_file, 0o600)
-                os.replace(temp_file, self._SESSION_FILE)
+                os.replace(temp_file, session_file)
             except OSError as error:
                 logger.debug(f"保存 HDHive WebAPI Cookie 失败：{error}")

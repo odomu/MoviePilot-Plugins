@@ -66,8 +66,8 @@ class TelevisionSyncProcessor(OwnerDelegator):
 
             # 加载该订阅的历史积分花费（用 tmdb_id + 季数作为唯一标识）
             sub_key = self.subscription_budget_key(subscribe, MediaType.TV)
-            if track_points and hasattr(self._search_handler, 'reset_sub_spent_points'):
-                self._search_handler.reset_sub_spent_points(sub_key)
+            if track_points and self._search_handler:
+                self._search_handler.reset_subscription_budgets(sub_key)
 
             mediainfo: MediaInfo = self._subscribe_mediainfo(
                 subscribe, MediaType.TV, cache=False
@@ -82,7 +82,11 @@ class TelevisionSyncProcessor(OwnerDelegator):
             total_ep = subscribe.total_episode or 0
             start_ep = subscribe.start_episode or 1
             expected_episodes = set(range(start_ep, total_ep + 1)) if total_ep >= start_ep else set()
+            discover_manual_episodes = bool(
+                manual_resources and transient_target and not expected_episodes
+            )
             missing_episodes: List[int] = []
+            discovered_manual_episodes: Set[int] = set()
             target_episode_air_dates: Dict[int, str] = {}
             calendar_entry: Optional[Dict[str, Any]] = None
             # 收集阶段已读取 TMDB 季网页；这里复用结果，避免重复请求网页。
@@ -213,7 +217,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                         f"{self._format_episode_ranges(restored_missing)}"
                     )
 
-            if not missing_episodes:
+            if not missing_episodes and not discover_manual_episodes:
                 logger.info(f"{mediainfo.title_year} S{season:02d} Emby 与115已完整存在")
                 if not transient_target:
                     self._subscribe_handler.check_and_finish_subscribe(
@@ -221,8 +225,8 @@ class TelevisionSyncProcessor(OwnerDelegator):
                         mediainfo=mediainfo,
                         success_episodes=sorted(existing_episodes_in_resources),
                     )
-                if track_points and hasattr(self._search_handler, 'clear_sub_points'):
-                    self._search_handler.clear_sub_points(sub_key)
+                if track_points and self._search_handler:
+                    self._search_handler.clear_subscription_budgets(sub_key)
                 return transferred_count
 
             # 过滤掉小于开始集数的剧集。
@@ -294,7 +298,11 @@ class TelevisionSyncProcessor(OwnerDelegator):
                 {"manual": [dict(resource) for resource in manual_resources]}
                 if manual_resources else {}
             )
-            self._set_task_phase(subscribe, "搜索缺失剧集", 55)
+            self._set_task_phase(
+                subscribe,
+                "处理手动网盘资源" if manual_resources else "搜索缺失剧集",
+                55,
+            )
             if not manual_resources:
                 prefetched_results = self._search_handler.search_sources(
                     sources=enabled_sources,
@@ -318,13 +326,8 @@ class TelevisionSyncProcessor(OwnerDelegator):
                 search_prefix = f"[{search_label}][{source.upper()}]"
                 if self._stop_requested():
                     break
-                if not missing_episodes:
+                if not missing_episodes and not discover_manual_episodes:
                     logger.debug(f"{mediainfo.title_year} S{season} 所有缺失剧集已转存完成，不再查询后续源")
-                    break
-
-                if self._remaining_transfer_quota() <= 0:
-                    logger.info(
-                        f"已达单次同步上限 {self._max_transfer_per_sync}，剩余 {len(missing_episodes)} 集将在下次同步处理")
                     break
 
                 logger.debug(
@@ -347,10 +350,6 @@ class TelevisionSyncProcessor(OwnerDelegator):
                 # 遍历搜索结果
                 for resource_index, resource in enumerate(candidate_resources):
                     if self._stop_requested():
-                        break
-                    if self._remaining_transfer_quota() <= 0:
-                        logger.info(
-                            f"已达单次同步上限 {self._max_transfer_per_sync}，剩余 {len(missing_episodes)} 集将在下次同步处理")
                         break
                     self._set_task_phase(
                         subscribe,
@@ -403,14 +402,14 @@ class TelevisionSyncProcessor(OwnerDelegator):
                         continue
                     seen_share_urls.update(resource_urls)
 
+                    resource_input_label = self._resource_input_label(share_url)
                     if len(resource_urls) > 1:
                         logger.debug(
                             f"合并检查 {len(resource_urls)} 条互补ED2K资源：{resource_title}"
                         )
                     else:
-                        action = "检查离线资源" if self._is_offline_url(share_url) else "检查分享"
                         logger.debug(
-                            f"{action}：{resource_title} - "
+                            f"检查{resource_input_label}：{resource_title} - "
                             f"{self._resource_log_reference(share_url)}"
                         )
 
@@ -434,7 +433,9 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             )
                             if title_episodes:
                                 target_episode_set = (
-                                        missing_episode_set & title_episodes
+                                    title_episodes - discovered_manual_episodes
+                                    if discover_manual_episodes
+                                    else missing_episode_set & title_episodes
                                 )
                                 if not target_episode_set:
                                     logger.debug(
@@ -450,8 +451,11 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                     resource, season
                                 )
                                 target_episode_set = (
-                                    missing_episode_set & preview_episodes
-                                    if preview_episodes else missing_episode_set
+                                    preview_episodes - discovered_manual_episodes
+                                    if discover_manual_episodes
+                                    else missing_episode_set & preview_episodes
+                                    if preview_episodes
+                                    else missing_episode_set
                                 )
                                 target_episodes = sorted(target_episode_set)
 
@@ -469,8 +473,6 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                     f"标题={magnet_title or resource_title}"
                                 )
                                 continue
-                            if not self._reserve_transfer_slots(1):
-                                break
                             pending_key = self._queue_magnet_package(
                                 resource,
                                 share_url,
@@ -482,8 +484,9 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 transient_target=transient_target,
                             )
                             if not pending_key:
-                                self._release_transfer_slots(1)
                                 continue
+                            if discover_manual_episodes:
+                                discovered_manual_episodes.update(target_episodes)
                             provider_name = str(
                                 (resource.get("magnet_metadata") or {}).get("display_name")
                                 or resource_title
@@ -520,10 +523,19 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             season,
                             mediainfo if is_cross_batch else None,
                         )
-                        matched_episode_numbers = missing_episode_set & share_episodes
-                        absent_episode_numbers = missing_episode_set - share_episodes
+                        matched_episode_numbers = (
+                            share_episodes - discovered_manual_episodes
+                            if discover_manual_episodes
+                            else missing_episode_set & share_episodes
+                        )
+                        absent_episode_numbers = (
+                            set()
+                            if discover_manual_episodes
+                            else missing_episode_set - share_episodes
+                        )
                         logger.debug(
-                            f"分享实际包含 {video_count} 个视频，S{season:02d} 可识别集数："
+                            f"{resource_input_label}实际包含 {video_count} 个视频，"
+                            f"S{season:02d} 可识别集数："
                             f"{self._format_episode_ranges(share_episodes)}；"
                             f"当前缺失中可用：{self._format_episode_ranges(matched_episode_numbers)}"
                         )
@@ -540,16 +552,20 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             continue
                         if absent_episode_numbers:
                             logger.debug(
-                                f"分享未包含当前缺失集数："
+                                f"{resource_input_label}未包含当前缺失集数："
                                 f"{self._format_episode_ranges(absent_episode_numbers)}"
                             )
 
                         # 收集该分享中所有匹配的文件
                         matched_items = []
-                        episodes_to_match = [
-                            episode for episode in missing_episodes
-                            if not share_episodes or episode in share_episodes
-                        ]
+                        episodes_to_match = (
+                            sorted(matched_episode_numbers)
+                            if discover_manual_episodes
+                            else [
+                                episode for episode in missing_episodes
+                                if not share_episodes or episode in share_episodes
+                            ]
+                        )
                         matched_files = self._match_episode_files(
                             share_files,
                             mediainfo,
@@ -593,29 +609,44 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 })
 
                         if not matched_items:
-                            logger.debug(f"该分享未匹配到 S{season} 的任何缺失剧集，可能是季数不匹配或文件名无法识别")
+                            logger.debug(
+                                f"该{resource_input_label}未匹配到 S{season} 的任何缺失剧集，"
+                                "可能是季数不匹配或文件名无法识别"
+                            )
                             continue
 
-                        self._set_task_phase(subscribe, "转存匹配剧集", 92)
-                        logger.debug(
-                            f"准备批量转存：{mediainfo.title_year} S{season:02d}，"
-                            f"{len(matched_items)} 个文件到 {self._cloud_transfer_path}"
+                        cloud_resource = self._is_cloud_resource_url(share_url)
+                        direct_cloud_resource = (
+                                cloud_resource
+                                and self._is_direct_cloud_resource_url(share_url)
                         )
-                        transfer_results, reserved_slots = self._transfer_episode_items(
+                        self._set_task_phase(
+                            subscribe,
+                            "登记网盘剧集整理"
+                            if direct_cloud_resource else "转存匹配剧集",
+                            92,
+                        )
+                        logger.debug(
+                            f"准备批量整理：{mediainfo.title_year} S{season:02d}，"
+                            f"{len(matched_items)} 个网盘内文件直接进入目标目录"
+                            if direct_cloud_resource
+                            else f"准备跨盘转存：{mediainfo.title_year} S{season:02d}，"
+                                 f"{len(matched_items)} 个文件进入目标网盘后整理"
+                            if cloud_resource
+                            else f"准备批量转存：{mediainfo.title_year} S{season:02d}，"
+                                 f"{len(matched_items)} 个文件到 {self._cloud_transfer_path}"
+                        )
+                        transfer_results = self._transfer_episode_items(
                             matched_items,
                             share_url,
                             mediainfo,
                             subscribe,
                             season,
-                            sub_key if track_points else "",
+                            sub_key,
                             track_subscription=not transient_target,
+                            transient_target=transient_target,
                         )
                         if not transfer_results:
-                            if reserved_slots <= 0:
-                                logger.info(
-                                    f"已达单次同步上限 {self._max_transfer_per_sync}，"
-                                    f"剩余 {len(missing_episodes)} 集将在下次同步处理"
-                                )
                             break
                         self._set_task_phase(subscribe, "登记文件后处理", 95)
                         batch_success_episodes = []
@@ -688,6 +719,10 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 logger.error(f"转存失败：{mediainfo.title} S{season:02d}E{episode:02d}")
 
                         if completed_missing_episodes:
+                            if discover_manual_episodes:
+                                discovered_manual_episodes.update(
+                                    completed_missing_episodes
+                                )
                             missing_episodes = [
                                 episode for episode in missing_episodes
                                 if episode not in completed_missing_episodes
@@ -712,7 +747,10 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 episodes=episodes_str,
                             )
 
-                        if self._stop_requested() or not missing_episodes:
+                        if (
+                                self._stop_requested()
+                                or not discover_manual_episodes and not missing_episodes
+                        ):
                             break
 
                     except Exception as e:
@@ -749,9 +787,9 @@ class TelevisionSyncProcessor(OwnerDelegator):
                     success_episodes=all_success_episodes
                 )
                 if track_points and remaining_lack == 0 and hasattr(
-                        self._search_handler, "clear_sub_points"
+                        self._search_handler, "clear_subscription_budgets"
                 ):
-                    self._search_handler.clear_sub_points(sub_key)
+                    self._search_handler.clear_subscription_budgets(sub_key)
 
         except Exception as e:
             logger.error(f"处理订阅 {subscribe.name} 出错：{str(e)}")

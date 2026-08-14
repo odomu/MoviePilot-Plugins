@@ -158,7 +158,7 @@ class UIConfig:
             "platform_download_policy": "block",
             "block_start_time": "18:00",
             "block_end_time": "23:59",
-            "max_transfer_per_sync": 50,
+            "transfer_task_batch_size": 50,
             "cross_transfer_enabled": False,
             "cross_transfer_media_types": ["movie", "tv"],
             "cross_transfer_download_path": "",

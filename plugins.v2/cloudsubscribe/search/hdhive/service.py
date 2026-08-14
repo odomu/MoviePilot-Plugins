@@ -2,28 +2,81 @@
 
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urljoin, urlparse
 
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
-from ...core import OwnerDelegator
-from ...search.hdhive import (
+from ...core import OwnerDelegator, SearchQuery, format_search_label
+from .web import (
     HDHIVE_DETAIL_RESOURCE_TYPES,
     HDHIVE_RESOURCE_TYPES,
     HDHiveClient,
     HDHiveResourceService,
     HDHiveWebError,
+    valid_share_url,
 )
+from ..budget import PointBudgetLedger
 from ...utils.cache import normalize_platform_cache_key
+from ...utils.cache import create_platform_ttl_cache
 
 
 class HDHiveSearchService(OwnerDelegator):
     """提供 HDHive WebAPI 与开放 API 搜索能力。"""
 
     _HISTORY_KEY = "hdhive_sub_points_history"
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        cache_identity = f"{owner._hdhive_query_mode}:{owner._hdhive_username}"
+        unlocked_cache = create_platform_ttl_cache(
+            "search:hdhive_unlocked_urls",
+            cache_identity,
+            maxsize=256,
+            ttl=30 * 60,
+        )
+        object.__setattr__(self, "_budget", PointBudgetLedger(
+            self._HISTORY_KEY,
+            owner._hdhive_max_unlock_points,
+            owner._hdhive_max_points_per_sub,
+            unlocked_cache=unlocked_cache,
+        ))
+
+    @property
+    def _hdhive_budget(self):
+        return self._budget
+
+    @property
+    def available(self) -> bool:
+        return bool(self._hdhive_enabled and (
+                (
+                        self._hdhive_query_mode == "web"
+                        and self._hdhive_username
+                        and self._hdhive_password
+                )
+                or (
+                        self._hdhive_query_mode == "api"
+                        and self._hdhive_client
+                        and self._hdhive_client.is_ready
+                )
+        ))
+
+    @property
+    def resource_types(self):
+        return frozenset(self._resource_type_order_config)
+
+    @property
+    def cache_context(self) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "mode": self._hdhive_query_mode,
+            "torrentclaw_enabled": self._hdhive_torrentclaw_enabled,
+            "torrentclaw_subtitle_languages": list(
+                self._hdhive_torrentclaw_subtitle_languages
+            ),
+        }
 
     @staticmethod
     def _hdhive_source_url(resource: Dict[str, Any]) -> str:
@@ -64,7 +117,7 @@ class HDHiveSearchService(OwnerDelegator):
             "quality": resource.get("quality") or "",
             "size": resource.get("size") or 0,
             "update_time": resource.get("created_at") or "",
-            "slug": str(resource.get("slug") or "").strip(),
+            "resource_ref": str(resource.get("slug") or "").strip(),
             "resource_type": self._openapi_resource_type(resource),
             "need_unlock": need_unlock,
             "need_access": not url and not need_unlock,
@@ -92,7 +145,7 @@ class HDHiveSearchService(OwnerDelegator):
     def _valid_share_value(value: Any, resource_type: str) -> bool:
         values = value if isinstance(value, (list, tuple, set)) else [value]
         return bool(values) and all(
-            HDHiveResourceService._valid_share_url(item, resource_type)
+            valid_share_url(item, resource_type)
             for item in values
         )
 
@@ -137,12 +190,18 @@ class HDHiveSearchService(OwnerDelegator):
                 self._hdhive_web_resources = resources
             return resources
 
-    def get_hdhive_web_client(self) -> HDHiveClient:
-        """返回搜索、账户信息与签到共同复用的唯一 WebAPI 客户端。"""
+    def get_client(self) -> Any:
+        """返回当前查询模式复用的账户客户端。"""
+        if self._hdhive_query_mode == "api":
+            return self._hdhive_client
         self._get_hdhive_web_resources()
         return self._hdhive_web_client
 
-    def close(self, release_cache: bool = False) -> None:
+    @property
+    def budget(self):
+        return self._budget
+
+    def close(self) -> None:
         """释放 HDHive Web 客户端资源。"""
         with self._hdhive_web_lock:
             web_client = self._hdhive_web_client
@@ -153,17 +212,22 @@ class HDHiveSearchService(OwnerDelegator):
         if web_client and web_client_owned:
             web_client.close()
 
-    def _search_hdhive(
-            self,
-            mediainfo: MediaInfo,
-            media_type: MediaType,
-            season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-            target_episode_air_dates: Optional[Dict[int, str]] = None,
-            subscribe: Any = None,
-            test_mode: bool = False,
-            result_limit: Optional[int] = None,
-    ) -> Optional[List[Dict]]:
+    def clear_cache(self) -> int:
+        total = 0
+        with self._hdhive_web_lock:
+            resources = self._hdhive_web_resources
+        for target in (resources, self._hdhive_client):
+            if not target or not callable(getattr(target, "clear_cache", None)):
+                continue
+            result = target.clear_cache()
+            total += (
+                sum(int(value or 0) for value in result.values())
+                if isinstance(result, dict)
+                else int(result or 0)
+            )
+        return total
+
+    def search(self, query: SearchQuery) -> Optional[List[Dict]]:
         """
         使用 HDHive 搜索资源
         根据配置的查询模式选择 Web 或 OpenAPI。
@@ -173,15 +237,26 @@ class HDHiveSearchService(OwnerDelegator):
         :param season: 季号（电视剧时使用）
         :return: 当前转存网盘可处理的资源列表（统一格式）
         """
+        mediainfo = query.mediainfo
+        media_type = query.media_type
+        season = query.season
+        target_episodes = list(query.target_episodes)
+        target_episode_air_dates = dict(query.target_episode_air_dates)
+        subscribe = query.subscribe
+        test_mode = query.test_mode
+        result_limit = query.result_limit
         tmdb_id = mediainfo.tmdb_id or getattr(subscribe, "tmdbid", None)
+        search_prefix = (
+            f"[{format_search_label(mediainfo, media_type, season)}][HDHIVE]"
+        )
         if not tmdb_id:
-            logger.debug(f"{mediainfo.title} 缺少 TMDB ID，跳过 HDHive 查询")
+            logger.debug(f"{search_prefix} 缺少 TMDB ID，跳过查询")
             return []
 
         hdhive_media_type = "movie" if media_type == MediaType.MOVIE else "tv"
 
         if self._hdhive_query_mode == "web":
-            return self._search_hdhive_web(
+            return self._search_web(
                 mediainfo,
                 hdhive_media_type,
                 tmdb_id=tmdb_id,
@@ -192,7 +267,7 @@ class HDHiveSearchService(OwnerDelegator):
                 test_mode=test_mode,
                 result_limit=result_limit,
             )
-        return self._search_hdhive_api(
+        return self._search_openapi(
             mediainfo,
             hdhive_media_type,
             tmdb_id=tmdb_id,
@@ -201,7 +276,7 @@ class HDHiveSearchService(OwnerDelegator):
             result_limit=result_limit,
         )
 
-    def _search_hdhive_web(
+    def _search_web(
             self,
             mediainfo: MediaInfo,
             hdhive_media_type: str,
@@ -216,19 +291,18 @@ class HDHiveSearchService(OwnerDelegator):
         """
         使用 WebAPI 模式查询 HDHive 资源。
         """
+        search_label = format_search_label(
+            mediainfo,
+            MediaType.MOVIE if hdhive_media_type == "movie" else MediaType.TV,
+            season,
+        )
+        search_prefix = f"[{search_label}][HDHIVE]"
         if not self._hdhive_username or not self._hdhive_password:
-            logger.warning("HDHive WebAPI 需要配置用户名和密码")
+            logger.warning(f"{search_prefix} WebAPI 需要配置用户名和密码")
             return []
 
         try:
             started = time.monotonic()
-            search_label = self._search_label(
-                mediainfo,
-                MediaType.MOVIE if hdhive_media_type == "movie" else MediaType.TV,
-                season,
-            )
-            search_prefix = f"[{search_label}][HDHIVE]"
-
             resources = self._get_hdhive_web_resources()
             if test_mode:
                 results = resources.search_test_resources(
@@ -261,6 +335,10 @@ class HDHiveSearchService(OwnerDelegator):
                 )
 
             results = list(results)
+            for item in results:
+                item["preview_episodes_authoritative"] = bool(
+                    item.get("preview_episodes")
+                )
 
             if results:
                 free_count = sum(1 for item in results if not item.get("need_unlock"))
@@ -280,16 +358,15 @@ class HDHiveSearchService(OwnerDelegator):
                     for key, value in type_counts.items()
                 )
                 logger.debug(
-                    f"{search_prefix} WebAPI 查询完成："
+                    f"{search_prefix} WebAPI 渠道统计："
                     f"资源页={resource_page_count}，候选={len(results)}"
                     f"（免费/已解锁: {free_count}，待积分解锁: {paid_count}，"
-                    f"类型: {type_summary or '无'}），"
-                    f"总耗时={time.monotonic() - started:.2f}s"
+                    f"类型: {type_summary or '无'}）"
                 )
             else:
                 logger.debug(
-                    f"{search_prefix} WebAPI 查询完成：候选=0（站点无资源或均未通过渠道预筛），"
-                    f"总耗时={time.monotonic() - started:.2f}s"
+                    f"{search_prefix} WebAPI 渠道统计："
+                    "站点无资源或均未通过渠道预筛"
                 )
             return results
 
@@ -313,7 +390,7 @@ class HDHiveSearchService(OwnerDelegator):
             # 暂态失败不能伪装成正常空结果，否则上层会写入负缓存。
             return None
 
-    def _search_hdhive_api(
+    def _search_openapi(
             self, mediainfo: MediaInfo, hdhive_media_type: str,
             tmdb_id: Optional[int] = None, season: Optional[int] = None,
             test_mode: bool = False,
@@ -323,8 +400,8 @@ class HDHiveSearchService(OwnerDelegator):
         使用 API 模式查询 HDHive 资源
         需要应用 Secret + 用户授权（OpenAPI 客户端）
         """
-        from ...search.hdhive import HDHiveOpenAPIError
-        search_label = self._search_label(
+        from .open import HDHiveOpenAPIError
+        search_label = format_search_label(
             mediainfo,
             MediaType.MOVIE if hdhive_media_type == "movie" else MediaType.TV,
             season,
@@ -356,8 +433,7 @@ class HDHiveSearchService(OwnerDelegator):
 
             if not data.get("success") or not data.get("data"):
                 logger.debug(
-                    f"{search_prefix} API 查询完成：站点资源=0，候选=0，"
-                    f"总耗时={time.monotonic() - started:.2f}s"
+                    f"{search_prefix} API 渠道统计：站点资源=0"
                 )
                 return []
 
@@ -383,9 +459,8 @@ class HDHiveSearchService(OwnerDelegator):
                     ):
                         break
                 logger.debug(
-                    f"{search_prefix} API 查询完成：站点资源={len(data.get('data') or [])}，"
-                    f"候选={len(raw_candidates)}，模式=只读测试，"
-                    f"总耗时={time.monotonic() - started:.2f}s"
+                    f"{search_prefix} API 渠道统计："
+                    f"站点资源={len(data.get('data') or [])}，模式=只读测试"
                 )
                 return raw_candidates
 
@@ -492,12 +567,10 @@ class HDHiveSearchService(OwnerDelegator):
                 free_count = sum(1 for r in available_resources if not r.get("need_unlock"))
                 unlock_count = len(available_resources) - free_count
                 logger.debug(
-                    f"{search_prefix} API 查询完成：站点资源={len(data.get('data') or [])}，"
+                    f"{search_prefix} API 渠道统计：站点资源={len(data.get('data') or [])}，"
                     f"启用类型={len(enabled_resources)}，预筛={len(resources)}，"
-                    f"候选={len(available_resources)}"
-                    f"（免费/已解锁: {free_count}，待积分解锁: {unlock_count}），"
-                    f"跳过（缺少标识={missing_slug_count}，积分未知={unknown_points_count}，"
-                    f"总耗时={time.monotonic() - started:.2f}s"
+                    f"免费/已解锁={free_count}，待积分解锁={unlock_count}，"
+                    f"跳过（缺少标识={missing_slug_count}，积分未知={unknown_points_count}）"
                 )
                 return available_resources
             else:
@@ -507,10 +580,9 @@ class HDHiveSearchService(OwnerDelegator):
                     )
                     return None
                 logger.debug(
-                    f"{search_prefix} API 查询完成：站点资源={len(data.get('data') or [])}，"
-                    f"启用类型={len(enabled_resources)}，预筛={len(resources)}，候选=0，"
-                    f"跳过（缺少标识={missing_slug_count}，积分未知={unknown_points_count}，"
-                    f"总耗时={time.monotonic() - started:.2f}s"
+                    f"{search_prefix} API 渠道统计：站点资源={len(data.get('data') or [])}，"
+                    f"启用类型={len(enabled_resources)}，预筛={len(resources)}，"
+                    f"跳过（缺少标识={missing_slug_count}，积分未知={unknown_points_count}）"
                 )
                 return []
 
@@ -518,100 +590,31 @@ class HDHiveSearchService(OwnerDelegator):
             logger.error(f"{search_prefix} API 查询失败: {e}")
             return None
 
-    def set_data_funcs(self, get_data_func, save_data_func):
-        """设置持久化数据读写函数。"""
-        self._hdhive_budget.set_data_funcs(get_data_func, save_data_func)
-
-    def reset_task_spent_points(self):
-        """
-        供 SyncHandler 在每次同步任务开始时调用
-        仅重置全局积分账本（单订阅的从持久化数据加载）
-        """
-        self._hdhive_budget.reset_task()
-        if self._hdhive_enabled and self._hdhive_auto_unlock:
-            logger.debug(
-                f"HDHive ({self._hdhive_query_mode}) 任务积分账本已初始化："
-                f"任务总预算={self._hdhive_budget.task_limit}，"
-                f"单订阅预算={self._hdhive_budget.subscribe_limit}，"
-                f"已解锁链接缓存={self._hdhive_budget.cached_url_count()}"
-            )
-
-    def has_hdhive_unlock_budget(self, unlock_points: int) -> bool:
-        """判断当前任务和订阅是否还有足够积分解锁指定资源。"""
-        status = self._hdhive_budget.status(unlock_points)
-        logger.debug(
-            "HDHive 积分预算检查："
-            f"{self._hdhive_budget.format_snapshot(unlock_points)}"
-        )
-        return bool(status and status.allowed)
-
-    def reset_sub_spent_points(self, sub_key: str = ""):
-        """
-        供 SyncHandler 在开始处理每一个新的订阅时调用
-        从持久化数据中加载该订阅的历史累计花费
-        :param sub_key: 订阅唯一标识，如 "逐玉_S1"
-        """
-        spent_points = self._hdhive_budget.reset_subscribe(sub_key)
-        if sub_key and self._hdhive_enabled and self._hdhive_auto_unlock:
-            logger.debug(
-                f"HDHive 订阅积分账本：key={sub_key}，"
-                f"历史已花费={spent_points}，"
-                f"单订阅预算={self._hdhive_budget.subscribe_limit}，"
-                f"单订阅剩余={max(0, self._hdhive_budget.subscribe_limit - spent_points)}，"
-                f"本轮任务已花费={self._hdhive_budget.task_spent}，"
-                f"任务总预算={self._hdhive_budget.task_limit}，"
-                f"任务剩余={max(0, self._hdhive_budget.task_limit - self._hdhive_budget.task_spent)}"
-            )
-
-    def clear_sub_points(self, sub_key: str):
-        """
-        订阅完成后清除该订阅的历史积分记录
-        :param sub_key: 订阅唯一标识
-        """
-        if self._hdhive_budget.clear_subscribe(sub_key):
-            logger.debug(f"HDHive 已清除订阅 {sub_key} 的历史积分记录")
-
-    def preview_hdhive_resource(
-            self,
-            slug: str,
-            resource_type: str,
-            target_season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-            supports_file_preview: Optional[bool] = None,
-            detail_path: str = "",
-            search_label: str = "",
-    ) -> Dict[str, Any]:
+    def preview(self, candidate: Mapping[str, Any]) -> Dict[str, Any]:
         """只读预览 HDHive file-list，不触发积分解锁。"""
         if self._hdhive_query_mode != "web":
             raise HDHiveWebError(
                 "HDHive API 模式不支持未解锁资源预览",
                 code="preview_unsupported",
             )
-        search_prefix = (
-            f"[{search_label}][HDHIVE]" if search_label else "[HDHIVE]"
-        )
+        search_label = str(candidate.get("search_label") or "")
+        search_prefix = f"[{search_label}][HDHIVE]" if search_label else "[HDHIVE]"
         return self._get_hdhive_web_resources().preview_resource(
-            slug=slug,
-            resource_type=resource_type,
-            target_season=target_season,
-            target_episodes=target_episodes,
-            supports_file_preview=supports_file_preview,
-            detail_path=detail_path,
+            slug=str(candidate.get("resource_ref") or ""),
+            resource_type=str(candidate.get("resource_type") or ""),
+            target_season=candidate.get("target_season"),
+            target_episodes=candidate.get("target_episodes"),
+            supports_file_preview=candidate.get("supports_file_preview"),
+            detail_path=str(
+                (candidate.get("provider_data") or {}).get("detail_path") or ""
+            ),
             log_prefix=search_prefix,
         )
 
-    def unlock_hdhive_resource(
+    def unlock(
             self,
-            slug: str,
-            unlock_points: int,
-            resource_type: str,
-            media_page_url: str = "",
+            candidate: Mapping[str, Any],
             search_label: str = "",
-            is_unlocked: bool = False,
-            target_season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-            supports_file_preview: Optional[bool] = None,
-            detail_path: str = "",
     ) -> Any:
         """串行执行付费解锁，保证全局和单订阅积分预算原子扣减。"""
         while not self._hdhive_unlock_operation_lock.acquire(timeout=0.25):
@@ -623,22 +626,25 @@ class HDHiveSearchService(OwnerDelegator):
                 )
                 return None
         try:
-            return self._unlock_hdhive_resource_locked(
-                slug,
-                unlock_points,
-                resource_type,
-                media_page_url,
+            return self._unlock(
+                str(candidate.get("resource_ref") or ""),
+                int(candidate.get("unlock_points") or 0),
+                str(candidate.get("resource_type") or ""),
+                str(candidate.get("media_page_url") or ""),
                 search_label,
-                is_unlocked,
-                target_season,
-                target_episodes,
-                supports_file_preview,
-                detail_path,
+                bool(candidate.get("is_unlocked")),
+                candidate.get("target_season"),
+                candidate.get("target_episodes"),
+                candidate.get("supports_file_preview"),
+                str(
+                    (candidate.get("provider_data") or {}).get("detail_path")
+                    or ""
+                ),
             )
         finally:
             self._hdhive_unlock_operation_lock.release()
 
-    def _unlock_hdhive_resource_locked(
+    def _unlock(
             self,
             slug: str,
             unlock_points: int,
@@ -785,7 +791,7 @@ class HDHiveSearchService(OwnerDelegator):
                     )
                     return None
             else:
-                from ...search.hdhive import HDHiveOpenAPIError
+                from .open import HDHiveOpenAPIError
                 if not self._hdhive_client or not self._hdhive_client.is_ready:
                     logger.warning("HDHive API 模式需要应用 Secret 和有效用户 Token 才能解锁")
                     return None

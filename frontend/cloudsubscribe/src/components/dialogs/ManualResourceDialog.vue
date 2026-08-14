@@ -18,21 +18,10 @@
 
         <v-btn-toggle v-model="actionMode" mandatory divided color="primary" density="compact" class="mb-4">
           <v-btn value="links" prepend-icon="mdi-link-variant">添加资源</v-btn>
-          <v-btn value="upgrade" prepend-icon="mdi-auto-fix">媒体洗版</v-btn>
+          <v-btn v-if="enableCloudUpgrade" value="upgrade" prepend-icon="mdi-auto-fix">媒体洗版</v-btn>
         </v-btn-toggle>
 
         <template v-if="actionMode === 'links'">
-          <v-btn-toggle
-            v-if="!lockedInitialMedia"
-            v-model="targetMode"
-            mandatory
-            divided
-            density="compact"
-            class="mb-3">
-            <v-btn value="subscribe">订阅卡片</v-btn>
-            <v-btn value="tmdb">TMDB 媒体</v-btn>
-          </v-btn-toggle>
-
           <v-text-field
             v-if="lockedInitialMedia"
             :model-value="lockedManualTargetLabel"
@@ -44,101 +33,103 @@
             class="mb-3" />
 
           <v-autocomplete
-            v-else-if="targetMode === 'subscribe'"
-            v-model="subscribeId"
-            v-model:search="subscribeSearch"
-            :items="filteredSubscribes"
-            item-title="title"
-            item-value="value"
+            v-else
+            v-model="selectedTarget"
+            v-model:search="targetSearch"
+            :items="targetCandidates"
+            :item-title="targetTitle"
+            return-object
             :no-filter="true"
-            label="指定订阅"
-            placeholder="请选择电影或电视剧订阅"
+            label="指定媒体"
+            placeholder="搜索订阅或 TMDB 媒体"
             variant="outlined"
             density="compact"
-            :loading="loadingOptions"
+            :loading="loadingOptions || searchingTmdb || loadingTmdbSeasons"
             :disabled="submitting"
-            no-data-text="没有可用订阅，可切换到 TMDB 媒体"
+            no-data-text="没有匹配订阅，可查询 TMDB"
             hide-details="auto"
-            class="mb-3" />
-
-          <template v-else>
-            <div class="manual-search-row mb-3">
-              <v-text-field
-                v-model="tmdbKeyword"
-                label="搜索 TMDB 媒体"
-                placeholder="输入电影或电视剧名称"
-                variant="outlined"
-                density="compact"
-                hide-details
-                :disabled="submitting"
-                @keyup.enter="searchTmdb" />
+            class="mb-3"
+            @keyup.enter="searchTmdb">
+            <template #append-inner>
               <v-btn
-                color="primary"
-                variant="tonal"
+                icon="mdi-movie-search"
+                variant="text"
+                size="small"
+                title="查询 TMDB"
                 :loading="searchingTmdb"
-                :disabled="!tmdbKeyword.trim() || submitting"
-                @click="searchTmdb">
-                搜索
-              </v-btn>
-            </div>
-            <v-autocomplete
-              v-model="selectedMedia"
-              :items="tmdbCandidates"
-              :item-title="candidateTitle"
-              return-object
-              label="选择 TMDB 结果"
-              placeholder="请先搜索并选择准确媒体"
+                :disabled="submitting || !targetSearch.trim()"
+                @click.stop="searchTmdb" />
+            </template>
+          </v-autocomplete>
+
+          <v-select
+            v-if="targetMediaType === 'tv'"
+            v-model="seasons"
+            :items="availableSeasons"
+            :loading="loadingTmdbSeasons"
+            multiple
+            chips
+            closable-chips
+            :disabled="submitting || loadingTmdbSeasons || !availableSeasons.length"
+            label="季"
+            placeholder="留空默认全部季"
               variant="outlined"
               density="compact"
-              :disabled="submitting"
-              no-data-text="暂无 TMDB 候选"
               hide-details="auto"
-              class="mb-3" />
-            <div v-if="selectedMedia?.media_type === 'tv'" class="episode-range-fields mb-3">
-              <v-text-field
-                v-model.number="season"
-                type="number"
-                min="1"
-                label="季"
-                variant="outlined"
-                density="compact"
-                hide-details />
-              <v-text-field
-                v-model.number="episodeStart"
-                type="number"
-                min="1"
-                label="开始集"
-                variant="outlined"
-                density="compact"
-                hide-details />
-              <v-text-field
-                v-model.number="episodeEnd"
-                type="number"
-                :min="episodeStart || 1"
-                label="结束集"
-                variant="outlined"
-                density="compact"
-                hide-details />
-            </div>
-          </template>
+            class="mb-3"
+            @update:model-value="updateSeasons" />
 
           <v-textarea
-            v-model="resourceLinks"
-            label="资源链接"
+            :model-value="resourceLinks"
+            :label="selectedCloudResource ? '网盘路径' : '资源链接'"
             placeholder="每行一个115分享、ED2K或Magnet链接"
-            hint="支持单个或多个资源包，单次最多50条；无订阅时按所选 TMDB 媒体和剧集范围进入相同处理流程。"
+            :hint="selectedCloudResource && !selectedCloudResourceAllowed
+              ? '当前媒体类型未启用跨盘转存，请重新选择目标网盘路径。'
+              : selectedCloudResource
+              ? '目标盘路径直接整理；其他网盘路径通过跨盘转存后整理。'
+              : '支持单个或多个资源包，单次最多50条；也可从右侧选择网盘路径。'"
             persistent-hint
             auto-grow
             rows="5"
             variant="outlined"
             density="compact"
-            :disabled="submitting" />
+            :class="{ 'cloud-resource-input': selectedCloudResource }"
+            :readonly="Boolean(selectedCloudResource)"
+            :disabled="submitting"
+            @update:model-value="updateResourceInput">
+            <template #append-inner>
+              <div class="resource-path-actions">
+                <v-btn
+                  icon="mdi-folder-open"
+                  variant="text"
+                  size="small"
+                  title="选择网盘路径"
+                  :disabled="submitting || !selectableCloudDrives.length"
+                  @click.stop="cloudDirectoryVisible = true" />
+                <v-btn
+                  v-if="selectedCloudResource"
+                  icon="mdi-delete-outline"
+                  variant="text"
+                  size="small"
+                  color="error"
+                  title="删除网盘路径"
+                  :disabled="submitting"
+                  @click.stop="clearCloudResource" />
+              </div>
+            </template>
+          </v-textarea>
           <v-checkbox
             v-model="manualUpgrade"
             label="将手动资源作为洗版候选"
             density="compact"
             hide-details
             class="mt-2"
+            :disabled="submitting" />
+          <v-checkbox
+            v-model="skipHistory"
+            label="不记录到历史列表"
+            density="compact"
+            hide-details
             :disabled="submitting" />
         </template>
 
@@ -271,7 +262,7 @@
           color="primary"
           :prepend-icon="actionMode === 'upgrade' ? 'mdi-auto-fix' : 'mdi-play'"
           :loading="submitting"
-          :disabled="active || !canSubmit"
+          :disabled="!canSubmit"
           @click="requestSubmit">
           {{ actionMode === "upgrade" ? "开始洗版" : "开始处理" }}
         </v-btn>
@@ -294,17 +285,28 @@
       </v-card-actions>
     </v-card>
   </v-dialog>
+  <CloudDirectoryDialog
+    v-model="cloudDirectoryVisible"
+    :api="api"
+    :plugin-id="pluginId"
+    :provider="selectedCloudResource?.provider || targetCloudDrive"
+    :target-provider="targetCloudDrive"
+    :providers="selectableCloudDrives"
+    :initial-path="selectedCloudResource?.path || '/'"
+    title="选择待整理的网盘路径"
+    :allow-create="false"
+    @select="selectCloudPath" />
 </template>
 
 <script setup>
 import {computed, ref, watch} from "vue";
 import {useDisplay} from "vuetify";
+import CloudDirectoryDialog from "./CloudDirectoryDialog.vue";
 
 const props = defineProps({
   modelValue: Boolean,
   api: { type: [Object, Function], required: true },
   pluginId: { type: String, default: "CloudSubscribe" },
-  active: Boolean,
   initialMode: { type: String, default: "links" },
   initialMedia: { type: Object, default: null },
 })
@@ -312,18 +314,24 @@ const emit = defineEmits(["update:modelValue", "started"])
 const display = useDisplay()
 const isMobile = computed(() => display.xs.value)
 const subscribes = ref([])
-const subscribeSearch = ref("")
 const subscribeId = ref(null)
+const selectedTarget = ref(null);
+const targetSearch = ref("");
 const actionMode = ref("links")
-const targetMode = ref("subscribe")
 const resourceLinks = ref("")
+const cloudDrives = ref([]);
+const targetCloudDrive = ref("");
+const crossTransferMediaTypes = ref([]);
+const enableCloudUpgrade = ref(false);
+const selectedCloudResource = ref(null);
+const cloudDirectoryVisible = ref(false);
 const manualUpgrade = ref(false)
-const tmdbKeyword = ref("")
+const skipHistory = ref(false);
 const tmdbCandidates = ref([])
 const selectedMedia = ref(null)
-const season = ref(1)
-const episodeStart = ref(1)
-const episodeEnd = ref(1)
+const seasons = ref([]);
+const availableSeasons = ref([]);
+const parsedSeasons = ref([]);
 const mediaServers = ref([])
 const mediaServer = ref(null)
 const mediaKeyword = ref("")
@@ -335,18 +343,45 @@ const loadingOptions = ref(false)
 const loadingMediaServers = ref(false)
 const loadingMedia = ref(false)
 const searchingTmdb = ref(false)
+const loadingTmdbSeasons = ref(false);
 const matchingUpgradeTmdb = ref(false)
 const submitting = ref(false)
 const confirmVisible = ref(false)
 const error = ref("")
+let cloudMediaResolveRevision = 0;
+let tmdbSeasonRevision = 0;
+let resourceResolveTimer = null;
+let resourceResolveRevision = 0;
 
-const filteredSubscribes = computed(() => {
-  const keyword = normalizeSearchText(subscribeSearch.value)
-  if (!keyword) return subscribes.value
-  return subscribes.value.filter((item) =>
-    normalizeSearchText(`${item?.title || ""} ${item?.value || ""}`).includes(keyword),
+const targetCandidates = computed(() => {
+  const keyword = normalizeSearchText(targetSearch.value);
+  const subscriptionItems = subscribes.value
+    .filter((item) => !keyword || normalizeSearchText(`${item?.title || ""} ${item?.value || ""}`).includes(keyword))
+    .map((item) => ({...item, target_kind: "subscribe", target_key: `subscribe:${item.value}`}));
+  const tmdbItems = tmdbCandidates.value.map((item) => ({
+    ...item,
+    target_kind: "tmdb",
+    target_key: `tmdb:${item.media_type}:${item.tmdb_id}`,
+  }));
+  return [...subscriptionItems, ...tmdbItems];
+});
+
+const targetMediaType = computed(() => String(selectedTarget.value?.media_type || ""));
+const manualMediaType = targetMediaType;
+
+const selectableCloudDrives = computed(() => {
+  const mediaType = manualMediaType.value;
+  if (!mediaType) return cloudDrives.value;
+  return cloudDrives.value.filter(
+    (item) => item.mode !== "cross" || crossTransferMediaTypes.value.includes(mediaType),
   )
 })
+
+const selectedCloudResourceAllowed = computed(
+  () =>
+    !selectedCloudResource.value ||
+    selectableCloudDrives.value.some((item) => item.value === selectedCloudResource.value.provider),
+);
 
 const selectedMediaKeys = computed(() => new Set(selectedMediaItems.value.map(mediaItemKey)))
 
@@ -381,13 +416,27 @@ const canSubmit = computed(() => {
   if (submitting.value) return false
   if (actionMode.value === "upgrade") return selectedMediaItems.value.length > 0
   if (!resourceLinks.value.trim()) return false
-  if (targetMode.value === "subscribe") return Boolean(subscribeId.value)
-  if (!selectedMedia.value?.tmdb_id) return false
-  if (selectedMedia.value.media_type !== "tv") return true
-  return (
-    Number(season.value) > 0 && Number(episodeStart.value) > 0 && Number(episodeEnd.value) >= Number(episodeStart.value)
-  )
+  if (!selectedCloudResourceAllowed.value) return false;
+  if (!selectedTarget.value?.tmdb_id) return false;
+  return true;
 })
+
+function normalizeSeasons(values) {
+  const normalized = [];
+  for (const value of Array.isArray(values) ? values : [values]) {
+    for (const token of String(value ?? "").split(/[,，\s]+/)) {
+      const season = Number(token);
+      if (Number.isInteger(season) && season > 0 && season <= 999 && !normalized.includes(season)) {
+        normalized.push(season);
+      }
+    }
+  }
+  return normalized.sort((left, right) => left - right);
+}
+
+function updateSeasons(value) {
+  seasons.value = normalizeSeasons(value);
+}
 
 function normalizeSearchText(value) {
   return String(value ?? "")
@@ -404,6 +453,46 @@ function candidateTitle(item) {
   if (!item) return ""
   const year = item.year ? ` (${item.year})` : ""
   return `${item.title || "未知媒体"}${year} · ${item.media_type_name || ""}`
+}
+
+function targetTitle(item) {
+  return item?.target_kind === "subscribe"
+    ? String(item.title || "指定订阅")
+    : `TMDB · ${candidateTitle(item)}`;
+}
+
+function findMatchingSubscribe(media, season = null) {
+  const candidates = subscribes.value.filter((item) => {
+    if (String(item?.media_type || "") !== String(media?.media_type || "")) return false;
+    if (Number(item?.tmdb_id || 0) !== Number(media?.tmdb_id || 0)) return false;
+    return season === null || Number(item?.season || 0) === Number(season);
+  });
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function applyRecognizedMedia(media, seasonValues = []) {
+  const parsed = normalizeSeasons(seasonValues);
+  const matched = findMatchingSubscribe(media, parsed.length === 1 ? parsed[0] : null);
+  if (matched) {
+    selectedTarget.value = {
+      ...matched,
+      target_kind: "subscribe",
+      target_key: `subscribe:${matched.value}`,
+    };
+    subscribeId.value = matched.value;
+    selectedMedia.value = matched;
+    parsedSeasons.value = parsed;
+    return;
+  }
+  const target = {
+    ...media,
+    target_kind: "tmdb",
+    target_key: `tmdb:${media.media_type}:${media.tmdb_id}`,
+  };
+  selectedTarget.value = target;
+  subscribeId.value = null;
+  selectedMedia.value = target;
+  parsedSeasons.value = parsed;
 }
 
 function mediaItemKey(item) {
@@ -445,8 +534,215 @@ function toggleAllMediaItems(selected) {
   selectedMediaItems.value = selected ? [...mediaContents.value] : []
 }
 
+function cloudResourceLabel(resource) {
+  const provider = cloudDrives.value.find((item) => item.value === resource?.provider);
+  return `网盘路径：[${provider?.title || resource?.provider || "目标网盘"}] ${resource?.path || "/"}`;
+}
+
+function updateResourceInput(value) {
+  const text = String(value || "");
+  if (selectedCloudResource.value && text !== cloudResourceLabel(selectedCloudResource.value)) {
+    selectedCloudResource.value = null;
+  }
+  resourceLinks.value = text;
+  if (!selectedCloudResource.value) scheduleResourceTargetResolve(text);
+}
+
+function scheduleResourceTargetResolve(text) {
+  if (resourceResolveTimer) window.clearTimeout(resourceResolveTimer);
+  const revision = ++resourceResolveRevision;
+  if (!/(?:https?:\/\/|ed2k:\/\/|magnet:\?)/i.test(text)) return;
+  resourceResolveTimer = window.setTimeout(() => {
+    resourceResolveTimer = null;
+    void resolveResourceTarget(text, revision);
+  }, 450);
+}
+
+async function resolveResourceTarget(text, revision) {
+  try {
+    const result = unwrap(
+      await props.api.post(`plugin/${props.pluginId}/sync/manual/resolve`, {
+        resource_links: text.split(/\r?\n/),
+      }),
+    );
+    if (revision !== resourceResolveRevision) return;
+    if (result.success === false) throw new Error(result.message || "资源识别失败");
+    const data = result.data || {};
+    targetSearch.value = String(data.title || targetSearch.value).trim();
+    parsedSeasons.value = normalizeSeasons(data.seasons || []);
+    const matchedId = Number(data.subscribe_id || 0);
+    const matched = matchedId > 0
+      ? subscribes.value.find((item) => Number(item.value) === matchedId)
+      : null;
+    tmdbCandidates.value = Array.isArray(data.candidates) ? data.candidates : [];
+    if (matched) {
+      selectedTarget.value = {
+        ...matched,
+        seasons: normalizeSeasons(data.available_seasons || []),
+        target_kind: "subscribe",
+        target_key: `subscribe:${matched.value}`,
+      };
+    } else if (tmdbCandidates.value.length === 1) {
+      applyRecognizedMedia(tmdbCandidates.value[0], parsedSeasons.value);
+    } else {
+      selectedTarget.value = null;
+      selectedMedia.value = null;
+    }
+  } catch (e) {
+    if (revision === resourceResolveRevision) error.value = e.message || "资源识别失败";
+  }
+}
+
+function parseCloudPathMedia(path) {
+  const segments = String(path || "")
+    .split("/")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const directoryName = segments[segments.length - 1] || "";
+  const marker = /\{\s*tmdb\s*id\s*[-_:]?\s*(\d+)\s*\}/i.exec(directoryName);
+  if (!marker) return null;
+  let title = directoryName
+    .slice(0, marker.index)
+    .replace(/^\s*[A-Za-z]\s+(?=\p{Script=Han})/u, "")
+    .replace(/[._\-\s]+$/g, "")
+    .trim();
+  if (!title) return null;
+  const seasonMatch = /(?:^|[\s._()[\]-])S(?:eason)?\s*0*(\d{1,3})(?=$|[\s._()[\]E{-])/i.exec(directoryName);
+  const seasonNumber = seasonMatch ? Math.max(1, Number(seasonMatch[1])) : null;
+  return {
+    tmdbId: Number(marker[1]),
+    title,
+    season: seasonNumber,
+    preferTv: /(?:更新|连载|\.更\s*\d+)/.test(directoryName),
+  };
+}
+
+async function requestTmdbCandidates(title, tmdbId = 0, mediaType = "") {
+  const result = unwrap(
+    await props.api.post(`plugin/${props.pluginId}/search/tmdb`, {
+      title,
+      tmdb_id: Number(tmdbId || 0) || null,
+      media_type: mediaType || null,
+    }),
+  );
+  if (result.success === false) throw new Error(result.message || "TMDB 搜索失败");
+  return Array.isArray(result.data?.items) ? result.data.items : [];
+}
+
+async function loadTmdbSeasons(target) {
+  const revision = ++tmdbSeasonRevision;
+  availableSeasons.value = [];
+  seasons.value = [];
+  if (target?.media_type !== "tv" || !target?.tmdb_id) return;
+  const applySeasons = (values) => {
+    availableSeasons.value = normalizeSeasons(values);
+    const parsed = normalizeSeasons(parsedSeasons.value);
+    seasons.value = parsed.filter((season) => availableSeasons.value.includes(season));
+  };
+  if (Array.isArray(target.seasons) && target.seasons.length) {
+    applySeasons(target.seasons);
+    return;
+  }
+  loadingTmdbSeasons.value = true;
+  try {
+    const result = unwrap(
+      await props.api.post(`plugin/${props.pluginId}/search/tmdb`, {
+        tmdb_id: target.tmdb_id,
+        title: target.title,
+        original_title: target.original_title,
+        year: target.year,
+        media_type: "tv",
+      }),
+    );
+    if (revision !== tmdbSeasonRevision) return;
+    if (result.success === false) throw new Error(result.message || "TMDB 季列表查询失败");
+    applySeasons(result.data?.seasons || result.data?.items?.[0]?.seasons || []);
+  } catch (e) {
+    if (revision === tmdbSeasonRevision) error.value = e.message || "TMDB 季列表查询失败";
+  } finally {
+    if (revision === tmdbSeasonRevision) loadingTmdbSeasons.value = false;
+  }
+}
+
+async function resolveCloudPathMedia(path, revision) {
+  const hint = parseCloudPathMedia(path);
+  if (!hint) return;
+  subscribeId.value = null;
+  targetSearch.value = hint.title;
+  selectedMedia.value = null;
+  selectedTarget.value = null;
+  parsedSeasons.value = hint.season ? [hint.season] : [];
+  searchingTmdb.value = true;
+  error.value = "";
+  try {
+    const result = unwrap(
+      await props.api.post(`plugin/${props.pluginId}/sync/manual/resolve`, {
+        cloud_path: path,
+        cloud_provider: selectedCloudResource.value?.provider || null,
+        title: hint.title,
+        tmdb_id: hint.tmdbId,
+        media_type: hint.preferTv ? "tv" : null,
+      }),
+    );
+    if (revision !== cloudMediaResolveRevision) return;
+    if (result.success === false) throw new Error(result.message || "网盘路径媒体识别失败");
+    const data = result.data || {};
+    targetSearch.value = String(data.title || hint.title).trim();
+    parsedSeasons.value = normalizeSeasons(data.seasons || []);
+    tmdbCandidates.value = Array.isArray(data.candidates) ? data.candidates : [];
+    const matchedId = Number(data.subscribe_id || 0);
+    const matchedSubscribe = matchedId > 0
+      ? subscribes.value.find((item) => Number(item.value) === matchedId)
+      : null;
+    if (matchedSubscribe) {
+      selectedTarget.value = {
+        ...matchedSubscribe,
+        seasons: normalizeSeasons(data.available_seasons || []),
+        target_kind: "subscribe",
+        target_key: `subscribe:${matchedSubscribe.value}`,
+      };
+      return;
+    }
+    const exactMatches = tmdbCandidates.value.filter(
+      (item) => Number(item?.tmdb_id || 0) === hint.tmdbId,
+    );
+    const matchedMedia =
+      (hint.preferTv && exactMatches.find((item) => item.media_type === "tv")) || exactMatches[0] || null;
+    if (!matchedMedia) {
+      throw new Error(`已识别 TMDB ID ${hint.tmdbId}，但未查询到对应媒体，请手动选择`);
+    }
+    applyRecognizedMedia(matchedMedia, parsedSeasons.value);
+  } catch (e) {
+    if (revision === cloudMediaResolveRevision) error.value = e.message || "网盘路径媒体识别失败";
+  } finally {
+    if (revision === cloudMediaResolveRevision) searchingTmdb.value = false;
+  }
+}
+
+function selectCloudPath(path, provider) {
+  if (resourceResolveTimer) window.clearTimeout(resourceResolveTimer);
+  resourceResolveRevision += 1;
+  selectedCloudResource.value = {
+    provider: String(provider || targetCloudDrive.value || "").trim(),
+    path: String(path || "/").trim() || "/",
+  };
+  resourceLinks.value = cloudResourceLabel(selectedCloudResource.value);
+  cloudDirectoryVisible.value = false;
+  cloudMediaResolveRevision += 1;
+  searchingTmdb.value = false;
+  void resolveCloudPathMedia(selectedCloudResource.value.path, cloudMediaResolveRevision);
+}
+
+function clearCloudResource() {
+  cloudMediaResolveRevision += 1;
+  searchingTmdb.value = false;
+  selectedCloudResource.value = null;
+  resourceLinks.value = "";
+}
+
 function matchInitialSubscribe() {
   subscribeId.value = null
+  selectedTarget.value = null;
   if (!props.initialMedia) return
   const media = props.initialMedia
   const targetTmdbId = Number(media.tmdb_id || 0)
@@ -465,14 +761,26 @@ function matchInitialSubscribe() {
   const seasonMatch = targetSeason > 0 ? matches.find((item) => Number(item.season || 0) === targetSeason) : null
   subscribeId.value = (seasonMatch || matches[0])?.value || null
   if (subscribeId.value) {
-    targetMode.value = "subscribe"
-    selectedMedia.value = null
+    const matched = matches.find((item) => item.value === subscribeId.value);
+    selectedTarget.value = {
+      ...matched,
+      target_kind: "subscribe",
+      target_key: `subscribe:${matched.value}`,
+    };
+    selectedMedia.value = matched;
   } else {
-    targetMode.value = "tmdb"
-    selectedMedia.value = {
+    const media = {
       ...media,
       media_type_name: media.media_type === "movie" ? "电影" : "电视剧",
     }
+    selectedTarget.value = {
+      ...media,
+      target_kind: "tmdb",
+      target_key: `tmdb:${media.media_type}:${media.tmdb_id}`,
+    };
+    selectedMedia.value = selectedTarget.value;
+    seasons.value = media.season ? [Number(media.season)] : [];
+    parsedSeasons.value = [...seasons.value];
   }
 }
 
@@ -504,12 +812,13 @@ async function resolveInitialMediaFallback() {
           (!targetYear || !item.year || String(item.year) === targetYear),
       )
     if (!matched?.tmdb_id) throw new Error("未找到对应的 TMDB 媒体")
-    selectedMedia.value = {
+    const resolved = {
       ...matched,
       ...media,
       tmdb_id: matched.tmdb_id,
       media_type: media.media_type || matched.media_type,
     }
+    applyRecognizedMedia(resolved, media.season ? [media.season] : []);
   } catch (e) {
     error.value = e.message || "历史媒体自动匹配失败"
   }
@@ -523,6 +832,12 @@ async function loadOptions() {
     if (result.success === false) throw new Error(result.message || "加载订阅失败")
     const data = result.data?.data || result.data || result
     subscribes.value = Array.isArray(data.subscribes) ? data.subscribes : []
+    cloudDrives.value = Array.isArray(data.cloud_drives) ? data.cloud_drives : [];
+    targetCloudDrive.value = String(data.target_cloud_drive || "");
+    enableCloudUpgrade.value = Boolean(data.enable_cloud_upgrade);
+    crossTransferMediaTypes.value = Array.isArray(data.cross_transfer_media_types)
+      ? data.cross_transfer_media_types.map((value) => String(value))
+      : [];
   } catch (e) {
     error.value = e.message || "加载订阅失败"
   } finally {
@@ -596,18 +911,12 @@ async function matchUpgradeTmdb() {
 }
 
 async function searchTmdb() {
-  if (!tmdbKeyword.value.trim() || searchingTmdb.value) return
+  if (!targetSearch.value.trim() || searchingTmdb.value) return;
   searchingTmdb.value = true
   error.value = ""
   try {
-    const result = unwrap(
-      await props.api.post(`plugin/${props.pluginId}/search/tmdb`, {
-        title: tmdbKeyword.value.trim(),
-      }),
-    )
-    if (result.success === false) throw new Error(result.message || "TMDB 搜索失败")
-    tmdbCandidates.value = result.data?.items || []
-    selectedMedia.value = tmdbCandidates.value.length === 1 ? tmdbCandidates.value[0] : null
+    tmdbCandidates.value = await requestTmdbCandidates(targetSearch.value.trim());
+    if (tmdbCandidates.value.length === 1) applyRecognizedMedia(tmdbCandidates.value[0], parsedSeasons.value);
   } catch (e) {
     error.value = e.message || "TMDB 搜索失败"
   } finally {
@@ -650,27 +959,40 @@ async function submit() {
         }),
       )
     } else {
-      const media = selectedMedia.value
+      const target = selectedTarget.value;
+      const selectedSeasons = normalizeSeasons(seasons.value);
+      const isSingleSubscriptionSeason = Boolean(
+        target?.target_kind === "subscribe" && (
+          target.media_type !== "tv" || (
+            selectedSeasons.length === 1
+            && Number(target.season || 0) === selectedSeasons[0]
+          )
+        ),
+      );
+      const media = target
         ? {
-            ...selectedMedia.value,
-            season: Number(season.value),
-            episode_start: Number(episodeStart.value),
-            episode_end: Number(episodeEnd.value),
+          ...target,
+          seasons: selectedSeasons,
           }
         : null
       result = unwrap(
         await props.api.post(`plugin/${props.pluginId}/sync/manual`, {
-          subscribe_id: targetMode.value === "subscribe" ? subscribeId.value : null,
-          media: targetMode.value === "tmdb" ? media : null,
-          resource_links: resourceLinks.value.split(/\r?\n/),
+          subscribe_id: isSingleSubscriptionSeason ? target.value : null,
+          media: isSingleSubscriptionSeason ? null : media,
+          resource_links: selectedCloudResource.value ? [] : resourceLinks.value.split(/\r?\n/),
+          cloud_path: selectedCloudResource.value?.path || null,
+          cloud_provider: selectedCloudResource.value?.provider || null,
           manual_upgrade: manualUpgrade.value,
+          skip_history: skipHistory.value,
         }),
       )
     }
     if (result.success === false) throw new Error(result.message || "提交失败")
     emit("started", result.message || "任务已启动")
     resourceLinks.value = ""
+    selectedCloudResource.value = null;
     manualUpgrade.value = false
+    skipHistory.value = false;
     selectedMediaItems.value = []
     confirmVisible.value = false
     emit("update:modelValue", false)
@@ -685,6 +1007,19 @@ watch(actionMode, (value) => {
   error.value = ""
   if (value === "upgrade") loadMediaServers()
 })
+
+watch(selectedTarget, (value) => {
+  if (!value) {
+    subscribeId.value = null;
+    selectedMedia.value = null;
+    availableSeasons.value = [];
+    seasons.value = [];
+    return;
+  }
+  subscribeId.value = value.target_kind === "subscribe" ? value.value : null;
+  selectedMedia.value = value;
+  void loadTmdbSeasons(value);
+});
 
 watch(mediaServer, () => {
   mediaContents.value = []
@@ -709,20 +1044,28 @@ watch(
   () => props.modelValue,
   async (visible) => {
     if (visible) {
-      actionMode.value = props.initialMode === "upgrade" ? "upgrade" : "links"
-      targetMode.value = "subscribe"
+      cloudMediaResolveRevision += 1;
+      actionMode.value = "links";
+      selectedCloudResource.value = null;
+      skipHistory.value = false;
+      cloudDirectoryVisible.value = false;
       mediaKeyword.value = String(props.initialMedia?.title || "").trim()
-      tmdbKeyword.value = ""
+      targetSearch.value = "";
       tmdbCandidates.value = []
+      selectedTarget.value = null;
       selectedMedia.value = null
+      seasons.value = [];
+      availableSeasons.value = [];
+      parsedSeasons.value = [];
       mediaContents.value = []
       selectedMediaItems.value = []
       upgradeTmdbCandidates.value = []
       selectedUpgradeTmdb.value = null
       confirmVisible.value = false
-      subscribeSearch.value = ""
+      targetSearch.value = "";
       subscribeId.value = null
       await loadOptions()
+      actionMode.value = props.initialMode === "upgrade" && enableCloudUpgrade.value ? "upgrade" : "links";
       matchInitialSubscribe()
       await resolveInitialMediaFallback()
       if (actionMode.value === "upgrade") {
@@ -732,8 +1075,10 @@ watch(
         }
       }
     } else {
+      searchingTmdb.value = false;
       error.value = ""
       confirmVisible.value = false
+      cloudDirectoryVisible.value = false;
     }
   },
   { immediate: true },
@@ -749,11 +1094,36 @@ watch(
   max-height: min(760px, calc(100dvh - 32px));
 }
 
-.manual-search-row,
-.episode-range-fields {
+.manual-search-row {
   display: flex;
   align-items: flex-start;
   gap: 8px;
+}
+
+.tmdb-target-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.tmdb-target-row.has-season {
+  grid-template-columns: minmax(0, 1fr) 72px;
+}
+
+.resource-path-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cloud-resource-input :deep(.v-field) {
+  background: rgba(var(--v-theme-primary), 0.06);
+}
+
+.cloud-resource-input :deep(textarea) {
+  color: rgb(var(--v-theme-primary));
+  font-weight: 500;
+  cursor: default;
 }
 
 .media-selection-header {
@@ -825,9 +1195,8 @@ watch(
     width: 100%;
   }
 
-  .episode-range-fields {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  .tmdb-target-row.has-season {
+    grid-template-columns: minmax(0, 1fr) 64px;
   }
 
   .media-selection-list {

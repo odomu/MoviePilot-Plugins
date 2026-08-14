@@ -12,6 +12,18 @@ from .cloud import (
 )
 from .delegation import OwnerDelegator, get_component, resolve_component
 from .scraper import MediaScraper
+from .search import (
+    SearchCandidate,
+    SearchCapability,
+    SearchCapabilityError,
+    SearchPolicy,
+    SearchProvider,
+    SearchQuery,
+    SearchRegistry,
+    format_search_label,
+    format_search_log_prefix,
+    normalize_search_candidate,
+)
 from .transfer import CrossDriveTransfer, CrossTransferTaskManager, LocalRapidUploadAdapter
 
 __all__ = [
@@ -25,6 +37,16 @@ __all__ = [
     "DirectoryListing",
     "DirectoryLookup",
     "MediaScraper",
+    "SearchCandidate",
+    "SearchCapability",
+    "SearchCapabilityError",
+    "SearchPolicy",
+    "SearchProvider",
+    "SearchQuery",
+    "SearchRegistry",
+    "format_search_label",
+    "format_search_log_prefix",
+    "normalize_search_candidate",
     "get_component",
     "resolve_component",
     "CrossDriveTransfer",

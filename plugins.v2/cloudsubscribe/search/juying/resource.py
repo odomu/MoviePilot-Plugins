@@ -350,7 +350,7 @@ class JuyingResourceService:
         self._validate_target(resource_type, target)
         access_code = str(payload.get("access_code") or "").strip()
         target = self._append_access_code(resource_type, target, access_code)
-        return {"url": target, "resource_type": resource_type, "pan_type": resource_type,
+        return {"url": target, "resource_type": resource_type,
                 "access_mode": str(payload.get("access_mode") or ""),
                 "expires_in": self._safe_int(payload.get("expires_in"))}
 
@@ -399,13 +399,15 @@ class JuyingResourceService:
             for row in rows:
                 if test_mode:
                     results.append({
-                        **row,
+                        **{
+                            key: value for key, value in row.items()
+                            if key != "resource_id"
+                        },
                         "url": "",
-                        "pan_type": row["resource_type"],
-                        "source": "juying",
-                        "source_service": "juying",
                         "source_url": row["source_url"],
-                        "juying_resource_id": row["resource_id"],
+                        "provider_data": {
+                            "resource_id": row["resource_id"]
+                        },
                     })
                     continue
                 try:
@@ -422,9 +424,10 @@ class JuyingResourceService:
                 results.append({**resolved, "title": row["title"],
                                 "description": row["description"], "size": row["size"],
                                 "update_time": row["update_time"], "uploader": row["uploader"],
-                                "source": "juying", "source_service": "juying",
                                 "source_url": row["source_url"],
-                                "juying_resource_id": row["resource_id"]})
+                                "provider_data": {
+                                    "resource_id": row["resource_id"]
+                                }})
             return results
 
     def clear_cache(self) -> Dict[str, int]:

@@ -4,7 +4,9 @@
       <div v-for="task in tasks" :key="task.id" class="task-row">
         <v-icon
           :icon="
-            task.task_kind === 'cross_transfer'
+            task.task_kind === 'sync_queue'
+              ? 'mdi-clock-outline'
+              : task.task_kind === 'cross_transfer'
               ? 'mdi-swap-horizontal-bold'
               : task.media_type === '电影'
                 ? 'mdi-movie-outline'
@@ -33,7 +35,7 @@
             <div class="task-phase-wrap">
               <span class="task-phase text-caption text-medium-emphasis">
                 {{
-                  task.status === "postprocessing"
+                  task.postprocess_active || task.status === "postprocessing"
                     ? postprocessingSummary(task)
                     : task.task_kind === "cross_transfer"
                       ? task.error || task.message || task.phase
@@ -43,7 +45,7 @@
                 }}
               </span>
               <v-btn
-                v-if="task.status === 'postprocessing'"
+                v-if="hasPostprocessDetails(task)"
                 class="task-detail-toggle"
                 :icon="isTaskExpanded(task.id) ? 'mdi-chevron-up' : 'mdi-information-outline'"
                 variant="text"
@@ -61,32 +63,52 @@
               {{ formatSize(displayTransferred(task)) }} / {{ formatSize(displayTotal(task)) }} ·
               {{ formatSpeed(task.speed_bytes_per_second || task.upload_speed) }}
             </span>
+            <span
+              v-else-if="task.postprocess_active"
+              class="task-transfer text-caption text-medium-emphasis">
+              {{ Math.round(taskProgress(task)) }}%
+            </span>
           </div>
           <v-progress-linear
-            class="task-progress"
-            :model-value="Number(task.progress || 0)"
+            :class="['task-progress', {'task-progress--active': task.postprocess_active || task.status === 'postprocessing'}]"
+            :model-value="taskProgress(task)"
             :style="progressStyle(task)"
             :indeterminate="
-              !task.transfer_active &&
-              !['pt_upgrade', 'cross_transfer'].includes(task.task_kind) &&
-              ['running', 'stopping', 'postprocessing'].includes(task.status)
+              task.postprocess_active || task.status === 'postprocessing'
+                ? !task.postprocess_active
+                : !task.transfer_active &&
+                  !['pt_upgrade', 'cross_transfer'].includes(task.task_kind) &&
+                  ['running', 'stopping'].includes(task.status)
             "
             :color="taskColor(task.status)"
             height="5"
             rounded />
           <v-expand-transition>
-            <div v-if="task.status === 'postprocessing' && isTaskExpanded(task.id)" class="task-details text-caption">
-              <div class="task-detail-row">
-                <span class="task-detail-label">当前阶段</span>
-                <span>{{ task.phase || "等待处理" }}</span>
+            <div
+              v-if="hasPostprocessDetails(task) && isTaskExpanded(task.id)"
+              class="task-details text-caption">
+              <div v-if="task.current_file" class="task-detail-row">
+                <span class="task-detail-label">当前文件</span>
+                <span class="task-current-file" :title="task.current_file">{{ task.current_file }}</span>
               </div>
-              <div v-if="task.message" class="task-detail-row">
-                <span class="task-detail-label">处理信息</span>
-                <span>{{ task.message }}</span>
+              <div v-if="Number(task.postprocess_file_total || 0) > 0" class="task-detail-row">
+                <span class="task-detail-label">文件进度</span>
+                <span>
+                  第 {{ Number(task.postprocess_file_index || 1) }} / {{ Number(task.postprocess_file_total || 1) }} 个
+                </span>
               </div>
-              <div class="task-detail-row">
-                <span class="task-detail-label">待处理</span>
-                <span>{{ Number(task.pending_count || 0) }} 个文件</span>
+              <div v-if="postprocessSteps(task).length" class="task-detail-row task-process-row">
+                <span class="task-detail-label">处理过程</span>
+                <div class="task-process">
+                  <div
+                    v-for="(step, index) in postprocessSteps(task)"
+                    :key="step.key"
+                    class="task-process-step"
+                    :class="`task-process-step--${postprocessStepState(task, index)}`">
+                    <v-icon :icon="postprocessStepIcon(task, index)" size="14" />
+                    <span>{{ step.label }}</span>
+                  </div>
+                </div>
               </div>
             </div>
           </v-expand-transition>
@@ -133,8 +155,46 @@ const tasks = computed(() =>
 )
 
 function postprocessingSummary(task) {
+  if (task?.postprocess_active) {
+    return currentPostprocessStep(task)?.label || "正在处理文件";
+  }
   const pendingCount = Number(task?.pending_count || 0);
   return pendingCount > 0 ? `${pendingCount} 个文件待完成后处理` : "正在完成文件后处理";
+}
+
+function hasPostprocessDetails(task) {
+  return Boolean(
+    task?.postprocess_active ||
+    task?.current_file ||
+    Number(task?.postprocess_file_total || 0) > 0 ||
+    postprocessSteps(task).length,
+  );
+}
+
+function postprocessSteps(task) {
+  return Array.isArray(task?.postprocess_steps)
+    ? task.postprocess_steps.filter((step) => step?.key && step?.label)
+    : [];
+}
+
+function currentPostprocessStep(task) {
+  const steps = postprocessSteps(task);
+  const currentKey = String(task?.postprocess_step || "");
+  return steps.find((step) => step.key === currentKey) || null;
+}
+
+function postprocessStepState(task, index) {
+  const currentIndex = Math.max(0, Number(task?.postprocess_step_index || 0));
+  if (index < currentIndex) return "completed";
+  if (index === currentIndex) return "active";
+  return "pending";
+}
+
+function postprocessStepIcon(task, index) {
+  const state = postprocessStepState(task, index);
+  if (state === "completed") return "mdi-check-circle";
+  if (state === "active") return "mdi-progress-clock";
+  return "mdi-circle-outline";
 }
 
 function isTaskExpanded(taskId) {
@@ -152,13 +212,13 @@ function toggleTaskDetails(taskId) {
 }
 
 function canStop(task) {
-  return ["queued", "running", "stopping", "postprocessing"].includes(task?.status);
+  return task?.task_kind !== "sync_queue" && ["queued", "running", "stopping", "postprocessing"].includes(task?.status);
 }
 
 function taskStatus(status) {
   return (
     {
-      queued: "等待",
+      queued: "排队中",
       running: "运行中",
       stopping: "停止中",
       postprocessing: "后处理中",
@@ -213,10 +273,18 @@ function progressStyle(task) {
   if (["stopping", "stopped", "canceled"].includes(task?.status)) {
     return {"--task-progress-gradient": "linear-gradient(90deg, #ffd54f, #fb8c00)"};
   }
-  const progress = Math.max(0, Math.min(100, Number(task?.progress || 0)));
+  const progress = taskProgress(task);
   return {
     "--task-progress-gradient": `linear-gradient(90deg, ${progressColor(progress)}, ${progressColor(Math.min(100, progress + 18))})`,
   }
+}
+
+function taskProgress(task) {
+  const value =
+    task?.postprocess_active || task?.status === "postprocessing"
+      ? Number(task?.postprocess_progress || 0)
+      : Number(task?.progress || 0);
+  return Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
 }
 
 function resultIcon(status, taskKind) {
@@ -362,6 +430,39 @@ function displayTotal(task) {
   font-weight: 500;
 }
 
+.task-current-file {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-process-row {
+  align-items: start;
+}
+
+.task-process {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+}
+
+.task-process-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: rgba(var(--v-theme-on-surface), var(--v-disabled-opacity));
+  white-space: nowrap;
+}
+
+.task-process-step--completed {
+  color: rgb(var(--v-theme-success));
+}
+
+.task-process-step--active {
+  color: rgb(var(--v-theme-primary));
+  font-weight: 500;
+}
+
 .task-transfer {
   flex: 0 0 auto;
   white-space: nowrap;
@@ -375,6 +476,21 @@ function displayTotal(task) {
   background: var(--task-progress-gradient) !important;
   transition: width 0.35s ease,
   background 0.35s ease;
+}
+
+.task-progress--active :deep(.v-progress-linear__determinate) {
+  background-image: linear-gradient(110deg, transparent 22%, rgba(255, 255, 255, 0.72) 48%, transparent 72%),
+  var(--task-progress-gradient) !important;
+  background-position: -120px 0, 0 0;
+  background-size: 120px 100%, 100% 100%;
+  background-repeat: no-repeat;
+  animation: task-progress-shimmer 1.15s linear infinite;
+}
+
+@keyframes task-progress-shimmer {
+  to {
+    background-position: 120px 0, 0 0;
+  }
 }
 
 .idle-state {

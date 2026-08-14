@@ -12,11 +12,7 @@ import unicodedata
 from app.log import logger
 
 from ..http_client import normalize_proxies, requests
-from ..types import (
-    SUPPORTED_RESOURCE_TYPES,
-    normalize_resource_type,
-    resource_type_from_url,
-)
+from ..types import resource_type_from_url
 
 _DOC_HOSTS = {"kdocs.cn", "www.kdocs.cn", "docs.qq.com", "docs.weixin.qq.com"}
 _URL_RE = re.compile(
@@ -29,7 +25,6 @@ _QQ_CALLBACK_RE = re.compile(
 )
 _KDOCS_ID_RE = re.compile(r"/(?:l|view)/([^/?#]+)", re.IGNORECASE)
 _QQ_ID_RE = re.compile(r"/(?:doc|sheet|s)/([^/?#]+)", re.IGNORECASE)
-_CONTEXT_WINDOW = 8000
 
 
 def is_online_document_url(url: str) -> bool:
@@ -451,7 +446,6 @@ def _extract_links(text: str, sheet_names: List[str]) -> List[Dict[str, Any]]:
         links.append({
             "url": url,
             "resource_type": resource_type,
-            "pan_type": resource_type,
             "sheet_name": sheet_name,
             "_position": matched.start(),
         })
@@ -487,111 +481,16 @@ def parse_online_document(url: str, proxy: Any = None, timeout: int = 30) -> Dic
 
 
 class OnlineDocumentClient:
-    """从多个公开在线文档中搜索网盘资源。"""
+    """读取公开在线文档的轻量协议客户端。"""
 
     def __init__(self, documents=None, resource_types=None, proxy=None, timeout=30):
-        self.documents = self._normalize_documents(documents, resource_types)
+        self.documents = list(documents or [])
+        self.resource_types = resource_types
         self.proxy = proxy
         self.timeout = timeout
-
-    @staticmethod
-    def _normalize_documents(documents, default_resource_types=None) -> List[Dict[str, Any]]:
-        normalized = []
-        for value in documents or []:
-            item = value if isinstance(value, dict) else {"url": value}
-            url = str(item.get("url") or "").strip()
-            if not is_online_document_url(url):
-                continue
-            resource_types = item.get("resource_types") or default_resource_types or []
-            if isinstance(resource_types, str):
-                resource_types = re.split(r"[,，\s]+", resource_types)
-            normalized.append({
-                "url": url,
-                "resource_types": list(dict.fromkeys(
-                    normalize_resource_type(kind) for kind in resource_types
-                    if normalize_resource_type(kind) in SUPPORTED_RESOURCE_TYPES
-                )),
-            })
-        return normalized
 
     def clear_cache(self):
         return None
 
-    @staticmethod
-    def _matching_links(
-            parsed: Dict[str, Any], keywords: Iterable[str]
-    ) -> List[Dict[str, Any]]:
-        links = list(parsed.get("links") or [])
-        needles = list(dict.fromkeys(
-            str(keyword or "").casefold().strip()
-            for keyword in keywords
-            if str(keyword or "").strip()
-        ))
-        if not needles:
-            return links
-        text = str(parsed.get("text") or "")
-        lowered = text.casefold()
-        positions = []
-        for needle in needles:
-            offset = 0
-            while True:
-                position = lowered.find(needle, offset)
-                if position < 0:
-                    break
-                positions.append(position)
-                offset = position + max(1, len(needle))
-        if not positions:
-            return []
-        ranked = []
-        for index, item in enumerate(links):
-            link_position = int(item.get("_position") or 0)
-            distance = min(abs(link_position - position) for position in positions)
-            if distance <= _CONTEXT_WINDOW:
-                ranked.append((distance, index, item))
-        ranked.sort(key=lambda value: (value[0], value[1]))
-        return [item for _, _, item in ranked]
-
-    def search(
-            self, keyword: str, limit: int = 20, test_mode: bool = False, **_kwargs
-    ) -> List[Dict[str, Any]]:
-        results = []
-        normalized_limit = max(1, min(int(limit or 20), 100))
-        for document in self.documents:
-            document_url = document["url"]
-            parsed = parse_online_document(document_url, self.proxy, self.timeout)
-            if parsed.get("error"):
-                logger.warning(
-                    f"[ONLINE_DOCS] 文档读取失败：{document_url}，{parsed['error']}"
-                )
-                continue
-            search_keywords = [keyword, *(_kwargs.get("alternative_titles") or [])]
-            matched_links = self._matching_links(parsed, search_keywords)
-            logger.debug(
-                f"[ONLINE_DOCS] 关键词匹配：文档={document_url}，"
-                f"关键词={keyword}，正文字符={len(parsed.get('text') or '')}，"
-                f"资源链接={len(parsed.get('links') or [])}，相邻候选={len(matched_links)}，"
-                f"类型={'/'.join(document['resource_types']) or '全部'}，"
-                f"模式={'测试' if test_mode else '正式'}"
-            )
-            for item in matched_links:
-                allowed_types = document["resource_types"]
-                if (
-                        not test_mode
-                        and allowed_types
-                        and item.get("resource_type") not in allowed_types
-                ):
-                    continue
-                result = {
-                    key: value for key, value in item.items() if not key.startswith("_")
-                }
-                result.update({
-                    "title": keyword,
-                    "source": "online_docs",
-                    "source_service": "online_docs",
-                    "source_url": document_url,
-                    "document_type": parsed.get("document_type"),
-                })
-                results.append(result)
-                if len(results) >= normalized_limit:
-                    return results
-        return results
+    def read(self, url: str) -> Dict[str, Any]:
+        return parse_online_document(url, self.proxy, self.timeout)

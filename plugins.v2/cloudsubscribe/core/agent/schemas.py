@@ -42,8 +42,12 @@ class CloudSubscribeLinksInput(BaseModel):
         description="媒体类型，仅支持 movie 或 tv；选择 TMDB 候选时应与 tmdb_id 一并传入",
     )
     season: Optional[int] = Field(default=None, ge=1, le=999, description="电视剧季号")
-    episode_start: Optional[int] = Field(default=None, ge=1, le=9999, description="起始集")
-    episode_end: Optional[int] = Field(default=None, ge=1, le=9999, description="结束集")
+    seasons: Optional[List[int]] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="要同时整理的电视剧季号列表；按升序处理，与 season 二选一",
+    )
     selection_id: Optional[str] = Field(
         default=None,
         min_length=1,

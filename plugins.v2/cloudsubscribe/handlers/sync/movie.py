@@ -42,8 +42,8 @@ class MovieSyncProcessor(OwnerDelegator):
 
             # 加载该订阅的历史积分花费（用 tmdb_id 作为唯一标识）
             sub_key = self.subscription_budget_key(subscribe, MediaType.MOVIE)
-            if track_points and hasattr(self._search_handler, 'reset_sub_spent_points'):
-                self._search_handler.reset_sub_spent_points(sub_key)
+            if track_points and self._search_handler:
+                self._search_handler.reset_subscription_budgets(sub_key)
 
             # 检查历史记录是否已成功转存
             movie_history_score = -1  # -1 表示未转存过
@@ -209,12 +209,16 @@ class MovieSyncProcessor(OwnerDelegator):
                             mediainfo=mediainfo,
                             success_episodes=[1],
                         )
-                    if track_points and hasattr(self._search_handler, "clear_sub_points"):
-                        self._search_handler.clear_sub_points(sub_key)
+                    if track_points and self._search_handler:
+                        self._search_handler.clear_subscription_budgets(sub_key)
                     return transferred_count
 
             # 手动资源直接进入现有匹配转存链，否则查询搜索源。
-            self._set_task_phase(subscribe, "搜索候选资源", 45)
+            self._set_task_phase(
+                subscribe,
+                "处理手动网盘资源" if manual_resources else "搜索候选资源",
+                45,
+            )
             if manual_resources:
                 source_order = ["manual"]
                 source_results = {
@@ -276,8 +280,8 @@ class MovieSyncProcessor(OwnerDelegator):
 
                 # 检查是否是刚搜索出尚未真正解锁的延期解锁 HDHive 资源
                 if (resource.get("need_unlock") or resource.get("need_access")) and not share_url:
-                    slug = resource.get("slug")
-                    if slug and upgrade_target_exists and movie_history_score >= 0:
+                    resource_ref = resource.get("resource_ref")
+                    if resource_ref and upgrade_target_exists and movie_history_score >= 0:
                         preview_name = str(
                             getattr(self._search_handler, "_resource_filter_title", lambda value: "")(
                                 resource
@@ -324,9 +328,12 @@ class MovieSyncProcessor(OwnerDelegator):
                     )
                     continue
 
-                action = "检查离线资源" if self._is_offline_url(share_url) else "检查分享"
+                cloud_resource = self._is_cloud_resource_url(share_url)
+                direct_cloud_resource = (
+                        cloud_resource and self._is_direct_cloud_resource_url(share_url)
+                )
                 logger.info(
-                    f"{action}：{resource_title} - "
+                    f"检查{self._resource_input_label(share_url)}：{resource_title} - "
                     f"{self._resource_log_reference(share_url)}"
                 )
 
@@ -366,8 +373,6 @@ class MovieSyncProcessor(OwnerDelegator):
                                 )
                                 continue
                         self._set_task_phase(subscribe, "提交离线下载", 90)
-                        if not self._reserve_transfer_slots(1):
-                            break
                         pending_key = self._queue_magnet_package(
                             resource, share_url, subscribe, mediainfo,
                             sub_key=sub_key if track_points else "",
@@ -382,7 +387,6 @@ class MovieSyncProcessor(OwnerDelegator):
                             transient_target=transient_target,
                         )
                         if not pending_key:
-                            self._release_transfer_slots(1)
                             continue
                         self._append_magnet_pending_history(
                             history=history,
@@ -467,21 +471,29 @@ class MovieSyncProcessor(OwnerDelegator):
                                 self._resource_size_bytes(matched_file.get("size")),
                                 matched_file.get("sha1") or "",
                             )
+                        staging_dir = self._resource_staging_dir(
+                            share_url, matched_file
+                        )
                         logger.info(
-                            f"网盘转存暂存: {self._cloud_transfer_path}/{file_name}，"
-                            f"完成后移动到: {save_dir}/{target_name}"
+                            f"网盘源文件: {staging_dir}/{file_name}，"
+                            f"整理到: {save_dir}/{target_name}"
+                            if direct_cloud_resource
+                            else f"跨盘源文件: {self._cloud_resource_path(share_url)}/{file_name}，"
+                                 f"转存后整理到: {save_dir}/{target_name}"
+                            if cloud_resource
+                            else f"网盘转存暂存: {staging_dir}/{file_name}，"
+                                 f"完成后移动到: {save_dir}/{target_name}"
                         )
 
                         if self._stop_requested():
                             break
-                        self._set_task_phase(subscribe, "转存匹配文件", 90)
-                        if not self._reserve_transfer_slots(1):
-                            logger.info(
-                                f"已达单次同步上限 {self._max_transfer_per_sync}，"
-                                f"跳过电影转存：{mediainfo.title_year}"
-                            )
-                            break
-                        try:
+                        self._set_task_phase(
+                            subscribe,
+                            "登记网盘文件整理" if direct_cloud_resource else "转存匹配文件",
+                            90,
+                        )
+                        success = True
+                        if not direct_cloud_resource:
                             success = self._timed_sync_call(
                                 "share_transfer",
                                 self._transfer_file,
@@ -492,11 +504,7 @@ class MovieSyncProcessor(OwnerDelegator):
                                 matched_file.get("sha1"),
                                 media_type="movie",
                             )
-                        except Exception:
-                            self._release_transfer_slots(1)
-                            raise
                         if not success:
-                            self._release_transfer_slots(1)
                             if self._stop_requested():
                                 logger.info(
                                     f"用户已停止转存：{mediainfo.title}"
@@ -547,8 +555,14 @@ class MovieSyncProcessor(OwnerDelegator):
                                     None if transient_target else getattr(subscribe, "id", None)
                                 ),
                                 success_episodes=[] if transient_target else [1],
-                                sub_key=sub_key if track_points else "",
-                                staging_dir=self._cloud_transfer_path,
+                                sub_key=sub_key,
+                                transient_target=transient_target,
+                                target_subscribe=(
+                                    self._serialize_pending_target_subscribe(subscribe)
+                                    if transient_target else None
+                                ),
+                                skip_history=bool(resource.get("skip_history")),
+                                staging_dir=staging_dir,
                                 staging_name=(
                                         matched_file.get("staging_name") or file_name
                                 ),
@@ -575,7 +589,6 @@ class MovieSyncProcessor(OwnerDelegator):
                                 transferred_count = max(0, transferred_count - 1)
                                 movie_transferred = False
                                 movie_history_score = 0
-                                self._release_transfer_slots(1)
                                 logger.error(
                                     f"文件已转存但后处理任务登记失败：{target_name}"
                                 )
@@ -593,8 +606,8 @@ class MovieSyncProcessor(OwnerDelegator):
                                     file_name=target_name,
                                 )
                             logger.info(
-                                f"成功转存电影：{mediainfo.title} "
-                                f"(平台优先级:{current_score})"
+                                f"{'已登记网盘电影整理' if direct_cloud_resource else '成功转存电影'}："
+                                f"{mediainfo.title} (平台优先级:{current_score})"
                             )
 
                             # 收集转存详情用于通知
@@ -630,8 +643,8 @@ class MovieSyncProcessor(OwnerDelegator):
                                     mediainfo=mediainfo,
                                     success_episodes=[1],
                                 )
-                                if track_points and hasattr(self._search_handler, "clear_sub_points"):
-                                    self._search_handler.clear_sub_points(sub_key)
+                                if track_points and self._search_handler:
+                                    self._search_handler.clear_subscription_budgets(sub_key)
                         else:
                             logger.error(f"转存失败：{mediainfo.title}")
 

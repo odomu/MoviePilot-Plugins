@@ -520,7 +520,8 @@ const qrVisible = ref(false),
   previewShareUrl = ref(""),
   previewSource = ref(""),
   previewJuyingResourceId = ref(""),
-  previewHdhiveSlug = ref(""),
+  previewHdhiveResourceRef = ref(""),
+  previewProviderData = ref({}),
   previewPendingResource = ref({}),
   previewHdhiveUnlocked = ref(false),
   previewTargetSeason = ref(null),
@@ -795,11 +796,11 @@ function previewFileStem(value) {
 
 function canPreviewResource(item) {
   const source = String(item?.source || "").toLowerCase()
-  const hdhivePreview = source === "hdhive" && Boolean(item?.slug && item?.resource_type)
+  const hdhivePreview = source === "hdhive" && Boolean(item?.resource_ref && item?.resource_type);
   return Boolean(
     item?.can_preview &&
     (item?.url ||
-      (source === "juying" && item?.juying_resource_id) ||
+      (source === "juying" && item?.provider_data?.resource_id) ||
       hdhivePreview ||
       (item?.pending_resolution && ["seedhub", "pinglian"].includes(source))),
   )
@@ -817,12 +818,13 @@ function canAccessHdhiveResource(item) {
 
 function previewResourceKey(item) {
   const source = String(item?.source || "").toLowerCase()
-  const resourceId = String(item?.juying_resource_id || "")
+  const providerData = item?.provider_data || {};
+  const resourceId = String(providerData.resource_id || "");
   if (source === "juying" && resourceId) return `${source}:${resourceId}`
   return String(
     item?.url ||
       `${source}:${item?.resource_type || ""}:${
-        item?.slug || item?.seedhub_seed_id || item?.seedhub_path || item?.pinglian_resource_id || item?.id || ""
+        item?.resource_ref || providerData.seed_id || providerData.path || providerData.resource_id || item?.id || ""
       }`,
   )
 }
@@ -873,16 +875,14 @@ async function previewResource(item) {
   previewResourceType.value = String(item.resource_type || "").toLowerCase()
   previewShareUrl.value = shareUrl
   previewSource.value = String(item.source || "").toLowerCase()
-  previewJuyingResourceId.value = String(item.juying_resource_id || "")
-  previewHdhiveSlug.value = String(item.slug || "")
+  previewJuyingResourceId.value = String(
+    item.provider_data?.resource_id || "",
+  );
+  previewHdhiveResourceRef.value = String(item.resource_ref || "");
+  previewProviderData.value = {...(item.provider_data || {})};
   previewPendingResource.value = {
     pending_resolution: Boolean(item.pending_resolution),
-    seedhub_kind: String(item.seedhub_kind || ""),
-    seedhub_seed_id: String(item.seedhub_seed_id || ""),
-    seedhub_path: String(item.seedhub_path || ""),
-    seedhub_host: String(item.seedhub_host || ""),
-    pinglian_token: String(item.pinglian_token || ""),
-    pinglian_password: String(item.pinglian_password || ""),
+    provider_data: {...(item.provider_data || {})},
   }
   previewHdhiveUnlocked.value = Boolean(item.is_unlocked)
   previewTargetSeason.value = item.target_season ?? null
@@ -907,7 +907,7 @@ async function previewResource(item) {
 
 async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++previewRequestId) {
   const pendingJuying = previewSource.value === "juying" && previewJuyingResourceId.value
-  const pendingHdhive = previewSource.value === "hdhive" && previewHdhiveSlug.value && !previewShareUrl.value
+  const pendingHdhive = previewSource.value === "hdhive" && previewHdhiveResourceRef.value && !previewShareUrl.value;
   const pendingSourceResource =
     ["seedhub", "pinglian"].includes(previewSource.value) &&
     previewPendingResource.value.pending_resolution &&
@@ -924,8 +924,8 @@ async function loadPreviewDirectory(parentId, breadcrumbs, requestId = ++preview
         url: shareUrl,
         parent_id: parentId || "",
         source: previewSource.value,
-        juying_resource_id: previewJuyingResourceId.value,
-        slug: previewHdhiveSlug.value,
+        resource_ref: previewHdhiveResourceRef.value,
+        provider_data: previewProviderData.value,
         is_unlocked: previewHdhiveUnlocked.value,
         target_season: previewTargetSeason.value,
         target_episodes: previewTargetEpisodes.value,
@@ -1003,14 +1003,12 @@ async function unlockResource() {
 }
 
 function testItemStatus(item) {
-  if (item?.is_unlocked) return { label: "已解锁", color: "success" }
   if (item?.need_unlock) {
     return {
       label: `${Number(item.unlock_points || 0)} 积分`,
       color: "warning",
     }
   }
-  if (item?.is_free) return { label: "免费", color: "success" }
   if (item?.need_access) return { label: "待获取", color: "info" }
   return null
 }
@@ -1394,7 +1392,8 @@ watch(previewVisible, (visible) => {
   previewShareUrl.value = ""
   previewSource.value = ""
   previewJuyingResourceId.value = ""
-  previewHdhiveSlug.value = ""
+  previewHdhiveResourceRef.value = "";
+  previewProviderData.value = {};
   previewPendingResource.value = {}
   previewHdhiveUnlocked.value = false
   previewTargetSeason.value = null

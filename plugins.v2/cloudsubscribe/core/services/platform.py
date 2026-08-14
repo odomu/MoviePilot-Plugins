@@ -491,7 +491,7 @@ class PlatformIntegrationService(OwnerDelegator):
                 str(item.get("url") or "").strip()
                 or (
                         item.get("need_unlock")
-                        and item.get("slug")
+                        and item.get("resource_ref")
                 )
             )
             candidate = {
@@ -619,7 +619,7 @@ class PlatformIntegrationService(OwnerDelegator):
                 str((resource or {}).get("url") or "").strip()
                 or (
                         (resource or {}).get("need_unlock")
-                        and (resource or {}).get("slug")
+                        and (resource or {}).get("resource_ref")
                 )
             )
             if not usable:
@@ -651,12 +651,13 @@ class PlatformIntegrationService(OwnerDelegator):
             self._sync_handler.get_sync_metrics()
             if self._sync_handler else {}
         )
-        queue = {"pending": 0, "active": 0}
+        queue = {"pending": 0, "active": 0, "operations": 0}
         if self._subscribe_search_queue_lock is not None:
             with self._subscribe_search_queue_lock:
                 queue = {
                     "pending": len(self._subscribe_search_pending),
                     "active": len(self._subscribe_search_active),
+                    "operations": int(self._sync_queue_pending or 0),
                 }
         external_calls = 0
         external_elapsed_ms = 0
@@ -718,6 +719,94 @@ class PlatformIntegrationService(OwnerDelegator):
     def start_platform_sync(self) -> Dict[str, Any]:
         return self.api_vue_start_sync()
 
+    def api_vue_resolve_manual_links(self, payload: Dict[str, Any]) -> dict:
+        """只读识别手动资源，统一返回订阅、TMDB 候选与资源季。"""
+        payload = dict(payload or {})
+        links = self.extract_resource_links(payload.get("resource_links"))
+        cloud_path = str(payload.get("cloud_path") or "").strip()
+        if not links and not cloud_path:
+            return {"success": False, "message": "请提供有效资源链接或网盘路径"}
+        title = str(payload.get("title") or "").strip()
+        requested_type = str(payload.get("media_type") or "").strip().lower()
+        try:
+            requested_tmdb_id = int(payload.get("tmdb_id") or 0)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "TMDB ID 格式错误"}
+        preview = self._preview_link_media(links) if links else {}
+        recognized_title = (
+                title
+                or str(preview.get("title") or "").strip()
+                or self._link_media_title(links)
+        )
+        if not recognized_title:
+            return {"success": False, "message": "未能从分享内容识别媒体名称"}
+        media_type = requested_type or str(preview.get("media_type") or "").strip().lower()
+        if media_type and media_type not in {"movie", "tv"}:
+            return {"success": False, "message": "媒体类型仅支持 movie 或 tv"}
+        season_values = set(self._link_title_seasons(recognized_title))
+        season_values.update({
+            int(value) for value in preview.get("seasons") or []
+            if int(value) > 0
+        })
+        for link in links:
+            season_values.update(self._link_title_seasons(self._link_media_title([link])))
+        seasons = sorted(season_values)
+        matched = (
+            self._find_link_subscribe(
+                recognized_title,
+                media_type,
+                seasons[0] if len(seasons) == 1 else None,
+                requested_tmdb_id or None,
+            )
+            if len(seasons) <= 1 else None
+        )
+        candidates = []
+        if not matched:
+            search_result = self.api_vue_search_tmdb_candidates({
+                "title": recognized_title,
+                "tmdb_id": requested_tmdb_id or None,
+                "media_type": media_type or None,
+            })
+            if not search_result.get("success"):
+                return search_result
+            candidates = list((search_result.get("data") or {}).get("items") or [])
+            if media_type:
+                candidates = [item for item in candidates if item.get("media_type") == media_type]
+        resolved_media = (
+            self._link_subscribe_media(matched)
+            if matched else candidates[0] if len(candidates) == 1 else None
+        )
+        available_seasons = []
+        if resolved_media and resolved_media.get("media_type") == "tv":
+            detail_result = self.api_vue_search_tmdb_candidates({
+                "title": resolved_media.get("title") or recognized_title,
+                "original_title": resolved_media.get("original_title") or "",
+                "year": resolved_media.get("year"),
+                "tmdb_id": resolved_media.get("tmdb_id"),
+                "media_type": "tv",
+            })
+            detail_data = detail_result.get("data") or {}
+            available_seasons = list(detail_data.get("seasons") or [])
+            if not matched and detail_data.get("items"):
+                candidates = list(detail_data["items"])
+        selected_seasons = (
+            [value for value in seasons if value in set(available_seasons)]
+            if available_seasons else seasons
+        )
+        return {
+            "success": True,
+            "message": "已定位订阅" if matched else "已定位 TMDB 候选",
+            "data": {
+                "title": recognized_title,
+                "media_type": media_type,
+                "seasons": selected_seasons,
+                "detected_seasons": seasons,
+                "available_seasons": available_seasons,
+                "subscribe_id": int(getattr(matched, "id", 0) or 0) if matched else None,
+                "candidates": candidates,
+            },
+        }
+
     def submit_platform_links(
             self,
             subscribe_id: Optional[int] = None,
@@ -726,13 +815,22 @@ class PlatformIntegrationService(OwnerDelegator):
             title: str = "",
             media_type: str = "",
             season: Optional[int] = None,
-            episode_start: Optional[int] = None,
-            episode_end: Optional[int] = None,
+            seasons: Optional[List[int]] = None,
             selection_id: str = "",
             tmdb_id: Optional[int] = None,
             selection_scope: str = "",
     ) -> Dict[str, Any]:
         """提交链接；无有效订阅时先完成 TMDB 快速识别与选择。"""
+        try:
+            normalized_seasons = sorted({
+                int(value) for value in (seasons or [])
+                if int(value) > 0
+            })
+            if season is not None and not normalized_seasons:
+                normalized_seasons = [int(season)]
+        except (TypeError, ValueError):
+            return {"success": False, "message": "季数格式错误"}
+        season = normalized_seasons[0] if normalized_seasons else season
         try:
             normalized_subscribe_id = int(subscribe_id or 0)
         except (TypeError, ValueError):
@@ -780,8 +878,11 @@ class PlatformIntegrationService(OwnerDelegator):
             title = str(cached.get("title") or "")
             media_type = str(cached.get("media_type") or "")
             season = cached.get("season")
-            episode_start = cached.get("episode_start")
-            episode_end = cached.get("episode_end")
+            normalized_seasons = [
+                int(value) for value in cached.get("seasons") or []
+            ]
+            if season is not None and not normalized_seasons:
+                normalized_seasons = [int(season)]
         else:
             links = self.extract_resource_links(resource_links)
         if not links:
@@ -799,10 +900,6 @@ class PlatformIntegrationService(OwnerDelegator):
                     media_type = str(preview.get("media_type") or "")
                 if season is None:
                     season = preview.get("season")
-                if episode_start is None:
-                    episode_start = preview.get("episode_start")
-                if episode_end is None:
-                    episode_end = preview.get("episode_end")
             if not recognized_title:
                 return {
                     "success": False,
@@ -812,6 +909,31 @@ class PlatformIntegrationService(OwnerDelegator):
             normalized_type = str(media_type or "").strip().lower()
             if normalized_type and normalized_type not in {"movie", "tv"}:
                 return {"success": False, "message": "媒体类型仅支持 movie 或 tv"}
+            matched_subscribe = (
+                self._find_link_subscribe(
+                    recognized_title,
+                    normalized_type,
+                    season,
+                )
+                if len(normalized_seasons) <= 1 else None
+            )
+            if matched_subscribe:
+                result = self.api_vue_start_manual_sync({
+                    "subscribe_id": int(getattr(matched_subscribe, "id", 0) or 0),
+                    "resource_links": links,
+                }, wait=wait)
+                data = dict(result.get("data") or {})
+                data["matched_subscribe_id"] = int(
+                    getattr(matched_subscribe, "id", 0) or 0
+                )
+                data["media"] = self._link_subscribe_media(matched_subscribe)
+                result["data"] = data
+                logger.info(
+                    f"分享内容已定位订阅：标题={recognized_title}，"
+                    f"订阅={getattr(matched_subscribe, 'name', '')}，"
+                    f"季={getattr(matched_subscribe, 'season', '') or '电影'}"
+                )
+                return result
             search_result = self.api_vue_search_tmdb_candidates({"title": recognized_title})
             if not search_result.get("success"):
                 return search_result
@@ -851,8 +973,7 @@ class PlatformIntegrationService(OwnerDelegator):
                     "title": recognized_title,
                     "media_type": normalized_type,
                     "season": season,
-                    "episode_start": episode_start,
-                    "episode_end": episode_end,
+                    "seasons": normalized_seasons,
                     "candidates": candidates,
                 }
                 return {
@@ -866,12 +987,33 @@ class PlatformIntegrationService(OwnerDelegator):
                     },
                 }
 
+        matched_subscribe = (
+            self._find_link_subscribe(
+                str(selected_candidate.get("title") or title),
+                str(selected_candidate.get("media_type") or media_type),
+                season,
+                int(selected_candidate.get("tmdb_id") or 0),
+            )
+            if not normalized_subscribe_id and len(normalized_seasons) <= 1
+            else None
+        )
+        if matched_subscribe:
+            result = self.api_vue_start_manual_sync({
+                "subscribe_id": int(getattr(matched_subscribe, "id", 0) or 0),
+                "resource_links": links,
+            }, wait=wait)
+            data = dict(result.get("data") or {})
+            data["matched_subscribe_id"] = int(
+                getattr(matched_subscribe, "id", 0) or 0
+            )
+            data["media"] = self._link_subscribe_media(matched_subscribe)
+            result["data"] = data
+            return result
         media = self._link_media_payload(
             selected_candidate,
             source_title=title,
             season=season,
-            episode_start=episode_start,
-            episode_end=episode_end,
+            seasons=normalized_seasons,
         )
         result = self.api_vue_start_manual_sync({
             "resource_links": links,
@@ -907,6 +1049,71 @@ class PlatformIntegrationService(OwnerDelegator):
                     return unquote(str(values[0])).strip()
         return ""
 
+    @staticmethod
+    def _link_title_seasons(value: Any) -> List[int]:
+        """提取资源标题中的明确季范围，供 TMDB 季列表自动预选。"""
+        seasons = set()
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9])(?:S(?:eason)?\s*|第\s*)0*(\d{1,3})"
+            r"(?:\s*(?:[-~～至到])\s*(?:S(?:eason)?\s*|第\s*)?0*(\d{1,3}))?"
+            r"(?:\s*季)?(?=$|[\s._/\\\-\[\]()Eｅ集])",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(str(value or "")):
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+            if 0 < start <= end <= 999 and end - start <= 100:
+                seasons.update(range(start, end + 1))
+        return sorted(seasons)
+
+    def _find_link_subscribe(
+            self,
+            title: str,
+            media_type: str = "",
+            season: Optional[int] = None,
+            tmdb_id: Optional[int] = None,
+    ) -> Any:
+        """按分享识别结果只复用唯一明确的订阅，避免多季误配。"""
+        normalized_title = self._normalize_agent_title(title)
+        if not normalized_title and not tmdb_id:
+            return None
+        normalized_type = str(media_type or "").strip().lower()
+        candidates = []
+        for subscribe in SubscribeOper().list() or []:
+            subscribe_type = self._agent_media_type(getattr(subscribe, "type", None))
+            if normalized_type and self._agent_media_type(normalized_type) != subscribe_type:
+                continue
+            if tmdb_id:
+                try:
+                    if int(getattr(subscribe, "tmdbid", 0) or 0) != int(tmdb_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            elif self._normalize_agent_title(getattr(subscribe, "name", "")) != normalized_title:
+                continue
+            if season is not None and subscribe_type == MediaType.TV:
+                if int(getattr(subscribe, "season", 0) or 0) != int(season):
+                    continue
+            candidates.append(subscribe)
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _link_subscribe_media(subscribe: Any) -> Dict[str, Any]:
+        media_type = (
+            "movie"
+            if str(getattr(subscribe, "type", "")) == MediaType.MOVIE.value
+            else "tv"
+        )
+        media = {
+            "tmdb_id": int(getattr(subscribe, "tmdbid", 0) or 0),
+            "media_type": media_type,
+            "title": str(getattr(subscribe, "name", "") or "").strip(),
+            "year": getattr(subscribe, "year", None),
+        }
+        if media_type == "tv":
+            media["seasons"] = [int(getattr(subscribe, "season", 1) or 1)]
+        return media
+
     def _preview_link_media(self, links: List[str]) -> Dict[str, Any]:
         """从已配置网盘的分享文件名推断媒体名称和季集范围。"""
         if not self._sync_handler:
@@ -929,9 +1136,7 @@ class PlatformIntegrationService(OwnerDelegator):
                 logger.info(
                     f"分享内容识别完成：标题={inferred.get('title')}，"
                     f"类型={inferred.get('media_type') or '待 TMDB 判断'}，"
-                    f"季={inferred.get('season') or '未指定'}，"
-                    f"集数范围={inferred.get('episode_start') or '-'}~"
-                    f"{inferred.get('episode_end') or '-'}"
+                    f"季={','.join(str(value) for value in inferred.get('seasons') or []) or '未指定'}"
                 )
                 return inferred
             logger.warning(
@@ -945,7 +1150,6 @@ class PlatformIntegrationService(OwnerDelegator):
         """聚合分享中的视频文件名，选择出现频率最高的媒体元数据。"""
         scores: Counter = Counter()
         candidates: Dict[str, Dict[str, Any]] = {}
-        episodes: Dict[str, List[int]] = {}
         media_extensions = {
             str(value).lower() for value in (settings.RMT_MEDIAEXT or [])
         }
@@ -976,7 +1180,7 @@ class PlatformIntegrationService(OwnerDelegator):
             if not key:
                 continue
             scores[key] += 1
-            candidates.setdefault(key, {
+            candidate = candidates.setdefault(key, {
                 "title": parsed_title,
                 "year": getattr(meta, "year", None),
                 "media_type": (
@@ -985,35 +1189,34 @@ class PlatformIntegrationService(OwnerDelegator):
                        or getattr(meta, "begin_episode", None) is not None
                     else ""
                 ),
-                "season": getattr(meta, "begin_season", None),
+                "seasons": set(),
             })
-            values = list(getattr(meta, "episode_list", None) or [])
-            if not values and getattr(meta, "begin_episode", None) is not None:
-                values = [getattr(meta, "begin_episode")]
-            for value in values:
-                try:
-                    episode = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if episode > 0:
-                    episodes.setdefault(key, []).append(episode)
+            parsed_season = getattr(meta, "begin_season", None)
+            if parsed_season is not None and int(parsed_season) > 0:
+                candidate["seasons"].add(int(parsed_season))
+            for season_context in (
+                    item.get("_relative_path"),
+                    item.get("path"),
+                    item.get("_cloud_dir"),
+            ):
+                candidate["seasons"].update(
+                    PlatformIntegrationService._link_title_seasons(
+                        season_context
+                    )
+                )
         if not scores:
             return {}
         selected_key = scores.most_common(1)[0][0]
-        result = dict(candidates[selected_key])
-        selected_episodes = episodes.get(selected_key) or []
-        if selected_episodes:
-            result["episode_start"] = min(selected_episodes)
-            result["episode_end"] = max(selected_episodes)
-        return result
+        selected = dict(candidates[selected_key])
+        selected["seasons"] = sorted(selected.get("seasons") or [])
+        return selected
 
     @staticmethod
     def _link_media_payload(
             candidate: Dict[str, Any],
             source_title: str = "",
             season: Optional[int] = None,
-            episode_start: Optional[int] = None,
-            episode_end: Optional[int] = None,
+            seasons: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         media_type = str(candidate.get("media_type") or "").lower()
         media = {
@@ -1025,37 +1228,15 @@ class PlatformIntegrationService(OwnerDelegator):
         if media_type != "tv":
             return media
         meta = MetaInfo(str(source_title or media["title"]))
-        parsed_episodes = [
-            int(value) for value in (getattr(meta, "episode_list", None) or [])
-            if str(value).isdigit()
-        ]
-        episode_range = re.search(
-            r"(?i)S\d{1,3}E(\d{1,4})(?:\s*[-~～]\s*(?:E)?(\d{1,4}))?",
-            str(source_title or ""),
-        )
-        if episode_range:
-            range_start = int(episode_range.group(1))
-            range_end = int(episode_range.group(2) or range_start)
-            parsed_episodes.extend(range(range_start, max(range_start, range_end) + 1))
-        resolved_season = int(
-            season or getattr(meta, "begin_season", None) or 1
-        )
-        resolved_start = int(
-            episode_start
-            or (min(parsed_episodes) if parsed_episodes else None)
-            or getattr(meta, "begin_episode", None)
-            or 1
-        )
-        resolved_end = int(
-            episode_end
-            or (max(parsed_episodes) if parsed_episodes else None)
-            or resolved_start
-        )
-        media.update({
-            "season": max(1, resolved_season),
-            "episode_start": max(1, resolved_start),
-            "episode_end": max(resolved_start, resolved_end),
+        resolved_seasons = sorted({
+            int(value) for value in (seasons or [])
+            if int(value) > 0
         })
+        if not resolved_seasons:
+            resolved_season = season or getattr(meta, "begin_season", None)
+            if resolved_season:
+                resolved_seasons = [max(1, int(resolved_season))]
+        media["seasons"] = resolved_seasons
         return media
 
     @staticmethod
@@ -1143,8 +1324,7 @@ class PlatformIntegrationService(OwnerDelegator):
             title: str = "",
             media_type: str = "",
             season: Optional[int] = None,
-            episode_start: Optional[int] = None,
-            episode_end: Optional[int] = None,
+            seasons: Optional[List[int]] = None,
             selection_id: str = "",
             tmdb_id: Optional[int] = None,
             **kwargs,
@@ -1171,8 +1351,7 @@ class PlatformIntegrationService(OwnerDelegator):
             title=recognized_title,
             media_type=media_type,
             season=season,
-            episode_start=episode_start,
-            episode_end=episode_end,
+            seasons=seasons,
             selection_id=selection_id,
             tmdb_id=tmdb_id,
             selection_scope="workflow",

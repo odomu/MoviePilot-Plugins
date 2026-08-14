@@ -5,7 +5,7 @@ import re
 import threading
 import time
 from html.parser import HTMLParser
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from app.log import logger
@@ -18,9 +18,7 @@ from ..http_client import (
     request_error_summary,
     requests,
 )
-from ..matching import extract_year, title_matches, unique_texts
 from ..types import (
-    RESOURCE_TYPE_ORDER,
     SUPPORTED_RESOURCE_TYPES,
     normalize_resource_type,
     resource_type_from_url,
@@ -370,40 +368,7 @@ class PinglianClient:
         return payload
 
     @staticmethod
-    def _video_title(row: Dict[str, Any]) -> str:
-        """移除盘链候选标题末尾与 vod_year 重复的年份。"""
-        name = str(row.get("vod_name") or "").strip()
-        row_year = extract_year(row.get("vod_year"))
-        if not name or not row_year:
-            return name
-        normalized = re.sub(
-            rf"[\s（(【\[]*{re.escape(row_year)}[）)】\]]*$", "", name
-        ).strip()
-        return normalized or name
-
-    @staticmethod
-    def _select_video(
-            rows: Iterable[Dict[str, Any]], titles: List[str], year: str
-    ) -> Optional[Dict[str, Any]]:
-        best = None
-        for index, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            name = PinglianClient._video_title(row)
-            if not title_matches(name, titles):
-                continue
-            row_year = extract_year(row.get("vod_year"))
-            if year and row_year and row_year != year:
-                continue
-            exact = any(name.casefold() == title.casefold() for title in titles)
-            score = (200 if exact else 100) + (50 if year and row_year == year else 0)
-            ranked = (score, -index, row)
-            if best is None or (score, -index) > (best[0], best[1]):
-                best = ranked
-        return best[2] if best is not None else None
-
-    @staticmethod
-    def _append_password(resource_type: str, target: str, password: str) -> str | bytes:
+    def apply_password(resource_type: str, target: str, password: str) -> str | bytes:
         password = str(password or "").strip()
         if not password:
             return target
@@ -454,7 +419,7 @@ class PinglianClient:
             raise PinglianError("盘链资源标识无效", "pinglian_invalid_token")
         target = self._resolve_token(token, expected_type)
         return {
-            "url": self._append_password(expected_type, target, password),
+            "url": self.apply_password(expected_type, target, password),
             "resource_type": expected_type,
         }
 
@@ -480,203 +445,6 @@ class PinglianClient:
             .removeprefix("注册于 ").strip(),
             "invite_count": details.get("已邀请用户", ""),
         }
-
-    def search(
-            self,
-            title: str,
-            alternative_titles: Iterable[str],
-            year: Any,
-            resource_type_order: Iterable[str],
-            limit: int = 20,
-            test_mode: bool = False,
-    ) -> List[Dict[str, Any]]:
-        titles = unique_texts((title, *alternative_titles))
-        if not titles:
-            return []
-        allowed = (
-            list(RESOURCE_TYPE_ORDER)
-            if test_mode
-            else list(dict.fromkeys(
-                normalize_resource_type(value) for value in resource_type_order
-                if normalize_resource_type(value) in SUPPORTED_RESOURCE_TYPES
-            ))
-        )
-        if not allowed:
-            return []
-        expected_year = extract_year(year)
-        limit_value = max(1, min(int(limit or 20), 80))
-        prefix = "[PINGLIAN]"
-        logger.debug(
-            f"{prefix} 查询开始：关键词={','.join(titles)}，"
-            f"模式={'测试' if test_mode else '正式'}，"
-            f"资源类型={'全部' if test_mode else '/'.join(allowed)}"
-        )
-        with self._lock:
-            video = None
-            selected_keyword = ""
-            for keyword in titles:
-                payload = self.request_json(
-                    "/api/get_videos.php", params={"wd": keyword, "pg": 1}
-                )
-                rows = payload.get("list") or []
-                rows = rows if isinstance(rows, list) else []
-                logger.debug(
-                    f"{prefix} get_videos：关键词={keyword}，条目={len(rows)}"
-                )
-                video = self._select_video(rows, titles, expected_year)
-                if video:
-                    selected_keyword = keyword
-                    break
-            if not video:
-                logger.debug(f"{prefix} 未选中作品：关键词={','.join(titles)}")
-                return []
-            vod_id = video.get("vod_id")
-            logger.debug(
-                f"{prefix} 选中作品：vod_id={vod_id}，标题={self._video_title(video)}"
-            )
-            payload = self.request_json(
-                "/api/search_pan_links.php",
-                params={"keyword": selected_keyword, "vod_id": vod_id, "_t": int(time.time() * 1000)},
-            )
-            groups = payload.get("data") if payload.get("success") else None
-            if not isinstance(groups, dict):
-                logger.debug(f"{prefix} search_pan_links：分组=0，原始链接=0")
-                return []
-            type_order = {value: index for index, value in enumerate(allowed)}
-            candidates = []
-            raw_link_count = 0
-            type_counts: Dict[str, int] = {}
-            filtered_type_counts: Dict[str, int] = {}
-            for group_key, group in groups.items():
-                for row in (group.get("links") or []) if isinstance(group, dict) else []:
-                    raw_link_count += 1
-                    if not isinstance(row, dict):
-                        continue
-                    direct_target = str(row.get("url") or "").strip()
-                    raw_type = (
-                            row.get("type") or group_key
-                            or (group.get("name") if isinstance(group, dict) else "")
-                    )
-                    resource_type = normalize_resource_type(raw_type)
-                    if not resource_type and direct_target:
-                        resource_type = resource_type_from_url(direct_target)
-                    token = str(row.get("token") or "").strip()
-                    if resource_type:
-                        type_counts[resource_type] = type_counts.get(resource_type, 0) + 1
-                    if (
-                            resource_type not in type_order
-                            or (not direct_target and not token)
-                    ):
-                        continue
-                    filtered_type_counts[resource_type] = (
-                            filtered_type_counts.get(resource_type, 0) + 1
-                    )
-                    candidates.append((
-                        type_order[resource_type], row, resource_type,
-                        direct_target, token,
-                    ))
-
-            logger.debug(
-                f"{prefix} search_pan_links：分组={len(groups)}，"
-                f"原始链接={raw_link_count}，类型={'/'.join(f'{k}={v}' for k, v in type_counts.items()) or '无'}，"
-                f"已选类型候选={'/'.join(f'{k}={v}' for k, v in filtered_type_counts.items()) or '无'}，"
-                f"可用候选={len(candidates)}"
-            )
-
-            def user_tier(item) -> int:
-                try:
-                    return int(item[1].get("user_tier") or 0)
-                except (TypeError, ValueError):
-                    return 0
-
-            candidates.sort(
-                key=lambda item: (item[0], -user_tier(item))
-            )
-            if test_mode:
-                grouped = {}
-                for candidate in candidates:
-                    grouped.setdefault(candidate[2], []).append(candidate)
-                candidates = []
-                offsets = {resource_type: 0 for resource_type in grouped}
-                while grouped:
-                    for resource_type in list(grouped):
-                        rows = grouped[resource_type]
-                        offset = offsets[resource_type]
-                        candidates.append(rows[offset])
-                        offset += 1
-                        offsets[resource_type] = offset
-                        if offset >= len(rows):
-                            grouped.pop(resource_type)
-                            offsets.pop(resource_type, None)
-            results = []
-            seen = set()
-            direct_count = 0
-            resolved_count = 0
-            resolve_failed_count = 0
-            for _, row, resource_type, direct_target, token in candidates:
-                if len(results) >= limit_value:
-                    break
-                key = (
-                    resource_type,
-                    str(row.get("title") or "").strip(),
-                    direct_target or token,
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                source_url = f"{self.base_url}/pages/video.php?id={vod_id}"
-                target = direct_target
-                if target:
-                    if resource_type_from_url(target) != resource_type:
-                        resolve_failed_count += 1
-                        logger.debug(f"{prefix} 跳过类型不匹配的直链")
-                        continue
-                    direct_count += 1
-                elif test_mode:
-                    results.append({
-                        "title": str(row.get("title") or "盘链资源").strip(),
-                        "description": str(row.get("source") or "").strip(),
-                        "url": "",
-                        "resource_type": resource_type,
-                        "pan_type": resource_type,
-                        "update_time": str(row.get("time") or ""),
-                        "source": "pinglian",
-                        "source_service": "pinglian",
-                        "source_url": source_url,
-                        "pinglian_resource_id": str(row.get("id") or ""),
-                        "pinglian_token": token,
-                        "pinglian_password": str(row.get("password") or ""),
-                        "pending_resolution": True,
-                    })
-                    continue
-                else:
-                    try:
-                        target = self._resolve_token(token, resource_type)
-                        resolved_count += 1
-                    except PinglianError as error:
-                        resolve_failed_count += 1
-                        logger.debug(f"{prefix} 跳过不可用资源：{error.code}")
-                        continue
-                target = self._append_password(
-                    resource_type, target, row.get("password")
-                )
-                results.append({
-                    "title": str(row.get("title") or "盘链资源").strip(),
-                    "description": str(row.get("source") or "").strip(),
-                    "url": target,
-                    "resource_type": resource_type,
-                    "pan_type": resource_type,
-                    "update_time": str(row.get("time") or ""),
-                    "source": "pinglian",
-                    "source_service": "pinglian",
-                    "source_url": source_url,
-                    "pinglian_resource_id": str(row.get("id") or ""),
-                })
-            logger.debug(
-                f"{prefix} 返回完成：结果={len(results)}，直链={direct_count}，"
-                f"token回退={resolved_count}，跳过={resolve_failed_count}"
-            )
-            return results
 
     def clear_cache(self) -> Dict[str, int]:
         return {"session": int(self._authenticated)}

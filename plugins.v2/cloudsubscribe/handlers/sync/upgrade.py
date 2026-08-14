@@ -51,8 +51,8 @@ class UpgradeService(OwnerDelegator):
             transient_target = bool(getattr(subscribe, "_transient_target", False))
             season = subscribe.season or 1
             sub_key = self.subscription_budget_key(subscribe, MediaType.TV)
-            if hasattr(self._search_handler, "reset_sub_spent_points"):
-                self._search_handler.reset_sub_spent_points(sub_key)
+            if self._search_handler:
+                self._search_handler.reset_subscription_budgets(sub_key)
             logger.debug(f"开始洗版：{subscribe.name} S{season:02d}")
 
             mediainfo: MediaInfo = self._subscribe_mediainfo(
@@ -141,6 +141,9 @@ class UpgradeService(OwnerDelegator):
                     transferred_count=transferred_count,
                     exclude_ids=exclude_ids,
                     allow_upgrade=False,
+                    manual_resources=manual_resources,
+                    manual_upgrade=False,
+                    target_episodes=target_episodes,
                 )
 
             logger.info(f"{upgrade_log_prefix} 已建立 {len(local_scores)} 集基线")
@@ -232,7 +235,11 @@ class UpgradeService(OwnerDelegator):
                 logger.warning(f"{upgrade_log_prefix} 没有可用的搜索源")
                 return transferred_count
 
-            self._set_upgrade_phase(subscribe, "搜索候选资源", 40)
+            self._set_upgrade_phase(
+                subscribe,
+                "处理手动洗版资源" if manual_resources else "搜索候选资源",
+                40,
+            )
             prefetched_results = (
                 {"manual": [dict(resource) for resource in manual_resources]}
                 if manual_resources else {}
@@ -259,10 +266,6 @@ class UpgradeService(OwnerDelegator):
                     break
                 if not episodes_to_search:
                     break
-                if self._remaining_transfer_quota() <= 0:
-                    logger.info(f"{upgrade_log_prefix} 已达单次同步上限 {self._max_transfer_per_sync}")
-                    break
-
                 logger.debug(
                     f"{upgrade_log_prefix} 使用 {source.upper()} 处理"
                     f"{'跨盘' if is_cross_batch else '目标网盘'}候选"
@@ -273,17 +276,14 @@ class UpgradeService(OwnerDelegator):
                         break
                     if not episodes_to_search:
                         break
-                    if self._remaining_transfer_quota() <= 0:
-                        break
-
                     share_url = resource.get("url", "")
                     resource_title = resource.get("title", "")
                     pending_episodes = tuple(episodes_to_search)
 
                     # HDHive 解锁
                     if (resource.get("need_unlock") or resource.get("need_access")) and not share_url:
-                        slug = resource.get("slug")
-                        if slug:
+                        resource_ref = resource.get("resource_ref")
+                        if resource_ref:
                             preview_files = resource.get("preview_files") or []
                             preview_matches = self._match_episode_files(
                                 preview_files,
@@ -405,8 +405,6 @@ class UpgradeService(OwnerDelegator):
                                 }
                         if not worthwhile:
                             continue
-                        if not self._reserve_transfer_slots(1):
-                            break
                         pending_key = self._queue_magnet_package(
                             resource,
                             share_url,
@@ -421,7 +419,6 @@ class UpgradeService(OwnerDelegator):
                             transient_target=transient_target,
                         )
                         if not pending_key:
-                            self._release_transfer_slots(1)
                             continue
                         self._append_magnet_pending_history(
                             history=history,
@@ -565,7 +562,7 @@ class UpgradeService(OwnerDelegator):
                         continue
 
                     self._set_upgrade_phase(subscribe, "提交替换", 80)
-                    transfer_results, reserved_count = self._transfer_episode_items(
+                    transfer_results = self._transfer_episode_items(
                         matched_items,
                         share_url,
                         mediainfo,
@@ -573,13 +570,9 @@ class UpgradeService(OwnerDelegator):
                         season,
                         sub_key,
                         track_subscription=not manual_upgrade and not transient_target,
+                        transient_target=transient_target,
                     )
                     if not transfer_results:
-                        if reserved_count <= 0:
-                            logger.info(
-                                f"{upgrade_log_prefix} 已达单次同步上限 "
-                                f"{self._max_transfer_per_sync}"
-                            )
                         break
                     batch_detail_episodes = []
                     batch_success_episodes = []

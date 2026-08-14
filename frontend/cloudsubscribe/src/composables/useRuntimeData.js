@@ -212,12 +212,14 @@ export function useRuntimeData(api, notify, pluginId = "CloudSubscribe", {onSett
       if (!result?.success) throw new Error(result?.message || "启动失败");
       const selectedScope = result?.data?.scope === "selected";
       const subscribeCount = Number(result?.data?.subscribe_count || 0);
+      const historyTargetCount = Number(result?.data?.history_target_count || 0);
+      const mediaCount = Number(result?.data?.media_count || subscribeCount + historyTargetCount);
       startRequestedUntil = Date.now() + 10000;
       runtimeStreamDisabled = false;
       runtimeStreamFailures = 0;
       Object.assign(runtime, {
         status: "starting",
-        task: selectedScope ? `正在准备所选 ${subscribeCount} 个订阅` : "正在准备全部订阅",
+        task: selectedScope ? `正在准备所选 ${mediaCount} 个媒体目标` : "正在准备全部订阅",
         progress: 0,
         tasks: [],
       });

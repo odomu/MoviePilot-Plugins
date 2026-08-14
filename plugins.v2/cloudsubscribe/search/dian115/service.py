@@ -1,28 +1,44 @@
 """Dian115 资源搜索、客户端生命周期与积分解锁。"""
 
 import re
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urlencode
 
 from app.log import logger
-from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
-from ...core import OwnerDelegator
-from ...search.dian115 import (
-    Dian115Client,
-    Dian115Error,
-    Dian115ResourceService,
-)
-from ...search.matching import unique_texts
+from ...core import OwnerDelegator, SearchQuery, format_search_label
+from .client import Dian115Client, Dian115Error
+from .resource import Dian115ResourceService
+from ..budget import PointBudgetLedger
+from ..matching import unique_texts
 from ...utils.file_parser import MediaFileParser
+from ...utils.cache import create_platform_ttl_cache
 
 
 class Dian115SearchService(OwnerDelegator):
     """提供 Dian115 curl_cffi 搜索与按需解锁能力。"""
 
     _HISTORY_KEY = "dian115_sub_points_history"
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        unlocked_cache = create_platform_ttl_cache(
+            "search:dian115_unlocked_urls",
+            str(owner._dian115_email or "").casefold(),
+            maxsize=512,
+            ttl=30 * 60,
+        )
+        object.__setattr__(self, "_budget", PointBudgetLedger(
+            self._HISTORY_KEY,
+            owner._dian115_max_unlock_points,
+            owner._dian115_max_points_per_sub,
+            unlocked_cache=unlocked_cache,
+        ))
+
+    @property
+    def _dian115_budget(self):
+        return self._budget
 
     def _get_dian115_resources(self) -> Dian115ResourceService:
         """复用唯一认证客户端，返回独立的资源服务。"""
@@ -55,10 +71,34 @@ class Dian115SearchService(OwnerDelegator):
                 self._dian115_resources = resources
             return resources
 
-    def get_dian115_client(self) -> Dian115Client:
+    def get_client(self) -> Dian115Client:
         """返回搜索、账户信息与签到共同复用的唯一接口客户端。"""
         self._get_dian115_resources()
         return self._dian115_client
+
+    @property
+    def budget(self):
+        return self._budget
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self._dian115_enabled
+            and self._dian115_email
+            and self._dian115_password
+        )
+
+    @property
+    def resource_types(self):
+        return frozenset(self._resource_type_order_config)
+
+    @property
+    def cache_context(self) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "auto_unlock": self._dian115_auto_unlock,
+            "candidate_limit": self._dian115_candidate_limit,
+        }
 
     def close(self) -> None:
         with self._dian115_client_lock:
@@ -225,12 +265,10 @@ class Dian115SearchService(OwnerDelegator):
             "tags": tags,
             "tag_decoded": dict(tag),
             "resource_type": resource_type,
-            "pan_type": resource_type,
             "source": "dian115",
             "source_url": page_url,
             "media_page_url": page_url,
-            "detail_path": resource_path,
-            "slug": str(share_id),
+            "resource_ref": str(share_id),
             "unlock_group": f"dian115:share:{share_id}",
             "need_unlock": not is_unlocked and unlock_points > 0,
             "need_access": not is_unlocked and unlock_points <= 0,
@@ -245,36 +283,35 @@ class Dian115SearchService(OwnerDelegator):
             "hdr_type": str(tag.get("hdr") or ""),
             "subtitle": str(share.get("subtitle_label") or ""),
             "update_time": share.get("created_at"),
-            "dian115_share_id": share_id,
-            "dian115_resource_id": resource_id,
-            "dian115_resource_key": resource_key,
-            "dian115_tmdb_id": tmdb_id,
-            "dian115_media_type": media_type,
-            "dian115_season": int(target_season or 0),
+            "provider_data": {
+                "detail_path": resource_path,
+                "resource_id": resource_id,
+                "resource_key": resource_key,
+                "tmdb_id": tmdb_id,
+                "media_type": media_type,
+                "season": int(target_season or 0),
+            },
         }
 
-    def _search_dian115(
-            self,
-            mediainfo: MediaInfo,
-            media_type: MediaType,
-            season: Optional[int] = None,
-            target_episodes: Optional[List[int]] = None,
-            subscribe: Any = None,
-            test_mode: bool = False,
-            result_limit: Optional[int] = None,
-    ) -> Optional[List[Dict[str, Any]]]:
+    def search(self, query: SearchQuery) -> Optional[List[Dict[str, Any]]]:
+        mediainfo = query.mediainfo
+        media_type = query.media_type
+        season = query.season
+        target_episodes = list(query.target_episodes)
+        subscribe = query.subscribe
+        test_mode = query.test_mode
+        result_limit = query.result_limit
         tmdb_id = mediainfo.tmdb_id or getattr(subscribe, "tmdbid", None)
-        search_label = self._search_label(mediainfo, media_type, season)
+        search_label = format_search_label(mediainfo, media_type, season)
         prefix = f"[{search_label}][DIAN115]"
         if not tmdb_id:
             logger.debug(f"{prefix} 缺少 TMDB ID，跳过查询")
             return []
         if not self._dian115_email or not self._dian115_password:
-            logger.warning("Dian115 已启用但未配置邮箱或密码")
+            logger.warning(f"{prefix} 已启用但未配置邮箱或密码")
             return []
         normalized_type = "movie" if media_type == MediaType.MOVIE else "tv"
         target_season = int(season or 0) if normalized_type == "tv" else 0
-        started = time.monotonic()
         try:
             resources = self._get_dian115_resources()
             detail = resources.resource_detail(
@@ -306,13 +343,14 @@ class Dian115SearchService(OwnerDelegator):
                 # 免费或历史已解锁但当前详情未直接带链接时，调用 /unlock 只取回
                 # 已有访问数据；服务端返回 already=true 或 cost_points=0，不消耗积分。
                 if not test_mode and not candidate["url"] and not candidate["need_unlock"]:
+                    provider_data = candidate["provider_data"]
                     unlocked = resources.unlock_share(
-                        candidate["dian115_share_id"],
-                        candidate["dian115_resource_id"],
+                        int(candidate["resource_ref"]),
+                        provider_data["resource_id"],
                         max_unlock_points=0,
-                        tmdb_id=candidate["dian115_tmdb_id"],
-                        media_type=candidate["dian115_media_type"],
-                        season=candidate["dian115_season"],
+                        tmdb_id=provider_data["tmdb_id"],
+                        media_type=provider_data["media_type"],
+                        season=provider_data["season"],
                     )
                     candidate["url"] = self._unlock_payload_url(unlocked)
                     restored_count += bool(candidate["url"])
@@ -342,14 +380,13 @@ class Dian115SearchService(OwnerDelegator):
                     target_episodes=target_episodes,
                 )[:self._dian115_candidate_limit]
             logger.debug(
-                f"{prefix} WebAPI 查询完成：站点分享={len(shares)}，"
-                f"规范化={normalized_count}，候选={len(candidates)}，"
+                f"{prefix} WebAPI 渠道统计：站点分享={len(shares)}，"
+                f"规范化={normalized_count}，"
                 f"待积分解锁 {sum(bool(item.get('need_unlock')) for item in candidates)} 个，"
                 f"恢复已有访问链接 {restored_count} 个，"
                 f"跳过（自动解锁关闭={auto_unlock_skipped}，"
                 f"无可用链接={inaccessible_skipped}，"
-                f"预筛/上限={max(0, before_limit_count - len(candidates))}），"
-                f"总耗时={time.monotonic() - started:.2f}s"
+                f"预筛/上限={max(0, before_limit_count - len(candidates))}）"
             )
             return candidates
         except Dian115Error as error:
@@ -362,59 +399,18 @@ class Dian115SearchService(OwnerDelegator):
             logger.error(f"{prefix} 查询异常：{error}")
             return None
 
-    def set_data_funcs(self, get_func, save_func) -> None:
-        """注入订阅积分历史的持久化读写函数。"""
-        self._dian115_budget.set_data_funcs(get_func, save_func)
-
-    def reset_task_spent_points(self) -> None:
-        self._dian115_budget.reset_task()
-        if self._dian115_enabled and self._dian115_auto_unlock:
-            logger.debug(
-                "Dian115 任务积分账本已初始化："
-                f"任务总预算={self._dian115_budget.task_limit}，"
-                f"单订阅预算={self._dian115_budget.subscribe_limit}，"
-                f"已解锁链接缓存={self._dian115_budget.cached_url_count()}"
-            )
-
-    def reset_sub_spent_points(self, sub_key: str = "") -> None:
-        spent_points = self._dian115_budget.reset_subscribe(sub_key)
-        if sub_key and self._dian115_enabled and self._dian115_auto_unlock:
-            logger.debug(
-                f"Dian115 订阅积分账本：key={sub_key}，"
-                f"历史已花费={spent_points}，"
-                f"单订阅预算={self._dian115_budget.subscribe_limit}，"
-                f"单订阅剩余={max(0, self._dian115_budget.subscribe_limit - spent_points)}，"
-                f"本轮任务已花费={self._dian115_budget.task_spent}，"
-                f"任务总预算={self._dian115_budget.task_limit}，"
-                f"任务剩余={max(0, self._dian115_budget.task_limit - self._dian115_budget.task_spent)}"
-            )
-
-    def clear_sub_points(self, sub_key: str) -> None:
-        if self._dian115_budget.clear_subscribe(sub_key):
-            logger.debug(f"Dian115 已清除订阅 {sub_key} 的历史积分记录")
-
-    def has_dian115_unlock_budget(self, unlock_points: int) -> bool:
-        status = self._dian115_budget.status(unlock_points)
-        if status is None:
-            logger.debug(f"Dian115 积分预算检查失败：积分值无效={unlock_points}")
-            return False
-        logger.debug(
-            "Dian115 积分预算检查："
-            f"{self._dian115_budget.format_snapshot(unlock_points)}，"
-            f"上下文={'订阅' if self._dian115_budget.subscribe_key else '任务初始化/测试'}"
-        )
-        return status.allowed
-
-    def unlock_dian115_resource(
+    def unlock(
             self,
-            share_id: int,
-            resource_id: int,
-            unlock_points: int,
+            candidate: Mapping[str, Any],
             search_label: str = "",
-            tmdb_id: int = 0,
-            media_type: str = "",
-            season: int = 0,
     ) -> Optional[str]:
+        provider_data = candidate.get("provider_data") or {}
+        share_id = int(candidate.get("resource_ref") or 0)
+        resource_id = int(provider_data.get("resource_id") or 0)
+        unlock_points = int(candidate.get("unlock_points") or 0)
+        tmdb_id = int(provider_data.get("tmdb_id") or 0)
+        media_type = str(provider_data.get("media_type") or "")
+        season = int(provider_data.get("season") or 0)
         prefix = f"[{search_label}][DIAN115]" if search_label else "[DIAN115]"
         with self._dian115_budget.lock:
             cache_key = str(int(share_id or 0))

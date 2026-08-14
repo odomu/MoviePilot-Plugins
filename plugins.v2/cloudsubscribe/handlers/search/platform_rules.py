@@ -46,6 +46,21 @@ class PlatformRuleService(OwnerDelegator):
             str(value).strip() for value in fields if str(value or "").strip()
         ))
 
+    @staticmethod
+    def _file_filter_title(item: Any, index: int) -> str:
+        """保留父目录中的版本信息，供平台规则识别清晰度、来源和编码。"""
+        value = (
+                item.get("_relative_path")
+                or item.get("cloud_path")
+                or item.get("name")
+                or f"file-{index}"
+        )
+        title = str(value).replace("\\", " ").replace("/", " ").strip()
+        file_name = str(item.get("name") or "").strip()
+        if file_name and file_name not in title:
+            title = f"{title} {file_name}".strip()
+        return title
+
     def _filter_by_platform_rules(
             self,
             resources: List[Dict],
@@ -158,7 +173,7 @@ class PlatformRuleService(OwnerDelegator):
                 0, int(StringUtils.num_filesize(item.get("size")) or 0)
             )
             torrents.append(TorrentInfo(
-                title=str(item.get("name") or f"file-{index}"),
+                title=self._file_filter_title(item, index),
                 description="",
                 page_url=page_url,
                 size=size_bytes,

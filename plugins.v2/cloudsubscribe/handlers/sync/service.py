@@ -29,7 +29,7 @@ from .baseline import UpgradeBaselineService
 from .history import HistoryService
 from .matching import FileMatchingService
 from .movie import MovieSyncProcessor
-from .offline import OfflineTaskService
+from .postprocess import PostprocessService
 from .pt_upgrade import PtUpgradeService
 from .resources import ResourceTransferService
 from .rule_scoring import UpgradeRuleScoringService
@@ -55,7 +55,7 @@ _COMPONENT_TYPES = (
     TelevisionSyncProcessor,
     HistoryService,
     FileMatchingService,
-    OfflineTaskService,
+    PostprocessService,
     UpgradeBaselineService,
     UpgradeRuleScoringService,
     ResourceTransferService,
@@ -183,7 +183,7 @@ class SyncHandler:
             cloud_transfer_path: str,
             cloud_media_root: str = "/",
             cloud_transfer_paths: Optional[Mapping[str, str]] = None,
-            max_transfer_per_sync: int = 50,
+            transfer_task_batch_size: int = 50,
             cross_transfer_enabled: bool = False,
             cross_transfer_media_types: Optional[List[str]] = None,
             cloud_drive_registry=None,
@@ -231,7 +231,7 @@ class SyncHandler:
         :param cloud_transfer_path: 当前网盘转存暂存路径
         :param cloud_media_root: 当前网盘媒体库分类根目录
         :param cloud_transfer_paths: 各网盘提供方的转存暂存路径
-        :param max_transfer_per_sync: 单次同步最大转存数量
+        :param transfer_task_batch_size: 同一任务内每批处理的最大文件数
         :param batch_size: 批量转存每批文件数
         :param skip_other_season_dirs: 跳过其他季目录
         :param notify: 是否发送通知
@@ -301,7 +301,9 @@ class SyncHandler:
         self._search_handler = search_handler
         self._subscribe_handler = subscribe_handler
         self._chain = chain
-        self._max_transfer_per_sync = max_transfer_per_sync
+        self._transfer_task_batch_size = max(
+            1, min(int(transfer_task_batch_size or 50), 1000)
+        )
         policy = cloud_drive.policy if cloud_drive else None
         configured_batch_size = max(1, int(batch_size or 1))
         self._batch_size = min(
@@ -423,8 +425,6 @@ class SyncHandler:
         self._pt_upgrade_lock = threading.RLock()
         self._pt_upgrade_active = set()
         self._platform_history_lock = threading.RLock()
-        self._transfer_budget_lock = threading.RLock()
-        self._transfer_budget_used = 0
         self._sync_metrics_lock = threading.RLock()
         self._sync_metrics: Dict[str, Dict[str, int]] = {}
         self._media_recognition_lock = threading.RLock()
@@ -1187,29 +1187,6 @@ class SyncHandler:
             logger.debug(f"读取当前订阅任务上下文失败：{error}")
             return "", None
 
-    def reset_transfer_budget(self) -> None:
-        """重置本轮同步共享的转存文件数配额。"""
-        with self._transfer_budget_lock:
-            self._transfer_budget_used = 0
-
-    def _remaining_transfer_quota(self) -> int:
-        with self._transfer_budget_lock:
-            return max(0, self._max_transfer_per_sync - self._transfer_budget_used)
-
-    def _reserve_transfer_slots(self, requested: int) -> int:
-        """原子预留转存名额，返回本次实际取得的名额数。"""
-        with self._transfer_budget_lock:
-            reserved = min(max(0, int(requested or 0)), self._remaining_transfer_quota())
-            self._transfer_budget_used += reserved
-            return reserved
-
-    def _release_transfer_slots(self, count: int) -> None:
-        """转存失败时归还已预留但未使用的名额。"""
-        with self._transfer_budget_lock:
-            self._transfer_budget_used = max(
-                0, self._transfer_budget_used - max(0, int(count or 0))
-            )
-
     def _ensure_share_transfer_available(self, provider_key: str) -> None:
         key = str(provider_key or "default").lower()
         with self._share_transfer_risk_lock:
@@ -1237,22 +1214,78 @@ class SyncHandler:
             season: int,
             sub_key: str,
             track_subscription: bool = True,
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """统一执行剧集批量转存、STRM后处理和媒体目录通知。"""
-        requested = len(matched_items)
-        reserved = self._reserve_transfer_slots(requested)
-        if reserved <= 0:
-            return [], 0
-        selected_items = matched_items[:reserved]
-        if reserved < requested:
+            transient_target: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """在同一任务内拆批完成全部剧集转存。"""
+        items = list(matched_items or [])
+        if not items:
+            return []
+        batch_size = self._transfer_task_batch_size
+        batch_count = (len(items) + batch_size - 1) // batch_size
+        if batch_count > 1:
             logger.info(
-                f"匹配 {requested} 个文件，受单次同步配额限制仅转存 {reserved} 个"
+                f"匹配 {len(items)} 个文件，将按每批最多 {batch_size} 个"
+                f"分 {batch_count} 批在当前任务内处理"
             )
+        results = []
+        for batch_index, offset in enumerate(range(0, len(items), batch_size), 1):
+            if self._stop_requested():
+                break
+            batch_items = items[offset:offset + batch_size]
+            if batch_count > 1:
+                logger.debug(
+                    f"开始处理转存批次 {batch_index}/{batch_count}："
+                    f"文件={len(batch_items)}"
+                )
+            batch_results = self._transfer_episode_batch(
+                batch_items,
+                share_url,
+                mediainfo,
+                subscribe,
+                season,
+                sub_key,
+                track_subscription=track_subscription,
+                transient_target=transient_target,
+            )
+            results.extend(batch_results)
+            if self._stop_requested():
+                break
+            if batch_index < batch_count and not self._wait_transfer_batch_interval():
+                break
+        return results
+
+    def _wait_transfer_batch_interval(self) -> bool:
+        """在任务内批次之间等待，并允许停止请求及时中断。"""
+        deadline = time.monotonic() + self._batch_interval
+        while time.monotonic() < deadline:
+            if self._stop_requested():
+                return False
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        return True
+
+    def _transfer_episode_batch(
+            self,
+            matched_items: List[Dict[str, Any]],
+            share_url: str,
+            mediainfo: MediaInfo,
+            subscribe,
+            season: int,
+            sub_key: str,
+            track_subscription: bool = True,
+            transient_target: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """执行一个剧集转存批次及对应后处理。"""
+        selected_items = list(matched_items or [])
+        if not selected_items:
+            return []
         if self._stop_requested():
-            self._release_transfer_slots(reserved)
-            return [], reserved
+            return []
 
         file_ids = [str(item["file"]["id"]) for item in selected_items]
+        cloud_resource = self._is_cloud_resource_url(share_url)
+        direct_cloud_resource = (
+                cloud_resource and self._is_direct_cloud_resource_url(share_url)
+        )
         rename_items = {}
         for item in selected_items:
             file_item = item["file"]
@@ -1269,7 +1302,8 @@ class SyncHandler:
             provider_key = getattr(source_provider, "key", "") or getattr(
                 self._cloud_drive, "key", "default"
             )
-            self._ensure_share_transfer_available(provider_key)
+            if not cloud_resource:
+                self._ensure_share_transfer_available(provider_key)
             cross_batch = bool(
                 self._cross_transfer_enabled and source_provider
                 and self._cloud_drive and source_provider.key != self._cloud_drive.key
@@ -1359,6 +1393,9 @@ class SyncHandler:
                 success_ids = [
                     file_id for file_id, success in outcomes.items() if success
                 ]
+            elif direct_cloud_resource:
+                processed_items = selected_items
+                success_ids = file_ids
             else:
                 processed_items = selected_items
                 success_ids, failed_ids = self._timed_sync_call(
@@ -1385,11 +1422,9 @@ class SyncHandler:
                     "风控", "封禁", "受限", "频繁", "rate limit", "too many", "429",
             )):
                 self._activate_share_transfer_cooldown(locals().get("provider_key", "default"))
-            self._release_transfer_slots(reserved)
             raise
 
         success_id_set = {str(file_id) for file_id in (success_ids or [])}
-        self._release_transfer_slots(reserved - len(success_id_set))
         transferred_subtitle_ids = set()
         for item in processed_items:
             if str(item["file"]["id"]) not in success_id_set:
@@ -1412,7 +1447,9 @@ class SyncHandler:
                     "share_url": str(item["file"].get("url") or share_url),
                     "cloud_dir": item["target_dir"],
                     "file_name": item["target_name"],
-                    "staging_dir": self._cloud_transfer_path,
+                    "staging_dir": self._resource_staging_dir(
+                        str(item["file"].get("url") or share_url), item["file"]
+                    ),
                     "staging_name": (
                             item["file"].get("staging_name")
                             or item["file"]["name"]
@@ -1434,6 +1471,9 @@ class SyncHandler:
                     "upgrade_old_file_id": item.get("upgrade_old_file_id"),
                     "upgrade_old_size": item.get("upgrade_old_size") or 0,
                     "subtitles": item.get("subtitles") or [],
+                    "skip_history": bool(
+                        (item.get("resource") or {}).get("skip_history")
+                    ),
                 }
                 for item in processed_items
                 if str(item["file"]["id"]) in success_id_set
@@ -1444,6 +1484,11 @@ class SyncHandler:
             ),
             season=season,
             sub_key=sub_key,
+            transient_target=transient_target,
+            target_subscribe=(
+                self._serialize_pending_target_subscribe(subscribe)
+                if transient_target else None
+            ),
         )
         results = []
         for item in processed_items:
@@ -1454,7 +1499,6 @@ class SyncHandler:
                 logger.error(
                     f"文件已转存但后处理任务登记失败：{item['target_name']}"
                 )
-                self._release_transfer_slots(1)
                 success = False
             if success and strm_path:
                 self._media_server_notifier.notify(
@@ -1468,7 +1512,7 @@ class SyncHandler:
                 "success": success,
                 "pending_key": pending_key,
             })
-        return results, reserved
+        return results
 
     def _generate_strm(
             self,
@@ -1896,11 +1940,37 @@ class SyncHandler:
         provider_key = str(
             getattr(self._cloud_drive, "key", "cloud") or "cloud"
         )
+        cloud_resource = self._is_cloud_resource_url(share_url)
+        task_type = (
+            "cloud"
+            if cloud_resource and self._is_direct_cloud_resource_url(share_url)
+            else "cross_cloud"
+            if cloud_resource
+            else "share"
+        )
         return (
             f"{provider_key}:{source_identity}:{path_digest}",
-            "share",
+            task_type,
             "",
         )
+
+    @staticmethod
+    def _serialize_pending_target_subscribe(subscribe: Any) -> Dict[str, Any]:
+        return {
+            "name": str(getattr(subscribe, "name", "") or ""),
+            "year": getattr(subscribe, "year", None),
+            "type": str(getattr(subscribe, "type", "") or ""),
+            "tmdbid": getattr(subscribe, "tmdbid", None),
+            "doubanid": getattr(subscribe, "doubanid", None),
+            "season": getattr(subscribe, "season", None),
+            "start_episode": getattr(subscribe, "start_episode", None),
+            "total_episode": getattr(subscribe, "total_episode", None),
+            "media_category": getattr(subscribe, "media_category", None),
+            "episode_group": getattr(subscribe, "episode_group", None),
+            "filter_groups": getattr(subscribe, "filter_groups", None),
+            "best_version": bool(getattr(subscribe, "best_version", False)),
+            "_manual_upgrade": bool(getattr(subscribe, "_manual_upgrade", False)),
+        }
 
     def _build_pending_record(
             self,
@@ -1924,6 +1994,8 @@ class SyncHandler:
             notification_episodes: Optional[List[int]] = None,
             season: Optional[int] = None,
             sub_key: str = "",
+            transient_target: bool = False,
+            target_subscribe: Optional[Dict[str, Any]] = None,
             upgrade: bool = False,
             upgrade_mode: str = "",
             upgrade_old_cloud_dir: str = "",
@@ -1931,9 +2003,13 @@ class SyncHandler:
             upgrade_old_file_id: str = "",
             upgrade_old_size: int = 0,
             subtitles: Optional[List[Dict[str, Any]]] = None,
+            skip_history: bool = False,
     ) -> Dict[str, Any]:
         """构造单个后处理记录；单项和批量入口共用同一字段规则。"""
         current = current or {}
+        is_transient_target = bool(
+            transient_target or current.get("transient_target")
+        )
         success_values = success_episodes or current.get("success_episodes") or []
         notification_values = (
                 notification_episodes
@@ -1942,11 +2018,20 @@ class SyncHandler:
                 or current.get("success_episodes")
                 or []
         )
+        pending_task_id = str(
+            info_hash
+            or current.get("task_id")
+            or (
+                f"subscribe:{int(subscribe_id)}"
+                if subscribe_id
+                else f"media:{sub_key}" if sub_key else ""
+            )
+        )
         return {
             **current,
             "pending_key": pending_key,
             "task_type": task_type,
-            "task_id": info_hash,
+            "task_id": pending_task_id,
             "source_sha1": source_hash,
             "share_url": share_url,
             "cloud_dir": cloud_dir,
@@ -1977,7 +2062,8 @@ class SyncHandler:
             "created_at": float(current.get("created_at") or now),
             "next_check_at": now + self._OFFLINE_CHECK_DELAYS[0],
             "check_index": int(current.get("check_index") or 0),
-            "history_ready": False,
+            "history_ready": bool(skip_history or current.get("skip_history")),
+            "skip_history": bool(skip_history or current.get("skip_history")),
             "mediainfo": (
                 media_data
                 if media_data is not None
@@ -2005,6 +2091,11 @@ class SyncHandler:
                 }
             ),
             "sub_key": str(sub_key or current.get("sub_key") or ""),
+            "transient_target": is_transient_target,
+            "target_subscribe": (
+                copy.deepcopy(target_subscribe or current.get("target_subscribe") or {})
+                if is_transient_target else {}
+            ),
             "subtitles": copy.deepcopy(
                 subtitles if subtitles is not None else current.get("subtitles") or []
             ),
@@ -2032,6 +2123,9 @@ class SyncHandler:
             upgrade_old_file_id: str = "",
             upgrade_old_size: int = 0,
             subtitles: Optional[List[Dict[str, Any]]] = None,
+            transient_target: bool = False,
+            target_subscribe: Optional[Dict[str, Any]] = None,
+            skip_history: bool = False,
     ) -> str:
         effective_staging_dir = str(staging_dir or cloud_dir).rstrip("/") or "/"
         effective_staging_name = str(staging_name or file_name)
@@ -2074,6 +2168,9 @@ class SyncHandler:
                 upgrade_old_file_id=upgrade_old_file_id,
                 upgrade_old_size=upgrade_old_size,
                 subtitles=subtitles,
+                transient_target=transient_target,
+                target_subscribe=target_subscribe,
+                skip_history=skip_history,
             )
             self._save_offline_pending(pending)
             pending_count = len(pending)
@@ -2109,6 +2206,9 @@ class SyncHandler:
             upgrade_old_file_id: str = "",
             upgrade_old_size: int = 0,
             subtitles: Optional[List[Dict[str, Any]]] = None,
+            transient_target: bool = False,
+            target_subscribe: Optional[Dict[str, Any]] = None,
+            skip_history: bool = False,
     ) -> Tuple[Optional[Path], str]:
         strm_path = None
         if not staging_dir:
@@ -2149,6 +2249,9 @@ class SyncHandler:
             upgrade_old_file_id=upgrade_old_file_id,
             upgrade_old_size=upgrade_old_size,
             subtitles=subtitles,
+            transient_target=transient_target,
+            target_subscribe=target_subscribe,
+            skip_history=skip_history,
         )
         return None, pending_key
 
@@ -2159,6 +2262,8 @@ class SyncHandler:
             subscribe_id: Optional[int] = None,
             season: Optional[int] = None,
             sub_key: str = "",
+            transient_target: bool = False,
+            target_subscribe: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """一次持久化整批未就绪文件，避免逐项读写插件数据。"""
         if not items or not self._get_data:
@@ -2213,6 +2318,9 @@ class SyncHandler:
                     upgrade_old_file_id=item.get("upgrade_old_file_id") or "",
                     upgrade_old_size=item.get("upgrade_old_size") or 0,
                     subtitles=item.get("subtitles") or [],
+                    transient_target=transient_target,
+                    target_subscribe=target_subscribe,
+                    skip_history=bool(item.get("skip_history")),
                 )
                 result[str(item["result_key"])] = pending_key
             if result:
@@ -2228,6 +2336,8 @@ class SyncHandler:
             subscribe_id: Optional[int] = None,
             season: Optional[int] = None,
             sub_key: str = "",
+            transient_target: bool = False,
+            target_subscribe: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Tuple[Optional[Path], str]]:
         """复用批量重命名缓存生成 STRM，避免逐文件查询115。"""
         results: Dict[str, Tuple[Optional[Path], str]] = {}
@@ -2264,6 +2374,8 @@ class SyncHandler:
             subscribe_id=subscribe_id,
             season=season,
             sub_key=sub_key,
+            transient_target=transient_target,
+            target_subscribe=target_subscribe,
         )
         for item in queued_items:
             result_key = str(item["result_key"])
@@ -2282,12 +2394,16 @@ class SyncHandler:
             mediainfo: Optional[MediaInfo] = None,
     ) -> None:
         """文件最终就绪后再更新订阅进度并执行完结。"""
+        if item.get("transient_target"):
+            return
         task_type = str(item.get("task_type") or "share").strip().lower()
         provider_name = str(
             getattr(self._cloud_drive, "name", "网盘") or "网盘"
         )
         completion_source = {
             "share": f"{provider_name}分享转存",
+            "cloud": f"{provider_name}路径整理",
+            "cross_cloud": f"跨盘转存到{provider_name}后整理",
             "ed2k": "ED2K离线下载",
             "magnet": "Magnet离线下载",
         }.get(task_type, "文件后处理")
@@ -2405,9 +2521,9 @@ class SyncHandler:
             if (
                     should_clear_points
                     and sub_key
-                    and hasattr(self._search_handler, "clear_sub_points")
+                    and hasattr(self._search_handler, "clear_subscription_budgets")
             ):
-                self._search_handler.clear_sub_points(sub_key)
+                self._search_handler.clear_subscription_budgets(sub_key)
         except Exception as error:
             logger.error(f"文件后处理完成后更新订阅失败：{subscribe_id}，{error}")
 
@@ -2827,6 +2943,7 @@ class SyncHandler:
             media_type: str = "",
     ) -> bool:
         should_stop = stop_requested or self._stop_requested
+        cloud_resource = self._is_cloud_resource_url(share_url)
         source = self._resource_provider_for_url(share_url)
         cross_provider = bool(
             source and self._cloud_drive and source.key != self._cloud_drive.key
@@ -2844,7 +2961,10 @@ class SyncHandler:
             required = (
                     self._cross_transfer_enabled
                     and self._cross_transfer_manager
-                    and source.supports(CloudDriveCapability.SHARE_TRANSFER)
+                    and (
+                            cloud_resource
+                            or source.supports(CloudDriveCapability.SHARE_TRANSFER)
+                    )
                     and source.supports(CloudDriveCapability.FILE_QUERY)
                     and source.supports(CloudDriveCapability.FILE_DOWNLOAD)
                     and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
@@ -2856,41 +2976,56 @@ class SyncHandler:
                     f"{self._cloud_drive.name}，请检查跨盘开关和网盘能力"
                 )
                 return False
-            source_file_id = str(file_item.get("id") or "").strip()
-            if not source_file_id:
-                logger.warning(f"无法跨盘转存单个文件：{source.name} 文件 ID 为空")
-                return False
-            staged_path = self._cross_transfer_staging_path(source.key)
-            source_share = source.require(CloudDriveCapability.SHARE_TRANSFER)
-            try:
-                staged = source_share.transfer_file(
-                    share_url=share_url, file_id=source_file_id,
-                    save_path=staged_path,
-                    target_name=file_item.get("name") or target_name,
-                )
-            except Exception:
-                self._cleanup_cross_transfer_staging(source, "")
-                raise
-            if not staged:
-                self._cleanup_cross_transfer_staging(source, "")
-                return False
-            source_files = source.require(CloudDriveCapability.FILE_QUERY)
-            staged_name = file_item.get("name") or target_name
-            item = None
-            for attempt in range(10):
-                item = source_files.find_file(staged_path, staged_name)
-                if item or should_stop():
-                    break
-                time.sleep(min(0.5 + attempt * 0.25, 2.0))
-            if not item:
-                logger.warning(
-                    f"跨盘临时文件尚未可见：{source.name} "
-                    f"{staged_path}/{staged_name}"
-                )
-                self._cleanup_cross_transfer_staging(source, "")
-                return False
+            if cloud_resource:
+                item = self._cloud_file_from_dict(file_item)
+                if not item.id:
+                    logger.warning(f"无法跨盘整理文件：{source.name} 文件 ID 为空")
+                    return False
+            else:
+                source_file_id = str(file_item.get("id") or "").strip()
+                if not source_file_id:
+                    logger.warning(f"无法跨盘转存单个文件：{source.name} 文件 ID 为空")
+                    return False
+                staged_path = self._cross_transfer_staging_path(source.key)
+                source_share = source.require(CloudDriveCapability.SHARE_TRANSFER)
+                try:
+                    staged = source_share.transfer_file(
+                        share_url=share_url, file_id=source_file_id,
+                        save_path=staged_path,
+                        target_name=file_item.get("name") or target_name,
+                    )
+                except Exception:
+                    self._cleanup_cross_transfer_staging(source, "")
+                    raise
+                if not staged:
+                    self._cleanup_cross_transfer_staging(source, "")
+                    return False
+                source_files = source.require(CloudDriveCapability.FILE_QUERY)
+                staged_name = file_item.get("name") or target_name
+                item = None
+                for attempt in range(10):
+                    item = source_files.find_file(staged_path, staged_name)
+                    if item or should_stop():
+                        break
+                    time.sleep(min(0.5 + attempt * 0.25, 2.0))
+                if not item:
+                    logger.warning(
+                        f"跨盘临时文件尚未可见：{source.name} "
+                        f"{staged_path}/{staged_name}"
+                    )
+                    self._cleanup_cross_transfer_staging(source, "")
+                    return False
             if source_sha1 and not item.sha1:
-                item = CloudFile(item.id, item.name, False, item.size, source_sha1, item.md5, native=item.native)
+                item = CloudFile(
+                    item.id,
+                    item.name,
+                    False,
+                    item.size,
+                    source_sha1,
+                    item.md5,
+                    playback_values=item.playback_values,
+                    native=item.native,
+                )
             try:
                 if not parent_task_id:
                     parent_task_id, _ = self._current_task_context()
@@ -2948,8 +3083,9 @@ class SyncHandler:
                         )
                 return success
             finally:
-                # 只清理暂存文件，保留稳定目录供后续任务复用。
-                self._cleanup_cross_transfer_staging(source, "", item)
+                if not cloud_resource:
+                    # 只清理分享转存产生的源盘暂存文件，绝不删除用户选择的网盘文件。
+                    self._cleanup_cross_transfer_staging(source, "", item)
         service = source.require(CloudDriveCapability.SHARE_TRANSFER) if source else self._share_transfer
         return bool(service.transfer_file(
             share_url=share_url, file_id=file_item.get("id"),

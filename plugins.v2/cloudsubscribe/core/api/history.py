@@ -32,7 +32,7 @@ class HistoryApi(OwnerDelegator):
             result = self._sync_handler.clear_deletable_history(force=force)
             if clear_points_history and self._search_handler:
                 result["points_history"] = (
-                    self._search_handler.clear_points_history()
+                    self._search_handler.clear_point_history()
                 )
         except Exception as error:
             logger.error(f"清空历史记录异常：{error}")

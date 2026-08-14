@@ -5,21 +5,16 @@ import html
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from ..http_client import (
     RequestGate, gated_request, normalize_proxies, normalize_proxy_address,
     proxy_server, requests,
 )
-from ..matching import extract_season, extract_year, title_matches, unique_texts
 from ..types import resource_type_from_url
-from ...utils.cache import (
-    create_platform_ttl_cache,
-    normalize_platform_cache_key,
-)
+from ...utils.cache import create_platform_ttl_cache
 
 
 class SeedHubError(RuntimeError):
@@ -109,22 +104,16 @@ class SeedHubClient:
             base_url: str = "https://www.seedhub.cc",
             proxy: Any = None,
             request_timeout: int = 20,
-            resolve_concurrency: int = 6,
             request_interval: float = 0.3,
     ):
         self.base_url = str(base_url or "https://www.seedhub.cc").rstrip("/")
         self._proxies = normalize_proxies(proxy)
         self._browser_proxy = self._normalize_browser_proxy(proxy)
         self._request_timeout = max(5, min(int(request_timeout or 20), 60))
-        self._resolve_concurrency = max(1, min(int(resolve_concurrency or 6), 8))
-        self._search_cache = create_platform_ttl_cache(
-            "seedhub:search", self.base_url, maxsize=128, ttl=15 * 60
-        )
         self._magnet_cache = create_platform_ttl_cache(
             "seedhub:magnets", self.base_url, maxsize=1024, ttl=60 * 60
         )
         self._cache_lock = threading.RLock()
-        self._search_locks = tuple(threading.Lock() for _ in range(16))
         self._browser_lock = threading.RLock()
         self._browser_state_version = 0
         self._browser_cookie_header = ""
@@ -325,71 +314,10 @@ class SeedHubClient:
             })
         return candidates
 
-    @staticmethod
-    def _type_matches(value: object, media_type: str) -> bool:
-        text = str(value or "").strip().casefold()
-        if not text:
-            return False
-        if media_type == "tv":
-            return any(marker in text for marker in ("剧集", "电视剧", "tv", "series"))
-        return any(marker in text for marker in ("电影", "movie"))
-
-    def _select_candidate(
-            self,
-            candidates: Iterable[Dict[str, str]],
-            expected_titles: List[str],
-            expected_year: str,
-            media_type: str,
-            season: Optional[int],
-            douban_id: Optional[object] = None,
-    ) -> Optional[Dict[str, str]]:
-        expected_douban_id = str(douban_id or "").strip()
-        best_id_match = None
-        best_title_match = None
-        for index, candidate in enumerate(candidates):
-            if not self._type_matches(candidate.get("media_type"), media_type):
-                continue
-            candidate_titles = [candidate.get("title"), candidate.get("anchor_title")]
-            exact_douban = bool(
-                expected_douban_id
-                and str(candidate.get("douban_id") or "").strip()
-                == expected_douban_id
-            )
-            matched_title = any(
-                title_matches(value, expected_titles) for value in candidate_titles
-            )
-            if not exact_douban and not matched_title:
-                continue
-            candidate_year = str(candidate.get("year") or "")
-            if (
-                    not exact_douban and expected_year and candidate_year
-                    and candidate_year != expected_year
-            ):
-                continue
-            if (
-                    not exact_douban and media_type == "movie"
-                    and expected_year and not candidate_year
-            ):
-                continue
-            candidate_season = next(
-                (value for value in map(extract_season, candidate_titles) if value),
-                None,
-            )
-            if season and candidate_season and candidate_season != season:
-                continue
-            score = 1000 if exact_douban else 100
-            if expected_year and candidate_year == expected_year:
-                score += 40
-            if season and candidate_season == season:
-                score += 60
-            ranked = (score, -index, candidate)
-            if exact_douban:
-                if best_id_match is None or (score, -index) > best_id_match[:2]:
-                    best_id_match = ranked
-            elif best_title_match is None or (score, -index) > best_title_match[:2]:
-                best_title_match = ranked
-        best = best_id_match or best_title_match
-        return best[2] if best is not None else None
+    def search_candidates(self, keyword: str) -> List[Dict[str, str]]:
+        """请求搜索页并返回协议层作品条目。"""
+        text = self._get_text(f"{self.base_url}/s/{quote(keyword)}/")
+        return self._parse_search_candidates(text)
 
     def _parse_entries(self, text: str) -> List[Dict[str, str]]:
         entries = []
@@ -416,6 +344,15 @@ class SeedHubClient:
         parser.feed(text or "")
         parser.close()
         return parser.pan_entries
+
+    def detail_entries(self, movie_id: str) -> List[Dict[str, str]]:
+        """请求作品页并返回尚未解析链接的协议层资源条目。"""
+        text = self._get_text(f"{self.base_url}/movies/{movie_id}/")
+        entries = self._parse_entries(text)
+        entries.extend(
+            {"kind": "pan", **item} for item in self._parse_pan_entries(text)
+        )
+        return entries
 
     def _resolve_magnet(self, seed_id: str) -> str:
         with self._cache_lock:
@@ -464,7 +401,7 @@ class SeedHubClient:
             self._magnet_cache.set(cache_key, url)
         return url, resource_type
 
-    def _resolve_entry(self, item: Dict[str, str]) -> tuple[str, str]:
+    def resolve_entry(self, item: Dict[str, str]) -> tuple[str, str]:
         if item.get("kind") == "pan":
             return self._resolve_pan_link(item)
         magnet = self._resolve_magnet(str(item.get("seed_id") or ""))
@@ -507,174 +444,15 @@ class SeedHubClient:
         else:
             raise SeedHubError("SeedHub 资源类型无效")
 
-        url, actual_type = self._resolve_entry(item)
+        url, actual_type = self.resolve_entry(item)
         if not url or actual_type != expected_type:
             raise SeedHubError("SeedHub 资源链接解析失败")
         return {"url": url, "resource_type": actual_type}
 
-    def _pending_entries(
-            self, movie_id: str, entries: List[Dict[str, str]], limit: int
-    ) -> List[Dict[str, Any]]:
-        """测试模式只返回可识别候选，实际链接由预览操作按需解析。"""
-        results = []
-        seen = set()
-        for item in entries:
-            kind = str(item.get("kind") or "").strip().lower()
-            if kind == "magnet":
-                seed_id = str(item.get("seed_id") or "").strip()
-                if not re.fullmatch(r"\d{1,32}", seed_id):
-                    continue
-                identity = f"magnet:{seed_id}"
-                resource_type = "magnet"
-            elif kind == "pan":
-                path = str(item.get("href") or "").strip()
-                host = str(item.get("host") or "").strip().lower()
-                resource_type = resource_type_from_url(f"https://{host}") if host else ""
-                if not path or not resource_type:
-                    continue
-                identity = f"pan:{path}"
-            else:
-                continue
-            if identity in seen:
-                continue
-            seen.add(identity)
-            resource_id = item.get("seed_id") or item.get("href") or ""
-            results.append({
-                "url": "",
-                "title": item.get("title") or f"SeedHub 资源 {resource_id}",
-                "size": item.get("size") or 0,
-                "update_time": item.get("updated_at") or "",
-                "resource_type": resource_type,
-                "pan_type": resource_type,
-                "source": "seedhub",
-                "source_service": "seedhub",
-                "source_url": f"{self.base_url}/movies/{movie_id}/",
-                "pending_resolution": True,
-                "seedhub_kind": kind,
-                "seedhub_seed_id": str(item.get("seed_id") or ""),
-                "seedhub_path": str(item.get("href") or ""),
-                "seedhub_host": str(item.get("host") or ""),
-            })
-            if len(results) >= limit:
-                break
-        return results
-
-    def _resolve_entries(
-            self, movie_id: str, entries: List[Dict[str, str]], limit: int
-    ) -> List[Dict[str, Any]]:
-        results = []
-        seen = set()
-        with ThreadPoolExecutor(
-                max_workers=min(self._resolve_concurrency, len(entries) or 1),
-                thread_name_prefix="seedhub",
-        ) as executor:
-            for offset in range(0, len(entries), self._resolve_concurrency):
-                batch = entries[offset:offset + self._resolve_concurrency]
-                futures = [
-                    (item, executor.submit(self._resolve_entry, item))
-                    for item in batch
-                ]
-                for item, future in futures:
-                    try:
-                        url, resource_type = future.result()
-                    except SeedHubError:
-                        continue
-                    key = url.casefold()
-                    if not url or not resource_type or key in seen:
-                        continue
-                    seen.add(key)
-                    identity = item.get("seed_id") or item.get("href") or ""
-                    title = item.get("title") or f"SeedHub 资源 {identity}"
-                    results.append({
-                        "url": url,
-                        "title": title,
-                        "size": item.get("size") or 0,
-                        "update_time": item.get("updated_at") or "",
-                        "resource_type": resource_type,
-                        "pan_type": resource_type,
-                        "source": "seedhub",
-                        "source_service": "seedhub",
-                        "source_url": f"{self.base_url}/movies/{movie_id}/",
-                        "seed_id": item.get("seed_id") or "",
-                    })
-                    if len(results) >= limit:
-                        break
-                if len(results) >= limit:
-                    break
-        return results
-
-    def search(
-            self,
-            keywords: Iterable[str],
-            expected_titles: Iterable[str],
-            expected_year: object,
-            media_type: str,
-            season: Optional[int] = None,
-            douban_id: Optional[object] = None,
-            limit: int = 20,
-            test_mode: bool = False,
-    ) -> List[Dict[str, Any]]:
-        titles = [str(value).strip() for value in expected_titles if str(value or "").strip()]
-        normalized_keywords = unique_texts(keywords)
-        if not titles or not normalized_keywords:
-            return []
-        normalized_limit = max(1, min(int(limit or 20), 80))
-        year = extract_year(expected_year)
-        cache_key = (tuple(normalized_keywords), tuple(titles), year, media_type,
-                     season, str(douban_id or ""), normalized_limit, bool(test_mode))
-        cache_key = normalize_platform_cache_key(cache_key)
-        lock = self._search_locks[hash(cache_key) % len(self._search_locks)]
-        with lock:
-            with self._cache_lock:
-                cached = self._search_cache.get(cache_key)
-            if cached is not None:
-                return [dict(item) for item in cached]
-
-            selected = None
-            for keyword in normalized_keywords:
-                text = self._get_text(f"{self.base_url}/s/{quote(keyword)}/")
-                candidates = self._parse_search_candidates(text)
-                selected = self._select_candidate(
-                    candidates, titles, year, media_type, season, douban_id
-                )
-                if selected:
-                    break
-            if not selected:
-                with self._cache_lock:
-                    self._search_cache.set(cache_key, [])
-                return []
-
-            movie_id = selected["movie_id"]
-            detail_text = self._get_text(f"{self.base_url}/movies/{movie_id}/")
-            entries = self._parse_entries(detail_text)
-            entries.extend({"kind": "pan", **item} for item in self._parse_pan_entries(detail_text))
-            if not test_mode and media_type == "tv" and season:
-                matching_entries = [
-                    item for item in entries
-                    if extract_season(item.get("title")) in (None, season)
-                ]
-                entries = matching_entries
-            results = (
-                self._pending_entries(movie_id, entries, normalized_limit)
-                if test_mode else
-                self._resolve_entries(movie_id, entries, normalized_limit)
-            )
-            selected_douban_id = str(selected.get("douban_id") or "").strip()
-            if selected_douban_id:
-                for result in results:
-                    result["douban_id"] = selected_douban_id
-            with self._cache_lock:
-                self._search_cache.set(
-                    cache_key, [dict(item) for item in results]
-                )
-            return results
-
     def clear_cache(self) -> Dict[str, int]:
         with self._cache_lock:
             counts = {
-                "search": len(list(self._search_cache.items())),
                 "links": len(list(self._magnet_cache.items())),
             }
-            self._search_cache.clear()
             self._magnet_cache.clear()
         return counts

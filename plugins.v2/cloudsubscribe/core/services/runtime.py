@@ -134,6 +134,28 @@ class SyncRuntimeService(OwnerDelegator):
                            and task.get("status") in {"queued", "running", "stopping"}
                    )
             }
+            postprocess_fields = {
+                "pending_count",
+                "current_file",
+                "postprocess_active",
+                "postprocess_detail",
+                "postprocess_step",
+                "postprocess_step_index",
+                "postprocess_step_total",
+                "postprocess_steps",
+                "postprocess_file_index",
+                "postprocess_file_total",
+                "postprocess_progress",
+            }
+            for task_id, task in tasks.items():
+                previous = retained.get(task_id)
+                if not previous or previous.get("status") != "postprocessing":
+                    continue
+                task.update({
+                    key: previous[key]
+                    for key in postprocess_fields
+                    if key in previous
+                })
             retained.update(tasks)
             self._sync_tasks = retained
         self._mark_runtime_changed()
@@ -150,6 +172,25 @@ class SyncRuntimeService(OwnerDelegator):
 
     def _serialize_sync_tasks(self) -> List[Dict[str, Any]]:
         now = time.time()
+        sync_handler = self._sync_handler
+        disabled_postprocess_steps = set()
+        if not (
+                sync_handler
+                and bool(getattr(sync_handler, "_strm_generate_enabled", False))
+                and getattr(sync_handler, "_strm_generator", None)
+                and getattr(sync_handler, "_local_resource_path", None)
+        ):
+            disabled_postprocess_steps.add("strm")
+        if not (
+                sync_handler
+                and getattr(sync_handler, "_metadata_scraper", None)
+                and getattr(sync_handler, "_local_resource_path", None)
+                and (
+                        bool(getattr(sync_handler, "_nfo_scrape_enabled", False))
+                        or bool(getattr(sync_handler, "_image_scrape_enabled", False))
+                )
+        ):
+            disabled_postprocess_steps.add("metadata")
         with self._sync_tasks_lock:
             tasks = []
             for task in self._sync_tasks.values():
@@ -160,6 +201,19 @@ class SyncRuntimeService(OwnerDelegator):
                 serialized = {
                     key: value for key, value in task.items() if key != "stop_event"
                 }
+                serialized_steps = [
+                    step for step in serialized.get("postprocess_steps") or []
+                    if isinstance(step, dict)
+                                     and str(step.get("key") or "")
+                                     not in disabled_postprocess_steps
+                ]
+                serialized["postprocess_steps"] = serialized_steps
+                if str(serialized.get("postprocess_step") or "") in (
+                        disabled_postprocess_steps
+                ):
+                    serialized["postprocess_step"] = ""
+                    serialized["postprocess_step_index"] = 0
+                serialized["postprocess_step_total"] = len(serialized_steps)
                 queued_at = float(task.get("queued_at") or now)
                 started_at = float(task.get("started_at") or 0)
                 serialized["queue_seconds"] = round(
@@ -257,6 +311,22 @@ class SyncRuntimeService(OwnerDelegator):
                 message_parts.append(f"约 {(remaining + 59) // 60} 分钟后复查")
         return phase, "；".join(message_parts)
 
+    @staticmethod
+    def _idle_postprocess_state() -> Dict[str, Any]:
+        """清理仅用于实时展示的后处理文件进度。"""
+        return {
+            "current_file": "",
+            "postprocess_active": False,
+            "postprocess_detail": "",
+            "postprocess_step": "",
+            "postprocess_step_index": 0,
+            "postprocess_step_total": 0,
+            "postprocess_steps": [],
+            "postprocess_file_index": 0,
+            "postprocess_file_total": 0,
+            "postprocess_progress": 0,
+        }
+
     def _refresh_postprocessing_sync_tasks(self) -> None:
         """按持久化后处理记录恢复并刷新订阅任务状态。"""
         pending_items = (
@@ -314,6 +384,7 @@ class SyncRuntimeService(OwnerDelegator):
                         "progress": 100,
                         "pending_count": 0,
                         "finished_at": now,
+                        **self._idle_postprocess_state(),
                     })
                     changed = True
             for task_id, group in groups.items():
@@ -331,6 +402,13 @@ class SyncRuntimeService(OwnerDelegator):
                     "pending_count": pending_count,
                     "finished_at": None,
                 }
+                if not task:
+                    values.update(self._idle_postprocess_state())
+                elif not task.get("postprocess_active"):
+                    values.update({
+                        "postprocess_active": False,
+                        "postprocess_detail": "",
+                    })
                 if task:
                     if any(task.get(key) != value for key, value in values.items()):
                         task.update(values)
@@ -347,7 +425,6 @@ class SyncRuntimeService(OwnerDelegator):
                     "season": int(group["season"] or 1) if is_tv else None,
                     **values,
                     "transferred": 0,
-                    "message": "",
                     "queued_at": group["queued_at"],
                     "started_at": group["queued_at"],
                     "stop_event": ThreadEvent(),
@@ -367,6 +444,9 @@ class SyncRuntimeService(OwnerDelegator):
         initial_history_count = len(local_history)
         transfer_details: List[Dict[str, Any]] = []
         transferred_count = 0
+        direct_cloud_paths = self._direct_cloud_manual_resources(
+            manual_resources
+        )
 
         for subscribe in subscribes:
             task_id = self._sync_task_id(subscribe)
@@ -428,6 +508,10 @@ class SyncRuntimeService(OwnerDelegator):
                 postprocess_phase, postprocess_message = (
                     self._postprocessing_text(pending_items)
                 )
+                postprocess_state = (
+                    {} if pending_count and not stopped
+                    else self._idle_postprocess_state()
+                )
                 self._update_sync_task(
                     task_id,
                     status=(
@@ -439,7 +523,11 @@ class SyncRuntimeService(OwnerDelegator):
                         "已停止" if stopped
                         else postprocess_phase
                         if pending_count
-                        else f"已转存 {int(task_count or 0)} 个文件"
+                        else (
+                            f"已整理 {int(task_count or 0)} 个文件"
+                            if direct_cloud_paths
+                            else f"已转存 {int(task_count or 0)} 个文件"
+                        )
                         if int(task_count or 0) > 0
                         else "无需转存"
                     ),
@@ -448,6 +536,7 @@ class SyncRuntimeService(OwnerDelegator):
                     message=postprocess_message if pending_count else "",
                     transferred=int(task_count or 0),
                     finished_at=None if pending_count and not stopped else time.time(),
+                    **postprocess_state,
                 )
             except Exception as error:
                 logger.error(f"订阅 {getattr(subscribe, 'name', '')} 处理异常：{error}")
@@ -470,7 +559,11 @@ class SyncRuntimeService(OwnerDelegator):
                     pass
 
         return {
-            "history": local_history[initial_history_count:],
+            "history": [
+                record
+                for record in local_history[initial_history_count:]
+                if not record.get("skip_history")
+            ],
             "transfer_details": transfer_details,
             "transferred": transferred_count,
         }
@@ -506,6 +599,20 @@ class SyncRuntimeService(OwnerDelegator):
     def _serialize_runtime_tasks(self) -> List[Dict[str, Any]]:
         """合并订阅任务与其跨盘子任务，避免同一操作重复展示。"""
         tasks = self._serialize_sync_tasks()
+        if self._sync_queue_lock is not None:
+            with self._sync_queue_lock:
+                queued_operations = sorted(
+                    (
+                        dict(task)
+                        for task in self._sync_queue_tasks.values()
+                    ),
+                    key=lambda item: float(item.get("queued_at") or 0),
+                )
+            for position, task in enumerate(queued_operations, start=1):
+                task["queue_position"] = position
+                if task.get("status") == "queued":
+                    task["phase"] = f"排队中 · 队列位置 {position}"
+                tasks.append(task)
         transfer_manager = getattr(self, "_cross_transfer_manager", None)
         if not transfer_manager:
             return tasks
@@ -763,7 +870,7 @@ class SyncRuntimeService(OwnerDelegator):
                     return
                 current.update({
                     "status": "stopped",
-                    "phase": "文件后处理已安全停止",
+                    "phase": "文件后处理已停止，网盘文件已保留",
                     "progress": 100,
                     "pending_count": 0,
                     "finished_at": time.time(),
@@ -771,9 +878,9 @@ class SyncRuntimeService(OwnerDelegator):
                 current.pop("postprocess_stop_token", None)
                 current.pop("postprocess_stop_pending_keys", None)
             logger.info(
-                f"文件后处理任务已安全停止：{task_snapshot.get('title')}，"
-                f"当前提交已完成，取消剩余 {removed} 个文件；"
-                "保留网盘离线任务和文件"
+                f"文件后处理任务已停止：{task_snapshot.get('title')}，"
+                f"已移除 {removed} 个待处理记录；"
+                "网盘离线任务和现有文件均保留"
             )
         except Exception as error:
             with self._sync_tasks_lock:

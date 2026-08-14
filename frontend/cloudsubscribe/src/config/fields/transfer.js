@@ -74,10 +74,12 @@ export function createTransferSection(options) {
             show: enabled("cross_transfer_enabled"),
           },
           {
-            key: "max_transfer_per_sync",
-            label: "单次最大转存文件数",
+            key: "transfer_task_batch_size",
+            label: "任务内每批处理文件数",
+            hint: "仅控制任务内拆批大小；当前任务会继续处理后续批次直至完成。",
             type: "number",
             min: 1,
+            max: 1000,
             cols: 4,
           },
           {

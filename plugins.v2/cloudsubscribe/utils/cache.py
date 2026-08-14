@@ -71,7 +71,10 @@ class _PlatformTTLCache(TTLCache):
         return super().exists(self._key(key), **kwargs)
 
     def pop(self, key: Any, default: Any = None, **kwargs: Any) -> Any:
-        return super().pop(self._key(key), default, **kwargs)
+        try:
+            return super().pop(self._key(key), default, **kwargs)
+        except KeyError:
+            return default
 
     def setdefault(self, key: Any, default: Any = None, **kwargs: Any) -> Any:
         return super().setdefault(self._key(key), default, **kwargs)

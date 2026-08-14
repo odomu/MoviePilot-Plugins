@@ -2,7 +2,9 @@
 
 import copy
 import re
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from urllib.parse import unquote, urlsplit
 
 from app.log import logger
 
@@ -11,6 +13,7 @@ from ...core import (
     CloudDriveProvider,
     CloudFile,
     OwnerDelegator,
+    SearchCapability,
 )
 from ...search.types import normalize_resource_type, resource_type_from_url
 from ...utils import MediaFileParser, parse_magnet_metadata
@@ -23,6 +26,96 @@ class ResourceTransferService(OwnerDelegator):
         r"(?<![A-Za-z0-9])[Ss]\s*0*(\d{1,3})(?!\d)|"
         r"第\s*0*(\d{1,3})\s*季"
     )
+
+    @staticmethod
+    def _is_cloud_resource_url(value: str) -> bool:
+        return str(value or "").strip().lower().startswith("cloud://")
+
+    def _resource_input_label(self, value: str) -> str:
+        if self._is_cloud_resource_url(value):
+            return "网盘路径"
+        if self._is_offline_url(value):
+            return "离线资源"
+        return "分享"
+
+    @classmethod
+    def _cloud_resource_provider_key(cls, value: str) -> str:
+        if not cls._is_cloud_resource_url(value):
+            return ""
+        return str(urlsplit(str(value).strip()).netloc or "").strip().lower()
+
+    def _is_direct_cloud_resource_url(self, value: str) -> bool:
+        source_key = self._cloud_resource_provider_key(value)
+        target_key = str(getattr(self._cloud_drive, "key", "") or "").strip().lower()
+        return not source_key or not target_key or source_key == target_key
+
+    @classmethod
+    def _cloud_resource_path(cls, value: str) -> str:
+        if not cls._is_cloud_resource_url(value):
+            return ""
+        path = unquote(urlsplit(str(value or "").strip()).path or "/")
+        return str(PurePosixPath("/" + path.replace("\\", "/").lstrip("/")))
+
+    def _resource_staging_dir(
+            self, share_url: str, file_item: Optional[Dict[str, Any]] = None
+    ) -> str:
+        if (
+                self._is_cloud_resource_url(share_url)
+                and self._is_direct_cloud_resource_url(share_url)
+        ):
+            source_path = str((file_item or {}).get("cloud_path") or "").strip()
+            return source_path or self._cloud_resource_path(share_url)
+        return self._cloud_transfer_path
+
+    def _list_cloud_resource_files(
+            self, path: str, provider_key: str = ""
+    ) -> List[Dict[str, Any]]:
+        """递归列出所选网盘目录，并保留每个文件的真实源目录。"""
+        source_drive = self._cloud_drive
+        if provider_key and self._cloud_drive_registry:
+            try:
+                source_drive = self._cloud_drive_registry.get(provider_key)
+            except KeyError:
+                return []
+        if not source_drive or not source_drive.supports(CloudDriveCapability.DIRECTORY_READ):
+            return []
+        directory_service = source_drive.require(CloudDriveCapability.DIRECTORY_READ)
+        lookup = directory_service.resolve_directory(path)
+        if not lookup.checked:
+            raise RuntimeError(f"读取网盘资源路径失败：{path}")
+        if lookup.directory_id is None:
+            return []
+        files = []
+        root_path = PurePosixPath(path)
+        stack = [(path, str(lookup.directory_id))]
+        visited = set()
+        while stack:
+            current_path, directory_id = stack.pop()
+            if directory_id in visited:
+                continue
+            visited.add(directory_id)
+            listing = directory_service.list_directory(directory_id)
+            if not listing.checked:
+                raise RuntimeError(f"读取网盘资源目录失败：{current_path}")
+            for item in listing.files:
+                if item.is_directory:
+                    child_path = str(PurePosixPath(current_path) / item.name)
+                    stack.append((child_path, str(item.id)))
+                    continue
+                current_posix_path = PurePosixPath(current_path)
+                try:
+                    relative_parent = current_posix_path.relative_to(root_path)
+                except ValueError:
+                    relative_parent = current_posix_path
+                relative_path = str(relative_parent / item.name).lstrip("/")
+                files.append({
+                    **dict(item),
+                    "cloud_path": current_path,
+                    "cloud_provider": provider_key,
+                    "_relative_path": relative_path,
+                    "_cloud_file": item,
+                })
+        return files
 
     @staticmethod
     def _resource_preview_episodes(
@@ -319,6 +412,8 @@ class ResourceTransferService(OwnerDelegator):
             "source": source,
             "points": points,
         }
+        if resource.get("skip_history"):
+            result["skip_history"] = True
         if source_url:
             result["source_url"] = source_url
         return result
@@ -386,8 +481,8 @@ class ResourceTransferService(OwnerDelegator):
                 resource.get("need_unlock") or resource.get("need_access")
         ):
             return ""
-        slug = str(resource.get("slug") or "").strip()
-        if not slug:
+        resource_ref = str(resource.get("resource_ref") or "").strip()
+        if not resource_ref:
             return ""
         source = str(resource.get("source") or "").strip().lower()
         try:
@@ -406,15 +501,15 @@ class ResourceTransferService(OwnerDelegator):
             resource, target_season
         )
         if (
-                source == "hdhive"
+                resource.get("preview_episodes_authoritative")
                 and target_episodes
                 and remark_episodes
                 and not (target_episodes & remark_episodes)
         ):
             prefix = f"{log_prefix} " if log_prefix else ""
             logger.debug(
-                f"{prefix}HDHive remark 已明确不覆盖当前缺集，"
-                f"跳过详情预览与解锁：slug={slug}"
+                f"{prefix}{source.upper()} 预览已明确不覆盖当前缺集，"
+                f"跳过详情预览与解锁：resource_ref={resource_ref}"
             )
             return ""
         try:
@@ -423,13 +518,23 @@ class ResourceTransferService(OwnerDelegator):
             unlock_points = 0
         prefix = f"{log_prefix} " if log_prefix else ""
         resource_title = str(resource.get("title") or "").strip()
-        is_dian115 = source == "dian115"
-        has_budget = (
-            self._search_handler.has_dian115_unlock_budget(unlock_points)
-            if is_dian115
-            else self._search_handler.has_hdhive_unlock_budget(unlock_points)
+        if not (
+                self._search_handler.supports(
+                    source, SearchCapability.RESOURCE_UNLOCK
+                )
+                and self._search_handler.supports(
+            source, SearchCapability.POINT_BUDGET
         )
-        source_label = "Dian115" if is_dian115 else "HDHive"
+        ):
+            logger.debug(
+                f"{prefix}跳过 {source.upper()} 资源 {resource_title}："
+                "渠道未声明资源解锁和积分预算能力"
+            )
+            return ""
+        has_budget = self._search_handler.has_unlock_budget(
+            source, unlock_points
+        )
+        source_label = self._search_handler.source_name(source)
         if not has_budget:
             logger.debug(
                 f"{prefix}跳过 {source_label} 资源 {resource_title}："
@@ -441,31 +546,11 @@ class ResourceTransferService(OwnerDelegator):
         media_page_suffix = f"，媒体页：{media_page_url}" if media_page_url else ""
         logger.info(
             f"{prefix}遇到尚未取得链接的 {source_label} 资源 {resource_title} "
-            f"(slug: {slug})，尝试{action_label}{media_page_suffix}"
+            f"(resource_ref: {resource_ref})，尝试{action_label}{media_page_suffix}"
         )
-        if is_dian115:
-            unlocked = self._search_handler.unlock_dian115_resource(
-                int(resource.get("dian115_share_id") or slug),
-                int(resource.get("dian115_resource_id") or 0),
-                unlock_points,
-                search_label=search_label,
-                tmdb_id=int(resource.get("dian115_tmdb_id") or 0),
-                media_type=str(resource.get("dian115_media_type") or ""),
-                season=int(resource.get("dian115_season") or 0),
-            )
-        else:
-            unlocked = self._search_handler.unlock_hdhive_resource(
-                slug,
-                unlock_points,
-                resource.get("resource_type"),
-                media_page_url=media_page_url,
-                search_label=search_label,
-                is_unlocked=bool(resource.get("is_unlocked")),
-                target_season=resource.get("target_season"),
-                target_episodes=resource.get("target_episodes"),
-                supports_file_preview=resource.get("supports_file_preview"),
-                detail_path=str(resource.get("detail_path") or ""),
-            )
+        unlocked = self._search_handler.unlock_resource(
+            source, resource, search_label=search_label
+        )
         if self._stop_requested() or not unlocked:
             if not self._stop_requested():
                 logger.error(
@@ -510,6 +595,15 @@ class ResourceTransferService(OwnerDelegator):
             log_prefix: str = "",
     ) -> List[Dict[str, Any]]:
         """校验分享并读取文件列表，供电影、剧集和洗版共同使用。"""
+        if self._is_cloud_resource_url(share_url):
+            files = self._list_cloud_resource_files(
+                self._cloud_resource_path(share_url),
+                self._cloud_resource_provider_key(share_url),
+            )
+            files = list(MediaFileParser.iter_files(files))
+            if not files:
+                logger.debug(f"所选网盘路径没有可处理文件：{self._cloud_resource_path(share_url)}")
+            return files
         if not self._validate_resource_url(
                 share_url, resource_label="分享链接", log_prefix=log_prefix
         ):
@@ -563,6 +657,8 @@ class ResourceTransferService(OwnerDelegator):
         if resource_type:
             return resource_type
         normalized_url = str(share_url).lstrip().lower()
+        if normalized_url.startswith("cloud://"):
+            return "cloud"
         if normalized_url.startswith("ed2k://"):
             return "ed2k"
         if normalized_url.startswith("magnet:?"):
@@ -585,6 +681,8 @@ class ResourceTransferService(OwnerDelegator):
         if not self._cloud_drive:
             return False
         actual_url = str(share_url or resource.get("url") or "").strip()
+        if self._supported_resource_type(resource, share_url) == "cloud":
+            return not self._is_direct_cloud_resource_url(actual_url)
         if actual_url and not self._is_offline_url(actual_url):
             source = self._resource_provider_for_url(actual_url)
             if source:
@@ -632,6 +730,14 @@ class ResourceTransferService(OwnerDelegator):
         if not self._cloud_drive_registry:
             return self._cloud_drive
         key = self._supported_resource_type({}, share_url)
+        if key == "cloud":
+            source_key = self._cloud_resource_provider_key(share_url)
+            if source_key and self._cloud_drive_registry:
+                try:
+                    return self._cloud_drive_registry.get(source_key)
+                except KeyError:
+                    return None
+            return self._cloud_drive
         aliases = {"189": "tianyi", "aliyun": "alipan"}
         try:
             return self._cloud_drive_registry.get(aliases.get(key, key))
@@ -650,6 +756,9 @@ class ResourceTransferService(OwnerDelegator):
 
     @staticmethod
     def _cloud_file_from_dict(item: Dict[str, Any]) -> CloudFile:
+        existing = item.get("_cloud_file")
+        if isinstance(existing, CloudFile):
+            return existing
         return CloudFile(
             id=str(item.get("id") or ""),
             name=str(item.get("name") or ""),
@@ -666,6 +775,25 @@ class ResourceTransferService(OwnerDelegator):
         if not self._cloud_drive:
             return False
         resource_type = self._supported_resource_type(resource, share_url)
+        if resource_type == "cloud":
+            source = self._resource_provider_for_url(share_url)
+            if not source or not source.supports(CloudDriveCapability.DIRECTORY_READ):
+                return False
+            if self._is_direct_cloud_resource_url(share_url):
+                return all(
+                    self._cloud_drive.supports(capability)
+                    for capability in (
+                        CloudDriveCapability.FILE_QUERY,
+                        CloudDriveCapability.FILE_MUTATION,
+                    )
+                )
+            return bool(
+                self._cross_transfer_enabled
+                and source.supports(CloudDriveCapability.FILE_QUERY)
+                and source.supports(CloudDriveCapability.FILE_DOWNLOAD)
+                and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
+                and self._cloud_drive.supports(CloudDriveCapability.FILE_QUERY)
+            )
         if not self._cloud_drive.supports_resource_type(resource_type):
             if not self._cross_transfer_enabled:
                 return False
@@ -693,7 +821,10 @@ class ResourceTransferService(OwnerDelegator):
     def _format_resource_summary(
             cls, resources: List[Dict[str, Any]]
     ) -> str:
-        labels = {"share": "网盘分享", "ed2k": "ED2K", "magnet": "Magnet"}
+        labels = {
+            "share": "网盘分享", "cloud": "网盘路径",
+            "ed2k": "ED2K", "magnet": "Magnet",
+        }
         summary_counts: Dict[str, Dict[str, int]] = {}
         seen = set()
         for resource in resources or []:
@@ -729,4 +860,4 @@ class ResourceTransferService(OwnerDelegator):
             summaries.append(
                 f"{label} {counts['total']}（{'，'.join(statuses)}）"
             )
-        return f"共 {len(seen)} 个资源页：" + "；".join(summaries)
+        return f"共 {len(seen)} 个候选资源：" + "；".join(summaries)

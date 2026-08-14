@@ -17,8 +17,94 @@ from ...core import OwnerDelegator
 from ...utils import MediaFileParser
 
 
-class OfflineTaskService(OwnerDelegator):
+class PostprocessService(OwnerDelegator):
     """监控待处理文件并完成重命名、STRM和历史状态更新。"""
+
+    _POSTPROCESS_STEPS = (
+        ("locate", "检查并定位文件"),
+        ("organize", "重命名与移动"),
+        ("strm", "生成 STRM"),
+        ("subtitle", "处理字幕"),
+        ("metadata", "刮削元数据"),
+        ("commit", "登记完成状态"),
+        ("notify", "消息通知"),
+    )
+
+    @staticmethod
+    def _postprocess_task_id(item: Dict[str, Any]) -> str:
+        subscribe_id = int(item.get("subscribe_id") or 0)
+        if subscribe_id > 0:
+            return f"subscribe:{subscribe_id}"
+        sub_key = str(item.get("sub_key") or "").strip()
+        return f"media:{sub_key}" if sub_key else ""
+
+    def _postprocess_steps(
+            self, item: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, str]]:
+        has_subtitles = bool((item or {}).get("subtitles"))
+        strm_enabled = bool(
+            self._strm_generate_enabled
+            and self._strm_generator
+            and self._local_resource_path
+        )
+        metadata_enabled = bool(
+            self._metadata_scraper
+            and self._local_resource_path
+            and (self._nfo_scrape_enabled or self._image_scrape_enabled)
+        )
+        return [
+            {"key": key, "label": label}
+            for key, label in self._POSTPROCESS_STEPS
+            if not (key == "strm" and not strm_enabled)
+               and not (key == "subtitle" and not has_subtitles)
+               and not (key == "metadata" and not metadata_enabled)
+               and not (key == "notify" and not self._notify)
+        ]
+
+    def _update_postprocess_progress(
+            self,
+            item: Dict[str, Any],
+            step: str,
+            file_index: int,
+            file_total: int,
+            detail: str = "",
+    ) -> None:
+        """通过现有任务运行态推送当前文件和处理步骤。"""
+        if not self._task_update:
+            return
+        task_id = self._postprocess_task_id(item)
+        if not task_id:
+            return
+        steps = self._postprocess_steps(item)
+        step_index = next(
+            (
+                index for index, value in enumerate(steps)
+                if value["key"] == step
+            ),
+            None,
+        )
+        if step_index is None:
+            return
+        normalized_index = max(1, min(int(file_index or 1), int(file_total or 1)))
+        normalized_total = max(1, int(file_total or 1))
+        file_progress = (
+                                (normalized_index - 1)
+                                + (step_index + 1) / max(1, len(steps))
+                        ) / normalized_total
+        self._task_update(
+            task_id,
+            current_file=str(item.get("file_name") or "").strip(),
+            postprocess_active=True,
+            postprocess_detail=str(detail or "").strip(),
+            postprocess_step=step,
+            postprocess_step_index=step_index,
+            postprocess_step_total=len(steps),
+            postprocess_steps=steps,
+            postprocess_file_index=normalized_index,
+            postprocess_file_total=normalized_total,
+            postprocess_progress=round(file_progress * 100, 2),
+            progress=min(99, 95 + int(file_progress * 4)),
+        )
 
     def _cleanup_failed_offline_task(
             self, item: Dict[str, Any], reason: str
@@ -381,6 +467,8 @@ class OfflineTaskService(OwnerDelegator):
             pending_snapshot = copy.deepcopy(pending)
         completed = 0
         failed = 0
+        finalized_details: List[Dict[str, Any]] = []
+        notification_contexts: List[Tuple[Dict[str, Any], str]] = []
         subscription_batches: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         media_context_cache: Dict[
             Tuple[Any, ...], Tuple[Any, Dict[str, Any]]
@@ -408,6 +496,8 @@ class OfflineTaskService(OwnerDelegator):
         def queue_subscription_completion(
                 item: Dict[str, Any], media, media_data: Dict[str, Any]
         ) -> None:
+            if item.get("transient_target"):
+                return
             episode_values = (
                     item.get("success_episodes")
                     or item.get("notification_episodes")
@@ -458,6 +548,24 @@ class OfflineTaskService(OwnerDelegator):
                 if task.get("id")
             }
             directory_snapshots: Dict[str, Tuple[bool, Dict[str, Any]]] = {}
+            due_positions = {
+                pending_key: index
+                for index, pending_key in enumerate(due_keys, 1)
+            }
+
+            def update_progress(
+                    item: Dict[str, Any],
+                    pending_key: str,
+                    step: str,
+                    detail: str = "",
+            ) -> None:
+                self._update_postprocess_progress(
+                    item,
+                    step,
+                    due_positions.get(pending_key, 1),
+                    len(due_keys),
+                    detail,
+                )
 
             def directory_snapshot(cloud_dir: str) -> Tuple[bool, Dict[str, Any]]:
                 normalized_dir = str(cloud_dir or "").rstrip("/")
@@ -484,6 +592,7 @@ class OfflineTaskService(OwnerDelegator):
                 return result
 
             upgrade_delete_batch: Dict[str, Dict[str, Any]] = {}
+
             def finish_finalized_item(
                     item: Dict[str, Any],
                     pending_key: str,
@@ -492,6 +601,9 @@ class OfflineTaskService(OwnerDelegator):
                     media_data: Dict[str, Any],
             ) -> None:
                 nonlocal completed
+                update_progress(
+                    item, pending_key, "commit", "更新历史和订阅进度"
+                )
                 if item.get("upgrade") and str(
                         item.get("upgrade_mode") or self._upgrade_mode
                 ) != "coexist":
@@ -512,7 +624,8 @@ class OfflineTaskService(OwnerDelegator):
                 # pending 扫描结束，否则中途停止会丢失已完成项的通知。
                 self._mark_offline_history_status(pending_key, "成功")
                 if detail:
-                    self._send_finalized_batch([detail])
+                    finalized_details.append(detail)
+                    notification_contexts.append((item, pending_key))
                 logger.debug(
                     f"文件后处理完成"
                     f"{'并生成 STRM' if strm_path else ''}："
@@ -664,6 +777,15 @@ class OfflineTaskService(OwnerDelegator):
                         }
 
                 for staging_dir, rename_items in rename_groups.items():
+                    first_key = next(iter(rename_items), "")
+                    first_item = pending.get(first_key) or {}
+                    if first_item:
+                        update_progress(
+                            first_item,
+                            first_key,
+                            "organize",
+                            f"批量重命名 {len(rename_items)} 个文件",
+                        )
                     renamed = self._cloud_batch_mutations.rename_files(
                         staging_dir, rename_items
                     )
@@ -686,6 +808,15 @@ class OfflineTaskService(OwnerDelegator):
                     move_groups.setdefault(final_dir, {})[pending_key] = target_file
 
                 for final_dir, move_items in move_groups.items():
+                    first_key = next(iter(move_items), "")
+                    first_item = pending.get(first_key) or {}
+                    if first_item:
+                        update_progress(
+                            first_item,
+                            first_key,
+                            "organize",
+                            f"批量移动 {len(move_items)} 个文件",
+                        )
                     moved = self._cloud_batch_mutations.move_files(
                         move_items, final_dir
                     )
@@ -696,7 +827,34 @@ class OfflineTaskService(OwnerDelegator):
                         item["moved_at"] = now
                         moved_files[pending_key] = target_file
 
-            metadata_batches = {}
+            def finalize_after_metadata(
+                    item: Dict[str, Any],
+                    pending_key: str,
+                    file_name: str,
+                    strm_path,
+                    media,
+                    media_data: Dict[str, Any],
+            ) -> None:
+                if (
+                        media
+                        and self._metadata_scraper
+                        and self._local_resource_path
+                        and (self._nfo_scrape_enabled or self._image_scrape_enabled)
+                ):
+                    update_progress(
+                        item, pending_key, "metadata", "刮削当前文件元数据"
+                    )
+                    self._scrape_metadata_batch([{
+                        "cloud_dir": item["cloud_dir"],
+                        "file_name": file_name,
+                        "notification_episodes": (
+                            [item.get("episode")] if item.get("episode") else []
+                        ),
+                    }], media, season=item.get("season"))
+                finalize_ready_item(
+                    item, pending_key, strm_path, media, media_data
+                )
+
             for pending_key in due_keys:
                 item = pending.get(pending_key)
                 if not item:
@@ -705,6 +863,9 @@ class OfflineTaskService(OwnerDelegator):
                 file_name = str(item.get("file_name") or pending_key)
                 created_at = float(item.get("created_at") or now)
                 target_file = None
+                update_progress(
+                    item, pending_key, "locate", "检查下载和文件就绪状态"
+                )
                 if task_type == "magnet":
                     task = task_map.get(str(item.get("task_id") or "").upper())
                     task_done = bool(task and task.get("completed"))
@@ -725,6 +886,9 @@ class OfflineTaskService(OwnerDelegator):
                         else:
                             self._schedule_finalize_retry(item, now)
                         continue
+                    update_progress(
+                        item, pending_key, "organize", "整理 Magnet 下载文件"
+                    )
                     finalized = self._finalize_magnet_package(
                         item, pending_key, subscribe_cache=subscribe_cache
                     )
@@ -735,7 +899,11 @@ class OfflineTaskService(OwnerDelegator):
                     if finalized:
                         # Magnet 一个离线任务可能匹配多个真实文件；该任务的
                         # 历史已在 _finalize_magnet_package 中持久化，立即入队。
-                        self._send_finalized_batch(finalized)
+                        update_progress(
+                            item, pending_key, "commit", "登记文件和通知结果"
+                        )
+                        finalized_details.extend(finalized)
+                        notification_contexts.append((item, pending_key))
                         completed += len(finalized)
                     else:
                         failed += 1
@@ -794,6 +962,12 @@ class OfflineTaskService(OwnerDelegator):
                 staging_name = (
                     file_name if already_moved
                     else str(item.get("staging_name") or file_name)
+                )
+                update_progress(
+                    item,
+                    pending_key,
+                    "locate",
+                    f"在 {staging_dir} 定位 {staging_name}",
                 )
                 target_file = moved_files.get(pending_key) or prepared_files.get(pending_key)
                 if target_file:
@@ -868,6 +1042,9 @@ class OfflineTaskService(OwnerDelegator):
                 if item.get("upgrade") and str(
                         item.get("upgrade_mode") or self._upgrade_mode
                 ) != "coexist":
+                    update_progress(
+                        item, pending_key, "organize", "替换旧版本文件"
+                    )
                     replaced_file = self._replace_upgrade_file(
                         item=item,
                         pending_key=pending_key,
@@ -883,6 +1060,9 @@ class OfflineTaskService(OwnerDelegator):
                     already_moved = True
 
                 if not already_moved:
+                    update_progress(
+                        item, pending_key, "organize", "重命名并移动到媒体目录"
+                    )
                     if target_file.name != file_name:
                         if not self._cloud_mutations.rename_file(
                                 staging_dir, target_file, file_name
@@ -923,36 +1103,24 @@ class OfflineTaskService(OwnerDelegator):
                     resolved_key = context_key or self._media_context_key(item)
                     if resolved_key and media:
                         media_context_cache[resolved_key] = (media, media_data)
-                if media:
-                    try:
-                        batch_key = (
-                            getattr(media, "type", None),
-                            getattr(media, "tmdb_id", None),
-                            int(item.get("season") or 0),
-                        )
-                        batch = metadata_batches.setdefault(
-                            batch_key,
-                            {"mediainfo": media, "season": item.get("season"), "items": []},
-                        )
-                        batch["items"].append({
-                            "cloud_dir": item["cloud_dir"],
-                            "file_name": file_name,
-                            "notification_episodes": (
-                                [item.get("episode")] if item.get("episode") else []
-                            ),
-                        })
-                    except Exception as error:
-                        logger.warning(f"后处理元数据解析失败：{file_name}，{error}")
-
                 if not self._strm_generate_enabled or not self._strm_generator or not self._local_resource_path:
-                    if not self._finalize_subtitle_files(item, directory_snapshot):
-                        self._schedule_finalize_retry(item, now)
-                        continue
-                    finalize_ready_item(
-                        item, pending_key, None, media, media_data
+                    if item.get("subtitles"):
+                        update_progress(
+                            item, pending_key, "subtitle", "检查并整理伴随字幕"
+                        )
+                        if not self._finalize_subtitle_files(
+                                item, directory_snapshot
+                        ):
+                            self._schedule_finalize_retry(item, now)
+                            continue
+                    finalize_after_metadata(
+                        item, pending_key, file_name, None, media, media_data
                     )
                     continue
 
+                update_progress(
+                    item, pending_key, "strm", "生成并校验 STRM 文件"
+                )
                 strm_path = self._generate_strm(
                     item["cloud_dir"], file_name, target_file=target_file
                 )
@@ -960,17 +1128,26 @@ class OfflineTaskService(OwnerDelegator):
                     logger.error(f"STRM 生成后文件不存在或为空：{strm_path}")
                     strm_path = None
                 if strm_path:
-                    if not self._finalize_subtitle_files(
-                            item, directory_snapshot, strm_path=strm_path
-                    ):
-                        self._schedule_finalize_retry(item, now)
-                        continue
+                    if item.get("subtitles"):
+                        update_progress(
+                            item, pending_key, "subtitle", "检查并整理伴随字幕"
+                        )
+                        if not self._finalize_subtitle_files(
+                                item, directory_snapshot, strm_path=strm_path
+                        ):
+                            self._schedule_finalize_retry(item, now)
+                            continue
                     if not self._strm_file_ready(strm_path):
                         logger.error(f"洗版后 STRM 文件不存在或为空：{strm_path}")
                         self._schedule_finalize_retry(item, now)
                         continue
-                    finalize_ready_item(
-                        item, pending_key, strm_path, media, media_data
+                    finalize_after_metadata(
+                        item,
+                        pending_key,
+                        file_name,
+                        strm_path,
+                        media,
+                        media_data,
                     )
                     continue
 
@@ -1015,11 +1192,6 @@ class OfflineTaskService(OwnerDelegator):
                         "已保留后处理任务等待重试"
                     )
 
-            for batch in metadata_batches.values():
-                self._scrape_metadata_batch(
-                    batch["items"], batch["mediainfo"], season=batch["season"]
-                )
-
             for batch in subscription_batches.values():
                 completion_item = batch["item"]
                 completion_item["success_episodes"] = sorted(batch["episodes"])
@@ -1031,6 +1203,17 @@ class OfflineTaskService(OwnerDelegator):
                     batch["media_data"],
                     mediainfo=batch["mediainfo"],
                 )
+
+            if finalized_details:
+                if self._notify and notification_contexts:
+                    progress_item, progress_key = notification_contexts[-1]
+                    update_progress(
+                        progress_item,
+                        progress_key,
+                        "notify",
+                        f"汇总发送 {len(finalized_details)} 个文件的完成通知",
+                    )
+                self._send_finalized_batch(finalized_details)
 
         with self._offline_pending_lock:
             current_pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
@@ -1076,6 +1259,19 @@ class OfflineTaskService(OwnerDelegator):
             "failed": failed,
             "pending": pending_count,
         }
+        task_ids = {
+            self._postprocess_task_id(item)
+            for pending_key in due_keys
+            if (item := pending_snapshot.get(pending_key))
+               and self._postprocess_task_id(item)
+        }
+        if self._task_update:
+            for task_id in task_ids:
+                self._task_update(
+                    task_id,
+                    postprocess_active=False,
+                    postprocess_detail="",
+                )
         self._notify_offline_pending_changed(result["pending"])
         return result
 
@@ -1330,14 +1526,18 @@ class OfflineTaskService(OwnerDelegator):
 
         if not history_records:
             return None
+        persisted_records = [
+            record for record in history_records
+            if not record.get("skip_history")
+        ]
         with self._offline_pending_lock:
             history = [
                 record for record in (self._get_data("history") or [])
                 if str(record.get("finalize_key") or "") != pending_key
             ]
-            history.extend(history_records)
+            history.extend(persisted_records)
             self._save_data("history", history)
-        self._record_platform_transfer_histories(history_records)
+        self._record_platform_transfer_histories(persisted_records)
         item["success_episodes"] = (
             [] if item.get("transient_target") else success_episodes
         )

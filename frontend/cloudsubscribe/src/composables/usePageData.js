@@ -13,6 +13,7 @@ export function useHistoryPageData(api, notify, pluginId = "CloudSubscribe") {
       resourceTypes: [],
       sources: [],
     },
+    enableCloudUpgrade: false,
   });
   const historyStats = reactive({
     total: 0,
@@ -102,6 +103,7 @@ export function useHistoryPageData(api, notify, pluginId = "CloudSubscribe") {
             : [],
           sources: Array.isArray(pageData.filter_options?.sources) ? pageData.filter_options.sources : [],
         },
+        enableCloudUpgrade: Boolean(pageData.enable_cloud_upgrade),
       });
       historyQuery.page = historyPage.page;
       historyQuery.pageSize = historyPage.pageSize;

@@ -68,7 +68,9 @@ class PointBudgetLedger:
     def subscribe_key(self) -> str:
         return str(getattr(self._local, "key", "") or "")
 
-    def set_data_funcs(self, get_data: Callable, save_data: Callable) -> None:
+    def configure_storage(
+            self, get_data: Callable, save_data: Callable
+    ) -> None:
         with self.lock:
             self._get_data = get_data
             self._save_data = save_data
@@ -96,7 +98,7 @@ class PointBudgetLedger:
             self._local.key = ""
             self._local.spent = 0
 
-    def reset_subscribe(self, key: str = "") -> int:
+    def reset_subscription(self, key: str = "") -> int:
         with self.lock:
             normalized_key = str(key or "")
             history = self._load_history() if normalized_key else {}
@@ -105,7 +107,7 @@ class PointBudgetLedger:
             self._local.spent = spent
             return spent
 
-    def clear_subscribe(self, key: str) -> bool:
+    def clear_subscription(self, key: str) -> bool:
         with self.lock:
             normalized_key = str(key or "")
             history = self._load_history()
@@ -129,7 +131,7 @@ class PointBudgetLedger:
                 self._unlocked_cache.clear()
             return count
 
-    def can_spend(self, points: Any) -> bool:
+    def has_budget(self, points: Any) -> bool:
         status = self.status(points)
         return bool(status and status.allowed)
 

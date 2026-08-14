@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Dict, List
 
+from app.log import logger
 from app.schemas import MediaInfo
 
 from ...core import OwnerDelegator
@@ -29,12 +30,25 @@ class FileMatchingService(OwnerDelegator):
             episode_list,
             mediainfo=mediainfo if require_media_match else None,
         )
-        return {
-            episode: self._search_handler.select_file_candidate(
-                candidates.get(episode) or [], mediainfo, subscribe
+        results = {}
+        for episode in episode_list:
+            episode_candidates = candidates.get(episode) or []
+            selected, priority = self._search_handler.select_file_candidate(
+                episode_candidates, mediainfo, subscribe
             )
-            for episode in episode_list
-        }
+            results[episode] = selected, priority
+            if selected and len(episode_candidates) > 1:
+                selected_path = str(
+                    selected.get("_relative_path")
+                    or selected.get("name")
+                    or ""
+                ).strip()
+                logger.debug(
+                    f"{mediainfo.title_year} S{season:02d}E{episode:02d} "
+                    f"存在 {len(episode_candidates)} 个版本，平台规则选择："
+                    f"{selected_path}（优先级 {priority}）"
+                )
+        return results
 
     def _match_movie_file(
             self,

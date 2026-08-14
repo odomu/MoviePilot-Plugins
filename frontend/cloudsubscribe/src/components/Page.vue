@@ -37,7 +37,6 @@
               variant="tonal"
               size="small"
               prepend-icon="mdi-link-variant-plus"
-              :disabled="active"
               @click="openManualDialog()">
               手动添加
             </v-btn>
@@ -110,6 +109,7 @@
                 :deleting-key="deletingHistoryKey"
                 :notifying-key="notifyingHistoryKey"
                 :upgrading-key="upgradingHistoryKey"
+                :enable-cloud-upgrade="historyPage.enableCloudUpgrade"
                 @refresh="loadPage"
                 @query-change="updateHistoryQuery"
                 @clear="openClearHistory"
@@ -131,7 +131,6 @@
       v-show="manualVisible"
       v-model="manualVisible"
       :api="api"
-      :active="active"
       :initial-mode="manualInitialMode"
       :initial-media="manualInitialMedia"
       @started="manualStarted" />
@@ -140,7 +139,7 @@
         <v-card-title class="text-subtitle-1">{{ immediateSearchDialogTitle }}</v-card-title>
         <v-card-text>
           <template v-if="selectedHistoryCount">
-            确认立即搜索所选 {{ selectedHistoryCount }} 个历史媒体关联的订阅？
+            确认立即搜索所选 {{ selectedHistoryCount }} 个历史媒体？
             <v-alert type="info" variant="tonal" density="compact" class="mt-3">
               本次仅搜索所选历史记录，不会搜索其他订阅。
             </v-alert>
@@ -428,7 +427,7 @@ const immediateSearchLabel = computed(() =>
   selectedHistoryCount.value ? `搜索所选（${selectedHistoryCount.value}）` : "搜索全部",
 )
 const immediateSearchTitle = computed(() =>
-  selectedHistoryCount.value ? `立即搜索所选 ${selectedHistoryCount.value} 个历史媒体关联的订阅` : "立即搜索全部订阅",
+  selectedHistoryCount.value ? `立即搜索所选 ${selectedHistoryCount.value} 个历史媒体` : "立即搜索全部订阅",
 )
 const immediateSearchDialogTitle = computed(() => (selectedHistoryCount.value ? "搜索所选历史记录" : "搜索全部订阅"))
 

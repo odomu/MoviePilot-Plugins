@@ -267,7 +267,7 @@
         <template #item.actions="{ item }">
           <div class="summary-actions">
             <v-btn
-              v-if="canUpgradeGroup(item)"
+              v-if="props.enableCloudUpgrade && canUpgradeGroup(item)"
               icon="mdi-auto-fix"
               color="warning"
               variant="text"
@@ -394,7 +394,7 @@
                   <td class="action-column">
                     <div class="action-buttons">
                       <v-btn
-                          v-if="canUpgradeRecord(record)"
+                        v-if="props.enableCloudUpgrade && canUpgradeRecord(record)"
                           icon="mdi-auto-fix"
                           color="warning"
                           variant="text"
@@ -458,7 +458,7 @@
                     </span>
                     <div class="history-mobile-summary-actions">
                       <v-btn
-                        v-if="canUpgradeGroup(item)"
+                        v-if="props.enableCloudUpgrade && canUpgradeGroup(item)"
                         icon="mdi-auto-fix"
                         color="warning"
                         variant="text"
@@ -554,7 +554,7 @@
                     <v-spacer />
                     <div class="action-buttons history-mobile-actions">
                       <v-btn
-                        v-if="canUpgradeRecord(record)"
+                        v-if="props.enableCloudUpgrade && canUpgradeRecord(record)"
                         icon="mdi-auto-fix"
                         color="warning"
                         variant="text"
@@ -654,6 +654,7 @@ const props = defineProps({
   deletingKey: {type: String, default: ""},
   notifyingKey: {type: String, default: ""},
   upgradingKey: {type: String, default: ""},
+  enableCloudUpgrade: Boolean,
 })
 const emit = defineEmits([
   "refresh",
@@ -746,6 +747,21 @@ const selectedGroups = computed(() => {
 const deletableSelectedGroups = computed(() => selectedGroups.value.filter((group) => group.deletable));
 const groupedItemKeys = computed(() => new Set(historyGroups.value.map((group) => group.group_key)));
 
+function historySeasonEpisodes(group) {
+  const episodes = {};
+  for (const record of group?.records || []) {
+    const season = Number(record?.season || 0);
+    const episode = Number(record?.episode || 0);
+    if (season <= 0 || episode <= 0) continue;
+    const key = String(season);
+    if (!episodes[key]) episodes[key] = [];
+    episodes[key].push(episode);
+  }
+  return Object.fromEntries(
+    Object.entries(episodes).map(([season, values]) => [season, uniqueOptions(values).sort((a, b) => a - b)]),
+  );
+}
+
 function emitQueryChange(overrides = {}) {
   const query = {
     page: props.page,
@@ -825,6 +841,7 @@ watch(
           title: group.title || "",
           year: group.year || "",
           seasons: group.seasons || [],
+          season_episodes: historySeasonEpisodes(group),
         })),
       });
     },
@@ -867,6 +884,7 @@ function resourceTypeLabel(value) {
         tianyi: "天翼云盘",
         alipan: "阿里云盘",
         aliyun: "阿里云盘",
+        cloud: "网盘路径",
         ed2k: "ED2K",
         magnet: "Magnet",
         unknown: "未知",

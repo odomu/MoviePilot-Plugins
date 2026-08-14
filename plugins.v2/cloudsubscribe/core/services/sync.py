@@ -4,6 +4,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Event as ThreadEvent, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from app.db import SessionFactory
 from app.db.models.subscribe import Subscribe
@@ -26,6 +27,111 @@ class SyncExecutionService(OwnerDelegator):
     _SUBSCRIBE_SEARCH_BATCH_SECONDS = 1.0
     # 防止平台短时间重复回调；完成后不应阻塞正常的手动重试一分钟。
     _SUBSCRIBE_SEARCH_DEBOUNCE_SECONDS = 5.0
+
+    def _run_queued_sync_operation(
+            self,
+            sync_kwargs: Dict[str, Any],
+            label: str,
+            queue_task_id: str,
+    ) -> bool:
+        try:
+            logger.info(f"开始执行排队任务：{label}")
+            return self.sync_subscribes(
+                **sync_kwargs,
+                wait_for_slot=True,
+                queue_task_id=queue_task_id,
+            )
+        finally:
+            self._remove_sync_queue_task(queue_task_id)
+            with self._sync_queue_lock:
+                self._sync_queue_pending = max(
+                    0, int(self._sync_queue_pending or 0) - 1
+                )
+            self._mark_runtime_changed()
+
+    def _submit_sync_operation(
+            self,
+            sync_kwargs: Dict[str, Any],
+            label: str,
+    ) -> Tuple[Any, int]:
+        """把人工触发的同步操作统一送入单线程 FIFO 队列。"""
+        executor = self._sync_queue_executor
+        if not executor or self._subscribe_search_queue_shutdown.is_set():
+            raise RuntimeError("同步队列已停止")
+        queue_task_id = f"sync-queue:{uuid4().hex}"
+        with self._sync_queue_lock:
+            self._sync_queue_pending = int(self._sync_queue_pending or 0) + 1
+            position = self._sync_queue_pending
+            self._sync_queue_tasks[queue_task_id] = {
+                "id": queue_task_id,
+                "task_kind": "sync_queue",
+                "title": str(label or "订阅任务"),
+                "media_type": "",
+                "status": "queued",
+                "phase": f"排队中 · 队列位置 {position}",
+                "progress": 0,
+                "message": "",
+                "queued_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+            }
+            try:
+                future = executor.submit(
+                    self._run_queued_sync_operation,
+                    dict(sync_kwargs),
+                    str(label or "订阅任务"),
+                    queue_task_id,
+                )
+            except Exception:
+                self._sync_queue_pending = max(0, self._sync_queue_pending - 1)
+                self._sync_queue_tasks.pop(queue_task_id, None)
+                raise
+        self._mark_runtime_changed()
+        logger.info(f"任务已进入同步队列：{label}，队列位置 {position}")
+        return future, position
+
+    def queue_sync_operation(
+            self,
+            sync_kwargs: Dict[str, Any],
+            label: str,
+    ) -> int:
+        _, position = self._submit_sync_operation(sync_kwargs, label)
+        return position
+
+    def _remove_sync_queue_task(self, task_id: str) -> None:
+        removed = False
+        with self._sync_queue_lock:
+            removed = self._sync_queue_tasks.pop(str(task_id or ""), None) is not None
+        if removed:
+            self._mark_runtime_changed()
+
+    def _activate_sync_queue_task(self, task_id: str) -> None:
+        changed = False
+        with self._sync_queue_lock:
+            task = self._sync_queue_tasks.get(str(task_id or ""))
+            if task and task.get("status") != "running":
+                task.update({
+                    "status": "running",
+                    "phase": "正在准备媒体任务",
+                    "started_at": time.time(),
+                })
+                changed = True
+        if changed:
+            self._mark_runtime_changed()
+
+    def _direct_cloud_manual_resources(
+            self, resources: Optional[List[Dict[str, Any]]]
+    ) -> bool:
+        """判断手动资源是否全部来自目标网盘路径，可直接整理。"""
+        target_provider = str(
+            getattr(self._cloud_drive, "key", "") or ""
+        ).strip().lower()
+        return bool(resources and target_provider) and all(
+            str(item.get("resource_type") or "").strip().lower() == "cloud"
+            and str(item.get("cloud_provider") or "").strip().lower()
+            == target_provider
+            for item in resources
+        )
 
     @staticmethod
     def _history_group_key(
@@ -194,7 +300,10 @@ class SyncExecutionService(OwnerDelegator):
         for group in grouped.values():
             canonical_item = min(
                 group,
-                key=lambda item: int(getattr(item, "id", 0) or 0),
+                key=lambda item: (
+                    bool(getattr(item, "_transient_target", False)),
+                    int(getattr(item, "id", 0) or 0),
+                ),
             )
             canonical.append(canonical_item)
             duplicates = [
@@ -360,12 +469,15 @@ class SyncExecutionService(OwnerDelegator):
                     f"{'全部订阅' if subscribe_ids is None else len(subscribe_ids)}，"
                     f"订阅并发上限 {self._subscription_concurrency}"
                 )
-                self.sync_subscribes(
-                    subscribe_ids=subscribe_ids,
-                    subscribe_states=subscribe_states,
-                    wait_for_slot=True,
-                    queue_revision=queue_revision,
+                future, _ = self._submit_sync_operation(
+                    {
+                        "subscribe_ids": subscribe_ids,
+                        "subscribe_states": subscribe_states,
+                        "queue_revision": queue_revision,
+                    },
+                    "订阅卡片搜索",
                 )
+                future.result()
                 with self._subscribe_search_queue_lock:
                     completed_at = time.monotonic()
                     for queued_id, queued_state in batch.items():
@@ -407,8 +519,10 @@ class SyncExecutionService(OwnerDelegator):
             subscribe_states: Optional[str] = None,
             manual_resources: Optional[List[Dict[str, Any]]] = None,
             manual_target: Optional[Dict[str, Any]] = None,
+            history_search_targets: Optional[List[Dict[str, Any]]] = None,
             upgrade_request: Optional[Dict[str, Any]] = None,
             manual_upgrade: bool = False,
+            queue_task_id: str = "",
     ) -> bool:
         if self._stop_requested():
             logger.info("同步任务已收到停止请求，取消执行")
@@ -436,11 +550,19 @@ class SyncExecutionService(OwnerDelegator):
             return False
         required = {
             CloudDriveCapability.AUTHENTICATION,
-            CloudDriveCapability.SHARE_TRANSFER,
             CloudDriveCapability.DIRECTORY_READ,
             CloudDriveCapability.FILE_QUERY,
             CloudDriveCapability.FILE_MUTATION,
         }
+        cloud_path_only = bool(manual_resources) and all(
+            str(resource.get("resource_type") or "").strip().lower() == "cloud"
+            for resource in manual_resources
+        )
+        direct_cloud_path_only = self._direct_cloud_manual_resources(
+            manual_resources
+        )
+        if not cloud_path_only:
+            required.add(CloudDriveCapability.SHARE_TRANSFER)
         missing = [
             capability.value for capability in required
             if not self._cloud_drive.supports(capability)
@@ -460,6 +582,9 @@ class SyncExecutionService(OwnerDelegator):
             else
             "手动添加"
             if manual_resources
+            else
+            "历史记录搜索"
+            if history_search_targets
             else f"{self._cloud_drive.name}订阅同步"
         )
         self._set_sync_status("running", "正在读取订阅列表", 5)
@@ -467,7 +592,7 @@ class SyncExecutionService(OwnerDelegator):
         try:
             if self._search_handler:
                 if not manual_resources:
-                    self._search_handler.reset_task_spent_points()
+                    self._search_handler.reset_point_budgets()
                 self._search_handler.reset_search_metrics()
         except Exception:
             pass
@@ -488,18 +613,35 @@ class SyncExecutionService(OwnerDelegator):
                     upgrade_request.get("records") or []
                 )
         elif manual_target:
-            subscribes = [self._sync_handler.build_transient_media_target(
-                manual_target,
-                target_id=-1,
-                manual_upgrade=manual_upgrade,
-            )]
+            manual_media_type = str(
+                manual_target.get("media_type") or ""
+            ).strip().lower()
+            manual_seasons = sorted({
+                int(value) for value in manual_target.get("seasons") or []
+            })
+            manual_targets = (
+                [
+                    {**manual_target, "season": season}
+                    for season in manual_seasons
+                ]
+                if manual_media_type == "tv"
+                else [manual_target]
+            )
+            subscribes = [
+                self._sync_handler.build_transient_media_target(
+                    target,
+                    target_id=-index,
+                    manual_upgrade=manual_upgrade,
+                )
+                for index, target in enumerate(manual_targets, start=1)
+            ]
         else:
             with SessionFactory() as db:
                 subscribe_oper = SubscribeOper(db=db)
-                if subscribe_ids is not None:
+                if subscribe_ids is not None or history_search_targets:
                     normalized_ids = []
                     seen_ids = set()
-                    for queued_id in subscribe_ids:
+                    for queued_id in subscribe_ids or []:
                         try:
                             normalized_id = int(queued_id or 0)
                         except (TypeError, ValueError):
@@ -525,6 +667,14 @@ class SyncExecutionService(OwnerDelegator):
                     subscribes = [subscribe] if subscribe else []
                 else:
                     subscribes = subscribe_oper.list(subscribe_states or "N,R")
+            for index, target in enumerate(history_search_targets or [], start=1):
+                subscribes.append(
+                    self._sync_handler.build_transient_media_target(
+                        target,
+                        target_id=-index,
+                        episodes=set(target.get("episodes") or []),
+                    )
+                )
 
         if not subscribes:
             logger.debug("当前没有可处理的订阅")
@@ -560,6 +710,7 @@ class SyncExecutionService(OwnerDelegator):
         unresolved_tmdb_count = 0
         active_subscribes = []
         transient_request = bool(manual_target or upgrade_request)
+        history_target_request = bool(history_search_targets)
         if manual_resources or transient_request:
             active_subscribes, _ = self._deduplicate_subscribes(all_subscribes)
             if transient_request:
@@ -577,6 +728,11 @@ class SyncExecutionService(OwnerDelegator):
             }
             candidates = []
             for subscribe in all_subscribes:
+                if history_target_request and bool(
+                        getattr(subscribe, "_transient_target", False)
+                ):
+                    candidates.append(subscribe)
+                    continue
                 subscribe_id_value = int(getattr(subscribe, "id", 0) or 0)
                 if self._is_subscribe_excluded(subscribe_id_value):
                     excluded_count += 1
@@ -599,9 +755,7 @@ class SyncExecutionService(OwnerDelegator):
                 candidates.append(subscribe)
 
             candidates, _ = self._deduplicate_subscribes(candidates)
-            prepared, unresolved_tmdb_count = self._prepare_searchable_subscribes(
-                candidates
-            )
+            prepared, unresolved_tmdb_count = self._prepare_searchable_subscribes(candidates)
             if prepared:
                 logger.debug(
                     f"订阅批量预处理完成：{len(prepared)} 个唯一订阅"
@@ -623,6 +777,7 @@ class SyncExecutionService(OwnerDelegator):
         total_subscribes = len(active_subscribes)
         if not active_subscribes:
             self._register_sync_tasks([])
+            self._remove_sync_queue_task(queue_task_id)
             logger.debug(
                 f"订阅收集完成，无需搜索：排除 {excluded_count} 个，"
                 f"延期 {deferred_count} 个，后处理 {postprocessing_count} 个，"
@@ -656,20 +811,26 @@ class SyncExecutionService(OwnerDelegator):
             ).append(record)
         transfer_details: List[Dict[str, Any]] = []
         transferred_count = 0
+        preparing_phase = (
+            "准备处理手动资源"
+            if manual_resources
+            else "准备搜索历史媒体"
+            if history_search_targets
+            else "准备搜索资源"
+        )
         self._set_sync_status(
             "running",
-            f"已加载 {total_subscribes} 个订阅，准备搜索资源",
+            f"已加载 {total_subscribes} 个媒体目标，{preparing_phase}",
             8,
             {
                 "current": 0,
                 "total": total_subscribes,
                 "transferred": 0,
-                "phase": "准备搜索资源",
+                "phase": preparing_phase,
             },
         )
-        if self._sync_handler:
-            self._sync_handler.reset_transfer_budget()
         self._register_sync_tasks(active_subscribes)
+        self._remove_sync_queue_task(queue_task_id)
         grouped_subscribes = {}
         for subscribe in active_subscribes:
             grouped_subscribes.setdefault(
@@ -678,13 +839,23 @@ class SyncExecutionService(OwnerDelegator):
 
         completed_subscribes = 0
         if grouped_subscribes:
-            worker_count = min(
-                self._subscription_concurrency,
-                len(grouped_subscribes),
-                self._cloud_drive.policy.max_concurrency,
+            ordered_manual_seasons = bool(
+                manual_target
+                and str(manual_target.get("media_type") or "").strip().lower() == "tv"
+                and len(manual_target.get("seasons") or []) > 1
+            )
+            worker_count = (
+                1
+                if ordered_manual_seasons
+                else min(
+                    self._subscription_concurrency,
+                    len(grouped_subscribes),
+                    self._cloud_drive.policy.max_concurrency,
+                )
             )
             logger.debug(
-                f"订阅并发调度：{total_subscribes} 个订阅，"
+                f"{'手动多季顺序调度' if ordered_manual_seasons else '订阅并发调度'}："
+                f"{total_subscribes} 个媒体目标，"
                 f"{len(grouped_subscribes)} 个媒体队列，并发数 {worker_count}"
             )
             executor = ThreadPoolExecutor(
@@ -762,15 +933,28 @@ class SyncExecutionService(OwnerDelegator):
                     transfer_details.extend(result["transfer_details"])
                     transferred_count += int(result["transferred"] or 0)
                     completed_subscribes += len(group)
+                    progress_text = (
+                        f"正在按季整理媒体（{completed_subscribes}/{total_subscribes}）"
+                        if direct_cloud_path_only
+                        else f"正在按季处理媒体（{completed_subscribes}/{total_subscribes}）"
+                        if ordered_manual_seasons
+                        else f"正在并行处理订阅（{completed_subscribes}/{total_subscribes}）"
+                    )
                     self._set_sync_status(
                         "running",
-                        f"正在并行处理订阅（{completed_subscribes}/{total_subscribes}）",
+                        progress_text,
                         10 + int(completed_subscribes / max(total_subscribes, 1) * 85),
                         {
                             "current": completed_subscribes,
                             "total": total_subscribes,
                             "transferred": transferred_count,
-                            "phase": "并行搜索与转存",
+                            "phase": (
+                                "按季整理网盘文件"
+                                if direct_cloud_path_only
+                                else "按季搜索与转存"
+                                if ordered_manual_seasons
+                                else "并行搜索与转存"
+                            ),
                             "concurrency": worker_count,
                         },
                     )
@@ -828,13 +1012,20 @@ class SyncExecutionService(OwnerDelegator):
             mode_label = "指定模式" if self._subscribe_filter_mode == "include" else "排除模式"
             logger.debug(f"订阅过滤（{mode_label}）：跳过 {skipped_count} 个订阅")
 
+        action_name = "整理" if direct_cloud_path_only else "转存"
         if self._stop_requested():
-            logger.info(f"网盘订阅同步已停止，停止前共转存 {transferred_count} 个文件")
+            logger.info(
+                f"网盘订阅同步已停止，停止前共{action_name} "
+                f"{transferred_count} 个文件"
+            )
             if self._notify:
                 self.post_message(
                     mtype=self._notification_type,
                     title="【网盘订阅助手】任务已停止",
-                    text=f"已按请求停止处理，停止前共转存 {transferred_count} 个文件。"
+                    text=(
+                        f"已按请求停止处理，停止前共{action_name} "
+                        f"{transferred_count} 个文件。"
+                    )
                 )
             return False
 
@@ -846,10 +1037,13 @@ class SyncExecutionService(OwnerDelegator):
                 "current": total_subscribes,
                 "total": total_subscribes,
                 "transferred": transferred_count,
+                "action_name": action_name,
                 "phase": "保存结果与发送通知",
             },
         )
-        logger.info(f"网盘订阅同步完成，共转存 {transferred_count} 个文件")
+        logger.info(
+            f"网盘订阅同步完成，共{action_name} {transferred_count} 个文件"
+        )
         pending_finalize_count = 0
         if self._sync_handler:
             pending_finalize_tasks = self._sync_handler.get_pending_finalize_tasks()
@@ -894,7 +1088,7 @@ class SyncExecutionService(OwnerDelegator):
             self.post_message(
                 mtype=self._notification_type,
                 title="【网盘订阅助手】执行完成",
-                text="本次同步未发现需要转存的新资源。"
+                text=f"本次同步未发现需要{action_name}的新资源。"
             )
 
         return True
@@ -944,10 +1138,12 @@ class SyncExecutionService(OwnerDelegator):
             progress_callback: Optional[Callable[..., None]] = None,
             manual_resources: Optional[List[Dict[str, Any]]] = None,
             manual_target: Optional[Dict[str, Any]] = None,
+            history_search_targets: Optional[List[Dict[str, Any]]] = None,
             upgrade_request: Optional[Dict[str, Any]] = None,
             manual_upgrade: bool = False,
             wait_for_slot: bool = False,
             queue_revision: Optional[int] = None,
+            queue_task_id: str = "",
             result: Optional[Dict[str, Any]] = None,
             lock_acquired: bool = False,
     ) -> bool:
@@ -957,29 +1153,33 @@ class SyncExecutionService(OwnerDelegator):
                 and subscribe_states is None
                 and not manual_resources
                 and not manual_target
+                and not history_search_targets
                 and not upgrade_request
         )
         if lock_acquired:
             pass
         elif wait_for_slot:
+            def queue_cancelled() -> bool:
+                return bool(
+                    self._subscribe_search_queue_shutdown.is_set()
+                    or (
+                            queue_revision is not None
+                            and queue_revision != self._subscribe_search_queue_revision
+                    )
+                )
+
             while not sync_lock.acquire(timeout=0.5):
-                if (
-                        self._subscribe_search_queue_shutdown.is_set()
-                        or queue_revision != self._subscribe_search_queue_revision
-                ):
+                if queue_cancelled():
                     if result is not None:
                         result.update(self._sync_execution_result(
-                            False, "订阅搜索排队任务已取消"
+                            False, "排队任务已取消"
                         ))
                     return False
-            if (
-                    self._subscribe_search_queue_shutdown.is_set()
-                    or queue_revision != self._subscribe_search_queue_revision
-            ):
+            if queue_cancelled():
                 sync_lock.release()
                 if result is not None:
                     result.update(self._sync_execution_result(
-                        False, "订阅搜索排队任务已取消"
+                        False, "排队任务已取消"
                     ))
                 return False
         elif not sync_lock.acquire(blocking=False):
@@ -989,6 +1189,8 @@ class SyncExecutionService(OwnerDelegator):
                     False, "已有订阅任务正在运行"
                 ))
             return False
+        if queue_task_id:
+            self._activate_sync_queue_task(queue_task_id)
         notification_batch_started = False
         run_context: Dict[str, Any] = {}
         task_counts: Dict[str, int] = {}
@@ -1017,8 +1219,10 @@ class SyncExecutionService(OwnerDelegator):
                     subscribe_states=subscribe_states,
                     manual_resources=manual_resources,
                     manual_target=manual_target,
+                    history_search_targets=history_search_targets,
                     manual_upgrade=manual_upgrade,
                     upgrade_request=upgrade_request,
+                    queue_task_id=queue_task_id,
                 )
             except Exception as e:
                 logger.error(f"同步任务异常：{e}")
@@ -1067,6 +1271,9 @@ class SyncExecutionService(OwnerDelegator):
                             self._sync_handler._self_heal_cleanup()
             if result is not None:
                 transferred = int(run_context.get("transferred") or 0)
+                action_name = str(
+                    run_context.get("action_name") or "转存"
+                )
                 if stop_requested:
                     message = "订阅搜索已停止"
                 elif task_counts.get("failed"):
@@ -1090,14 +1297,18 @@ class SyncExecutionService(OwnerDelegator):
                     else:
                         pending_text = f"其中 {pending_count} 个网盘文件等待就绪，"
                     message = (
-                        f"订阅搜索已提交 {transferred} 个文件，"
+                        f"订阅搜索已提交{action_name} {transferred} 个文件，"
                         f"{pending_text}"
                         "完成后将再通知"
                     )
                 elif transferred:
-                    message = f"订阅搜索完成，共转存 {transferred} 个文件"
+                    message = (
+                        f"订阅搜索完成，共{action_name} {transferred} 个文件"
+                    )
                 else:
-                    message = "订阅搜索完成，未发现需要转存的新资源"
+                    message = (
+                        f"订阅搜索完成，未发现需要{action_name}的新资源"
+                    )
                 result.update(self._sync_execution_result(
                     success,
                     message,
