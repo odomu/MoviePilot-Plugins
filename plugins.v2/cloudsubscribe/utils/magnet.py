@@ -6,7 +6,7 @@ import io
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 from app.core.config import settings
@@ -53,10 +53,14 @@ def _extract_preview_episodes(
         display_name: str,
         provider_text: str,
         torrent_files: list,
+        default_season: Optional[int] = None,
 ) -> Dict[str, list]:
     """使用元数据识别汇总资源包含的季集。"""
     episodes: Dict[str, set] = {}
-    resource_seasons = [1]
+    resource_seasons = (
+        [max(1, int(default_season))]
+        if default_season is not None else []
+    )
     resource_texts = list(dict.fromkeys(
         text for text in (
             str(display_name or "").strip(),
@@ -67,8 +71,12 @@ def _extract_preview_episodes(
         resource_meta = MetaInfo(
             title=resource_title,
         )
-        parsed_seasons = resource_meta.season_list or resource_seasons
-        if resource_meta.season_list:
+        parsed_seasons = (
+            resource_meta.season_list
+            if resource_meta.begin_season is not None
+            else resource_seasons
+        )
+        if resource_meta.begin_season is not None:
             resource_seasons = resource_meta.season_list
         if resource_meta.episode_list:
             for season in parsed_seasons:
@@ -169,6 +177,7 @@ def parse_magnet_metadata(
         provider_text: str = "",
         fetch_info: bool = False,
         timeout: float = 8,
+        default_season: Optional[int] = None,
 ) -> Dict[str, Any]:
     """解析 URI 和提供者文本；可按需短时获取完整 torrent 元数据。"""
     try:
@@ -209,6 +218,7 @@ def parse_magnet_metadata(
         display_name=display_name,
         provider_text=provider_text,
         torrent_files=torrent_files,
+        default_season=default_season,
     )
 
     return {

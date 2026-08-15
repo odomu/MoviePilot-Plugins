@@ -7,13 +7,13 @@ from urllib.parse import urlencode
 from app.log import logger
 from app.schemas.types import MediaType
 
-from ...core import OwnerDelegator, SearchQuery, format_search_label
 from .client import Dian115Client, Dian115Error
 from .resource import Dian115ResourceService
 from ..budget import PointBudgetLedger
 from ..matching import unique_texts
-from ...utils.file_parser import MediaFileParser
+from ...core import OwnerDelegator, SearchQuery, format_search_label
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.file_parser import MediaFileParser
 
 
 class Dian115SearchService(OwnerDelegator):
@@ -276,6 +276,10 @@ class Dian115SearchService(OwnerDelegator):
             "is_unlocked": is_unlocked,
             "is_free": unlock_points <= 0,
             "preview_episodes": preview_episodes,
+            "identity_verified": True,
+            "target_season": (
+                int(target_season) if target_season is not None else None
+            ),
             "resolution": str(tag.get("resolution") or ""),
             "codec": str(tag.get("video_codec") or ""),
             "audio_codec": str(tag.get("audio_codec") or ""),

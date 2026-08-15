@@ -9,7 +9,6 @@ from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
-from ...core import OwnerDelegator, SearchQuery, format_search_label
 from .web import (
     HDHIVE_DETAIL_RESOURCE_TYPES,
     HDHIVE_RESOURCE_TYPES,
@@ -19,8 +18,9 @@ from .web import (
     valid_share_url,
 )
 from ..budget import PointBudgetLedger
-from ...utils.cache import normalize_platform_cache_key
+from ...core import OwnerDelegator, SearchQuery, format_search_label
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.cache import normalize_platform_cache_key
 
 
 class HDHiveSearchService(OwnerDelegator):
@@ -256,7 +256,7 @@ class HDHiveSearchService(OwnerDelegator):
         hdhive_media_type = "movie" if media_type == MediaType.MOVIE else "tv"
 
         if self._hdhive_query_mode == "web":
-            return self._search_web(
+            results = self._search_web(
                 mediainfo,
                 hdhive_media_type,
                 tmdb_id=tmdb_id,
@@ -267,14 +267,22 @@ class HDHiveSearchService(OwnerDelegator):
                 test_mode=test_mode,
                 result_limit=result_limit,
             )
-        return self._search_openapi(
-            mediainfo,
-            hdhive_media_type,
-            tmdb_id=tmdb_id,
-            season=season,
-            test_mode=test_mode,
-            result_limit=result_limit,
-        )
+        else:
+            results = self._search_openapi(
+                mediainfo,
+                hdhive_media_type,
+                tmdb_id=tmdb_id,
+                season=season,
+                test_mode=test_mode,
+                result_limit=result_limit,
+            )
+        if results is not None:
+            for item in results:
+                item["identity_verified"] = True
+                item["target_season"] = (
+                    int(season) if season is not None else None
+                )
+        return results
 
     def _search_web(
             self,

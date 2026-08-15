@@ -5,6 +5,7 @@ from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
+from app.core.metainfo import MetaInfo
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
@@ -13,6 +14,27 @@ from .. import CloudDriveCapability, OwnerDelegator
 
 
 class SyncApi(OwnerDelegator):
+    def _resolve_manual_tmdb_media(
+            self,
+            tmdb_id: int,
+            media_type: str,
+    ):
+        """以后端 TMDB ID 重新获取规范媒体信息，不信任前端标题。"""
+        resolved_type = (
+            MediaType.TV if media_type == "tv" else MediaType.MOVIE
+        )
+        meta = MetaInfo(str(tmdb_id))
+        meta.type = resolved_type
+        mediainfo = self.chain.recognize_media(
+            meta=meta,
+            mtype=resolved_type,
+            tmdbid=tmdb_id,
+            cache=True,
+        )
+        if not mediainfo:
+            raise ValueError(f"TMDB 媒体不存在：{tmdb_id}")
+        return mediainfo
+
     @staticmethod
     def _manual_resource_type(link: str, default: str) -> str:
         value = str(link or "").lower()
@@ -306,11 +328,20 @@ class SyncApi(OwnerDelegator):
             try:
                 tmdb_id = int(raw_media.get("tmdb_id") or 0)
                 media_type = str(raw_media.get("media_type") or "").strip().lower()
-                title = str(raw_media.get("title") or "").strip()
             except (TypeError, ValueError):
                 return {"success": False, "message": "TMDB 媒体信息格式错误"}
-            if tmdb_id <= 0 or media_type not in {"movie", "tv"} or not title:
+            if tmdb_id <= 0 or media_type not in {"movie", "tv"}:
                 return {"success": False, "message": "请选择订阅或有效的 TMDB 媒体"}
+            try:
+                canonical_media = self._resolve_manual_tmdb_media(
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                )
+            except Exception as error:
+                return {"success": False, "message": f"读取 TMDB 媒体信息失败：{error}"}
+            canonical_title = str(getattr(canonical_media, "title", "") or "").strip()
+            if not canonical_title:
+                return {"success": False, "message": "TMDB 媒体缺少规范标题"}
             seasons = []
             if media_type == "tv":
                 raw_seasons = raw_media.get("seasons")
@@ -326,7 +357,25 @@ class SyncApi(OwnerDelegator):
                 except (TypeError, ValueError):
                     return {"success": False, "message": "季数格式错误"}
                 if not seasons:
-                    seasons = self._resolve_tmdb_seasons(raw_media)
+                    raw_seasons = getattr(canonical_media, "seasons", None) or {}
+                    values = (
+                        raw_seasons.keys()
+                        if isinstance(raw_seasons, dict) else raw_seasons
+                    )
+                    resolved_seasons = set()
+                    for value in values or []:
+                        if isinstance(value, dict):
+                            value = value.get("season_number") or value.get("season")
+                        try:
+                            season = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if season > 0:
+                            resolved_seasons.add(season)
+                    seasons = sorted(resolved_seasons)
+                    if not seasons:
+                        total_seasons = int(getattr(canonical_media, "number_of_seasons", 0) or 0)
+                        seasons = list(range(1, total_seasons + 1))
                 if not seasons:
                     return {"success": False, "message": "未查询到 TMDB 真实季信息"}
                 if seasons[-1] > 999:
@@ -334,8 +383,8 @@ class SyncApi(OwnerDelegator):
             media_target = {
                 "tmdb_id": tmdb_id,
                 "media_type": media_type,
-                "title": title,
-                "year": raw_media.get("year"),
+                "title": canonical_title,
+                "year": getattr(canonical_media, "year", None),
                 "seasons": seasons,
             }
 
@@ -583,6 +632,8 @@ class SyncApi(OwnerDelegator):
             future.result()
             data = dict(result.get("data") or {})
             data["resource_count"] = len(resources)
+            if media_target:
+                data["media"] = dict(media_target)
             result["data"] = data
             return result
         queue_position = self.queue_sync_operation(
@@ -596,7 +647,10 @@ class SyncApi(OwnerDelegator):
                 if subscribe_id
                 else f"无订阅媒体任务已排队，共 {len(resources)} 条资源"
             ),
-            "data": {"queue_position": queue_position},
+            "data": {
+                "queue_position": queue_position,
+                **({"media": dict(media_target)} if media_target else {}),
+            },
         }
 
     def start_selected_resources(

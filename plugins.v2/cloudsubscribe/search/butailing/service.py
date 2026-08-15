@@ -6,10 +6,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from app.schemas.types import MediaType
 
-from ...core.search import SearchQuery
+from .client import ButailingClient
 from ..magnet import clear_cache, media_titles, normalize_magnets
 from ..matching import extract_season, extract_year, title_matches, unique_texts
-from .client import ButailingClient
+from ...core.search import SearchQuery
 
 
 class ButailingSearchService:
@@ -131,16 +131,19 @@ class ButailingSearchService:
         ):
             return []
         year = extract_year(expected_year)
+        identity_verified = False
         if expected_douban_id:
             detail = self._client.detail(int(expected_douban_id))
-            selected = self._select_row(
-                [detail], expected_titles, year, media_type, season,
-                expected_douban_id, imdb_id,
-            )
-            if not selected:
+            expected_type = 2 if media_type == "tv" else 1
+            try:
+                detail_type = int(detail.get("type") or 0)
+            except (TypeError, ValueError):
+                detail_type = 0
+            if not detail or detail_type != expected_type:
                 return []
-            selected_douban_id = selected.get("doub_id") or expected_douban_id
-            selected_title = selected.get("title") or (
+            identity_verified = True
+            selected_douban_id = detail.get("doub_id") or expected_douban_id
+            selected_title = detail.get("title") or (
                 expected_titles[0] if expected_titles else ""
             )
         else:
@@ -182,6 +185,10 @@ class ButailingSearchService:
                 "resource_type": "magnet",
                 "source_url": f"https://web5.mukaku.com/mv/{selected_douban_id}",
                 "provider_data": {"douban_id": int(selected_douban_id)},
+                "identity_verified": identity_verified,
+                "target_season": (
+                    int(season) if identity_verified and season else None
+                ),
             })
             if len(results) >= normalized_limit:
                 break

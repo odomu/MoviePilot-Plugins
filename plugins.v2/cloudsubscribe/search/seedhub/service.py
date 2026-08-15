@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from app.schemas.types import MediaType
 
-from ...core.search import SearchQuery
+from .client import SeedHubClient, SeedHubError
 from ..magnet import clear_cache, media_titles, normalize_magnets
 from ..matching import (
     extract_season,
@@ -15,7 +15,7 @@ from ..matching import (
     unique_texts,
 )
 from ..types import resource_type_from_url
-from .client import SeedHubClient, SeedHubError
+from ...core.search import SearchQuery
 
 
 class SeedHubSearchService:
@@ -87,7 +87,10 @@ class SeedHubSearchService:
                 (value for value in map(extract_season, candidate_titles) if value),
                 None,
             )
-            if season and candidate_season and candidate_season != season:
+            if (
+                    not exact_douban and season and candidate_season
+                    and candidate_season != season
+            ):
                 continue
             score = 1000 if exact_douban else 100
             if expected_year and candidate_year == expected_year:
@@ -217,6 +220,11 @@ class SeedHubSearchService:
                 break
         if not selected:
             return []
+        identity_verified = bool(
+            douban_id
+            and str(selected.get("douban_id") or "").strip()
+            == str(douban_id).strip()
+        )
         movie_id = selected["movie_id"]
         entries = self._client.detail_entries(movie_id)
         if not test_mode and media_type == "tv" and season:
@@ -235,6 +243,10 @@ class SeedHubSearchService:
             for result in results:
                 result.setdefault("provider_data", {})["douban_id"] = (
                     selected_douban_id
+                )
+                result["identity_verified"] = identity_verified
+                result["target_season"] = (
+                    int(season) if identity_verified and season else None
                 )
         return results
 

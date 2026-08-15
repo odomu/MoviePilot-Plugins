@@ -133,7 +133,7 @@ class JuyingResourceService:
                 f"[JUYING] {label} ID 精确命中媒体："
                 f"{selected.get('title') or selected.get('id') or query}"
             )
-            return selected
+            return {**selected, "_identity_verified": True}
 
         attempted = set()
         for query in titles:
@@ -230,6 +230,7 @@ class JuyingResourceService:
             self._search_cache.set(cache_key, [])
             return []
         source_url = f"{self._client.base_url}/movie/{movie_id}"
+        identity_verified = bool(movie.get("_identity_verified"))
         context = {"title": title, "alternative_titles": alternative_titles, "year": year,
                    "media_type": media_type, "tmdb_id": tmdb_id,
                    "douban_id": douban_id, "imdb_id": imdb_id, "season": season,
@@ -258,7 +259,12 @@ class JuyingResourceService:
                                 "link_hidden_reason": str(row.get("link_hidden_reason") or ""),
                                 "update_time": str(row.get("created_at") or ""),
                                 "uploader": str(row.get("uploader") or ""),
-                                "source_url": source_url})
+                                "source_url": source_url,
+                                "identity_verified": identity_verified,
+                                "target_season": (
+                                    int(season)
+                                    if identity_verified and season else None
+                                )})
         self._search_cache.set(
             cache_key, [dict(item) for item in public_rows]
         )
@@ -425,6 +431,10 @@ class JuyingResourceService:
                                 "description": row["description"], "size": row["size"],
                                 "update_time": row["update_time"], "uploader": row["uploader"],
                                 "source_url": row["source_url"],
+                                "identity_verified": bool(
+                                    row.get("identity_verified")
+                                ),
+                                "target_season": row.get("target_season"),
                                 "provider_data": {
                                     "resource_id": row["resource_id"]
                                 }})

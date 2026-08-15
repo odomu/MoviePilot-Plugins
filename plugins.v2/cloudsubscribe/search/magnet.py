@@ -42,7 +42,14 @@ def normalize_magnets(
             )
             if str(resource.get(key) or "").strip()
         )
-        metadata = parse_magnet_metadata(url, provider_text)
+        default_season = (
+            int(resource.get("target_season"))
+            if resource.get("identity_verified") and resource.get("target_season")
+            else None
+        )
+        metadata = parse_magnet_metadata(
+            url, provider_text, default_season=default_season
+        )
         if not metadata:
             continue
         info_hash = str(metadata.get("info_hash") or "").upper()

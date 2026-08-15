@@ -878,6 +878,28 @@ class SyncHandler:
             return False
 
         tmdb_id = 0
+        # 同一豆瓣身份可能已有其他订阅完成 TMDB 回填，优先复用该稳定映射，
+        # 避免被不同语言标题、季标题或年份差异误判为无匹配。
+        source_douban_id = str(getattr(subscribe, "doubanid", "") or "").strip()
+        if source_douban_id:
+            for candidate in SubscribeOper().list() or []:
+                if int(getattr(candidate, "id", 0) or 0) == subscribe_id:
+                    continue
+                if str(getattr(candidate, "doubanid", "") or "").strip() != source_douban_id:
+                    continue
+                candidate_type = str(getattr(candidate, "type", "") or "")
+                if candidate_type != getattr(subscribe, "type", ""):
+                    continue
+                tmdb_id = self._tmdb_id_from_media({
+                    "id": getattr(candidate, "tmdbid", None)
+                })
+                if tmdb_id:
+                    logger.debug(
+                        f"订阅复用同豆瓣身份的 TMDB 映射："
+                        f"{getattr(subscribe, 'name', '')} -> {tmdb_id}"
+                    )
+                    break
+
         source_lookups = (
             (
                 "doubanid",
@@ -891,6 +913,8 @@ class SyncHandler:
             ),
         )
         for source_name, method_name, source_id in source_lookups:
+            if tmdb_id:
+                break
             lookup = getattr(self._chain, method_name, None)
             if not source_id or not callable(lookup):
                 continue

@@ -74,7 +74,8 @@ class SearchCandidate(TypedDict, total=False):
     is_unlocked: bool
     preview_episodes: Dict[str, List[int]]
     preview_episodes_authoritative: bool
-    target_season: int
+    identity_verified: bool
+    target_season: Optional[int]
     target_episodes: List[int]
     supports_file_preview: bool
     provider_data: Dict[str, Any]
@@ -114,6 +115,12 @@ def normalize_search_candidate(
     result["provider_data"] = (
         dict(provider_data) if isinstance(provider_data, Mapping) else {}
     )
+    result["identity_verified"] = bool(result.get("identity_verified"))
+    try:
+        target_season = int(result.get("target_season") or 0)
+    except (TypeError, ValueError):
+        target_season = 0
+    result["target_season"] = target_season if target_season > 0 else None
     return result
 
 

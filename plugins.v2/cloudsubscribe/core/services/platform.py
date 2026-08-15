@@ -1030,7 +1030,7 @@ class PlatformIntegrationService(OwnerDelegator):
             except KeyError:
                 pass
         data = dict(result.get("data") or {})
-        data["media"] = media
+        data.setdefault("media", media)
         result["data"] = data
         return result
 
@@ -1222,18 +1222,15 @@ class PlatformIntegrationService(OwnerDelegator):
         media = {
             "tmdb_id": int(candidate.get("tmdb_id") or 0),
             "media_type": media_type,
-            "title": str(candidate.get("title") or source_title or "").strip(),
-            "year": candidate.get("year"),
         }
         if media_type != "tv":
             return media
-        meta = MetaInfo(str(source_title or media["title"]))
         resolved_seasons = sorted({
             int(value) for value in (seasons or [])
             if int(value) > 0
         })
         if not resolved_seasons:
-            resolved_season = season or getattr(meta, "begin_season", None)
+            resolved_season = season
             if resolved_season:
                 resolved_seasons = [max(1, int(resolved_season))]
         media["seasons"] = resolved_seasons
