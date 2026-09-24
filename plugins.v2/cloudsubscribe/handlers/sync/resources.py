@@ -70,7 +70,21 @@ class ResourceTransferService(OwnerDelegator):
         ):
             source_path = str((file_item or {}).get("cloud_path") or "").strip()
             return source_path or self._cloud_resource_path(share_url)
-        return self._cloud_transfer_path
+        transfer_path = str(getattr(self, "_cloud_transfer_path", "/") or "/").rstrip("/") or "/"
+        organize_enabled = getattr(self, "_organize_after_transfer", True)
+        if not organize_enabled and file_item:
+            parent_path = str(file_item.get("parent_path") or "").strip("/").strip()
+            if not parent_path:
+                rel = str(
+                    file_item.get("_relative_path")
+                    or file_item.get("relative_path")
+                    or ""
+                ).strip("/").strip()
+                if rel and "/" in rel:
+                    parent_path = rel.rsplit("/", 1)[0]
+            if parent_path:
+                return f"{transfer_path}/{parent_path}" if transfer_path != "/" else f"/{parent_path}"
+        return transfer_path
 
     def _list_cloud_resource_files(
             self, path: str, provider_key: str = ""

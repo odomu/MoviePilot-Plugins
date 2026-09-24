@@ -163,9 +163,9 @@ class QuarkShareService:
             info, token = self._share_access(share_url)
             result = []
             share_items: Dict[str, Dict[str, str]] = {}
-            stack = ["0"]
+            stack = [("0", "")]
             while stack:
-                parent_id = stack.pop()
+                parent_id, parent_path = stack.pop()
                 page = 1
                 while True:
                     response = self._get_share_files(
@@ -179,13 +179,21 @@ class QuarkShareService:
                         if not item:
                             continue
                         if item.is_directory:
-                            stack.append(item.id)
+                            sub_parent = (
+                                f"{parent_path}/{item.name}".strip("/")
+                                if parent_path else item.name
+                            )
+                            stack.append((item.id, sub_parent))
                         else:
                             share_items[item.id] = {
                                 "token": str(raw.get("share_fid_token") or ""),
                                 "parent_id": str(raw.get("pdir_fid") or parent_id),
                             }
-                            result.append(dict(item))
+                            dict_item = dict(item)
+                            if parent_path:
+                                dict_item["parent_path"] = parent_path
+                                dict_item["relative_path"] = f"{parent_path}/{item.name}"
+                            result.append(dict_item)
                     if len(items) < self.page_size:
                         break
                     page += 1

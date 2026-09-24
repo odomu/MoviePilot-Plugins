@@ -233,11 +233,26 @@ class MovieSyncProcessor(OwnerDelegator):
                 source_order = self._search_handler.get_enabled_sources(
                     media_type=MediaType.MOVIE
                 )
+
+                def on_movie_search_progress(data: Dict[str, Any]) -> None:
+                    completed = data.get("completed", 0)
+                    total = max(1, data.get("total", 1))
+                    current_prog = 45 + int((completed / total) * 20)  # 45% -> 65%
+                    self._set_task_phase(
+                        subscribe,
+                        data.get("summary") or "搜索候选资源",
+                        current_prog,
+                        search_active=data.get("active", False),
+                        search_channels=data.get("channels", []),
+                        search_total_results=data.get("total_results", 0),
+                    )
+
                 source_results = self._search_handler.search_sources(
                     sources=source_order,
                     mediainfo=mediainfo,
                     media_type=MediaType.MOVIE,
                     subscribe=subscribe,
+                    progress_callback=on_movie_search_progress,
                 )
             resource_batches = self._build_transfer_resource_batches(
                 source_order, source_results
@@ -274,7 +289,7 @@ class MovieSyncProcessor(OwnerDelegator):
                     break
                 self._set_task_phase(
                     subscribe,
-                    f"检查候选资源 {resource_index + 1}/{len(candidate_resources)}",
+                    f"校验候选资源 ({resource_index + 1}/{len(candidate_resources)})",
                     60 + int((resource_index + 1) / len(candidate_resources) * 22),
                 )
 
@@ -472,19 +487,24 @@ class MovieSyncProcessor(OwnerDelegator):
                                 f"电影 {mediainfo.title} 洗版：{reason}"
                             )
 
-                        save_dir, target_name = self._platform_target(
-                            self._CLOUD_MEDIA_ROOT, subscribe, mediainfo, file_name
-                        )
-                        if is_upgrade and self._upgrade_mode == "coexist":
-                            target_name = self._coexist_target_name(
-                                target_name,
-                                file_name,
-                                self._resource_size_bytes(matched_file.get("size")),
-                                matched_file.get("sha1") or "",
-                            )
+                        organize_enabled = getattr(self, "_organize_after_transfer", True)
                         staging_dir = self._resource_staging_dir(
                             share_url, matched_file
                         )
+                        if organize_enabled:
+                            save_dir, target_name = self._platform_target(
+                                self._CLOUD_MEDIA_ROOT, subscribe, mediainfo, file_name
+                            )
+                            if is_upgrade and self._upgrade_mode == "coexist":
+                                target_name = self._coexist_target_name(
+                                    target_name,
+                                    file_name,
+                                    self._resource_size_bytes(matched_file.get("size")),
+                                    matched_file.get("sha1") or "",
+                                )
+                        else:
+                            save_dir = staging_dir
+                            target_name = file_name
                         logger.info(
                             f"网盘源文件: {staging_dir}/{file_name}，"
                             f"整理到: {save_dir}/{target_name}"
@@ -505,13 +525,18 @@ class MovieSyncProcessor(OwnerDelegator):
                         )
                         success = True
                         if not direct_cloud_resource:
+                            transfer_target_name = (
+                                target_name
+                                if (organize_enabled and not self._is_offline_url(share_url))
+                                else None
+                            )
                             success = self._timed_sync_call(
                                 "share_transfer",
                                 self._transfer_file,
                                 share_url,
                                 matched_file,
-                                self._cloud_transfer_path,
-                                None if self._is_offline_url(share_url) else target_name,
+                                staging_dir if not organize_enabled else self._cloud_transfer_path,
+                                transfer_target_name,
                                 matched_file.get("sha1"),
                                 media_type="movie",
                             )

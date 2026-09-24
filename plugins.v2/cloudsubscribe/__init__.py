@@ -62,6 +62,7 @@ from .subscribe import (  # noqa: F401 - 导入即注册自动订阅渠道
     create_tmdb_provider,
 )
 from .utils import configure_magnet_metadata_url
+from .utils.file_parser import MediaFileParser
 from .utils.http_client import build_proxy_url, validate_proxy_address
 
 _COMPONENT_TYPES = (
@@ -99,7 +100,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.5.7"
+    plugin_version = "1.5.8"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -176,6 +177,10 @@ class CloudSubscribe(_PluginBase):
     _batch_interval: float = 3
     _transfer_risk_cooldown: int = 1800
     _skip_other_season_dirs: bool = True
+    _video_extensions: List[str] = [".mkv", ".mp4", ".avi", ".iso"]
+    _subtitle_extensions: List[str] = [
+        ".srt", ".ass", ".ssa", ".vtt", ".sub", ".sup", ".idx", ".smi", ".mks"
+    ]
 
     # 洗版配置
     _upgrade_subscribe_ids: list = []
@@ -457,6 +462,8 @@ class CloudSubscribe(_PluginBase):
             "emby_mediainfo_enabled",
             "platform_media_sync_enabled",
             "platform_deep_delete_enabled",
+            "video_extensions",
+            "subtitle_extensions",
         }
         changed_keys = set()
         if not reset_runtime and self._applied_config:
@@ -472,12 +479,19 @@ class CloudSubscribe(_PluginBase):
                 self._direct_transfer_enabled = bool(
                     config.get("direct_transfer_enabled", True)
                 )
+                if "video_extensions" in changed_keys or "subtitle_extensions" in changed_keys:
+                    video_exts, sub_exts = MediaFileParser.configure_extensions(
+                        video_extensions=config.get("video_extensions"),
+                        subtitle_extensions=config.get("subtitle_extensions"),
+                    )
+                    self._video_extensions = sorted(video_exts)
+                    self._subtitle_extensions = sorted(sub_exts)
                 self._apply_notification_config(config)
                 self._get_component(MessageRoutingHook).install()
                 self._applied_config = copy.deepcopy(config)
                 from app.core.plugin import PluginManager
                 PluginManager().clear_plugin_agent_tools_cache()
-                logger.info("基础开关或通知配置已热更新，网盘与搜索客户端保持运行")
+                logger.info("基础开关或扩展名/通知配置已热更新，网盘与搜索客户端保持运行")
                 return
         self.stop_service(preserve_subscribe_queue=not reset_runtime)
         self._stop_event = ThreadEvent()
@@ -743,6 +757,12 @@ class CloudSubscribe(_PluginBase):
         self._batch_interval = max(0, min(float(config.get("batch_interval", 3) or 0), 60))
         self._transfer_risk_cooldown = max(60, min(int(config.get("transfer_risk_cooldown", 1800) or 1800), 86400))
         self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
+        configured_video_exts, configured_sub_exts = MediaFileParser.configure_extensions(
+            video_extensions=config.get("video_extensions"),
+            subtitle_extensions=config.get("subtitle_extensions"),
+        )
+        self._video_extensions = sorted(configured_video_exts)
+        self._subtitle_extensions = sorted(configured_sub_exts)
 
         self._upgrade_subscribe_ids = config.get("upgrade_subscribe_ids", []) or []
         self._self_heal_interval = int(config.get("self_heal_interval", 10))

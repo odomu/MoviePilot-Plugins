@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple, Callable
 
 from app.log import logger
 from app.schemas import MediaInfo
@@ -451,7 +451,50 @@ class SearchHandler:
         ).has_budget(points))
 
     def source_name(self, source: str) -> str:
-        return self._search_registry.get(source).name
+        return self.get_source_display_name(source)
+
+    def get_source_display_name(self, source: str) -> str:
+        source_key = str(source or "").strip().lower()
+        try:
+            return self._search_registry.get(source_key).name
+        except Exception:
+            fallback_names = {
+                "quark": "夸克网盘",
+                "alipan": "阿里云盘",
+                "115": "115网盘",
+                "xunlei": "迅雷云盘",
+                "uc": "UC网盘",
+                "pansou": "盘搜",
+                "tg": "Telegram",
+                "mikan": "蜜柑计划",
+                "animegarden": "动漫花园",
+                "manual": "手动资源",
+            }
+            return fallback_names.get(source_key, source_key.upper())
+
+    def _dispatch_default_search_progress(self, subscribe: Any, progress_data: Dict[str, Any]) -> None:
+        if not self._plugin:
+            return
+        update_func = getattr(self._plugin, "_update_sync_task", None)
+        task_id_func = getattr(self._plugin, "_sync_task_id", None)
+        if not update_func or not task_id_func:
+            return
+        try:
+            task_id = task_id_func(subscribe)
+            total = max(1, progress_data.get("total", 1))
+            completed = progress_data.get("completed", 0)
+            ratio = completed / total
+            progress_val = 40 + int(ratio * 25) if progress_data.get("active") else 65
+            update_func(
+                task_id,
+                phase=progress_data.get("summary") or "搜索候选资源",
+                progress=progress_val,
+                search_active=progress_data.get("active", False),
+                search_channels=progress_data.get("channels", []),
+                search_total_results=progress_data.get("total_results", 0),
+            )
+        except Exception as e:
+            logger.debug(f"自动推送搜索运行态失败: {e}")
 
     def supports(self, source: str, capability: SearchCapability) -> bool:
         try:
@@ -657,6 +700,7 @@ class SearchHandler:
             apply_platform_rules: bool = True,
             force_refresh: bool = False,
             result_limit: Optional[int] = None,
+            raise_errors: bool = False,
     ) -> List[Dict]:
         source = str(source or "").strip().lower()
         if self._stop_requested():
@@ -703,6 +747,8 @@ class SearchHandler:
             logger.debug(
                 f"⚡ [{search_label}][{source.upper()}] 渠道已触发熔断保护({state.value})，跳过检索 (冷却剩余 {remaining:.1f}s)"
             )
+            if raise_errors:
+                raise RuntimeError(f"熔断保护({state.value})")
             return []
 
         external_started = time.monotonic()
@@ -722,6 +768,8 @@ class SearchHandler:
             logger.warning(f"[{search_label}][{source.upper()}] 渠道风控冷却中，快速跳过：{error}")
             if self._search_circuit_breaker_enabled:
                 SEARCH_CIRCUIT_BREAKER.record_failure(source, str(error))
+            if raise_errors:
+                raise error
             return []
         except Exception as error:
             logger.warning(
@@ -730,6 +778,8 @@ class SearchHandler:
             )
             if self._search_circuit_breaker_enabled:
                 SEARCH_CIRCUIT_BREAKER.record_failure(source, str(error))
+            if raise_errors:
+                raise error
             return []
         finally:
             self._record_search_metric(source, "external_calls")
@@ -743,6 +793,8 @@ class SearchHandler:
         if results is None:
             if self._search_circuit_breaker_enabled:
                 SEARCH_CIRCUIT_BREAKER.record_failure(source, "查询返回空异常")
+            if raise_errors:
+                raise RuntimeError("查询返回空异常")
             return []
 
         if self._search_circuit_breaker_enabled:
@@ -774,13 +826,110 @@ class SearchHandler:
             apply_platform_rules: bool = True,
             force_refresh: bool = False,
             result_limit: Optional[int] = None,
+            progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, List[Dict]]:
-        """并发查询相互独立的来源；各来源内部仍遵守限流与熔断。"""
+        """并发查询相互独立的来源；各来源内部仍遵守限流与熔断，实时反馈进度与渠道详情。"""
         ordered_sources = list(dict.fromkeys(sources or []))
         search_label = self._search_label(mediainfo, media_type, season)
         results: Dict[str, List[Dict]] = {source: [] for source in ordered_sources}
         if not ordered_sources:
             return results
+
+        channels_lock = threading.Lock()
+        channels_state = {
+            source: {
+                "key": source,
+                "name": self.get_source_display_name(source),
+                "status": "pending",  # pending, searching, success, failed, timeout, circuit_break, skipped
+                "count": 0,
+                "elapsed_ms": 0,
+                "error": "",
+                "started_at": 0,
+            }
+            for source in ordered_sources
+        }
+
+        # 检查是否有熔断保护渠道
+        for source in ordered_sources:
+            if self._search_circuit_breaker_enabled and not SEARCH_CIRCUIT_BREAKER.can_execute(source):
+                rem = SEARCH_CIRCUIT_BREAKER.get_cooldown_remaining(source)
+                channels_state[source]["status"] = "circuit_break"
+                channels_state[source]["error"] = f"熔断冷却中({rem:.0f}s)"
+
+        def generate_search_summary(active: bool = True) -> Tuple[str, str]:
+            completed_channels = [
+                c for c in channels_state.values()
+                if c["status"] in {"success", "failed", "timeout", "circuit_break", "skipped"}
+            ]
+            searching_channels = [
+                c for c in channels_state.values()
+                if c["status"] == "searching"
+            ]
+            total = len(ordered_sources)
+            completed = len(completed_channels)
+            total_results = sum(c["count"] for c in channels_state.values())
+
+            parts = []
+            for c in channels_state.values():
+                name = c["name"]
+                status = c["status"]
+                if status == "success":
+                    parts.append(f"{name}:{c['count']}")
+                elif status == "failed":
+                    parts.append(f"{name}:失败")
+                elif status == "timeout":
+                    parts.append(f"{name}:超时")
+                elif status == "circuit_break":
+                    parts.append(f"{name}:熔断")
+                elif status == "skipped":
+                    parts.append(f"{name}:跳过")
+
+            channel_brief = " ".join(parts)
+            if active:
+                phase_text = f"搜索候选资源 ({completed}/{total})"
+            else:
+                if total_results > 0:
+                    phase_text = f"搜索完成 · 找到 {total_results} 条候选"
+                else:
+                    phase_text = "未找到候选资源"
+
+            return phase_text, channel_brief
+
+        def emit_progress(active: bool = True):
+            with channels_lock:
+                now_mono = time.monotonic()
+                for s_name, c_data in channels_state.items():
+                    if c_data["status"] == "searching":
+                        st = source_started_at.get(s_name)
+                        if st:
+                            c_data["elapsed_ms"] = int((now_mono - st) * 1000)
+                phase_text, brief = generate_search_summary(active=active)
+                completed_count = sum(
+                    1 for c in channels_state.values()
+                    if c["status"] in {"success", "failed", "timeout", "circuit_break", "skipped"}
+                )
+                total_results = sum(c["count"] for c in channels_state.values())
+                channels_copy = copy.deepcopy(list(channels_state.values()))
+
+            progress_data = {
+                "active": active,
+                "total": len(ordered_sources),
+                "completed": completed_count,
+                "total_results": total_results,
+                "summary": phase_text,
+                "brief": brief,
+                "channels": channels_copy,
+            }
+            if progress_callback:
+                try:
+                    progress_callback(progress_data)
+                except Exception as cb_err:
+                    logger.debug(f"搜索进度回调执行异常: {cb_err}")
+            elif subscribe is not None:
+                self._dispatch_default_search_progress(subscribe, progress_data)
+
+        # 触发初始进度
+        emit_progress(active=True)
 
         workers = min(max(1, self._search_concurrency), len(ordered_sources))
         executor = ThreadPoolExecutor(
@@ -797,6 +946,11 @@ class SearchHandler:
             started_at = time.monotonic()
             with source_started_lock:
                 source_started_at[source] = started_at
+            with channels_lock:
+                if channels_state[source]["status"] != "circuit_break":
+                    channels_state[source]["status"] = "searching"
+                    channels_state[source]["started_at"] = time.time()
+            emit_progress(active=True)
             return self.search_single_source(
                 source,
                 mediainfo,
@@ -808,6 +962,7 @@ class SearchHandler:
                 apply_platform_rules,
                 force_refresh,
                 result_limit,
+                raise_errors=True,
             )
 
         try:
@@ -835,6 +990,11 @@ class SearchHandler:
                 for f in timed_out_futures:
                     source = futures[f]
                     abandoned_sources.add(source)
+                    elapsed = int((now - started_snapshot.get(source, now)) * 1000)
+                    with channels_lock:
+                        channels_state[source]["status"] = "timeout"
+                        channels_state[source]["elapsed_ms"] = elapsed
+                        channels_state[source]["error"] = "响应超时"
                     logger.debug(
                         f"⏰ [{search_label}] 搜索渠道 {source.upper()} 响应超时，已主动停止等待"
                     )
@@ -845,6 +1005,9 @@ class SearchHandler:
                         )
                     f.cancel()
                     pending.discard(f)
+
+                if timed_out_futures:
+                    emit_progress(active=bool(pending))
 
                 if not pending:
                     break
@@ -863,26 +1026,49 @@ class SearchHandler:
                 done, pending = wait(pending, timeout=wait_step, return_when=FIRST_COMPLETED)
                 for f in done:
                     source = futures[f]
+                    elapsed = int((time.monotonic() - started_snapshot.get(source, time.monotonic())) * 1000)
                     try:
-                        results[source] = f.result() or []
+                        res = f.result() or []
+                        results[source] = res
+                        with channels_lock:
+                            channels_state[source]["status"] = "success"
+                            channels_state[source]["count"] = len(res)
+                            channels_state[source]["elapsed_ms"] = elapsed
+                    except RequestGateCooldown as error:
+                        with channels_lock:
+                            channels_state[source]["status"] = "failed"
+                            channels_state[source]["elapsed_ms"] = elapsed
+                            channels_state[source]["error"] = f"风控冷却: {error}"
                     except Exception as error:
-                        logger.error(
-                            f"[{search_label}] 搜索源 {source} 并发查询失败：{error}"
-                        )
+                        err_msg = str(error)
+                        status = "circuit_break" if "熔断" in err_msg else "failed"
+                        with channels_lock:
+                            channels_state[source]["status"] = status
+                            channels_state[source]["elapsed_ms"] = elapsed
+                            channels_state[source]["error"] = err_msg
+                if done:
+                    emit_progress(active=bool(pending))
         finally:
-            # 正式同步的 Provider 由插件持有，不能因单个媒体停止而关闭共享会话。
             if pending or stopped:
                 for f in pending:
                     source = futures.get(f)
                     if source:
                         abandoned_sources.add(source)
+                        with channels_lock:
+                            if channels_state[source]["status"] in {"pending", "searching"}:
+                                channels_state[source]["status"] = "skipped" if stopped else "failed"
                     f.cancel()
                 if abandoned_sources:
                     logger.info(
                         f"⏹️ [{search_label}] 搜索流程结束，已停止等待未完成的渠道：{', '.join(sorted(s.upper() for s in abandoned_sources))}"
                     )
-            # 绝不阻塞主线程等待后台慢任务，立即释放
             executor.shutdown(wait=False, cancel_futures=True)
+
+        with channels_lock:
+            for s in ordered_sources:
+                if channels_state[s]["status"] in {"pending", "searching"}:
+                    channels_state[s]["status"] = "skipped" if stopped else "failed"
+        emit_progress(active=False)
 
         if not stopped:
             logger.debug(

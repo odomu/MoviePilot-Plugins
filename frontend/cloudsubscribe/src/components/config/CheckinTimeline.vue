@@ -222,8 +222,7 @@ function providerStatus(provider) {
   }
   const today = dateColumns.value[0]?.key
   const record = historyState(provider).items.find((item) => {
-    const parsed = new Date(item.executed_at)
-    return !Number.isNaN(parsed.getTime()) && localDateKey(parsed) === today
+    return String(item.executed_at || "").slice(0, 10) === today;
   })
   if (!record) return null
   const already =
@@ -255,27 +254,25 @@ function latestSigninDays(provider) {
 }
 
 function buildSigninDays(provider) {
-  const state = historyState(provider);
-  const items = state.items || [];
-  const record = items[0];
-  if (record && record.signin_days !== undefined && record.signin_days !== null && record.signin_days !== "") {
-    const val = Number(record.signin_days);
-    if (Number.isFinite(val) && val > 0) return `${val}天`;
+  // 签到天数完全由后端统一计算下发，前端不处理时间计算
+  const topDays = histories[provider.key]?.signin_days;
+  if (topDays !== undefined && topDays !== null && topDays !== "") {
+    const val = Number(topDays);
+    if (Number.isFinite(val) && val > 0) {
+      return `${val}天`;
+    }
   }
-  const signedDates = new Set();
-  items.forEach((item) => {
-    if (item && item.success) {
-      const parsed = new Date(item.executed_at);
-      if (!Number.isNaN(parsed.getTime())) {
-        signedDates.add(localDateKey(parsed));
-      } else {
-        signedDates.add(item.id || item.executed_at || Math.random());
+
+  const items = historyState(provider).items || [];
+  for (const item of items) {
+    if (item?.signin_days !== undefined && item?.signin_days !== null && item?.signin_days !== "") {
+      const val = Number(item.signin_days);
+      if (Number.isFinite(val) && val > 0) {
+        return `${val}天`;
       }
     }
-  });
-  if (signedDates.size > 0) {
-    return `${signedDates.size}天`;
   }
+
   const status = providerStatus(provider);
   if (status && (status.tone === "already" || status.tone === "success")) {
     return "1天";
@@ -342,9 +339,8 @@ function timelineDays(provider) {
 function buildTimelineDays(provider) {
   const recordsByDay = new Map()
   for (const item of historyState(provider).items) {
-    const parsed = new Date(item.executed_at)
-    if (Number.isNaN(parsed.getTime())) continue
-    const key = localDateKey(parsed)
+    const key = String(item.executed_at || "").slice(0, 10);
+    if (!key) continue;
     if (!recordsByDay.has(key)) recordsByDay.set(key, [])
     recordsByDay.get(key).push(item)
   }
@@ -462,6 +458,7 @@ function applyHistory(providerKey, data) {
     total: Number(data.total || 0),
     items: Array.isArray(data.items) ? data.items : [],
     current_points: data.current_points ?? null,
+    signin_days: data.signin_days ?? null,
     loaded: true,
     error: "",
   };

@@ -304,6 +304,19 @@ class TelevisionSyncProcessor(OwnerDelegator):
                 55,
             )
             if not manual_resources:
+                def on_tv_search_progress(data: Dict[str, Any]) -> None:
+                    completed = data.get("completed", 0)
+                    total = max(1, data.get("total", 1))
+                    current_prog = 45 + int((completed / total) * 20)  # 45% -> 65%
+                    self._set_task_phase(
+                        subscribe,
+                        data.get("summary") or "搜索缺失剧集",
+                        current_prog,
+                        search_active=data.get("active", False),
+                        search_channels=data.get("channels", []),
+                        search_total_results=data.get("total_results", 0),
+                    )
+
                 prefetched_results = self._search_handler.search_sources(
                     sources=enabled_sources,
                     mediainfo=mediainfo,
@@ -312,6 +325,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                     target_episodes=missing_episodes,
                     target_episode_air_dates=target_episode_air_dates,
                     subscribe=subscribe,
+                    progress_callback=on_tv_search_progress,
                 )
             resource_batches = self._build_transfer_resource_batches(
                 enabled_sources, prefetched_results
@@ -354,7 +368,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                         break
                     self._set_task_phase(
                         subscribe,
-                        f"检查候选资源 {resource_index + 1}/{len(candidate_resources)}",
+                        f"校验候选资源 ({resource_index + 1}/{len(candidate_resources)})",
                         72 + int((resource_index + 1) / len(candidate_resources) * 16),
                     )
 
@@ -610,10 +624,18 @@ class TelevisionSyncProcessor(OwnerDelegator):
 
                                 is_upgrade = False
 
-                                target_dir, target_name = self._platform_target(
-                                    self._CLOUD_MEDIA_ROOT, subscribe, mediainfo,
-                                    file_name, season, episode
-                                )
+                                organize_enabled = getattr(self, "_organize_after_transfer", True)
+                                if organize_enabled:
+                                    target_dir, target_name = self._platform_target(
+                                        self._CLOUD_MEDIA_ROOT, subscribe, mediainfo,
+                                        file_name, season, episode
+                                    )
+                                else:
+                                    target_dir = self._resource_staging_dir(
+                                        str(matched_file.get("url") or share_url),
+                                        matched_file,
+                                    )
+                                    target_name = file_name
                                 matched_items.append({
                                     "file": matched_file,
                                     "resource": resource_by_url.get(

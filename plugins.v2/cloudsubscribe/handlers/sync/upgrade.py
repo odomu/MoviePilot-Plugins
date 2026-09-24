@@ -14,9 +14,9 @@ from ...core import OwnerDelegator
 
 class UpgradeService(OwnerDelegator):
     def _set_upgrade_phase(
-            self, subscribe, phase: str, progress: int
+            self, subscribe, phase: str, progress: int, **extra_kwargs
     ) -> None:
-        self._set_task_phase(subscribe, phase, progress)
+        self._set_task_phase(subscribe, phase, progress, **extra_kwargs)
 
     def _process_tv_subscribe_upgrade(
             self,
@@ -245,6 +245,19 @@ class UpgradeService(OwnerDelegator):
                 if manual_resources else {}
             )
             if not manual_resources:
+                def on_upgrade_search_progress(data: Dict[str, Any]) -> None:
+                    completed = data.get("completed", 0)
+                    total = max(1, data.get("total", 1))
+                    current_prog = 40 + int((completed / total) * 20)  # 40% -> 60%
+                    self._set_upgrade_phase(
+                        subscribe,
+                        data.get("summary") or "搜索候选资源",
+                        current_prog,
+                        search_active=data.get("active", False),
+                        search_channels=data.get("channels", []),
+                        search_total_results=data.get("total_results", 0),
+                    )
+
                 prefetched_results = self._search_handler.search_sources(
                     sources=enabled_sources,
                     mediainfo=mediainfo,
@@ -253,6 +266,7 @@ class UpgradeService(OwnerDelegator):
                     target_episodes=episodes_to_search,
                     target_episode_air_dates=target_episode_air_dates,
                     subscribe=subscribe,
+                    progress_callback=on_upgrade_search_progress,
                 )
             resource_batches = self._build_transfer_resource_batches(
                 enabled_sources, prefetched_results

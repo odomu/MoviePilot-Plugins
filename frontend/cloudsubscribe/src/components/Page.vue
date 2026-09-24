@@ -9,6 +9,15 @@
           class="header-action"
           variant="text"
           size="small"
+          prepend-icon="mdi-coffee-outline"
+          title="赞赏支持"
+          @click="rewardVisible = true">
+          赞赏支持
+        </v-btn>
+        <v-btn
+          class="header-action"
+          variant="text"
+          size="small"
           prepend-icon="mdi-cog-outline"
           title="配置"
           @click="emit('switch')">
@@ -134,150 +143,120 @@
       :initial-mode="manualInitialMode"
       :initial-media="manualInitialMedia"
       @started="manualStarted" />
-    <v-dialog v-model="searchConfirmVisible" max-width="440" persistent>
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">{{ immediateSearchDialogTitle }}</v-card-title>
-        <v-card-text>
-          <template v-if="selectedHistoryCount">
-            确认立即搜索所选 {{ selectedHistoryCount }} 个历史媒体？
-            <v-alert type="info" variant="tonal" density="compact" class="mt-3">
-              本次仅搜索所选历史记录，不会搜索其他订阅。
-            </v-alert>
-          </template>
-          <template v-else>确认立即搜索全部订阅？</template>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" :disabled="searchStarting" @click="searchConfirmVisible = false">取消</v-btn>
-          <v-btn color="primary" :loading="searchStarting" @click="confirmImmediateSearch">
-            {{ selectedHistoryCount ? "搜索所选" : "搜索全部" }}
-          </v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-    <v-dialog v-model="retryVisible" max-width="440" persistent>
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">恢复历史任务</v-card-title>
-        <v-card-text>
-          确认恢复“{{ historyUpgradeLabel(retryingRecord ? { records: [retryingRecord] } : null) }}”的转存任务？
-          <v-alert type="info" variant="tonal" density="compact" class="mt-3">
-            将重新检查目标文件、本地缓存和原分享，必要时重新执行跨盘转存及后处理。
-          </v-alert>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" :disabled="Boolean(retryingHistoryKey)" @click="retryVisible = false">取消</v-btn>
-          <v-btn color="primary" :loading="Boolean(retryingHistoryKey)" @click="retryHistory">确认恢复</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-    <v-dialog v-model="upgradeVisible" max-width="440" persistent>
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">确认历史洗版</v-card-title>
-        <v-card-text>
-          确认洗版“{{ historyUpgradeLabel(upgradingPayload) }}”？
-          <v-alert type="warning" variant="tonal" density="compact" class="mt-3">
-            将继续使用该条历史记录作为现有版本基线，并按当前洗版设置搜索和比较候选资源。
-          </v-alert>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" :disabled="Boolean(upgradingHistoryKey)" @click="upgradeVisible = false">取消</v-btn>
-          <v-btn color="warning" :loading="Boolean(upgradingHistoryKey)" @click="confirmHistoryUpgrade">确认洗版</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-    <StopTasksDialog
+    <ConfirmDialog
+      v-model="searchConfirmVisible"
+      :title="immediateSearchDialogTitle"
+      :loading="searchStarting"
+      :confirm-text="selectedHistoryCount ? '搜索所选' : '搜索全部'"
+      persistent
+      @confirm="confirmImmediateSearch">
+      <template v-if="selectedHistoryCount">
+        确认立即搜索所选 {{ selectedHistoryCount }} 个历史媒体？
+        <v-alert type="info" variant="tonal" density="compact" class="mt-3">
+          本次仅搜索所选历史记录，不会搜索其他订阅。
+        </v-alert>
+      </template>
+      <template v-else>确认立即搜索全部订阅？</template>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-model="retryVisible"
+      title="恢复历史任务"
+      alert-text="将重新检查目标文件、本地缓存和原分享，必要时重新执行跨盘转存及后处理。"
+      confirm-text="确认恢复"
+      :loading="Boolean(retryingHistoryKey)"
+      persistent
+      @confirm="retryHistory">
+      确认恢复“{{ historyUpgradeLabel(retryingRecord ? {records: [retryingRecord]} : null) }}”的转存任务？
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-model="upgradeVisible"
+      title="确认历史洗版"
+      alert-text="将继续使用该条历史记录作为现有版本基线，并按当前洗版设置搜索和比较候选资源。"
+      alert-type="warning"
+      confirm-text="确认洗版"
+      confirm-color="warning"
+      :loading="Boolean(upgradingHistoryKey)"
+      persistent
+      @confirm="confirmHistoryUpgrade">
+      确认洗版“{{ historyUpgradeLabel(upgradingPayload) }}”？
+    </ConfirmDialog>
+    <ConfirmDialog
       v-if="stopVisible"
       v-model="stopVisible"
-      :task="stoppingTask"
-      :task-count="stoppableTaskCount"
+      :title="stoppingTask ? '停止任务' : '停止全部任务'"
+      icon="mdi-stop-circle-outline"
+      icon-color="warning"
+      alert-type="warning"
+      :alert-text="['downloading', 'transferring', 'postprocessing'].includes(stoppingTask?.status)
+        ? '将停止插件文件后处理；离线任务、已下载文件和STRM均会保留。'
+        : '任务将在安全节点停止，已完成的处理不会回退。'"
+      confirm-text="确认停止"
+      confirm-color="warning"
       :loading="stopping"
-      @confirm="stopConfirmed" />
+      persistent
+      @confirm="stopConfirmed">
+      <div v-if="stoppingTask">确认停止“{{ stoppingTask.title || "此任务" }}”？</div>
+      <div v-else-if="stoppableTaskCount > 0">确认停止当前 {{ stoppableTaskCount }} 个等待或运行中的任务？</div>
+      <div v-else>确认停止当前订阅任务？</div>
+    </ConfirmDialog>
     <v-snackbar v-model="messageVisible" :color="messageType" location="top" timeout="3500" variant="elevated">
       {{ message }}
       <template #actions>
         <v-btn icon="mdi-close" size="small" variant="text" @click="messageVisible = false" />
       </template>
     </v-snackbar>
-    <v-dialog v-model="clearVisible" max-width="420">
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">清空历史记录</v-card-title>
-        <v-card-text>
-          <div class="mb-2">确认清理本插件的转存历史？</div>
-          <v-checkbox
-            v-model="forceClearHistory"
-            label="强制清理全部历史记录（含处理中）"
-            color="error"
-            density="compact"
-            hide-details />
-          <v-checkbox
-            v-model="clearPointsHistory"
-            label="同时清空 HDHive/Dian115 已花费积分记录"
-            color="warning"
-            density="compact"
-            hide-details />
-          <v-alert :type="forceClearHistory ? 'warning' : 'info'" variant="tonal" density="compact" class="mt-2">
-            {{
-              forceClearHistory
-                ? "已勾选：成功、失败、处理中和下载中的历史都会删除；网盘文件、STRM、离线任务及后处理任务均会保留。"
-                : "未勾选：仅清理成功或失败的终态历史，处理中和下载中的记录会保留。"
-            }}
-          </v-alert>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" @click="clearVisible = false">取消</v-btn>
-          <v-btn color="error" :loading="clearing" @click="clearHistory">确认清空</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-    <CacheClearDialog v-if="cacheVisible" v-model="cacheVisible" :loading="clearingCache" @confirm="clearCache" />
-    <v-dialog v-model="deleteVisible" max-width="420">
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">删除历史记录</v-card-title>
-        <v-card-text>
-          <div v-if="deletingGroupCount" class="mb-2">
-            确认删除所选 {{ deletingGroupCount }} 个汇总项中的 {{ deletingRecords.length }} 条转存历史？
-          </div>
-          <div v-else class="mb-2">确认删除“{{ deletingRecord?.file_name || "此记录" }}”的转存历史？</div>
-          <v-checkbox
-            v-model="deleteLinkedFiles"
-            label="同时删除关联的网盘文件和STRM"
-            color="error"
-            density="compact"
-            hide-details />
-          <v-alert :type="deleteLinkedFiles ? 'warning' : 'info'" variant="tonal" density="compact" class="mt-2">
-            {{
-              deleteLinkedFiles
-                ? "已勾选：将按此记录的精确路径删除网盘文件（移入回收站）和本地STRM；其他版本不受影响。"
-                : "未勾选：仅删除插件历史记录；网盘文件和STRM均会保留。"
-            }}
-          </v-alert>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" @click="deleteVisible = false">取消</v-btn>
-          <v-btn color="error" :loading="Boolean(deletingHistoryKey)" @click="deleteHistory">确认删除</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-    <v-dialog v-model="notifyVisible" max-width="420">
-      <v-card rounded="lg">
-        <v-card-title class="text-subtitle-1">补发汇总通知</v-card-title>
-        <v-card-text>
-          将为“{{ notifyingSummaryTitle || notifyingRecord?.file_name || "此记录" }}”重新发送入库通知和Webhook。
-          <v-alert v-if="notifyError" type="error" variant="tonal" density="compact" class="mt-3">
-            {{ notifyError }}
-          </v-alert>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" @click="notifyVisible = false">取消</v-btn>
-          <v-btn color="primary" :loading="Boolean(notifyingHistoryKey)" @click="notifyHistory">确认发送</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
+    <ConfirmDialog
+      v-if="clearVisible"
+      v-model="clearVisible"
+      title="清空历史记录"
+      icon="mdi-delete-sweep-outline"
+      icon-color="error"
+      body="确认清理本插件的转存历史？此操作不可逆。"
+      :options="[
+        { key: 'forceClear', label: '强制清理全部历史记录（含处理中）', color: 'error' },
+        { key: 'clearPoints', label: '同时清空 HDHive/Dian115 已花费积分记录', color: 'warning' },
+      ]"
+      confirm-text="确认清空"
+      confirm-color="error"
+      :loading="clearing"
+      @confirm="clearHistory" />
+    <ConfirmDialog
+      v-if="cacheVisible"
+      v-model="cacheVisible"
+      title="清理缓存"
+      icon="mdi-cached"
+      icon-color="primary"
+      :options="CACHE_CATEGORIES"
+      :default-selected="['search']"
+      show-select-all
+      show-selected-count
+      confirm-text="确认清理"
+      :loading="clearingCache"
+      @confirm="clearCache" />
+    <ConfirmDialog
+      v-if="deleteVisible"
+      v-model="deleteVisible"
+      title="删除历史记录"
+      icon="mdi-delete-outline"
+      icon-color="error"
+      :body="deletingGroupCount
+        ? `确认删除所选 ${deletingGroupCount} 个汇总项中的 ${deletingRecords.length} 条转存历史？`
+        : `确认删除“${deletingRecord?.file_name || '此记录'}”的转存历史？`"
+      :options="[{ key: 'deleteLinked', label: '同时删除关联的网盘文件和STRM', color: 'error' }]"
+      confirm-text="确认删除"
+      confirm-color="error"
+      :loading="Boolean(deletingHistoryKey)"
+      @confirm="deleteHistory" />
+    <ConfirmDialog
+      v-model="notifyVisible"
+      title="补发汇总通知"
+      confirm-text="确认发送"
+      :error-text="notifyError"
+      :loading="Boolean(notifyingHistoryKey)"
+      @confirm="notifyHistory">
+      将为“{{ notifyingSummaryTitle || notifyingRecord?.file_name || "此记录" }}”重新发送入库通知和Webhook。
+    </ConfirmDialog>
+    <RewardDialog v-model="rewardVisible" />
   </div>
 </template>
 
@@ -288,18 +267,19 @@ import HistoryTable from "./dashboard/HistoryTable.vue";
 import StatsGrid from "./dashboard/StatsGrid.vue";
 import {useHistoryPageData} from "../composables/usePageData.js";
 import {useRuntimeData} from "../composables/useRuntimeData.js";
-import {useCacheActions} from "../composables/useCacheActions.js";
+import {CACHE_CATEGORIES, useCacheActions} from "../composables/useCacheActions.js";
 
-const CacheClearDialog = defineAsyncComponent(() => import("./dialogs/CacheClearDialog.vue"))
+const ConfirmDialog = defineAsyncComponent(() => import("./dialogs/ConfirmDialog.vue"));
 const ManualResourceDialog = defineAsyncComponent(() => import("./dialogs/ManualResourceDialog.vue"))
 const OfflineTasksDialog = defineAsyncComponent(() => import("./dialogs/OfflineTasksDialog.vue"))
-const StopTasksDialog = defineAsyncComponent(() => import("./dialogs/StopTasksDialog.vue"))
+const RewardDialog = defineAsyncComponent(() => import("./dialogs/RewardDialog.vue"));
 
 const props = defineProps({
   api: { type: [Object, Function], required: true },
 })
 const emit = defineEmits(["close", "switch", "action"])
 const api = props.api
+const rewardVisible = ref(false);
 const message = ref(""),
   messageType = ref("success"),
   messageVisible = ref(false),
@@ -481,8 +461,6 @@ async function stopConfirmed() {
 }
 
 function openClearHistory() {
-  forceClearHistory.value = false
-  clearPointsHistory.value = false;
   clearVisible.value = true
 }
 
@@ -507,13 +485,11 @@ async function playHistory(itemId) {
   }
 }
 
-async function clearHistory() {
+async function clearHistory({forceClear, clearPoints}) {
   clearing.value = true
   try {
-    const resultMessage = await clearHistoryRequest(forceClearHistory.value, clearPointsHistory.value);
+    const resultMessage = await clearHistoryRequest(forceClear, clearPoints);
     clearVisible.value = false
-    forceClearHistory.value = false
-    clearPointsHistory.value = false;
     notify(resultMessage)
   } catch (e) {
     notify(e.message || "清空失败", "error")
@@ -607,7 +583,6 @@ function confirmDeleteHistory(record) {
   deletingRecord.value = record
   deletingRecords.value = []
   deletingGroupCount.value = 0
-  deleteLinkedFiles.value = false
   deleteVisible.value = true
 }
 
@@ -622,24 +597,22 @@ function confirmDeleteGroups({ records, groupCount }) {
   deletingRecord.value = null
   deletingRecords.value = deletableRecords
   deletingGroupCount.value = Number(groupCount || 0)
-  deleteLinkedFiles.value = false
   deleteVisible.value = true
 }
 
-async function deleteHistory() {
+async function deleteHistory({deleteLinked}) {
   const batch = deletingGroupCount.value > 0
   const record = deletingRecord.value
   if (!batch && !record) return
   deletingHistoryKey.value = batch ? "batch" : [record.time, record.share_url, record.file_name].join("|")
   try {
     const resultMessage = batch
-      ? await deleteHistoryBatchRequest(deletingRecords.value, deleteLinkedFiles.value)
-      : await deleteHistoryRequest(record, deleteLinkedFiles.value)
+      ? await deleteHistoryBatchRequest(deletingRecords.value, deleteLinked)
+      : await deleteHistoryRequest(record, deleteLinked)
     deleteVisible.value = false
     deletingRecord.value = null
     deletingRecords.value = []
     deletingGroupCount.value = 0
-    deleteLinkedFiles.value = false
     notify(resultMessage)
   } catch (error) {
     notify(error.message || "删除失败", "error")
@@ -825,6 +798,12 @@ async function notifyHistory() {
   overflow: hidden !important;
 }
 
+.dialog-card {
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.16) !important;
+}
+
+
+
 @media (max-width: 600px) {
   :global(.v-overlay__content:has(.cloud-subscribe-page)) {
     width: 100vw !important;
@@ -887,14 +866,17 @@ async function notifyHistory() {
 
   .page-actions {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     width: 100%;
-    gap: 6px;
+    gap: 8px;
   }
 
   .page-actions :deep(.v-btn) {
     min-width: 0;
-    padding-inline: 8px;
+    height: 34px;
+    padding-inline: 10px;
+    font-size: 13px;
+    border-radius: 8px;
   }
 }
 </style>

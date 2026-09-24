@@ -131,10 +131,16 @@ class TianyiShareService:
             share_id = str(info.get("shareId") or "")
             cached: dict[str, dict[str, Any]] = {}
             files = []
-            stack = [str(info.get("fileId") or "-11")]
+            stack = [(str(info.get("fileId") or "-11"), "")]
             while stack:
-                file_list, folder_list = self._list_directory(info, stack.pop())
-                stack.extend(str(item.get("id") or item.get("fileId") or "") for item in folder_list)
+                folder_id, parent_path = stack.pop()
+                file_list, folder_list = self._list_directory(info, folder_id)
+                for folder in folder_list:
+                    sub_id = str(folder.get("id") or folder.get("fileId") or "")
+                    sub_name = str(folder.get("name") or folder.get("fileName") or "").strip()
+                    if sub_id:
+                        sub_path = f"{parent_path}/{sub_name}".strip("/") if parent_path else sub_name
+                        stack.append((sub_id, sub_path))
                 for item in file_list:
                     file_id = str(item.get("id") or item.get("fileId") or "")
                     name = str(item.get("name") or item.get("fileName") or "")
@@ -147,6 +153,9 @@ class TianyiShareService:
                         "size": int(item.get("size") or item.get("fileSize") or 0),
                         "md5": str(item.get("md5") or ""),
                     }
+                    if parent_path:
+                        normalized["parent_path"] = parent_path
+                        normalized["relative_path"] = f"{parent_path}/{name}"
                     cached[file_id] = item
                     files.append(normalized)
             self._share_items[share_id] = cached

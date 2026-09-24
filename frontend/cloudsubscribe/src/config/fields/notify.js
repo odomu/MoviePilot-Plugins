@@ -30,7 +30,7 @@ export function createNotifySection(options) {
             hint: "延迟触发入库通知秒数",
             type: "number",
             min: 0,
-            cols: 4,
+            cols: 6,
             show: enabled("media_server_refresh_enabled"),
           },
           {
@@ -39,7 +39,7 @@ export function createNotifySection(options) {
             type: "textarea",
             placeholder: "/媒体服务器/strm#/strm",
             hint: "每行：媒体服务器路径#本地路径",
-            cols: 12,
+            cols: 6,
             show: enabled("media_server_refresh_enabled"),
           },
         ],

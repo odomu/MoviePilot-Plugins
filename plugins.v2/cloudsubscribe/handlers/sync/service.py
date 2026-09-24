@@ -787,6 +787,7 @@ class SyncHandler:
         direct_cloud_resource = (
                 cloud_resource and self._is_direct_cloud_resource_url(share_url)
         )
+        organize_enabled = getattr(self, "_organize_after_transfer", True)
         rename_items = {}
         for item in selected_items:
             file_item = item["file"]
@@ -794,7 +795,7 @@ class SyncHandler:
             rename_items[str(file_item["id"])] = {
                 "sha1": file_item.get("sha1"),
                 "target_name": (
-                    None if self._is_offline_url(item_url) else item["target_name"]
+                    None if (not organize_enabled or self._is_offline_url(item_url)) else item["target_name"]
                 ),
                 "url": item_url,
             }
@@ -838,11 +839,17 @@ class SyncHandler:
                     if batch_stop_requested():
                         return file_id, None
                     try:
+                        item_staging_dir = self._resource_staging_dir(
+                            str(item["file"].get("url") or share_url), item["file"]
+                        )
+                        save_target_name = (
+                            item["target_name"] if organize_enabled else item["file"].get("name")
+                        )
                         success = self._transfer_file(
                             str(item["file"].get("url") or share_url),
                             item["file"],
-                            self._cloud_transfer_path,
-                            item["target_name"],
+                            item_staging_dir if not organize_enabled else self._cloud_transfer_path,
+                            save_target_name,
                             str(item["file"].get("sha1") or ""),
                             parent_task_id=parent_task_id,
                             stop_requested=batch_stop_requested,
@@ -912,76 +919,97 @@ class SyncHandler:
             else:
                 processed_items = selected_items
                 pre_existing_ids = set()
-                # 转存前预检转存目录：若转存路径下已存在待转存文件，直接复用并跳过向网盘发起重复转存，防止网盘报错或重复转存卡死
-                staging_valid, staging_index = self._cloud_directory_snapshot(self._cloud_transfer_path)
-                if staging_valid and staging_index:
-                    for item in selected_items:
-                        file_id = str(item["file"]["id"])
-                        target_name = str(item.get("target_name") or "").strip()
-                        raw_name = str(item["file"].get("name") or "").strip()
-                        file_size = int(item["file"].get("size") or 0)
-                        file_sha1 = str(item["file"].get("sha1") or "").upper()
-                        matched_staging_file = None
-                        if target_name and target_name in staging_index:
-                            matched_staging_file = staging_index[target_name]
-                        elif raw_name and raw_name in staging_index:
-                            matched_staging_file = staging_index[raw_name]
-                        elif file_sha1:
-                            matched_staging_file = next(
-                                (f for f in staging_index.values() if
-                                 str(getattr(f, "sha1", "") or "").upper() == file_sha1),
-                                None
-                            )
-                        elif file_size > 0:
-                            matched_staging_file = next(
-                                (f for f in staging_index.values() if int(getattr(f, "size", 0) or 0) == file_size and (
-                                        target_name and getattr(f, "name", "").startswith(Path(target_name).stem)
-                                        or raw_name and getattr(f, "name", "").startswith(Path(raw_name).stem)
-                                )),
-                                None
-                            )
-                        if matched_staging_file:
-                            pre_existing_ids.add(file_id)
-                            item["file"]["staging_name"] = matched_staging_file.name
-                            logger.debug(
-                                f"转存目录已存在目标资源，复用并跳过重复转存：{self._cloud_transfer_path}/{matched_staging_file.name}"
-                            )
+                share_transferred = False
+                if not organize_enabled and hasattr(self._share_transfer, "transfer_share"):
+                    try:
+                        logger.info(
+                            f"转存后整理已关闭，执行整包分享转存以保留母文件夹与目录结构：{share_url} -> {self._cloud_transfer_path}"
+                        )
+                        share_success = bool(self._timed_sync_call(
+                            "share_transfer",
+                            self._share_transfer.transfer_share,
+                            share_url=share_url,
+                            save_path=self._cloud_transfer_path,
+                        ))
+                        if share_success:
+                            success_ids = list(file_ids)
+                            failed_ids = []
+                            share_transferred = True
+                    except Exception as share_err:
+                        logger.warning(f"整包分享转存未成功，将尝试按文件列表转存：{share_err}")
 
-                remaining_file_ids = [fid for fid in file_ids if fid not in pre_existing_ids]
-                if remaining_file_ids:
-                    success_ids, failed_ids = self._timed_sync_call(
-                        "share_transfer",
-                        self._share_transfer.transfer_files_batch,
-                        share_url=share_url,
-                        file_ids=remaining_file_ids,
-                        save_path=self._cloud_transfer_path,
-                        batch_size=self._batch_size,
-                        batch_interval=self._batch_interval,
-                        risk_cooldown=self._transfer_risk_cooldown,
-                        rename_items=rename_items,
-                    )
-                else:
-                    success_ids, failed_ids = [], []
+                if not share_transferred:
+                    # 转存前预检转存目录：若转存路径下已存在待转存文件，直接复用并跳过向网盘发起重复转存，防止网盘报错或重复转存卡死
+                    staging_valid, staging_index = self._cloud_directory_snapshot(self._cloud_transfer_path)
+                    if staging_valid and staging_index:
+                        for item in selected_items:
+                            file_id = str(item["file"]["id"])
+                            target_name = str(item.get("target_name") or "").strip()
+                            raw_name = str(item["file"].get("name") or "").strip()
+                            file_size = int(item["file"].get("size") or 0)
+                            file_sha1 = str(item["file"].get("sha1") or "").upper()
+                            matched_staging_file = None
+                            if target_name and target_name in staging_index:
+                                matched_staging_file = staging_index[target_name]
+                            elif raw_name and raw_name in staging_index:
+                                matched_staging_file = staging_index[raw_name]
+                            elif file_sha1:
+                                matched_staging_file = next(
+                                    (f for f in staging_index.values() if
+                                     str(getattr(f, "sha1", "") or "").upper() == file_sha1),
+                                    None
+                                )
+                            elif file_size > 0:
+                                matched_staging_file = next(
+                                    (f for f in staging_index.values() if
+                                     int(getattr(f, "size", 0) or 0) == file_size and (
+                                             target_name and getattr(f, "name", "").startswith(Path(target_name).stem)
+                                             or raw_name and getattr(f, "name", "").startswith(Path(raw_name).stem)
+                                     )),
+                                    None
+                                )
+                            if matched_staging_file:
+                                pre_existing_ids.add(file_id)
+                                item["file"]["staging_name"] = matched_staging_file.name
+                                logger.debug(
+                                    f"转存目录已存在目标资源，复用并跳过重复转存：{self._cloud_transfer_path}/{matched_staging_file.name}"
+                                )
 
-                success_ids = list(success_ids or []) + list(pre_existing_ids)
+                    remaining_file_ids = [fid for fid in file_ids if fid not in pre_existing_ids]
+                    if remaining_file_ids:
+                        success_ids, failed_ids = self._timed_sync_call(
+                            "share_transfer",
+                            self._share_transfer.transfer_files_batch,
+                            share_url=share_url,
+                            file_ids=remaining_file_ids,
+                            save_path=self._cloud_transfer_path,
+                            batch_size=self._batch_size,
+                            batch_interval=self._batch_interval,
+                            risk_cooldown=self._transfer_risk_cooldown,
+                            rename_items=rename_items,
+                        )
+                    else:
+                        success_ids, failed_ids = [], []
 
-                # 对网盘转存返回失败的项进行转存目录复核自愈（防止网盘因已存在报错等返回假失败）
-                if failed_ids:
-                    _, post_staging_index = self._cloud_directory_snapshot(self._cloud_transfer_path)
-                    recheck_success = []
-                    for fid in failed_ids:
-                        target_item = next((it for it in selected_items if str(it["file"]["id"]) == fid), None)
-                        if not target_item:
-                            continue
-                        t_name = str(target_item.get("target_name") or "")
-                        r_name = str(target_item["file"].get("name") or "")
-                        if (t_name and t_name in post_staging_index) or (r_name and r_name in post_staging_index):
-                            recheck_success.append(fid)
-                            logger.debug(f"转存虽返回失败但转存目录已核验到文件，自愈恢复：{t_name or r_name}")
-                    if recheck_success:
-                        success_ids.extend(recheck_success)
-                        recheck_set = set(recheck_success)
-                        failed_ids = [fid for fid in failed_ids if fid not in recheck_set]
+                    success_ids = list(success_ids or []) + list(pre_existing_ids)
+
+                    # 对网盘转存返回失败的项进行转存目录复核自愈（防止网盘因已存在报错等返回假失败）
+                    if failed_ids:
+                        _, post_staging_index = self._cloud_directory_snapshot(self._cloud_transfer_path)
+                        recheck_success = []
+                        for fid in failed_ids:
+                            target_item = next((it for it in selected_items if str(it["file"]["id"]) == fid), None)
+                            if not target_item:
+                                continue
+                            t_name = str(target_item.get("target_name") or "")
+                            r_name = str(target_item["file"].get("name") or "")
+                            if (t_name and t_name in post_staging_index) or (r_name and r_name in post_staging_index):
+                                recheck_success.append(fid)
+                                logger.debug(f"转存虽返回失败但转存目录已核验到文件，自愈恢复：{t_name or r_name}")
+                        if recheck_success:
+                            success_ids.extend(recheck_success)
+                            recheck_set = set(recheck_success)
+                            failed_ids = [fid for fid in failed_ids if fid not in recheck_set]
 
                 if (
                         failed_ids and not success_ids

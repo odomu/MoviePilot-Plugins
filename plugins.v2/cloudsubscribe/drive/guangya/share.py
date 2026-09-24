@@ -169,9 +169,9 @@ class GuangyaShareService:
         try:
             info, token = self._share_access(share_url)
             result = []
-            stack = [""]
+            stack = [("", "")]
             while stack:
-                parent_id = stack.pop()
+                parent_id, parent_path = stack.pop()
                 page = 1
                 while True:
                     response = self._share_files(token, parent_id, page, self.page_size)
@@ -183,10 +183,16 @@ class GuangyaShareService:
                         if not item:
                             continue
                         if item.is_directory:
-                            stack.append(item.id)
+                            dir_name = str(item.name or "").strip()
+                            sub_path = f"{parent_path}/{dir_name}".strip("/") if parent_path else dir_name
+                            stack.append((item.id, sub_path))
                         else:
                             item.playback_values["share_access_token"] = token
-                            result.append(dict(item))
+                            item_dict = dict(item)
+                            if parent_path:
+                                item_dict["parent_path"] = parent_path
+                                item_dict["relative_path"] = f"{parent_path}/{item.name}"
+                            result.append(item_dict)
                     if len(items) < self.page_size:
                         break
                     page += 1

@@ -333,7 +333,7 @@ class HDHavenClient:
                     "message": f"今日已{mode_text}，无需重复签到",
                     "signin_points": 0,
                     "points_change": 0,
-                    "signin_days": 1,
+                    "signin_days": None,
                     "status_code": 200,
                 }
             payload = resp.json() if resp.status_code in (200, 201) else {}
@@ -359,7 +359,7 @@ class HDHavenClient:
                 "signin_points": gain,
                 "points_change": gain,
                 "points_after": points_after,
-                "signin_days": 1,
+                "signin_days": None,
                 "status_code": 200,
             }
         except HDHavenError as err:
@@ -371,7 +371,7 @@ class HDHavenClient:
                     "message": f"今日已{mode_text}，无需重复签到",
                     "signin_points": 0,
                     "points_change": 0,
-                    "signin_days": 1,
+                    "signin_days": None,
                     "status_code": 200,
                 }
             raise

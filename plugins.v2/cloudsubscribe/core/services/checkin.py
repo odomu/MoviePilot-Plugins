@@ -85,6 +85,56 @@ class CheckinService(OwnerDelegator):
         except (TypeError, ValueError):
             return 0
 
+    @classmethod
+    def _calculate_signin_days(
+            cls,
+            history: List[Dict[str, Any]],
+            current_date_key: str = "",
+            current_success: bool = False,
+            raw_signin_days: Any = None,
+            provider_key: str = "",
+    ) -> Optional[int]:
+        """综合本地打卡历史与渠道返回，计算累计签到天数。"""
+        signed_dates = {
+            cls._record_date_key(item)
+            for item in (history or [])
+            if item.get("success") and cls._record_date_key(item)
+        }
+        if current_success and current_date_key:
+            signed_dates.add(current_date_key)
+        local_days = len(signed_dates)
+
+        remote_days = None
+        if raw_signin_days is not None and str(raw_signin_days).strip() != "":
+            try:
+                val = int(raw_signin_days)
+                if val > 0:
+                    if str(provider_key).lower() == "hdhaven" and val == 1 and local_days > 1:
+                        val = None
+                    remote_days = val
+            except (TypeError, ValueError):
+                remote_days = None
+
+        if remote_days is None:
+            for item in reversed(history or []):
+                item_days = item.get("signin_days")
+                if item_days is not None and str(item_days).strip() != "":
+                    try:
+                        val = int(item_days)
+                        if val > 0:
+                            if str(provider_key).lower() == "hdhaven" and val == 1 and local_days > 1:
+                                continue
+                            remote_days = val
+                            break
+                    except (TypeError, ValueError):
+                        continue
+
+        if remote_days is not None and local_days > 0:
+            return max(remote_days, local_days)
+        if remote_days is not None:
+            return remote_days
+        return local_days if local_days > 0 else None
+
     def get_checkin_providers(self) -> Tuple[CheckinDefinition, ...]:
         """向配置校验与调度注册暴露全部签到提供方契约。"""
         return tuple(get_checkin_definitions().values())
@@ -268,6 +318,7 @@ class CheckinService(OwnerDelegator):
             "total": len(history),
             "limit": normalized_limit,
             "current_points": current_points,
+            "signin_days": self._calculate_signin_days(history, provider_key=adapter.key),
             "items": [
                 self._public_record(record)
                 for record in list(reversed(history))[:normalized_limit]
@@ -314,6 +365,7 @@ class CheckinService(OwnerDelegator):
                 "provider_name": item.name,
                 "points_label": item.points_label,
                 "current_points": self._latest_points(history),
+                "signin_days": self._calculate_signin_days(history, provider_key=item.key),
                 "total": len(history),
                 "items": records,
             })
@@ -610,12 +662,22 @@ class CheckinService(OwnerDelegator):
             or getattr(error, "code", "")
             or ("unexpected_error" if error is not None else "")
         )
+        executed_at_text = self._now_text()
+        current_date = executed_at_text[:10]
+        history = self._load_history(provider)
+        signin_days = self._calculate_signin_days(
+            history=history,
+            current_date_key=current_date,
+            current_success=success,
+            raw_signin_days=data.get("signin_days"),
+            provider_key=provider.key,
+        )
         return {
             "id": f"{provider.key}-{uuid.uuid4().hex}",
             "provider": provider.key,
             "provider_name": provider.name,
             "points_label": provider.points_label,
-            "executed_at": self._now_text(),
+            "executed_at": executed_at_text,
             "trigger": str(trigger or "manual"),
             "mode": mode,
             "success": success,
@@ -629,7 +691,7 @@ class CheckinService(OwnerDelegator):
             "points_change": points_change,
             "points_before": points_before,
             "points_after": points_after,
-            "signin_days": data.get("signin_days"),
+            "signin_days": signin_days,
             "signin_points": signin_points,
             "lottery_target_count": lottery.get("target_count"),
             "lottery_executed": lottery.get(

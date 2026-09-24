@@ -152,6 +152,10 @@ class UIConfig:
             "organize_after_transfer": True,
             "organize_subtitles": True,
             "subtitle_traditional_to_simplified": False,
+            "video_extensions": [".mkv", ".mp4", ".avi", ".iso"],
+            "subtitle_extensions": [
+                ".srt", ".ass", ".ssa", ".vtt", ".sub", ".sup", ".idx", ".smi", ".mks",
+            ],
             "anime_pack_preferred": True,
             "offline_timeout": 30,
             "strm_generate_enabled": True,
@@ -592,5 +596,33 @@ class UIConfig:
                 target[key] = [v.strip() for v in re.split(r"[,，\n]+", val) if v.strip()]
             elif not isinstance(val, list):
                 target[key] = []
+
+        def _clean_ext_list(raw_val, defaults):
+            if isinstance(raw_val, str):
+                items = re.split(r"[,，\n\s]+", raw_val)
+            elif isinstance(raw_val, (list, set, tuple)):
+                items = list(raw_val)
+            else:
+                return list(defaults)
+            result = []
+            seen = set()
+            for item in items:
+                ext = str(item or "").strip().lower()
+                if not ext:
+                    continue
+                if not ext.startswith("."):
+                    ext = f".{ext}"
+                if ext not in seen:
+                    seen.add(ext)
+                    result.append(ext)
+            return result if result else list(defaults)
+
+        target["video_extensions"] = _clean_ext_list(
+            target.get("video_extensions"), [".mkv", ".mp4", ".avi", ".iso"]
+        )
+        target["subtitle_extensions"] = _clean_ext_list(
+            target.get("subtitle_extensions"),
+            [".srt", ".ass", ".ssa", ".vtt", ".sub", ".sup", ".idx", ".smi", ".mks"],
+        )
 
         return target

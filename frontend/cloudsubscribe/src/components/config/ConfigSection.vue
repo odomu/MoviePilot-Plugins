@@ -274,7 +274,9 @@
                     <v-select
                       v-model="document.resource_types"
                       label="资源类型"
-                      :items="field.items || []"
+                      :items="onlineDocumentTypeItems(field)"
+                      item-title="title"
+                      item-value="value"
                       multiple
                       chips
                       closable-chips
@@ -563,6 +565,34 @@ function isAutoSubscribeConfigured(provider) {
 
 function autoSubscribeTestTitle(provider) {
   return "测试抓取最多 3 条榜单示例，仅验证连通性，不创建订阅";
+}
+
+const FALLBACK_ONLINE_DOC_TYPES = [
+  {title: "115网盘", value: "115"},
+  {title: "123网盘", value: "123"},
+  {title: "夸克网盘", value: "quark"},
+  {title: "阿里云盘", value: "alipan"},
+  {title: "百度网盘", value: "baidu"},
+  {title: "UC网盘", value: "uc"},
+  {title: "天翼云盘", value: "tianyi"},
+  {title: "移动云盘", value: "yun139"},
+  {title: "光鸭网盘", value: "guangya"},
+  {title: "迅雷网盘", value: "xunlei"},
+  {title: "磁力链接", value: "magnet"},
+  {title: "电驴链接", value: "ed2k"},
+];
+
+function onlineDocumentTypeItems(field) {
+  if (Array.isArray(props.options?.resourceTypes) && props.options.resourceTypes.length > 0) {
+    return props.options.resourceTypes.map((item) => ({
+      title: item.name || item.title || item.value,
+      value: item.value,
+    }));
+  }
+  if (Array.isArray(field?.items) && field.items.length > 0) {
+    return field.items;
+  }
+  return FALLBACK_ONLINE_DOC_TYPES;
 }
 
 function onlineDocuments(key) {

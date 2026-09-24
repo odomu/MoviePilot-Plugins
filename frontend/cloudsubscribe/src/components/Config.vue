@@ -93,7 +93,15 @@
               </div>
 
               <!-- 底部：开源社区链接与支持 -->
-              <div v-if="repoUrl || authorUrl" class="status-panel-links">
+              <div class="status-panel-links">
+                <a
+                  class="status-action-link"
+                  title="赞赏支持作者"
+                  @click="rewardDialogVisible = true">
+                  <v-icon icon="mdi-coffee-outline" size="13" class="mr-1" />
+                  <span>赞赏支持</span>
+                  <v-icon icon="mdi-chevron-right" size="12" class="ml-auto opacity-50" />
+                </a>
                 <a
                   v-if="repoUrl"
                   :href="repoUrl"
@@ -234,6 +242,7 @@
       :provider="directoryProvider"
       :initial-path="directoryInitialPath"
       @select="selectDirectory" />
+    <RewardDialog v-model="rewardDialogVisible" />
     <v-dialog v-model="sourceTestVisible" max-width="640" class="source-test-dialog">
       <v-card class="source-test-card" :class="{ 'source-test-card--results': tmdbSearched || testSubmitted }">
         <v-card-title class="source-test-header d-flex align-center ga-2">
@@ -665,6 +674,9 @@ import {createConfigSections} from "../config/fields.js";
 
 const QrCodeDialog = defineAsyncComponent(() => import("./dialogs/QrCodeDialog.vue"))
 const DirectoryDialog = defineAsyncComponent(() => import("./dialogs/DirectoryDialog.vue"));
+const RewardDialog = defineAsyncComponent(() => import("./dialogs/RewardDialog.vue"));
+
+const rewardDialogVisible = ref(false);
 
 const props = defineProps({
   api: { type: [Object, Function], required: true },
@@ -898,15 +910,15 @@ const navGroups = computed(() => {
   const map = new Map(all.map((s) => [s.value, s]));
   const groups = [
     {
-      name: "核心订阅",
+      name: "核心配置",
       items: ["basic", "transfer", "subscribe", "upgrade"].map((v) => map.get(v)).filter(Boolean),
     },
     {
-      name: "存储与渠道",
+      name: "渠道配置",
       items: ["drive", "search"].map((v) => map.get(v)).filter(Boolean),
     },
     {
-      name: "服务与通知",
+      name: "服务通知",
       items: ["checkin", "notify"].map((v) => map.get(v)).filter(Boolean),
     },
   ];
@@ -2423,6 +2435,7 @@ watch(
   background: rgba(var(--v-theme-primary), 0.08);
 }
 
+
 :global(html[data-theme="transparent"]) .sidebar-status-panel,
 :global(html[data-theme="glass"]) .sidebar-status-panel,
 :global(html[data-theme-preference="transparent"]) .sidebar-status-panel,
@@ -2475,18 +2488,53 @@ watch(
 }
 
 .save-config-button {
-  min-width: 132px;
-  height: 42px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  border-radius: 8px !important;
-  box-shadow: 0 2px 8px rgba(var(--v-theme-primary), 0.28) !important;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  min-width: 136px;
+  height: 42px !important;
+  font-weight: 600 !important;
+  font-size: 0.875rem !important;
+  letter-spacing: 0.02em !important;
+  border-radius: 10px !important;
+  background: linear-gradient(135deg, rgb(var(--v-theme-primary)) 0%, #7c4dff 100%) !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
+  box-shadow: 0 4px 14px rgba(var(--v-theme-primary), 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }
 
 .save-config-button:hover {
-  box-shadow: 0 4px 14px rgba(var(--v-theme-primary), 0.38) !important;
-  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(var(--v-theme-primary), 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.32) !important;
+  transform: translateY(-2px);
+  filter: brightness(1.04);
+}
+
+.save-config-button:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px rgba(var(--v-theme-primary), 0.3) !important;
+}
+
+.save-config-button :deep(.v-icon) {
+  transition: transform 0.25s ease;
+}
+
+.save-config-button:hover :deep(.v-icon) {
+  transform: scale(1.12);
+}
+
+.reward-card {
+  background-color: rgb(var(--v-theme-surface)) !important;
+  border: 1px solid rgba(var(--v-border-color), 0.12);
+}
+
+.reward-img-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.reward-qrcode {
+  background-color: #ffffff !important;
+  padding: 8px;
+  border: 1px solid rgba(var(--v-border-color), 0.15);
 }
 
 .save-config-button:active {

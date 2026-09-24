@@ -296,6 +296,7 @@ class ShareService(OwnerDelegator):
             max_depth: int = 3,
             target_season: int = None,
             log_prefix: str = "",
+            parent_path: str = "",
     ) -> List[dict]:
         """递归列出分享文件（带速率限制和季数过滤优化）"""
         if depth > max_depth:
@@ -342,6 +343,9 @@ class ShareService(OwnerDelegator):
                             continue
 
                     sub_cid = int(item.get("id", 0))
+                    sub_parent_path = (
+                        f"{parent_path}/{dir_name}".strip("/") if parent_path else dir_name
+                    )
                     children = self._list_share_files_recursive(
                         share_code=share_code,
                         receive_code=receive_code,
@@ -350,10 +354,14 @@ class ShareService(OwnerDelegator):
                         max_depth=max_depth,
                         target_season=target_season,
                         log_prefix=log_prefix,
+                        parent_path=sub_parent_path,
                     )
                     files.extend(children)
                     continue
 
+                if parent_path:
+                    file_info["parent_path"] = parent_path
+                    file_info["relative_path"] = f"{parent_path}/{file_info['name']}"
                 files.append(file_info)
 
         except Exception as e:

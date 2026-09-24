@@ -51,27 +51,32 @@
               class="mb-2"
               hide-details
               :disabled="loading"
-              @keyup.enter="loadDirectories(currentPath)" />
-            <div class="directory-actions d-flex align-center ga-2 mb-2">
-              <v-btn
-                v-if="allowCreate"
-                prepend-icon="mdi-folder-plus-outline"
-                variant="tonal"
-                color="primary"
-                size="small"
-                :disabled="loading || createLoading"
-                @click="openCreateDirectoryDialog">
-                新建文件夹
-              </v-btn>
-              <v-btn
-                prepend-icon="mdi-refresh"
-                variant="text"
-                size="small"
-                :disabled="loading || createLoading"
-                @click="refreshDirectories">
-                刷新
-              </v-btn>
-            </div>
+              @keyup.enter="loadDirectories(currentPath)">
+              <template #append-inner>
+                <div class="d-flex align-center ga-1 mr-n1">
+                  <v-btn
+                    v-if="allowCreate"
+                    icon="mdi-folder-plus-outline"
+                    variant="text"
+                    size="small"
+                    density="comfortable"
+                    color="primary"
+                    title="新建文件夹"
+                    :disabled="loading || createLoading"
+                    @click.stop="openCreateDirectoryDialog" />
+                  <v-btn
+                    icon="mdi-refresh"
+                    variant="text"
+                    size="small"
+                    density="comfortable"
+                    color="medium-emphasis"
+                    title="刷新"
+                    :loading="loading"
+                    :disabled="loading || createLoading"
+                    @click.stop="refreshDirectories" />
+                </div>
+              </template>
+            </v-text-field>
             <div v-if="loading && !treeRoot.loaded" class="directory-loading">
               <v-progress-circular indeterminate color="primary" />
             </div>

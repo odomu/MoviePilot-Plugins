@@ -290,18 +290,24 @@ class Yun139ShareService:
         try:
             link_id, password = self._require_share(share_url)
             result: list = []
-            stack = [ROOT_NODE_ID]
+            stack = [(ROOT_NODE_ID, "")]
             while stack:
-                node_id = stack.pop()
+                node_id, parent_path = stack.pop()
                 folders, files = self._list_node(link_id, password, node_id)
                 for entry in folders:
                     node = self._share_node(link_id, password, entry, True)
                     if node:
-                        stack.append(str(node.native.get("node_id") or ""))
+                        dir_name = str(node.name or "").strip()
+                        sub_path = f"{parent_path}/{dir_name}".strip("/") if parent_path else dir_name
+                        stack.append((str(node.native.get("node_id") or ""), sub_path))
                 for entry in files:
                     node = self._share_node(link_id, password, entry, False)
                     if node:
-                        result.append(dict(node))
+                        item_dict = dict(node)
+                        if parent_path:
+                            item_dict["parent_path"] = parent_path
+                            item_dict["relative_path"] = f"{parent_path}/{node.name}"
+                        result.append(item_dict)
             return result
         except Exception as error:
             logger.warning(f"读取移动云盘分享文件失败：{error}")
@@ -397,25 +403,21 @@ class Yun139ShareService:
             shutil.rmtree(workdir, ignore_errors=True)
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
-        """把分享中根目录下的全部文件转存到本盘。"""
-        try:
-            link_id, password = self._require_share(share_url)
-            _, files = self._list_node(link_id, password)
-        except Exception as error:
-            logger.error(f"移动云盘分享转存前读取失败：{error}")
-            return False
-        nodes = []
-        for entry in files:
-            node = self._share_node(link_id, password, entry, False)
-            if node:
-                nodes.append(node)
-        if not nodes:
+        """把分享中的全部文件转存到本盘对应目录结构下。"""
+        files = self.list_share_files(share_url)
+        if not files:
             logger.warning("移动云盘分享中没有可转存的文件")
             return False
-        succeeded, failed = self.transfer_files_batch(
-            share_url, [node.id for node in nodes], save_path
-        )
-        return bool(succeeded) and not failed
+        all_succeeded = True
+        for item in files:
+            file_id = str(item.get("id") or "")
+            if not file_id:
+                continue
+            parent_path = str(item.get("parent_path") or "").strip("/").strip()
+            target_dir = f"{save_path.rstrip('/')}/{parent_path}" if parent_path else save_path
+            if not self.transfer_file(share_url, file_id, target_dir, target_name=item.get("name") or ""):
+                all_succeeded = False
+        return all_succeeded
 
     def transfer_file(
             self, share_url: str, file_id: str, save_path: str,

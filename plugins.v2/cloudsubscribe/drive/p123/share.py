@@ -100,16 +100,24 @@ class P123ShareService:
     def _iterate_share(self, info: Mapping[str, Any], max_depth: int = -1):
         share_key = str(info.get("share_key") or "")
         share_pwd = str(info.get("share_pwd") or "")
-        stack = [(0, 0)]
+        stack = [(0, 0, "")]
         while stack:
-            parent_id, depth = stack.pop()
+            parent_id, depth, parent_path = stack.pop()
             items = self.client.rate_limiter.call(
                 lambda p=parent_id: self._iterate_share_directory(share_key, share_pwd, p)
             )
             for item in items:
+                if parent_path:
+                    item["parent_path"] = parent_path
+                    item["relative_path"] = f"{parent_path}/{item.get('name')}"
                 yield item
                 if item.get("is_dir") and (max_depth < 0 or depth + 1 < max_depth):
-                    stack.append((int(item["id"]), depth + 1))
+                    dir_name = str(item.get("name") or "").strip()
+                    sub_parent = (
+                        f"{parent_path}/{dir_name}".strip("/")
+                        if parent_path else dir_name
+                    )
+                    stack.append((int(item["id"]), depth + 1, sub_parent))
 
     def check_share_status(self, share_url: str) -> ShareLinkStatus:
         status = ShareLinkStatus()
@@ -148,7 +156,14 @@ class P123ShareService:
                     "item": dict(item),
                     "raw": dict(raw) if isinstance(raw, Mapping) else {},
                 }
-                files.append(dict(file_item))
+                file_dict = dict(file_item)
+                if item.get("parent_path"):
+                    file_dict["parent_path"] = item["parent_path"]
+                    file_dict["relative_path"] = (
+                            item.get("relative_path")
+                            or f"{item['parent_path']}/{file_item.name}"
+                    )
+                files.append(file_dict)
             self._share_items[cache_key] = cached
             return files
         except Exception as error:

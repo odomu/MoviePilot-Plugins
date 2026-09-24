@@ -25,8 +25,14 @@
               :color="task.task_kind === 'pt_upgrade' ? 'warning' : 'primary'">
               {{ task.task_kind === "pt_upgrade" ? "PT 洗版" : "网盘洗版" }}
             </v-chip>
-            <v-chip :color="taskColor(task.status)" size="x-small" variant="tonal">
-              {{ taskStatus(task.status) }}
+            <v-chip :color="taskStatusColor(task)" size="x-small" variant="tonal" class="task-status-chip">
+              <v-progress-circular
+                v-if="task.search_active"
+                indeterminate
+                size="10"
+                width="2"
+                class="mr-1" />
+              <span class="task-status-label">{{ taskStatusBaseText(task) }}</span>
             </v-chip>
           </div>
           <div class="task-meta">
@@ -43,38 +49,42 @@
                 }}
               </span>
               <v-btn
-                v-if="hasPostprocessDetails(task)"
-                class="task-detail-toggle"
+                v-if="hasTaskDetails(task)"
+                class="task-detail-toggle ml-1"
                 :icon="isTaskExpanded(task.id) ? 'mdi-chevron-up' : 'mdi-information-outline'"
                 variant="text"
                 size="x-small"
-                :title="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
-                :aria-label="isTaskExpanded(task.id) ? '收起后处理详情' : '查看后处理详情'"
+                :title="isTaskExpanded(task.id) ? '收起详情' : '查看详情'"
+                :aria-label="isTaskExpanded(task.id) ? '收起详情' : '查看详情'"
                 @click="toggleTaskDetails(task.id)" />
             </div>
-            <span
-              v-if="
-                (task.transfer_active || ['pt_upgrade', 'cross_transfer'].includes(task.task_kind)) &&
-                displayTotal(task) > 0
-              "
-              class="task-transfer text-caption text-medium-emphasis">
-              {{ formatSize(displayTransferred(task)) }} / {{ formatSize(displayTotal(task)) }} ·
-              {{ formatSpeed(task.speed_bytes_per_second || task.upload_speed) }}
-            </span>
-            <span
-              v-else-if="hasDeterminateProgress(task)"
-              class="task-transfer text-caption text-medium-emphasis">
-              {{ Math.round(taskProgress(task)) }}%
-            </span>
+            <div class="d-flex align-center ga-2 flex-shrink-0 text-caption text-medium-emphasis">
+              <span
+                v-if="
+                  (task.transfer_active || ['pt_upgrade', 'cross_transfer'].includes(task.task_kind)) &&
+                  displayTotal(task) > 0
+                "
+                class="task-transfer">
+                {{ formatSize(displayTransferred(task)) }} / {{ formatSize(displayTotal(task)) }} ·
+                {{ formatSpeed(task.speed_bytes_per_second || task.upload_speed) }}
+              </span>
+              <span
+                v-else-if="hasDeterminateProgress(task)"
+                class="task-transfer font-weight-medium">
+                {{ Math.round(taskProgress(task)) }}%
+              </span>
+            </div>
           </div>
           <v-progress-linear
+            v-if="shouldShowProgress(task)"
             :class="[
               'task-progress',
               {
                 'task-progress--active':
                   task.postprocess_active ||
                   ['downloading', 'transferring', 'postprocessing'].includes(task.status) ||
-                  Boolean(task.transfer_active),
+                  Boolean(task.transfer_active) ||
+                  Boolean(task.search_active),
               },
             ]"
             :model-value="taskProgress(task)"
@@ -84,7 +94,76 @@
             height="5"
             rounded />
           <v-expand-transition>
-            <div v-if="hasPostprocessDetails(task) && isTaskExpanded(task.id)" class="task-details text-caption">
+            <div v-if="hasTaskDetails(task) && isTaskExpanded(task.id)" class="task-details text-caption">
+              <!-- 搜索渠道详情：全宽流式横向胶囊排布 -->
+              <div v-if="hasSearchDetails(task)" class="task-search-details">
+                <div class="task-search-channels">
+                  <div
+                    v-for="ch in task.search_channels"
+                    :key="ch.key"
+                    class="task-channel-badge"
+                    :class="[
+                      `task-channel-badge--${ch.status}`,
+                      { 'task-channel-badge--empty': ch.status === 'success' && ch.count === 0 }
+                    ]"
+                    :title="channelTooltip(task, ch)">
+                    <v-progress-circular
+                      v-if="ch.status === 'searching'"
+                      indeterminate
+                      size="10"
+                      width="1.6"
+                      class="mr-1" />
+                    <v-icon v-else :icon="channelIcon(ch)" size="12" class="mr-1" />
+                    <span class="task-channel-name">{{ ch.name }}</span>
+                    <template v-if="ch.status === 'success'">
+                      <span class="task-channel-count ml-1">{{ ch.count }}条</span>
+                      <span v-if="channelDisplayElapsed(task, ch)"
+                            class="task-channel-time ml-1.5 d-inline-flex align-center">
+                        <span class="opacity-60">(</span>
+                        <v-icon icon="mdi-clock-outline" size="9" class="mx-0.5 opacity-75" />
+                        <span>{{ channelDisplayElapsed(task, ch) }}</span>
+                        <span class="opacity-60">)</span>
+                      </span>
+                    </template>
+                    <template v-else-if="ch.status === 'searching'">
+                      <span class="task-channel-hint ml-1">搜索中</span>
+                      <span v-if="channelDisplayElapsed(task, ch)"
+                            class="task-channel-time ml-1.5 d-inline-flex align-center">
+                        <span class="opacity-60">(</span>
+                        <v-icon icon="mdi-clock-outline" size="9" class="mx-0.5 opacity-75" />
+                        <span>{{ channelDisplayElapsed(task, ch) }}</span>
+                        <span class="opacity-60">)</span>
+                      </span>
+                    </template>
+                    <template v-else-if="ch.status === 'timeout'">
+                      <span class="task-channel-hint ml-1">超时</span>
+                      <span v-if="channelDisplayElapsed(task, ch)"
+                            class="task-channel-time ml-1.5 d-inline-flex align-center">
+                        <span class="opacity-60">(</span>
+                        <v-icon icon="mdi-clock-outline" size="9" class="mx-0.5 opacity-75" />
+                        <span>{{ channelDisplayElapsed(task, ch) }}</span>
+                        <span class="opacity-60">)</span>
+                      </span>
+                    </template>
+                    <span v-else-if="ch.status === 'circuit_break'" class="task-channel-hint ml-1">
+                      熔断
+                    </span>
+                    <template v-else-if="ch.status === 'failed'">
+                      <span class="task-channel-hint ml-1">失败</span>
+                      <span v-if="channelDisplayElapsed(task, ch)"
+                            class="task-channel-time ml-1.5 d-inline-flex align-center">
+                        <span class="opacity-60">(</span>
+                        <v-icon icon="mdi-clock-outline" size="9" class="mx-0.5 opacity-75" />
+                        <span>{{ channelDisplayElapsed(task, ch) }}</span>
+                        <span class="opacity-60">)</span>
+                      </span>
+                    </template>
+                    <span v-else-if="ch.status === 'pending'" class="task-channel-hint ml-1">
+                      等待
+                    </span>
+                  </div>
+                </div>
+              </div>
               <div v-if="task.current_file" class="task-detail-row">
                 <span class="task-detail-label">当前文件</span>
                 <span class="task-current-file" :title="task.current_file">{{ task.current_file }}</span>
@@ -137,7 +216,7 @@
   </div>
 </template>
 <script setup>
-import {computed, ref} from "vue";
+import {computed, onMounted, onUnmounted, ref} from "vue";
 
 const props = defineProps({
   runtime: {type: Object, required: true},
@@ -152,6 +231,24 @@ const tasks = computed(() =>
       task.task_kind === "cross_transfer" || ["queued", "running", "stopping", "downloading", "transferring", "postprocessing"].includes(task.status),
   ),
 )
+
+const now = ref(Date.now());
+let timer = null;
+
+onMounted(() => {
+  timer = setInterval(() => {
+    if (tasks.value.some((t) => t.search_active || t.status === "running")) {
+      now.value = Date.now();
+    }
+  }, 200);
+});
+
+onUnmounted(() => {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+});
 
 function postprocessingSummary(task) {
   if (task?.status === "downloading") {
@@ -173,6 +270,58 @@ function postprocessingSummary(task) {
   }
   const pendingCount = Number(task?.pending_count || 0);
   return pendingCount > 0 ? `${pendingCount} 个文件待完成后处理` : "正在完成文件后处理";
+}
+
+function hasTaskDetails(task) {
+  return hasPostprocessDetails(task) || hasSearchDetails(task);
+}
+
+function hasSearchDetails(task) {
+  return Array.isArray(task?.search_channels) && task.search_channels.length > 0;
+}
+
+function channelIcon(ch) {
+  if (!ch) return "mdi-circle-outline";
+  if (ch.status === "success") {
+    return ch.count > 0 ? "mdi-check-circle" : "mdi-minus-circle-outline";
+  }
+  if (ch.status === "searching") {
+    return "mdi-magnify";
+  }
+  if (ch.status === "timeout") {
+    return "mdi-clock-alert-outline";
+  }
+  if (ch.status === "circuit_break") {
+    return "mdi-flash-off";
+  }
+  if (ch.status === "failed") {
+    return "mdi-alert-circle-outline";
+  }
+  return "mdi-clock-outline";
+}
+
+function channelTooltip(task, ch) {
+  if (!ch) return "";
+  const name = ch.name || ch.key;
+  const elapsedStr = channelDisplayElapsed(task, ch);
+  const elapsedPart = elapsedStr ? ` · 耗时 ${elapsedStr}` : "";
+  if (ch.status === "success") {
+    return `${name}：成功返回 ${ch.count} 条候选数据${elapsedPart}`;
+  }
+  if (ch.status === "searching") {
+    const liveElapsed = elapsedStr ? ` (已耗时 ${elapsedStr})` : "";
+    return `${name}：正在并发查询中${liveElapsed}...`;
+  }
+  if (ch.status === "timeout") {
+    return `${name}：搜索请求超时已跳过${elapsedPart}`;
+  }
+  if (ch.status === "circuit_break") {
+    return `${name}：${ch.error || "多次失败熔断保护中"}`;
+  }
+  if (ch.status === "failed") {
+    return `${name}：搜索失败 (${ch.error || "未知异常"})${elapsedPart}`;
+  }
+  return `${name}：等待检索`;
 }
 
 function hasPostprocessDetails(task) {
@@ -226,13 +375,84 @@ function canStop(task) {
   return ["queued", "running", "stopping", "downloading", "transferring", "postprocessing"].includes(task?.status);
 }
 
-function taskStatus(status) {
+function formatDuration(seconds) {
+  const sec = Math.max(0, Number(seconds || 0));
+  if (sec <= 0) return "";
+  if (sec < 60) {
+    return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)}s`;
+  }
+  const mins = Math.floor(sec / 60);
+  const remainSec = Math.round(sec % 60);
+  if (mins < 60) {
+    return `${mins}m ${remainSec}s`;
+  }
+  const hours = Math.floor(mins / 60);
+  const remainMins = mins % 60;
+  return `${hours}h ${remainMins}m`;
+}
+
+function formatChannelElapsed(ms) {
+  const m = Number(ms || 0);
+  if (m <= 0) return "";
+  const sec = m / 1000;
+  if (sec < 0.1) return "<0.1s";
+  return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)}s`;
+}
+
+const localChannelStartTimes = new Map();
+
+function getChannelElapsedMs(task, ch) {
+  if (!ch) return 0;
+  if (ch.status === "searching") {
+    const key = `${task?.id || ""}:${ch.key || ch.name}`;
+    if (ch.started_at && Number(ch.started_at) > 0) {
+      const startMs = Number(ch.started_at) * 1000;
+      return Math.max(0, now.value - startMs);
+    }
+    if (!localChannelStartTimes.has(key)) {
+      const initialElapsed = Number(ch.elapsed_ms || 0);
+      localChannelStartTimes.set(key, now.value - initialElapsed);
+    }
+    const startMs = localChannelStartTimes.get(key);
+    return Math.max(0, now.value - startMs);
+  }
+  return Number(ch.elapsed_ms || 0);
+}
+
+function channelDisplayElapsed(task, ch) {
+  const ms = getChannelElapsedMs(task, ch);
+  return formatChannelElapsed(ms);
+}
+
+function taskElapsedText(task) {
+  if (!task) return "";
+  if (task.status === "queued" || task.phase === "等待调度") return "";
+  const sec = Number(task.elapsed_seconds || 0);
+  if (sec > 0) {
+    return formatDuration(sec);
+  }
+  return "";
+}
+
+function taskStatusBaseText(task) {
+  if (!task) return "未知";
+  if (task.search_active) {
+    return "搜索中";
+  }
+  const status = task.status;
+  if (status === "running") {
+    const phase = String(task.phase || "");
+    if (phase.includes("校验候选") || phase.includes("检查候选")) {
+      return "校验中";
+    }
+    return "运行中";
+  }
   return (
     {
       queued: "排队中",
       running: "运行中",
       stopping: "停止中",
-      downloading: "离线下载中",
+      downloading: "离线中",
       transferring: "转存中",
       postprocessing: "后处理中",
       completed: "完成",
@@ -241,7 +461,73 @@ function taskStatus(status) {
       stopped: "已停止",
       canceled: "已取消",
     }[status] || "未知"
-  )
+  );
+}
+
+function taskStatusElapsed(task) {
+  if (!task) return "";
+  if (task.search_active) {
+    return taskElapsedText(task);
+  }
+  if (task.status === "running") {
+    const phase = String(task.phase || "");
+    if (phase.includes("校验候选") || phase.includes("检查候选")) {
+      return taskElapsedText(task);
+    }
+  }
+  return "";
+}
+
+function taskStatusText(task) {
+  const base = taskStatusBaseText(task);
+  const elapsed = taskStatusElapsed(task);
+  return elapsed ? `${base} (${elapsed})` : base;
+}
+
+function taskStatusColor(task) {
+  if (!task) return "secondary";
+  if (task.search_active) return "info";
+  const status = task.status;
+  if (status === "running") {
+    const phase = String(task.phase || "");
+    if (phase.includes("校验候选") || phase.includes("检查候选")) {
+      return "primary";
+    }
+    return "info";
+  }
+  return (
+    {
+      queued: "secondary",
+      running: "info",
+      stopping: "warning",
+      downloading: "info",
+      transferring: "info",
+      postprocessing: "primary",
+      completed: "success",
+      success: "success",
+      failed: "error",
+      stopped: "warning",
+      canceled: "warning",
+    }[status] || "secondary"
+  );
+}
+
+function taskStatus(status) {
+  return (
+    {
+      queued: "排队中",
+      running: "运行中",
+      stopping: "停止中",
+      downloading: "离线中",
+      transferring: "转存中",
+      postprocessing: "后处理中",
+      completed: "完成",
+      success: "完成",
+      failed: "失败",
+      stopped: "已停止",
+      canceled: "已取消",
+    }[status] || "未知"
+  );
 }
 
 function taskColor(status) {
@@ -294,8 +580,20 @@ function progressStyle(task) {
   }
 }
 
+function shouldShowProgress(task) {
+  if (!task) return false;
+  // 等待调度或排队中不显示进度条和动画，解决大量排队任务时的严重卡顿
+  if (task.status === "queued" || task.phase === "等待调度") {
+    return false;
+  }
+  return true;
+}
+
 function hasDeterminateProgress(task) {
   if (!task) return false;
+  if (task.status === "queued" || task.phase === "等待调度") {
+    return false;
+  }
   // 1. 跨盘或 PT 传输有字节数
   if (
     (task.transfer_active || ["pt_upgrade", "cross_transfer"].includes(task.task_kind)) &&
@@ -319,7 +617,11 @@ function hasDeterminateProgress(task) {
 }
 
 function isProgressIndeterminate(task) {
-  if (!task) return true;
+  if (!task) return false;
+  // 等待调度和排队状态绝不运行动画
+  if (task.status === "queued" || task.phase === "等待调度") {
+    return false;
+  }
   if (["completed", "success", "failed", "stopped", "canceled"].includes(task.status)) {
     return false;
   }
@@ -528,6 +830,119 @@ function displayTotal(task) {
 .task-process-step--active {
   color: rgb(var(--v-theme-primary));
   font-weight: 500;
+}
+
+.search-phase-chip {
+  flex: 0 0 auto;
+  height: 18px !important;
+  font-size: 10px !important;
+  padding: 0 6px !important;
+}
+
+.task-search-details {
+  width: 100%;
+  padding: 3px 0 1px;
+}
+
+.task-search-channels {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.task-channel-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  border-radius: 11px;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  background: rgba(var(--v-theme-surface-variant), 0.35);
+  color: rgba(var(--v-theme-on-surface), 0.82);
+  border: 1px solid rgba(var(--v-border-color), 0.16);
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.task-channel-badge:hover {
+  transform: translateY(-1px);
+}
+
+.task-channel-name {
+  font-weight: 500;
+}
+
+.task-channel-badge--success {
+  background: rgba(var(--v-theme-success), 0.14);
+  color: rgb(var(--v-theme-success));
+  border-color: rgba(var(--v-theme-success), 0.35);
+}
+
+.task-channel-badge--empty {
+  background: rgba(var(--v-theme-success), 0.08);
+  color: rgb(var(--v-theme-success));
+  border-color: rgba(var(--v-theme-success), 0.24);
+  opacity: 0.92;
+}
+
+.task-channel-badge--searching {
+  background: rgba(var(--v-theme-info), 0.12);
+  color: rgb(var(--v-theme-info));
+  border-color: rgba(var(--v-theme-info), 0.32);
+}
+
+.task-channel-badge--timeout {
+  background: rgba(var(--v-theme-warning), 0.1);
+  color: rgb(var(--v-theme-warning));
+  border-color: rgba(var(--v-theme-warning), 0.28);
+}
+
+.task-channel-badge--circuit_break {
+  background: rgba(var(--v-theme-warning), 0.08);
+  color: rgb(var(--v-theme-warning));
+  border-color: rgba(var(--v-theme-warning), 0.24);
+}
+
+.task-channel-badge--failed {
+  background: rgba(var(--v-theme-error), 0.12);
+  color: rgb(var(--v-theme-error));
+  border-color: rgba(var(--v-theme-error), 0.32);
+  font-weight: 550;
+}
+
+.task-channel-badge--pending {
+  color: rgba(var(--v-theme-on-surface), 0.45);
+  background: rgba(var(--v-theme-on-surface), 0.04);
+}
+
+.task-channel-count {
+  font-weight: 600;
+}
+
+.task-channel-time {
+  font-size: 10px;
+  font-weight: normal;
+  opacity: 0.85;
+}
+
+.task-status-chip {
+  font-weight: 550;
+}
+
+.task-status-time {
+  font-size: 10px;
+  font-weight: 500;
+  opacity: 0.92;
+}
+
+.task-elapsed {
+  font-variant-numeric: tabular-nums;
+  user-select: none;
 }
 
 .task-transfer {

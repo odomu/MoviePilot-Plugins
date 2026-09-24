@@ -1,6 +1,6 @@
 <template>
   <div class="multi-select-dialog-field">
-    <!-- 表单外层触发器输入框：与 Vuetify 原生 compact outlined 输入框外观、高度、浮动Label、Notch、Hint 100% 像素级对齐 -->
+    <!-- 表单外层触发器输入框：严格单行不换行，杜绝标签过多撑破下边缘溢出 -->
     <v-text-field
       :model-value="selectedList.length > 0 ? ' ' : ''"
       :label="field.label"
@@ -16,17 +16,25 @@
       :class="{ 'has-selected': selectedList.length > 0 }"
       :prepend-inner-icon="field.icon || 'mdi-checkbox-multiple-marked-outline'"
       @click="openDialog">
-      <!-- 左侧已选项目胶囊预览（展示前 3 项，不再显示混淆的 +N 剩余项） -->
+      <!-- 左侧已选项目胶囊预览（单行水平流，严格禁止换行溢出，超出用 +N 聚合） -->
       <template v-if="selectedList.length > 0" #default>
-        <div class="d-flex align-center flex-wrap ga-1 trigger-chips-wrapper" @click.stop="openDialog">
+        <div class="d-flex align-center flex-nowrap ga-1 trigger-chips-wrapper" @click.stop="openDialog">
           <v-chip
             v-for="item in visibleChips"
-            :key="item.value"
+            :key="String(item.value)"
             size="x-small"
             variant="tonal"
             color="primary"
-            class="font-weight-medium my-0">
+            class="font-weight-medium my-0 flex-shrink-0 trigger-chip">
             {{ item.title }}
+          </v-chip>
+          <v-chip
+            v-if="remainingCount > 0"
+            size="x-small"
+            variant="tonal"
+            color="secondary"
+            class="font-weight-medium my-0 flex-shrink-0 remaining-chip">
+            +{{ remainingCount }}
           </v-chip>
         </div>
       </template>
@@ -60,9 +68,9 @@
     </v-text-field>
 
     <!-- 弹窗多选选择器 -->
-    <v-dialog v-model="dialogVisible" max-width="580" scrollable>
+    <v-dialog v-model="dialogVisible" max-width="620" scrollable>
       <v-card class="multi-select-dialog rounded-xl overflow-hidden">
-        <!-- 美化后的弹窗顶部 Header：高光渐变顶板、微阴影凸起图标底座、药丸徽标与细腻关闭按钮 -->
+        <!-- 弹窗顶部 Header：高光渐变顶板、微阴影凸起图标底座、药丸徽标与细腻关闭按钮 -->
         <div class="dialog-header d-flex align-center px-4 py-3 border-b">
           <div class="dialog-header-icon mr-3">
             <v-icon
@@ -75,7 +83,7 @@
               {{ field.label }}
             </div>
             <div class="dialog-header-subtitle text-caption text-medium-emphasis text-truncate">
-              {{ field.hint || "支持多选，点击卡片直接勾选或取消" }}
+              {{ field.hint || (field.allowCustom ? "支持勾选与回车自定义添加" : "支持多选，点击卡片直接勾选或取消") }}
             </div>
           </div>
           <v-chip size="small" variant="tonal" color="primary"
@@ -93,13 +101,13 @@
 
         <v-divider />
 
-        <!-- 工具栏：搜索与批量操作 -->
+        <!-- 工具栏：搜索、自定义输入与批量操作（已移除冗余的顶栏生效标签，界面清爽直接） -->
         <div class="dialog-toolbar px-4 pt-3 pb-2 d-flex align-center justify-space-between ga-2">
-          <!-- 搜索条（仅当选项较多时展示，扁平微胶囊风格） -->
+          <!-- 搜索与自定义输入条 -->
           <div v-if="showSearch" class="search-box-wrapper flex-grow-1">
             <v-text-field
               v-model="searchKeyword"
-              placeholder="快速过滤选项..."
+              :placeholder="searchPlaceholder"
               density="compact"
               variant="solo-filled"
               flat
@@ -107,7 +115,22 @@
               prepend-inner-icon="mdi-magnify"
               hide-details
               clearable
-              class="compact-search-input" />
+              class="compact-search-input"
+              @keydown.enter.prevent="addCustomItem">
+              <!-- 支持自定义添加按钮 -->
+              <template v-if="canAddCustom" #append-inner>
+                <v-btn
+                  size="x-small"
+                  variant="flat"
+                  color="primary"
+                  rounded="pill"
+                  class="px-2 my-n1 font-weight-bold"
+                  title="回车或点击添加为新项并自动勾选"
+                  @click.stop="addCustomItem">
+                  添加
+                </v-btn>
+              </template>
+            </v-text-field>
           </div>
           <div v-else class="text-caption text-medium-emphasis">
             共 {{ normalizedItems.length }} 项可选
@@ -144,9 +167,10 @@
               反选
             </v-btn>
             <v-btn
-              variant="text"
+              variant="tonal"
               size="small"
               rounded="pill"
+              color="error"
               class="action-btn action-btn--clear px-2 text-caption font-weight-medium"
               prepend-icon="mdi-trash-can-outline"
               @click="clearTemp">
@@ -165,14 +189,27 @@
           <div v-else-if="filteredItems.length === 0" class="text-center py-8 text-medium-emphasis">
             <v-icon :icon="field.loadError ? 'mdi-alert-circle-outline' : 'mdi-file-search-outline'" size="36"
                     class="mb-2 opacity-40" />
-            <div class="text-caption">{{ field.loadError || "没有可选项" }}</div>
+            <div class="text-caption">
+              {{ field.loadError || (field.allowCustom && searchKeyword ? `无匹配项，可按回车添加 "${formattedCustomInput}"` : "没有可选项")
+              }}
+            </div>
+            <v-btn
+              v-if="canAddCustom"
+              size="small"
+              variant="tonal"
+              color="primary"
+              prepend-icon="mdi-plus"
+              class="mt-2"
+              @click="addCustomItem">
+              添加 "{{ formattedCustomInput }}" 并勾选
+            </v-btn>
           </div>
 
           <!-- 双列自适应网格 -->
           <div v-else class="options-grid-container">
             <div
               v-for="item in filteredItems"
-              :key="item.value"
+              :key="String(item.value)"
               class="option-card d-flex align-center px-3 py-2 rounded-lg cursor-pointer"
               :class="{ 'is-selected': isTempSelected(item.value) }"
               @click="toggleItem(item.value)">
@@ -184,15 +221,36 @@
                 class="mr-2 flex-shrink-0 option-checkbox" />
 
               <div class="option-info flex-grow-1 overflow-hidden">
-                <div
-                  class="option-title font-weight-medium text-body-2 text-truncate"
-                  :class="{ 'text-primary font-weight-bold': isTempSelected(item.value) }">
-                  {{ item.title }}
+                <div class="d-flex align-center ga-1">
+                  <div
+                    class="option-title font-weight-medium text-body-2 text-truncate"
+                    :class="{ 'text-primary font-weight-bold': isTempSelected(item.value) }">
+                    {{ item.title }}
+                  </div>
+                  <v-chip
+                    v-if="item.isCustom"
+                    size="x-small"
+                    variant="tonal"
+                    color="secondary"
+                    class="px-1 custom-tag">
+                    自定义
+                  </v-chip>
                 </div>
                 <div v-if="item.hint" class="option-hint text-caption text-medium-emphasis text-truncate">
                   {{ item.hint }}
                 </div>
               </div>
+
+              <!-- 自定义添加项支持从候选池彻底删除 -->
+              <v-btn
+                v-if="item.isCustom"
+                icon="mdi-trash-can-outline"
+                size="x-small"
+                variant="text"
+                color="error"
+                class="ml-1 flex-shrink-0 custom-del-btn"
+                title="删除此自定义项"
+                @click.stop="removeCustomItem(item.value)" />
             </div>
           </div>
         </v-card-text>
@@ -202,7 +260,7 @@
         <!-- 底部操作栏 -->
         <v-card-actions class="px-4 py-2">
           <div class="text-caption text-medium-emphasis">
-            已勾选 <span class="font-weight-bold text-primary">{{ tempSelection.length }}</span> 个选项
+            已勾选 <span class="font-weight-bold text-primary">{{ tempSelection.length }}</span> 项
           </div>
           <v-spacer />
           <v-btn variant="text" size="small" class="px-4" @click="dialogVisible = false">
@@ -245,39 +303,98 @@ const emit = defineEmits(["update:modelValue", "load-options", "refresh-options"
 const dialogVisible = ref(false);
 const searchKeyword = ref("");
 const tempSelection = ref([]);
+const customItems = ref([]);
 
-// 规范化所有候选项目为标准格式 [{ title, value, hint }]
-const normalizedItems = computed(() => {
+// 规范化配置自带的候选项目为标准格式 [{ title, value, hint, isCustom: false }]
+const baseItems = computed(() => {
   const items = props.field?.items || [];
   if (!Array.isArray(items)) return [];
 
   return items.map((item) => {
     if (typeof item === "string" || typeof item === "number") {
-      return {title: String(item), value: item, hint: ""};
+      return {title: String(item), value: item, hint: "", isCustom: false};
     }
     if (item && typeof item === "object") {
       const title = item.title ?? item.label ?? item.name ?? String(item.value ?? "");
       const value = item.value ?? item.title ?? item.label ?? "";
       const hint = item.hint ?? item.subtitle ?? item.desc ?? "";
-      return {title, value, hint};
+      return {title, value, hint, isCustom: false};
     }
-    return {title: String(item), value: item, hint: ""};
+    return {title: String(item), value: item, hint: "", isCustom: false};
   });
+});
+
+// 合并配置候选项与用户添加的自定义项
+const normalizedItems = computed(() => {
+  const combined = [...baseItems.value];
+  const seen = new Set(combined.map((i) => String(i.value).toLowerCase()));
+  for (const item of customItems.value) {
+    const key = String(item.value).toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      combined.push(item);
+    }
+  }
+  return combined;
 });
 
 // 已选项目的对象列表
 const selectedList = computed(() => {
-  const current = Array.isArray(props.modelValue) ? props.modelValue : (props.modelValue ? [props.modelValue] : []);
-  const map = new Map(normalizedItems.value.map((i) => [String(i.value), i]));
-  return current.map((val) => map.get(String(val)) || {title: String(val), value: val});
+  const current = Array.isArray(props.modelValue)
+    ? props.modelValue
+    : (props.modelValue ? [props.modelValue] : []);
+  const map = new Map(normalizedItems.value.map((i) => [String(i.value).toLowerCase(), i]));
+  return current.map((val) => {
+    const s = String(val).toLowerCase();
+    return map.get(s) || {title: String(val), value: val, isCustom: true};
+  });
 });
 
-// 触发器中最多展示前 3 个 Chip
-const visibleChips = computed(() => selectedList.value.slice(0, 3));
+// 触发器中严格单行紧凑展示（最多 3 个），防止折行撑破外框
+const maxVisible = computed(() => Math.min(Number(props.field?.maxChips) || 3, 3));
+const visibleChips = computed(() => selectedList.value.slice(0, maxVisible.value));
+const remainingCount = computed(() => Math.max(0, selectedList.value.length - maxVisible.value));
 
-// 是否展示搜索栏（选项大于 8 项或配置了 searchable）
+// 是否展示搜索/自定义输入栏
 const showSearch = computed(() => {
-  return normalizedItems.value.length > 8 || Boolean(props.field?.searchable);
+  return (
+    Boolean(props.field?.allowCustom) ||
+    normalizedItems.value.length > 8 ||
+    Boolean(props.field?.searchable)
+  );
+});
+
+// 搜索栏 Placeholder
+const searchPlaceholder = computed(() => {
+  if (props.field?.customPlaceholder) return props.field.customPlaceholder;
+  if (props.field?.allowCustom) {
+    return props.field.isExtension
+      ? "过滤选项或输入扩展名(如 .ts)回车添加..."
+      : "过滤选项或输入回车直接添加自定义...";
+  }
+  return "快速过滤选项...";
+});
+
+// 格式化用户输入的自定义值（若是扩展名自动规范为以点开头的全小写）
+function formatCustomValue(raw) {
+  let val = String(raw || "").trim();
+  if (props.field?.isExtension) {
+    if (!val.startsWith(".")) {
+      val = "." + val;
+    }
+    val = val.toLowerCase();
+  }
+  return val;
+}
+
+const formattedCustomInput = computed(() => formatCustomValue(searchKeyword.value));
+
+// 是否可触发自定义添加
+const canAddCustom = computed(() => {
+  if (!props.field?.allowCustom) return false;
+  const val = formattedCustomInput.value;
+  if (!val || (props.field?.isExtension && val === ".")) return false;
+  return true;
 });
 
 // 过滤后的候选项目
@@ -295,9 +412,30 @@ const filteredItems = computed(() => {
 
 function openDialog() {
   if (props.disabled) return;
-  const current = Array.isArray(props.modelValue) ? props.modelValue : (props.modelValue ? [props.modelValue] : []);
+  const current = Array.isArray(props.modelValue)
+    ? props.modelValue
+    : (props.modelValue ? [props.modelValue] : []);
   tempSelection.value = [...current];
   searchKeyword.value = "";
+
+  // 自动从当前已选值中识别不在配置 baseItems 里的自定义项，补入 customItems 中以正常显示
+  if (props.field?.allowCustom) {
+    const baseSet = new Set(baseItems.value.map((i) => String(i.value).toLowerCase()));
+    for (const val of current) {
+      const sVal = String(val).trim();
+      if (sVal && !baseSet.has(sVal.toLowerCase())) {
+        if (!customItems.value.some((c) => String(c.value).toLowerCase() === sVal.toLowerCase())) {
+          customItems.value.push({
+            title: sVal,
+            value: sVal,
+            hint: "自定义扩展名",
+            isCustom: true,
+          });
+        }
+      }
+    }
+  }
+
   dialogVisible.value = true;
   if (props.field?.dynamicOptions) {
     emit("load-options", props.field.dynamicOptions);
@@ -311,11 +449,13 @@ function refreshOptions() {
 }
 
 function isTempSelected(val) {
-  return tempSelection.value.some((v) => String(v) === String(val));
+  const target = String(val).toLowerCase();
+  return tempSelection.value.some((v) => String(v).toLowerCase() === target);
 }
 
 function toggleItem(val) {
-  const index = tempSelection.value.findIndex((v) => String(v) === String(val));
+  const target = String(val).toLowerCase();
+  const index = tempSelection.value.findIndex((v) => String(v).toLowerCase() === target);
   if (index !== -1) {
     tempSelection.value.splice(index, 1);
   } else {
@@ -323,36 +463,76 @@ function toggleItem(val) {
   }
 }
 
+function removeTempItem(val) {
+  const target = String(val).toLowerCase();
+  const index = tempSelection.value.findIndex((v) => String(v).toLowerCase() === target);
+  if (index !== -1) {
+    tempSelection.value.splice(index, 1);
+  }
+}
+
+function addCustomItem() {
+  if (!canAddCustom.value) return;
+  const val = formattedCustomInput.value;
+
+  const existsInBase = baseItems.value.some((i) => String(i.value).toLowerCase() === val.toLowerCase());
+  const existsInCustom = customItems.value.some((i) => String(i.value).toLowerCase() === val.toLowerCase());
+
+  if (!existsInBase && !existsInCustom) {
+    customItems.value.push({
+      title: val,
+      value: val,
+      hint: "自定义扩展名",
+      isCustom: true,
+    });
+  }
+
+  if (!tempSelection.value.some((v) => String(v).toLowerCase() === val.toLowerCase())) {
+    tempSelection.value.push(val);
+  }
+
+  searchKeyword.value = "";
+}
+
+function removeCustomItem(val) {
+  const target = String(val).toLowerCase();
+  const cIndex = customItems.value.findIndex((i) => String(i.value).toLowerCase() === target);
+  if (cIndex !== -1) {
+    customItems.value.splice(cIndex, 1);
+  }
+  removeTempItem(val);
+}
+
 function selectAll() {
   const allValues = filteredItems.value.map((i) => i.value);
-  const currentSet = new Set(tempSelection.value.map(String));
+  const currentSet = new Set(tempSelection.value.map((v) => String(v).toLowerCase()));
   for (const val of allValues) {
-    currentSet.add(String(val));
+    currentSet.add(String(val).toLowerCase());
   }
-  // 按照候选顺序重排
   tempSelection.value = normalizedItems.value
-    .filter((i) => currentSet.has(String(i.value)))
+    .filter((i) => currentSet.has(String(i.value).toLowerCase()))
     .map((i) => i.value);
 }
 
 function invertSelection() {
-  const visibleValues = new Set(filteredItems.value.map((i) => String(i.value)));
-  const currentSet = new Set(tempSelection.value.map(String));
+  const visibleValues = new Set(filteredItems.value.map((i) => String(i.value).toLowerCase()));
+  const currentSet = new Set(tempSelection.value.map((v) => String(v).toLowerCase()));
   const newSet = new Set();
 
   for (const v of tempSelection.value) {
-    if (!visibleValues.has(String(v))) {
-      newSet.add(String(v));
+    if (!visibleValues.has(String(v).toLowerCase())) {
+      newSet.add(String(v).toLowerCase());
     }
   }
   for (const i of filteredItems.value) {
-    if (!currentSet.has(String(i.value))) {
-      newSet.add(String(i.value));
+    const key = String(i.value).toLowerCase();
+    if (!currentSet.has(key)) {
+      newSet.add(key);
     }
   }
 
   tempSelection.value = normalizedItems.value
-    .filter((i) => newSet.has(String(i.value)))
+    .filter((i) => newSet.has(String(i.value).toLowerCase()))
     .map((i) => i.value);
 }
 
@@ -376,7 +556,6 @@ function clearSelection() {
   width: 100%;
 }
 
-/* 触发器输入框样式：类似 Vuetify outlined 紧凑输入框 */
 /* 触发器输入框样式：继承 Vuetify 统一规范 */
 .multi-select-custom-field {
   cursor: pointer;
@@ -398,13 +577,42 @@ function clearSelection() {
   pointer-events: none !important;
 }
 
+.multi-select-custom-field :deep(.v-field__field) {
+  overflow: hidden !important;
+}
+
+.multi-select-custom-field :deep(.v-field__input) {
+  overflow: hidden !important;
+  white-space: nowrap !important;
+  flex-wrap: nowrap !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+}
+
 .trigger-chips-wrapper {
-  max-width: 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap !important;
   overflow: hidden;
   white-space: nowrap;
   pointer-events: none;
   line-height: 1;
-  padding-top: 1px;
+  max-width: calc(100% - 68px);
+  gap: 4px;
+}
+
+.trigger-chip {
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remaining-chip {
+  opacity: 0.85;
+  flex-shrink: 0;
 }
 
 .trigger-append-actions {
@@ -531,18 +739,24 @@ function clearSelection() {
   align-items: center;
 }
 
+.compact-search-input :deep(.v-field__append-inner) {
+  padding-top: 0 !important;
+  align-items: center;
+}
+
 .action-btn {
   height: 28px !important;
   min-height: 28px !important;
 }
 
 .action-btn--clear {
-  color: rgba(var(--v-theme-on-surface), 0.6) !important;
+  color: rgb(var(--v-theme-error)) !important;
+  background-color: rgba(var(--v-theme-error), 0.1) !important;
 }
 
 .action-btn--clear:hover {
   color: rgb(var(--v-theme-error)) !important;
-  background-color: rgba(var(--v-theme-error), 0.08) !important;
+  background-color: rgba(var(--v-theme-error), 0.18) !important;
 }
 
 /* 选项双列网格布局：紧凑饱满、告别单列空洞 */
@@ -588,5 +802,19 @@ function clearSelection() {
 
 .option-card:active .option-checkbox {
   transform: scale(0.9);
+}
+
+.custom-tag {
+  font-size: 0.65rem !important;
+  height: 18px !important;
+}
+
+.custom-del-btn {
+  opacity: 0.6;
+  transition: opacity 0.2s ease;
+}
+
+.custom-del-btn:hover {
+  opacity: 1;
 }
 </style>

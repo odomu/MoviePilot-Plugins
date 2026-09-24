@@ -1,5 +1,6 @@
 """订阅与平台搜索钩子。"""
 
+import inspect
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Callable, List, Optional, Tuple
@@ -32,7 +33,11 @@ class SubscriptionSearchHook(OwnerDelegator):
         try:
             from app.scheduler import Scheduler
 
-            scheduler = Scheduler.get_existing_instance()
+            scheduler = (
+                Scheduler.get_existing_instance()
+                if hasattr(Scheduler, "get_existing_instance")
+                else Scheduler()
+            )
             if scheduler is None:
                 logger.debug("调度器尚未就绪，等待平台注册后安装订阅接管")
                 return
@@ -68,7 +73,11 @@ class SubscriptionSearchHook(OwnerDelegator):
         try:
             from app.scheduler import Scheduler
 
-            scheduler = Scheduler.get_existing_instance()
+            scheduler = (
+                Scheduler.get_existing_instance()
+                if hasattr(Scheduler, "get_existing_instance")
+                else Scheduler()
+            )
             jobs = getattr(scheduler, "_jobs", None) if scheduler else {}
             jobs = jobs or {}
             for job_id, original in originals.items():
@@ -326,12 +335,88 @@ class SubscriptionSearchHook(OwnerDelegator):
         # 正常调用 finish_returned_search_task 将原生队列任务标记为 completed 终态。
         return subscribe
 
+    @staticmethod
+    def _call_subscribe_chain_search(**kwargs) -> Any:
+        """安全调用 SubscribeChain.search，根据支持的参数自动适配，防止 TypeError。同时兼容 v2 和 v3。"""
+        chain = SubscribeChain()
+        search_func = getattr(chain, "search", None)
+        if not callable(search_func):
+            return None
+
+        sids = kwargs.get("sids")
+        try:
+            sig = inspect.signature(search_func)
+            has_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            # 如果原生 search 支持 sids 或支持 **kwargs（如 v3）
+            if has_var_kwargs or "sids" in sig.parameters:
+                filtered = kwargs if has_var_kwargs else {k: v for k, v in kwargs.items() if k in sig.parameters}
+                return search_func(**filtered)
+
+            # 原生 search 不支持 sids（如 v2 环境）
+            if sids:
+                single_kwargs = dict(kwargs)
+                single_kwargs.pop("sids", None)
+                results = []
+                for sub_id in sids:
+                    single_kwargs["sid"] = sub_id
+                    filtered = {k: v for k, v in single_kwargs.items() if k in sig.parameters}
+                    results.append(search_func(**filtered))
+                return results[-1] if results else None
+
+            filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            return search_func(**filtered)
+        except Exception as err:
+            logger.debug(f"检查 SubscribeChain.search 签名失败，尝试直接调用：{err}")
+            try:
+                return search_func(**kwargs)
+            except TypeError:
+                if sids:
+                    base_keys = ("state", "manual", "progress_callback")
+                    base_kwargs = {k: v for k, v in kwargs.items() if k in base_keys}
+                    results = []
+                    for sub_id in sids:
+                        results.append(search_func(sid=sub_id, **base_kwargs))
+                    return results[-1] if results else None
+                base_keys = ("sid", "state", "manual", "progress_callback")
+                base_kwargs = {k: v for k, v in kwargs.items() if k in base_keys}
+                return search_func(**base_kwargs)
+
+    @staticmethod
+    def _call_subscribe_chain_refresh(**kwargs) -> Any:
+        """安全调用 SubscribeChain.refresh，根据支持的参数自动适配。"""
+        chain = SubscribeChain()
+        refresh_func = getattr(chain, "refresh", None)
+        if not callable(refresh_func):
+            return None
+        try:
+            sig = inspect.signature(refresh_func)
+            has_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if has_var_kwargs:
+                return refresh_func(**kwargs)
+            filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            return refresh_func(**filtered)
+        except Exception as err:
+            logger.debug(f"检查 SubscribeChain.refresh 签名失败，尝试直接调用：{err}")
+            try:
+                return refresh_func(**kwargs)
+            except TypeError:
+                return refresh_func(progress_callback=kwargs.get("progress_callback"))
+
     def _dispatch_subscribe_search(
             self,
             sid: Optional[int] = None,
             state: Optional[str] = "R",
             manual: Optional[bool] = False,
             progress_callback: Optional[Callable[..., None]] = None,
+            sids: Optional[Tuple[int, ...]] = None,
+            scheduled_interval: Optional[int] = None,
+            **kwargs: Any,
     ):
         use_plugin = self._is_takeover_active()
         if state == "N" and self._enabled and self._takeover_new_subscribes:
@@ -339,11 +424,14 @@ class SubscriptionSearchHook(OwnerDelegator):
         if sid and self._is_subscribe_excluded(sid):
             use_plugin = False
         if not use_plugin:
-            return SubscribeChain().search(
+            return self._call_subscribe_chain_search(
                 sid=sid,
                 state=state,
                 manual=manual,
                 progress_callback=progress_callback,
+                sids=sids,
+                scheduled_interval=scheduled_interval,
+                **kwargs,
             )
 
         # 自身会每 5 分钟触发新增订阅搜索；接管状态下仅消费
@@ -351,11 +439,36 @@ class SubscriptionSearchHook(OwnerDelegator):
         if not bool(manual):
             return True
 
+        if sids:
+            logger.info(
+                f"订阅搜索转入网盘任务：subscribe_ids={sids}，"
+                f"manual={bool(manual)}"
+            )
+            for subscribe_id in sids:
+                if self._is_subscribe_excluded(subscribe_id):
+                    self._call_subscribe_chain_search(
+                        sid=subscribe_id,
+                        state=state,
+                        manual=manual,
+                        progress_callback=progress_callback,
+                        scheduled_interval=scheduled_interval,
+                        **kwargs,
+                    )
+                else:
+                    self.queue_subscribe_search(
+                        subscribe_id=subscribe_id,
+                        subscribe_state=state,
+                        progress_callback=progress_callback,
+                    )
+            return True
+
         if sid is None:
             return self._dispatch_all_subscribe_search(
                 state=state,
                 manual=manual,
                 progress_callback=progress_callback,
+                scheduled_interval=scheduled_interval,
+                **kwargs,
             )
 
         logger.info(
@@ -368,10 +481,19 @@ class SubscriptionSearchHook(OwnerDelegator):
             progress_callback=progress_callback,
         )
 
-    def _dispatch_subscribe_refresh(self, progress_callback: Optional[Callable[..., None]] = None, ):
+    def _dispatch_subscribe_refresh(
+            self,
+            progress_callback: Optional[Callable[..., None]] = None,
+            mtype: Optional[str] = None,
+            **kwargs: Any,
+    ):
         """按平台下载策略决定接管态是否继续RSS/PT 刷新。"""
         if not self._is_takeover_active():
-            return SubscribeChain().refresh(progress_callback=progress_callback)
+            return self._call_subscribe_chain_refresh(
+                progress_callback=progress_callback,
+                mtype=mtype,
+                **kwargs,
+            )
 
         if progress_callback:
             progress_callback(
@@ -386,16 +508,20 @@ class SubscriptionSearchHook(OwnerDelegator):
             state: Optional[str],
             manual: Optional[bool],
             progress_callback: Optional[Callable[..., None]],
+            scheduled_interval: Optional[int] = None,
+            **kwargs: Any,
     ) -> bool:
         """将全量平台任务拆成插件接管与原生保留两部分。"""
         try:
             subscribes = SubscribeOper().list(state or "N,R") or []
         except Exception as error:
             logger.warning(f"读取订阅接管范围失败，已回退原生搜索：{error}")
-            return SubscribeChain().search(
+            return self._call_subscribe_chain_search(
                 state=state,
                 manual=manual,
                 progress_callback=progress_callback,
+                scheduled_interval=scheduled_interval,
+                **kwargs,
             )
 
         managed_ids, native_ids = self._partition_subscribe_ids(subscribes)
@@ -410,7 +536,7 @@ class SubscriptionSearchHook(OwnerDelegator):
                 progress_callback=progress_callback if index == 0 else None,
             )
         for index, subscribe_id in enumerate(native_ids):
-            SubscribeChain().search(
+            self._call_subscribe_chain_search(
                 sid=subscribe_id,
                 state=None,
                 manual=manual,
@@ -419,6 +545,8 @@ class SubscriptionSearchHook(OwnerDelegator):
                     if not managed_ids and index == 0
                     else None
                 ),
+                scheduled_interval=scheduled_interval,
+                **kwargs,
             )
         return True
 

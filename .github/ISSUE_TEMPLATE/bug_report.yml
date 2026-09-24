@@ -23,11 +23,13 @@ body:
           required: true
         - label: 日志已脱敏，不包含 Cookie、Token、密码或其他凭据
           required: true
-  - type: input
+  - type: dropdown
     id: moviepilot-version
     attributes:
       label: MoviePilot 版本
-      placeholder: 例如：v2.14.6 或 v3.x
+      options:
+        - MoviePilot v2
+        - MoviePilot v3
     validations:
       required: true
   - type: input
@@ -35,16 +37,6 @@ body:
     attributes:
       label: 网盘订阅助手版本
       placeholder: 例如：1.8.0
-    validations:
-      required: true
-  - type: dropdown
-    id: platform
-    attributes:
-      label: 平台
-      options:
-        - MoviePilot v2
-        - MoviePilot v3
-        - 不确定
     validations:
       required: true
   - type: dropdown

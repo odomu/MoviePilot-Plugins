@@ -116,22 +116,32 @@ class AliPanShareService:
         try:
             info = self._prepare(share_url)
             result = []
-            stack = ["root"]
+            stack = [("root", "")]
             while stack:
-                for item in self._list(info, stack.pop()):
+                current_id, parent_path = stack.pop()
+                for item in self._list(info, current_id):
                     if item.get("type") == "folder":
-                        stack.append(str(item.get("file_id") or ""))
+                        folder_name = str(item.get("name") or "").strip()
+                        sub_parent = (
+                            f"{parent_path}/{folder_name}".strip("/")
+                            if parent_path else folder_name
+                        )
+                        stack.append((str(item.get("file_id") or ""), sub_parent))
                         continue
                     file_id = str(item.get("file_id") or "")
                     name = str(item.get("name") or "")
                     if not file_id or not name:
                         continue
                     info["items"][file_id] = item
-                    result.append({
+                    file_data = {
                         "id": file_id, "name": name, "is_dir": False,
                         "size": int(item.get("size") or 0),
                         "sha1": str(item.get("content_hash") or ""),
-                    })
+                    }
+                    if parent_path:
+                        file_data["parent_path"] = parent_path
+                        file_data["relative_path"] = f"{parent_path}/{name}"
+                    result.append(file_data)
             return result
         except Exception as error:
             logger.warning(f"读取阿里云盘分享文件失败：{error}")
@@ -221,10 +231,15 @@ class AliPanShareService:
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
         files = self.list_share_files(share_url)
-        return bool(files) and all(
-            self.transfer_file(share_url, item["id"], save_path, item["name"])
-            for item in files
-        )
+        if not files:
+            return False
+        all_succeeded = True
+        for item in files:
+            parent_path = str(item.get("parent_path") or "").strip("/").strip()
+            target_dir = f"{save_path.rstrip('/')}/{parent_path}" if parent_path else save_path
+            if not self.transfer_file(share_url, item["id"], target_dir, item["name"]):
+                all_succeeded = False
+        return all_succeeded
 
     def transfer_files_batch(
             self, share_url: str, file_ids: list, save_path: str, **kwargs,

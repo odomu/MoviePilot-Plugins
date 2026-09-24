@@ -605,13 +605,22 @@ class SyncMetadataService(OwnerDelegator):
         )
         return True
 
-    def _set_task_phase(self, subscribe: Any, phase: str, progress: int) -> None:
+    def _set_task_phase(
+            self, subscribe: Any, phase: str, progress: int, **extra_kwargs
+    ) -> None:
         """回写订阅任务的真实处理阶段。"""
         if self._task_update:
+            task_id = (
+                f"media:{self.subscription_budget_key(subscribe)}"
+                if bool(getattr(subscribe, "_transient_target", False))
+                   and hasattr(self, "subscription_budget_key")
+                else f"subscribe:{getattr(subscribe, 'id', '')}"
+            )
             self._task_update(
-                f"subscribe:{getattr(subscribe, 'id', '')}",
+                task_id,
                 phase=phase,
                 progress=max(0, min(100, int(progress))),
+                **extra_kwargs,
             )
 
     def _subscribe_mediainfo(
