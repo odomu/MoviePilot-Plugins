@@ -401,11 +401,14 @@ class HDHiveSourceDefinition(SearchSourceDefinition):
         password = str(cls.config_value(config, "hdhive_password", "") or "").strip()
         if not username or not password:
             return None
+        owner = ctx.get("storage_owner")
         return HDHiveClient(
             username=username,
             password=password,
             proxy=proxy,
             request_interval=float(cls.config_value(config, "hdhive_request_interval", 5) or 5),
+            get_data_func=getattr(owner, "get_data", None),
+            save_data_func=getattr(owner, "save_data", None),
         )
 
     @classmethod

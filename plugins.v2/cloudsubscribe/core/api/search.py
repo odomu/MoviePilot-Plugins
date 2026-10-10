@@ -208,6 +208,29 @@ class SearchApi(OwnerDelegator):
         resource_ref = str(payload.get("resource_ref") or "").strip()
         is_unlocked = bool(payload.get("is_unlocked"))
         parent_id = str(payload.get("parent_id") or "").strip()
+        raw_file_list = payload.get("file_list") or provider_data.get("file_list") or []
+        if isinstance(raw_file_list, list) and raw_file_list:
+            items = [
+                {
+                    "id": str(idx),
+                    "name": str(f if isinstance(f, str) else (f or {}).get("name") or "").strip(),
+                    "size": int((f or {}).get("size") or 0) if isinstance(f, dict) else 0,
+                    "is_dir": False,
+                    "can_enter": False,
+                }
+                for idx, f in enumerate(raw_file_list, start=1)
+                if str(f if isinstance(f, str) else (f or {}).get("name") or "").strip()
+            ]
+            return {
+                "success": True,
+                "data": {
+                    "items": items,
+                    "parent_id": "",
+                    "breadcrumbs": [{"id": "", "name": "根目录"}],
+                    "total": len(items),
+                },
+            }
+
         pending_resolve = (
             not url
             and (
@@ -636,6 +659,8 @@ class SearchApi(OwnerDelegator):
         test_owner = type("SearchTestOwner", (), {})()
         test_owner.get_data = self.get_data
         test_owner.save_data = self.save_data
+        test_owner.get_config = lambda: dict(config)
+        test_owner._applied_config = dict(config)
 
         handler = SearchHandler(
             plugin=test_owner,
@@ -1232,7 +1257,9 @@ class SearchApi(OwnerDelegator):
                     r_type, r_type.upper() if r_type else "未知"
                 )
                 item_copy["can_preview"] = bool(
-                    item.get("can_preview") or (r_type in PREVIEW_RESOURCE_TYPES)
+                    item.get("can_preview")
+                    or bool(item.get("file_list"))
+                    or (r_type in PREVIEW_RESOURCE_TYPES)
                 )
                 item_copy["tags"] = self._display_tags(item)
                 if not item_copy.get("size_formatted"):

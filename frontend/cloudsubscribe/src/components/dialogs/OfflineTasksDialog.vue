@@ -105,14 +105,15 @@
                   :value="taskSelectionKey(task)"
                   density="compact"
                   aria-label="选择离线任务" />
-                <v-icon :icon="taskIcon(task)" :color="statusColor(task.state, task.failed)" size="20" />
+                <v-icon :icon="taskIcon(task)" :color="statusColor(task.state, task.failed, task.finalized)"
+                        size="20" />
               </div>
               <div class="task-copy">
                 <div class="task-heading">
                   <div class="task-name text-body-2 font-weight-medium">
                     {{ task.target_name || task.name || "未命名任务" }}
                   </div>
-                  <v-chip :color="statusColor(task.state, task.failed)" size="x-small" variant="tonal">
+                  <v-chip :color="statusColor(task.state, task.failed, task.finalized)" size="x-small" variant="tonal">
                     {{ taskStatusText(task) }}
                   </v-chip>
                   <span class="task-percent text-caption">
@@ -121,9 +122,9 @@
                 </div>
                 <v-progress-linear
                   :model-value="progressValue(task)"
-                  :color="statusColor(task.state, task.failed)"
-                  :stream="['queued', 'running', 'retrying', 'processing'].includes(task.state)"
-                  :striped="['queued', 'running', 'retrying', 'processing'].includes(task.state)"
+                  :color="statusColor(task.state, task.failed, task.finalized)"
+                  :stream="isStreamingState(task)"
+                  :striped="isStreamingState(task)"
                   height="4"
                   rounded
                   class="my-1" />
@@ -267,12 +268,15 @@ function formatTime(timestamp) {
   return Number(timestamp) > 0 ? new Date(Number(timestamp) * 1000).toLocaleString() : "未知";
 }
 
-function statusColor(state, failed = false) {
-  return failed ? "error" : state === "completed" ? "success" : state === "retrying" ? "warning" : "info";
+function statusColor(state, failed = false, finalized = false) {
+  if (failed) return "error";
+  if (finalized) return "success";
+  return state === "completed" ? "success" : state === "retrying" ? "warning" : "info";
 }
 
 function taskIcon(task) {
   if (task?.failed) return "mdi-alert-circle-outline";
+  if (task?.finalized) return "mdi-check-circle-outline";
   if (task?.finalize_pending && task?.completed) return "mdi-file-sync-outline";
   if (task?.state === "completed") return "mdi-check-circle-outline";
   return "mdi-drive-download-outline";
@@ -280,12 +284,19 @@ function taskIcon(task) {
 
 function taskStatusText(task) {
   if (task?.finalize_pending && task?.completed) return "待整理";
+  if (task?.finalized) return task.finalized_text || "已入库";
   return task?.status_text || "未知状态";
 }
 
 function progressValue(task) {
+  if (task?.finalized) return 100;
   if (task?.completed && !task?.failed) return 100;
   return Math.max(0, Math.min(100, Number(task?.percent || 0)));
+}
+
+function isStreamingState(task) {
+  if (task?.finalized || task?.completed) return false;
+  return ["queued", "running", "retrying", "processing"].includes(task?.state);
 }
 
 async function load(force = false) {

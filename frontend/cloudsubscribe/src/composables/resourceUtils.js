@@ -595,14 +595,21 @@ export function isCrossTransferResource(res, mainDrive) {
 
 // 预览资源判断
 export function canPreviewResource(item) {
+  if (!item) return false;
   if (!isPreviewableResourceType(getNormalizedResourceType(item))) return false;
-  const hasUrl = Boolean(item?.url);
-  const isPendingResolvable = Boolean(
-    item?.pending_resolution ||
-    item?.resource_ref ||
-    item?.provider_data?.resource_id,
-  ) && item?.supports_file_preview !== false;
-  return hasUrl || isPendingResolvable;
+  if (item?.supports_file_preview === false) return false;
+
+  // 1. 优先使用后端动态判定的 can_preview 状态
+  if (typeof item?.can_preview === "boolean") return item.can_preview;
+
+  // 2. 有实际直链、携带文件列表、或声明支持免解锁文件预览
+  if (Boolean(item?.url)) return true;
+  if (Array.isArray(item?.file_list) && item.file_list.length > 0) return true;
+  if (Array.isArray(item?.files) && item.files.length > 0) return true;
+  if (Boolean(item?.supports_file_preview) && Boolean(item?.resource_ref)) return true;
+  if (Boolean(item?.pending_resolution) && Boolean(item?.resource_ref || item?.provider_data?.resource_id)) return true;
+
+  return false;
 }
 
 export function previewResourceKey(item) {

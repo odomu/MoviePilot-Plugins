@@ -211,6 +211,7 @@ class HDHavenSourceDefinition(SearchSourceDefinition):
         password = str(cls.config_value(config, "hdhaven_password", "") or "").strip()
         if not username or not password:
             return None
+        owner = (context or {}).get("storage_owner")
         return HDHavenClient(
             username=username,
             password=password,
@@ -220,6 +221,8 @@ class HDHavenSourceDefinition(SearchSourceDefinition):
             ),
             proxy=(context or {}).get("proxy"),
             request_interval=float(cls.config_value(config, "hdhaven_request_interval", 1.0) or 1.0),
+            get_data_func=getattr(owner, "get_data", None),
+            save_data_func=getattr(owner, "save_data", None),
         )
 
     @classmethod

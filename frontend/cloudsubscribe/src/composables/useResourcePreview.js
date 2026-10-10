@@ -1,5 +1,11 @@
 import {computed, ref, watch} from "vue";
-import {getNormalizedResourceType, getResourceTypeName, getSourceName, previewResourceKey} from "./resourceUtils";
+import {
+  canPreviewResource,
+  getNormalizedResourceType,
+  getResourceTypeName,
+  getSourceName,
+  previewResourceKey,
+} from "./resourceUtils";
 
 /** 管理资源预览、目录下钻、选择和转存编排。 */
 export function useResourcePreview({
@@ -50,7 +56,7 @@ export function useResourcePreview({
   }
 
   async function previewResource(item) {
-    if (previewingKey.value) return;
+    if (previewingKey.value || !canPreviewResource(item)) return;
     const token = nextPreviewRequest();
     previewingKey.value = previewResourceKey(item);
     const shareUrl = String(item?.url || "");
@@ -77,11 +83,41 @@ export function useResourcePreview({
     previewTargetEpisodes.value = Array.isArray(item?.target_episodes) ? [...item.target_episodes] : [];
     previewMeta.value = {
       provider_name: getSourceName(item?.source),
+      resource_type: previewResourceType.value,
       resource_type_name: getResourceTypeName(previewResourceType.value),
       display_name: String(item?.title || ""),
       share_url: shareUrl,
       size: Number(item?.size || item?.size_bytes || 0),
+      need_unlock: Boolean(item?.need_unlock),
+      is_unlocked: Boolean(item?.is_unlocked),
+      unlock_points: Number(item?.unlock_points || 0),
     };
+
+    const rawFiles = Array.isArray(item?.file_list)
+      ? item.file_list
+      : Array.isArray(item?.files)
+        ? item.files
+        : [];
+    if (rawFiles.length > 0) {
+      previewItems.value = rawFiles
+        .map((entry, idx) => {
+          const isObj = typeof entry === "object" && entry !== null;
+          const name = String(isObj ? entry.name || "" : entry || "").trim();
+          const size = isObj && entry.size ? Number(entry.size) : 0;
+          return {
+            id: String(idx + 1),
+            name,
+            size: size || (rawFiles.length === 1 && item?.size ? Number(item.size) : 0),
+            is_dir: false,
+            can_enter: false,
+          };
+        })
+        .filter((f) => Boolean(f.name));
+      previewLoading.value = false;
+      previewingKey.value = "";
+      return;
+    }
+
     const breadcrumbs = [{id: "", name: "根目录"}];
     previewBreadcrumbs.value = breadcrumbs;
     await loadPreviewDirectory("", breadcrumbs, token);
@@ -115,6 +151,7 @@ export function useResourcePreview({
         target_episodes: previewTargetEpisodes.value,
         episode_range: previewPendingResource.value.episode_range || "",
         unlock_points: previewPendingResource.value.unlock_points || 0,
+        file_list: Array.isArray(previewPendingResource.value.file_list) ? previewPendingResource.value.file_list : [],
       });
       if (!isPreviewRequestCurrent(token) || !previewVisible.value) return;
       if (response?.success === false) throw new Error(response.message || "资源预览失败");
@@ -126,12 +163,14 @@ export function useResourcePreview({
       }
       previewItems.value = Array.isArray(data.items) ? data.items : [];
       previewMeta.value = {
+        ...previewMeta.value,
         provider_name: String(data.provider_name || previewMeta.value.provider_name || ""),
+        resource_type: String(data.resource_type || previewResourceType.value || previewMeta.value.resource_type || ""),
         resource_type_name: String(data.resource_type_name || previewMeta.value.resource_type_name || ""),
         display_name: String(data.display_name || previewMeta.value.display_name || ""),
-        info_hash: String(data.info_hash || ""),
+        info_hash: String(data.info_hash || previewMeta.value.info_hash || ""),
         size: Number(data.size || previewMeta.value.size || 0),
-        share_url: String(data.share_url || shareUrl),
+        share_url: String(data.share_url || previewMeta.value.share_url || shareUrl),
       };
       previewBreadcrumbs.value = breadcrumbs;
     } catch (error) {

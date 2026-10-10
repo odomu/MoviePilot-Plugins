@@ -473,12 +473,24 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 break
                             continue
                         share_files = []
+                        val_kwargs = {}
+                        explicit_func = getattr(self, "_explicit_selection_values", None)
+                        if callable(explicit_func):
+                            try:
+                                val = explicit_func(resource)
+                                if isinstance(val, (tuple, list)) and len(val) == 2:
+                                    if val[0] or val[1]:
+                                        val_kwargs["target_file_ids"] = val[0]
+                                        val_kwargs["target_file_names"] = val[1]
+                            except Exception:
+                                pass
                         for current_url in resource_urls:
                             share_files.extend(self._validated_resource_files(
                                 current_url,
                                 resource_title=resource_title,
                                 target_season=(season if self._skip_other_season_dirs else None),
                                 log_prefix=search_prefix,
+                                **val_kwargs,
                             ))
                         if not share_files:
                             continue

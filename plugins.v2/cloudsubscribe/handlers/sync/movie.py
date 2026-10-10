@@ -486,9 +486,21 @@ class MovieSyncProcessor(OwnerDelegator):
                         logger.info(f"Magnet 已进入下载后真实文件匹配：{provider_name}")
                         continue
 
+                    val_kwargs = {}
+                    explicit_func = getattr(self, "_explicit_selection_values", None)
+                    if callable(explicit_func):
+                        try:
+                            val = explicit_func(resource)
+                            if isinstance(val, (tuple, list)) and len(val) == 2:
+                                if val[0] or val[1]:
+                                    val_kwargs["target_file_ids"] = val[0]
+                                    val_kwargs["target_file_names"] = val[1]
+                        except Exception:
+                            pass
                     share_files = self._validated_resource_files(
                         share_url,
                         resource_title=resource_title,
+                        **val_kwargs,
                     )
                     if not share_files:
                         continue

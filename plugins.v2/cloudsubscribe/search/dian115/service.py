@@ -278,6 +278,8 @@ class Dian115SearchService(OwnerDelegator):
             "is_free": unlock_points <= 0,
             "preview_episodes": preview_episodes,
             "identity_verified": True,
+            "can_preview": bool(file_list or url),
+            "supports_file_preview": bool(file_list or url),
             "target_season": (
                 int(target_season) if target_season is not None else None
             ),

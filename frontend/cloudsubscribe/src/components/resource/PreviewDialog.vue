@@ -27,6 +27,16 @@
 
       <v-divider />
       <v-card-text class="source-preview-body pa-4">
+        <v-alert
+          v-if="isLocked"
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-3 text-caption"
+        >
+          当前内容尚未解锁，仅供查看文件列表。未解锁内容不支持按文件单独转存，请使用积分整包解锁后再入库。
+        </v-alert>
+
         <div class="source-preview-meta mb-3 d-flex align-center ga-2 flex-wrap">
           <v-chip v-if="meta.provider_name" size="small" variant="tonal" color="primary">
             <v-icon start icon="mdi-cloud-outline" size="13" />
@@ -41,6 +51,10 @@
             {{ formatBytes(meta.size) }}
           </v-chip>
           <v-chip size="small" variant="tonal">共 {{ items.length }} 个项目</v-chip>
+          <v-chip v-if="isLocked" size="small" variant="tonal" color="warning" class="font-weight-medium">
+            <v-icon start icon="mdi-lock-outline" size="13" />
+            未解锁 (需 {{ meta.unlock_points || 0 }} 积分)
+          </v-chip>
         </div>
 
         <div v-if="breadcrumbs.length > 1" class="source-preview-breadcrumbs mb-2.5">
@@ -58,7 +72,7 @@
         </div>
 
         <div
-          v-if="items.length"
+          v-if="items.length && !isOffline && !isLocked"
           class="source-preview-batch-bar d-flex align-center justify-space-between px-3 py-1.5 mb-2 ga-2">
           <div class="d-flex align-center ga-2">
             <v-checkbox-btn
@@ -101,6 +115,7 @@
                 :class="{ 'source-preview-file--directory': file.can_enter }">
                 <template #prepend>
                   <v-checkbox-btn
+                    v-if="!isOffline && !isLocked"
                     :model-value="isSelected(file)"
                     density="compact"
                     hide-details
@@ -127,6 +142,7 @@
                     {{ formatBytes(file.size) }}
                   </span>
                   <v-btn
+                    v-if="!file.is_dir && !isOffline && !isLocked"
                     size="small"
                     color="primary"
                     variant="tonal"
@@ -153,17 +169,25 @@
 
       <v-divider />
       <v-card-actions class="pa-3 justify-space-between">
-        <span class="text-caption text-medium-emphasis">支持下钻浏览各层级子文件夹</span>
+        <span v-if="isLocked" class="text-caption text-warning">
+          未解锁内容不支持按文件部分转存，可点击右侧「解锁并转存」
+        </span>
+        <span v-else-if="isOffline" class="text-caption text-medium-emphasis">
+          磁力任务将作为离线下载整体转存，完成后自动识别并整理正片
+        </span>
+        <span v-else class="text-caption text-medium-emphasis">
+          支持下钻浏览各层级子文件夹，可按需勾选转存
+        </span>
         <div class="d-flex ga-2">
           <v-btn variant="tonal" size="small" @click="model = false">关闭</v-btn>
           <v-btn
             v-if="canTransfer"
-            color="primary"
+            :color="isLocked ? 'warning' : 'primary'"
             variant="flat"
             size="small"
-            prepend-icon="mdi-download"
+            :prepend-icon="isLocked ? 'mdi-lock-open-outline' : 'mdi-download'"
             @click="$emit('quick-transfer')">
-            一键转存
+            {{ isLocked ? `解锁并转存 (${meta.unlock_points || 0} 积分)` : "一键转存" }}
           </v-btn>
         </div>
       </v-card-actions>
@@ -173,7 +197,13 @@
 
 <script setup>
 import {computed} from "vue";
-import {formatBytes, previewFileExtension, previewFileIcon, previewFileStem} from "../../composables/resourceUtils";
+import {
+  formatBytes,
+  isOfflineResourceType,
+  previewFileExtension,
+  previewFileIcon,
+  previewFileStem,
+} from "../../composables/resourceUtils";
 
 const props = defineProps({
   modelValue: Boolean,
@@ -200,6 +230,23 @@ const emit = defineEmits([
   "quick-transfer",
 ]);
 const model = computed({get: () => props.modelValue, set: (value) => emit("update:modelValue", value)});
+
+const isLocked = computed(() => {
+  const meta = props.meta || {};
+  return Boolean(meta.need_unlock && !meta.is_unlocked && !props.shareUrl);
+});
+
+const isOffline = computed(() => {
+  const type = String(props.meta?.resource_type || "").toLowerCase();
+  const share = String(props.meta?.share_url || props.shareUrl || "").toLowerCase();
+  return (
+    isOfflineResourceType(type) ||
+    type === "magnet" ||
+    type === "ed2k" ||
+    share.startsWith("magnet:") ||
+    share.startsWith("ed2k://")
+  );
+});
 </script>
 
 <style scoped>
