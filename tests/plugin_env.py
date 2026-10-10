@@ -74,7 +74,11 @@ class OwnerDelegator:
         if name == "_owner":
             object.__setattr__(self, name, value)
             return
-        setattr(object.__getattribute__(self, "_owner"), name, value)
+        owner = self.__dict__.get("_owner")
+        if owner is not None:
+            setattr(owner, name, value)
+        else:
+            object.__setattr__(self, name, value)
 
 
 def _member(value):

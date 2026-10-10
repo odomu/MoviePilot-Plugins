@@ -18,9 +18,7 @@ install_app_mocks(
     "cloudsubscribe.utils.cache", "cloudsubscribe.search.types",
 )
 
-
-class OwnerDelegator:
-    pass
+from plugin_env import OwnerDelegator
 
 
 ensure_package("cloudsubscribe.core").OwnerDelegator = OwnerDelegator

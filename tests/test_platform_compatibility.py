@@ -1,24 +1,51 @@
-import sys
 import unittest
 from unittest.mock import MagicMock
 
-from plugin_env import OwnerDelegator, load_module, register_mock
+from plugin_env import OwnerDelegator, install_app_mocks, load_module, register_mock, register_package, set_media_type
+
+set_media_type("电影", "电视剧")
 
 # 构造 mock 的 app 基础依赖
+install_app_mocks(
+    "app.core",
+    "app.core.config",
+    "app.core.cache",
+    "app.core.context",
+    "app.core.metainfo",
+    "app.chain",
+    "app.chain.subscribe",
+    "app.chain.mediaserver",
+    "app.db",
+    "app.db.models",
+    "app.db.models.subscribe",
+    "app.db.models.downloadhistory",
+    "app.db.models.mediaserver",
+    "app.db.subscribe_oper",
+    "app.db.transferhistory_oper",
+    "app.db.downloadhistory_oper",
+    "app.helper",
+    "app.helper.mediaserver",
+    "app.application",
+    "app.application.mediaserver",
+    "app.utils",
+    "app.utils.string",
+    "app.scheduler",
+)
+
 mock_subscribe_chain = MagicMock()
 mock_subscribe_oper = MagicMock()
 mock_logger = MagicMock()
 
-register_mock("app")
-register_mock("app.log", logger=mock_logger)
-register_mock("app.scheduler")
-register_mock("app.chain.subscribe", SubscribeChain=mock_subscribe_chain)
-register_mock("app.db.subscribe_oper", SubscribeOper=mock_subscribe_oper)
+import sys
 
+sys.modules["app.log"].logger = mock_logger
+sys.modules["app.chain.subscribe"].SubscribeChain = mock_subscribe_chain
+sys.modules["app.db.subscribe_oper"].SubscribeOper = mock_subscribe_oper
 # 构造 mock 的 cloudsubscribe 包结构
-register_mock("cloudsubscribe")
-register_mock("cloudsubscribe.core", OwnerDelegator=OwnerDelegator)
+register_package("cloudsubscribe")
+register_package("cloudsubscribe.core", OwnerDelegator=OwnerDelegator)
 register_mock("cloudsubscribe.core.hook")
+load_module("cloudsubscribe.core.media", "plugins.v2/cloudsubscribe/core/media.py")
 
 SubscriptionSearchHook = load_module(
     "cloudsubscribe.core.hook.subscription",
@@ -244,7 +271,6 @@ class TestPlatformCompatibility(unittest.TestCase):
         """
         import re
         from pathlib import Path
-        from types import SimpleNamespace
 
         history_file = Path("plugins.v2/cloudsubscribe/handlers/sync/history.py")
         text = history_file.read_text(encoding="utf-8")
@@ -294,6 +320,224 @@ class TestPlatformCompatibility(unittest.TestCase):
         res_v2 = MockV2SubscribeChain().get_params(obj2)
         self.assertEqual(res_v2["mode"], "v2")
 
+    def test_is_subscribe_best_version_across_v2_v3_formats(self):
+        """
+        验证 is_subscribe_best_version 准确识别各种 v2/v3 形式的 best_version：
+        - v2 ORM 模型 / 整数属性 (1 / 0)
+        - v3 dataclass 快照 / Optional[int] (1 / None)
+        - 字典形式 (best_version: 1, "1", True, "true")
+        - 显式关闭形式 (0, False, None, "0", "false")
+        """
+        from types import SimpleNamespace
+        core_media = load_module(
+            "cloudsubscribe.core.media",
+            "plugins.v2/cloudsubscribe/core/media.py",
+        )
+        is_best = core_media.is_subscribe_best_version
+
+        # 1. 开启形式
+        self.assertTrue(is_best(SimpleNamespace(best_version=1)))
+        self.assertTrue(is_best(SimpleNamespace(best_version=True)))
+        self.assertTrue(is_best(SimpleNamespace(best_version="1")))
+        self.assertTrue(is_best(SimpleNamespace(best_version="true")))
+        self.assertTrue(is_best(SimpleNamespace(best_version="yes")))
+        self.assertTrue(is_best({"best_version": 1}))
+        self.assertTrue(is_best({"best_version": True}))
+        self.assertTrue(is_best({"best_version": "1"}))
+
+        # 2. 关闭形式
+        self.assertFalse(is_best(None))
+        self.assertFalse(is_best(SimpleNamespace(best_version=0)))
+        self.assertFalse(is_best(SimpleNamespace(best_version=False)))
+        self.assertFalse(is_best(SimpleNamespace(best_version=None)))
+        self.assertFalse(is_best(SimpleNamespace()))
+        self.assertFalse(is_best({"best_version": 0}))
+        self.assertFalse(is_best({"best_version": False}))
+        self.assertFalse(is_best({"best_version": None}))
+        self.assertFalse(is_best({}))
+
+    def test_is_cloud_upgrade_subscribe_respects_platform_best_version(self):
+        """
+        验证当订阅卡片在平台开启了洗版 (best_version=1) 时，
+        即使插件单独洗版订阅清单配置了其他订阅ID，也必须正确识别该订阅为洗版订阅。
+        """
+        from types import SimpleNamespace
+        subscription_service = load_module(
+            "cloudsubscribe.core.services.subscription",
+            "plugins.v2/cloudsubscribe/core/services/subscription.py",
+        )
+        owner = MagicMock()
+        owner._enable_cloud_upgrade = True
+        owner._upgrade_subscribe_ids = [999]  # 插件配置了其他指定订阅
+        svc = subscription_service.SubscriptionControlService(owner)
+
+        # 订阅卡片开启了 best_version=1，ID 为 123（不在 999 列表中）
+        sub = SimpleNamespace(id=123, best_version=1)
+        self.assertTrue(svc._is_cloud_upgrade_subscribe(sub))
+
+        # 订阅卡片未开启 best_version，且不在列表中 -> 不洗版
+        sub_no_wash = SimpleNamespace(id=123, best_version=0)
+        self.assertFalse(svc._is_cloud_upgrade_subscribe(sub_no_wash))
+
+        # 订阅卡片未开启 best_version，但是在插件独立清单中 (999) -> 洗版
+        sub_in_plugin_list = SimpleNamespace(id=999, best_version=0)
+        self.assertTrue(svc._is_cloud_upgrade_subscribe(sub_in_plugin_list))
+
+        # 插件全局网盘洗版关闭 -> 一律不洗版
+        owner._enable_cloud_upgrade = False
+        self.assertFalse(svc._is_cloud_upgrade_subscribe(sub))
+
+    def test_append_history_records_upgrade_preserves_finalize_key_and_pending_ready(self):
+        """
+        验证洗版任务 (is_upgrade) 在合并到已有成功记录时：
+        1. 必须推进为 incoming 状态 (处理中)，不得被旧的成功状态覆盖
+        2. 必须保留 finalize_key
+        3. 必须将 pending 任务标记为 history_ready=True，防止后处理被阻断 30 分钟
+        """
+        load_module("cloudsubscribe.core.history", "plugins.v2/cloudsubscribe/core/history.py")
+        register_mock("cloudsubscribe.search")
+        register_mock("cloudsubscribe.search.types", normalize_resource_type=lambda t: t,
+                      resource_type_from_url=lambda u: "share")
+        register_package("cloudsubscribe.drive")
+        register_mock("cloudsubscribe.drive.common", format_size=lambda s: f"{s}B",
+                      positive_int=lambda v: int(v) if v else None)
+        register_package("cloudsubscribe.handlers")
+        register_package("cloudsubscribe.handlers.sync")
+        register_mock("cloudsubscribe.handlers.sync.utils", normalize_season=lambda s: int(s or 1))
+        history_module = load_module(
+            "cloudsubscribe.handlers.sync.history",
+            "plugins.v2/cloudsubscribe/handlers/sync/history.py",
+        )
+        owner = MagicMock()
+        data_store = {
+            "history": [
+                {
+                    "title": "生化危机：爆发夜",
+                    "year": "2026",
+                    "type": "电影",
+                    "tmdb_id": "1423191",
+                    "status": "成功",
+                    "file_name": "生化危机：爆发夜 (2026).mp4",
+                    "rule_score": 0,
+                }
+            ],
+            "pending_offline_strm": {
+                "P115:KEY123": {
+                    "file_name": "Resident.Evil.2026.1080p.mkv",
+                    "history_ready": False,
+                    "created_at": 1000.0,
+                    "next_check_at": 1010.0,
+                }
+            },
+        }
+        owner.get_data = lambda k: data_store.get(k)
+        owner.save_data = lambda k, v: data_store.__setitem__(k, v)
+        owner._get_data = owner.get_data
+        owner._save_data = owner.save_data
+        owner._offline_pending_lock = MagicMock()
+        owner._offline_pending_lock.__enter__ = MagicMock(return_value=True)
+        owner._offline_pending_lock.__exit__ = MagicMock(return_value=None)
+        owner._OFFLINE_PENDING_KEY = "pending_offline_strm"
+        owner._record_platform_transfer_histories = MagicMock()
+        owner._history_changed = MagicMock()
+        owner._notify_offline_pending_changed = MagicMock()
+
+        svc = history_module.HistoryService(owner)
+
+        incoming_record = {
+            "title": "生化危机：爆发夜",
+            "year": "2026",
+            "type": "电影",
+            "tmdb_id": "1423191",
+            "status": "处理中",
+            "file_name": "Resident.Evil.2026.1080p.mkv",
+            "finalize_key": "P115:KEY123",
+            "upgrade": True,
+            "rule_score": 80,
+        }
+
+        svc.append_history_records([incoming_record])
+
+        # 验证历史记录状态和 finalize_key 已正确写入
+        saved_history = data_store["history"]
+        self.assertEqual(len(saved_history), 1)
+        self.assertEqual(saved_history[0]["status"], "处理中")
+        self.assertEqual(saved_history[0]["finalize_key"], "P115:KEY123")
+        self.assertTrue(saved_history[0]["upgrade"])
+
+        # 验证 pending 任务的 history_ready 已激活
+        saved_pending = data_store["pending_offline_strm"]
+        self.assertTrue(saved_pending["P115:KEY123"]["history_ready"])
+
+    def test_reconcile_real_history_status_cleans_orphan_pending_tasks(self):
+        """
+        验证状态校准逻辑：
+        当 STRM 产物文件已就绪或历史记录已是终态时，
+        必须将 pending 中的残留任务清理并通知前端，避免任务列表永久卡在‘转存中’。
+        """
+        from pathlib import Path
+        history_module = load_module(
+            "cloudsubscribe.handlers.sync.history",
+            "plugins.v2/cloudsubscribe/handlers/sync/history.py",
+        )
+        owner = MagicMock()
+        data_store = {
+            "history": [
+                {
+                    "title": "生化危机：爆发夜",
+                    "year": "2026",
+                    "type": "电影",
+                    "tmdb_id": "1423191",
+                    "status": "处理中",
+                    "finalize_key": "P115:ORPHAN1",
+                    "cloud_dir": "/media/电影",
+                    "file_name": "生化危机：爆发夜 (2026).mp4",
+                }
+            ],
+            "pending_offline_strm": {
+                "P115:ORPHAN1": {
+                    "file_name": "生化危机：爆发夜 (2026).mp4",
+                    "cloud_dir": "/media/电影",
+                    "history_ready": True,
+                },
+                "P115:GHOST2": {
+                    "file_name": "旧电影.mp4",
+                    "cloud_dir": "/media/电影",
+                    "history_ready": True,
+                    "moved_at": 1000.0,
+                },
+            },
+        }
+        owner.get_data = lambda k: data_store.get(k)
+        owner.save_data = lambda k, v: data_store.__setitem__(k, v)
+        owner._get_data = owner.get_data
+        owner._save_data = owner.save_data
+        owner._offline_pending_lock = MagicMock()
+        owner._offline_pending_lock.__enter__ = MagicMock(return_value=True)
+        owner._offline_pending_lock.__exit__ = MagicMock(return_value=None)
+        owner._OFFLINE_PENDING_KEY = "pending_offline_strm"
+        owner._record_platform_transfer_histories = MagicMock()
+        owner._history_changed = MagicMock()
+        owner._notify_offline_pending_changed = MagicMock()
+
+        svc = history_module.HistoryService(owner)
+        # 模拟 strm 文件已生成就绪
+        mock_strm = MagicMock(spec=Path)
+        mock_strm.is_file = MagicMock(return_value=True)
+        mock_strm.stat = MagicMock(return_value=MagicMock(st_size=1024))
+        svc._strm_local_path = MagicMock(
+            side_effect=lambda record: mock_strm if record.get("file_name") == "生化危机：爆发夜 (2026).mp4" else None)
+
+        res = svc.reconcile_real_history_status()
+        self.assertTrue(res["success"])
+
+        # 历史记录已收敛为成功
+        self.assertEqual(data_store["history"][0]["status"], "成功")
+        self.assertNotIn("finalize_key", data_store["history"][0])
+
+        # pending 中产物就绪和孤儿任务均已清理
+        self.assertEqual(len(data_store["pending_offline_strm"]), 0)
+        owner._notify_offline_pending_changed.assert_called()
     def test_typing_annotations_defined_across_all_modules(self):
         """
         验证插件模块类型注解规范：

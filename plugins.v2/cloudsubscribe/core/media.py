@@ -43,6 +43,20 @@ def _read(value: Any, field: str) -> Any:
     return getattr(value, field, None)
 
 
+def is_subscribe_best_version(subscribe: Any) -> bool:
+    """检查订阅对象是否启用了原生洗版 (best_version)，兼容 v2 与 v3 的模型、快照和字典格式。"""
+    if not subscribe:
+        return False
+    val = _read(subscribe, "best_version")
+    if val is None or val is False:
+        return False
+    if isinstance(val, (int, float)):
+        return val > 0
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(val)
+
+
 def _present(value: Any) -> bool:
     return value not in (None, "", 0, "0")
 

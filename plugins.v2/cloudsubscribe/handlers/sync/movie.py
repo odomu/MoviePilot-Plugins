@@ -9,7 +9,7 @@ from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
 from ...core import OwnerDelegator
-from ...core.media import tmdb_id_of
+from ...core.media import get_transfer_history_by, media_identity, tmdb_id_of
 from ...drive.common import format_size
 
 
@@ -105,6 +105,53 @@ class MovieSyncProcessor(OwnerDelegator):
                         f"电影 {subscribe.name} 洗版基线采用所选媒体库内容："
                         f"{manual_name}，评分 {manual_score}，{format_size(manual_size)}"
                     )
+                try:
+                    from app.db import SessionFactory
+                    from app.db.transferhistory_oper import TransferHistoryOper
+
+                    media_source, media_id = media_identity(subscribe)
+                    tmdbid = tmdb_id_of(subscribe)
+                    with SessionFactory() as db:
+                        oper = TransferHistoryOper(db=db)
+                        records = get_transfer_history_by(
+                            oper,
+                            mtype=MediaType.MOVIE.value,
+                            tmdb_id=tmdbid,
+                            media_source=media_source,
+                            media_id=media_id,
+                        ) if media_id or tmdbid else []
+                        if not records:
+                            records = oper.get_by(
+                                mtype=MediaType.MOVIE.value,
+                                title=getattr(subscribe, "name", None),
+                                year=str(getattr(subscribe, "year", None) or "") or None,
+                            ) or []
+                    for record in records or []:
+                        src_item = getattr(record, "src_fileitem", None) or {}
+                        dest_item = getattr(record, "dest_fileitem", None) or {}
+                        src_file = str(
+                            getattr(record, "src", None)
+                            or (src_item if isinstance(src_item, dict) else {}).get("name")
+                            or (dest_item if isinstance(dest_item, dict) else {}).get("name")
+                            or ""
+                        )
+                        src_name = Path(src_file).name if src_file else ""
+                        rec_size = int(
+                            (src_item if isinstance(src_item, dict) else {}).get("size")
+                            or (dest_item if isinstance(dest_item, dict) else {}).get("size")
+                            or 0
+                        )
+                        if src_name:
+                            rec_score = self._get_mp_rule_score(
+                                src_name, rec_size, subscribe, 0, mediainfo
+                            )
+                            if rec_score > movie_history_score:
+                                movie_history_score = rec_score
+                            if rec_size and not movie_history_size:
+                                movie_history_size = rec_size
+                except Exception as oper_err:
+                    logger.debug(f"读取电影整理历史基线异常：{oper_err}")
+
                 for media_item in self._media_server_resolver.movie_media(
                         chain=self._chain, mediainfo=mediainfo
                 ):
@@ -153,9 +200,12 @@ class MovieSyncProcessor(OwnerDelegator):
                         existing_score = self._get_mp_rule_score(
                             file_name, existing_size, subscribe, 0, mediainfo
                         )
-                        if existing_score >= movie_history_score:
+                        if existing_score > movie_history_score:
                             movie_history_score = existing_score
+                        if existing_size > 0:
                             movie_history_size = existing_size
+                        if movie_history_score < 0:
+                            movie_history_score = max(0, existing_score)
                         logger.info(
                             f"电影 {subscribe.name} 媒体服务器未提供有效大小，"
                             f"网盘回退基线：{movie_history_score} "

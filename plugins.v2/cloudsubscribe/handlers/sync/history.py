@@ -240,8 +240,8 @@ class HistoryService(OwnerDelegator):
         )
         if not media_type or media_key == "legacy::":
             return None
-        if media_type == MediaType.MOVIE.value:
-            return media_type, media_key
+        if media_type in {str(getattr(MediaType.MOVIE, "value", "movie")), "电影", "movie"}:
+            return "movie", media_key
         season = positive_int(record.get("season"))
         episode = positive_int(record.get("episode"))
         if not season or not episode:
@@ -352,7 +352,12 @@ class HistoryService(OwnerDelegator):
                     set(self._history_task_types(current))
                     | set(self._history_task_types(incoming))
                 )
-                if self._is_upgrade_history(incoming):
+                is_upgrade = bool(
+                    self._is_upgrade_history(incoming)
+                    or incoming.get("upgrade")
+                    or self._is_upgrade_history(current)
+                )
+                if is_upgrade:
                     merged["upgrade"] = True
                     merged["upgrade_count"] = max(
                         1, int(current.get("upgrade_count") or 0) + 1
@@ -362,10 +367,12 @@ class HistoryService(OwnerDelegator):
                     )
                     merged["previous_file_size"] = current.get("file_size")
                     merged["previous_rule_score"] = current.get("rule_score")
+                # 仅普通非洗版更新才保留历史终态；洗版任务为全新转存周期，必须推进为 incoming 状态
                 if (
                         current_status in {"成功", "失败"}
                         and incoming_status not in {"成功", "失败"}
                         and not reopen_terminal
+                        and not is_upgrade
                 ):
                     merged["status"] = current_status
                     for state_key in ("finalize_key", "failure_reason"):
@@ -375,6 +382,8 @@ class HistoryService(OwnerDelegator):
                             merged.pop(state_key, None)
                 if incoming_status != "失败":
                     merged.pop("failure_reason", None)
+                if incoming.get("finalize_key"):
+                    merged["finalize_key"] = incoming["finalize_key"]
                 history[index] = merged
                 platform_records.append(copy.deepcopy(merged))
                 if scope:
@@ -752,11 +761,23 @@ class HistoryService(OwnerDelegator):
         with self._offline_pending_lock:
             pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
             history = self._get_data("history") or []
+            orphan_cleaned = 0
             for record in history:
                 if str(record.get("status") or "") not in {"处理中", "下载中"}:
                     continue
                 key = str(record.get("finalize_key") or "").strip()
                 if key and key in pending:
+                    pitem = pending[key]
+                    strm_path = self._strm_local_path(pitem) or self._strm_local_path(record)
+                    if strm_path:
+                        record["status"] = "成功"
+                        record.pop("finalize_key", None)
+                        record.pop("failure_reason", None)
+                        pending.pop(key, None)
+                        success_count += 1
+                        orphan_cleaned += 1
+                        converged.append(copy.deepcopy(record))
+                        continue
                     pending_count += 1
                     continue
                 strm_path = self._strm_local_path(record)
@@ -768,8 +789,26 @@ class HistoryService(OwnerDelegator):
                 record.pop("failure_reason", None)
                 success_count += 1
                 converged.append(copy.deepcopy(record))
+            # 2. 清理 pending 中产物已就绪或历史已处于终态的残留后处理任务
+            history_keys = {
+                str(h.get("finalize_key") or "").strip().upper()
+                for h in history if str(h.get("finalize_key") or "").strip()
+            }
+            for pkey in list(pending.keys()):
+                pitem = pending[pkey]
+                strm_path = self._strm_local_path(pitem)
+                if strm_path:
+                    pending.pop(pkey, None)
+                    orphan_cleaned += 1
+                elif str(pkey).strip().upper() not in history_keys:
+                    if pitem.get("moved_at") or self._strm_local_path(pitem):
+                        pending.pop(pkey, None)
+                        orphan_cleaned += 1
             if success_count:
                 self._save_data("history", history)
+            if orphan_cleaned:
+                self._save_offline_pending(pending)
+                self._notify_offline_pending_changed(len(pending))
         if converged:
             self._record_platform_transfer_histories(converged)
             if self._history_changed:
@@ -804,8 +843,12 @@ class HistoryService(OwnerDelegator):
                 cloud_dir=cloud_dir,
                 file_name=file_name,
             )
-            if strm_path and strm_path.is_file() and strm_path.stat().st_size > 0:
-                return strm_path
+            if strm_path and strm_path.is_file():
+                try:
+                    if int(strm_path.stat().st_size or 0) > 0:
+                        return strm_path
+                except (TypeError, ValueError, OSError):
+                    return strm_path
         except OSError:
             return None
         return None

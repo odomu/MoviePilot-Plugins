@@ -376,17 +376,19 @@
                       @click.stop />
                   </td>
                   <td>
-                    <div class="d-flex align-center ga-1">
+                    <div class="d-flex align-center ga-1" style="min-width: 0; overflow: hidden;">
                       <span class="record-name" :title="record.display_name || '-'">
                         {{ record.display_name || "-" }}
                       </span>
-                      <v-chip v-if="record.upgrade" size="x-small" color="warning" variant="tonal">
+                      <v-chip v-if="record.upgrade" size="x-small" color="warning" variant="tonal"
+                              class="flex-shrink-0">
                         洗版
                         <v-tooltip activator="parent" location="top">
                           {{ record.upgrade_version_info }}
                         </v-tooltip>
                       </v-chip>
-                      <v-chip v-if="record.is_cross_transfer" size="x-small" color="info" variant="tonal">
+                      <v-chip v-if="record.is_cross_transfer" size="x-small" color="info" variant="tonal"
+                              class="flex-shrink-0">
                         跨盘
                         <v-tooltip activator="parent" location="top">
                           {{ record.cross_transfer_title }}
@@ -769,6 +771,7 @@ const expanded = ref([]);
 const selectedGroupKeys = ref([]);
 const selectedRecordKeys = ref([]);
 const filtersVisible = ref(false);
+const searchVisible = ref(false);
 let lastQuerySignature = "";
 
 const statusOptions = ["处理中", "下载中", "成功", "失败"];
@@ -1509,15 +1512,21 @@ function deleteTitle(record) {
   color: rgb(var(--v-theme-on-surface-variant));
 }
 
+.detail-table :deep(th.subtable-select-th),
+.detail-table :deep(td.subtable-select-td),
 .detail-table :deep(th:first-child),
 .detail-table :deep(td:first-child) {
-  width: 14%;
-  min-width: 0;
+  width: 44px !important;
+  min-width: 44px !important;
+  max-width: 44px !important;
+  padding: 0 4px !important;
+  text-align: center;
 }
 
 .detail-table :deep(th:nth-child(2)),
 .detail-table :deep(td:nth-child(2)) {
-  width: 10%;
+  width: 22%;
+  min-width: 0;
 }
 
 .detail-table :deep(th:nth-child(3)),
@@ -1527,7 +1536,7 @@ function deleteTitle(record) {
 
 .detail-table :deep(th:nth-child(4)),
 .detail-table :deep(td:nth-child(4)) {
-  width: 12%;
+  width: 7%;
 }
 
 .detail-table :deep(th:nth-child(5)),
@@ -1537,28 +1546,34 @@ function deleteTitle(record) {
 
 .detail-table :deep(th:nth-child(6)),
 .detail-table :deep(td:nth-child(6)) {
-  width: 10%;
+  width: 8%;
 }
 
 .detail-table :deep(th:nth-child(7)),
 .detail-table :deep(td:nth-child(7)) {
-  width: 9%;
+  width: 8%;
 }
 
 .detail-table :deep(th:nth-child(8)),
 .detail-table :deep(td:nth-child(8)) {
-  width: 140px;
+  width: 8%;
 }
 
-.detail-table :deep(td:not(:first-child)) {
+.detail-table :deep(th:nth-child(9)),
+.detail-table :deep(td:nth-child(9)) {
+  width: 165px;
+  min-width: 165px;
+}
+
+.detail-table :deep(td:not(.subtable-select-td):not(:first-child):not(:nth-child(2))) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .action-column {
-  width: 128px;
-  min-width: 128px;
+  width: 100px;
+  min-width: 100px;
   text-align: center;
   white-space: nowrap;
 }

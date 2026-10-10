@@ -5,6 +5,7 @@ import datetime
 import pytz
 from app.core.config import settings
 
+from ..media import is_subscribe_best_version
 from ...core import OwnerDelegator
 
 
@@ -53,12 +54,19 @@ class SubscriptionControlService(OwnerDelegator):
         return self._is_time_in_block()
 
     def _is_cloud_upgrade_subscribe(self, subscribe) -> bool:
-        """判断订阅是否属于插件网盘洗版范围。best_version 是必要条件。"""
-        if (
-                not self._enable_cloud_upgrade
-                or not subscribe
-                or not bool(getattr(subscribe, "best_version", False))
-        ):
+        """判断订阅是否属于插件网盘洗版范围。
+        优先读取平台原生订阅卡片的洗版设置（兼容 v2 与 v3），同时支持插件独立配置的洗版范围。
+        """
+        if not getattr(self, "_enable_cloud_upgrade", False) or not subscribe:
             return False
-        selected_ids = {str(value) for value in (self._upgrade_subscribe_ids or [])}
-        return not selected_ids or str(getattr(subscribe, "id", "")) in selected_ids
+        if bool(getattr(subscribe, "_manual_upgrade", False)):
+            return True
+        # 1. 优先遵循平台原生订阅卡片的洗版设置（best_version）
+        if is_subscribe_best_version(subscribe):
+            return True
+        # 2. 插件独立配置的洗版订阅清单
+        selected_ids = {
+            str(value) for value in (self._upgrade_subscribe_ids or [])
+            if str(value).strip()
+        }
+        return str(getattr(subscribe, "id", "") or "") in selected_ids

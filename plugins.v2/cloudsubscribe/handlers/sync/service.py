@@ -70,6 +70,7 @@ from ...core import (
     MediaScraper,
 )
 from ...core.media import (
+    is_subscribe_best_version,
     legacy_media_ids,
     list_subscribes_by_tmdb_id,
     tmdb_id_of,
@@ -514,19 +515,25 @@ class SyncHandler:
         return count
 
     def _is_cloud_upgrade_subscribe(self, subscribe: Any) -> bool:
-        """判断订阅是否属于插件网盘洗版范围。"""
-        if self._enable_cloud_upgrade and bool(
-                getattr(subscribe, "_manual_upgrade", False)
-        ):
-            return True
-        if (
-                not self._enable_cloud_upgrade
-                or not subscribe
-                or not bool(getattr(subscribe, "best_version", False))
-        ):
+        """判断订阅是否属于插件网盘洗版范围。
+        优先读取平台原生订阅卡片的洗版设置（兼容 v2 与 v3），同时支持插件独立配置的洗版范围。
+        """
+        if not getattr(self, "_enable_cloud_upgrade", False) or not subscribe:
             return False
-        selected_ids = self._upgrade_subscribe_id_set
-        return not selected_ids or str(getattr(subscribe, "id", "")) in selected_ids
+        if bool(getattr(subscribe, "_manual_upgrade", False)):
+            return True
+        # 1. 优先遵循平台原生订阅卡片的洗版设置（best_version）
+        if is_subscribe_best_version(subscribe):
+            return True
+        # 2. 插件独立配置的洗版订阅清单
+        selected_ids = getattr(self, "_upgrade_subscribe_id_set", None)
+        if selected_ids is None:
+            selected_ids = {
+                str(v)
+                for v in (getattr(self, "_upgrade_subscribe_ids", []) or [])
+                if str(v).strip()
+            }
+        return str(getattr(subscribe, "id", "") or "") in selected_ids
 
     @staticmethod
     def subscription_budget_key(
