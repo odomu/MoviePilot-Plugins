@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import math
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -17,6 +18,20 @@ try:
     P115_AVAILABLE = True
 except ImportError:
     P115_AVAILABLE = False
+
+P115_UPLOAD_PART_SIZE = 16 * 1024 * 1024
+P115_MAX_UPLOAD_PARTS = 9000
+
+
+def upload_part_size(file_size: int) -> int:
+    """按文件大小选择 115 分片大小：默认 16MB，超大文件放大以控制分片数。"""
+    size = max(0, int(file_size or 0))
+    part_size = P115_UPLOAD_PART_SIZE
+    if size > part_size * P115_MAX_UPLOAD_PARTS:
+        multiple = int(math.ceil(size / (part_size * P115_MAX_UPLOAD_PARTS)))
+        part_size *= max(1, multiple)
+    return part_size
+
 
 
 class P115UploadService(OwnerDelegator):
@@ -99,7 +114,7 @@ class P115UploadService(OwnerDelegator):
                         filename=upload_name,
                         filesha1=checksum,
                         filesize=file_size,
-                        partsize=-1,
+                        partsize=upload_part_size(file_size),
                         max_retries=0,
                     )
             else:
@@ -110,7 +125,7 @@ class P115UploadService(OwnerDelegator):
                     filename=upload_name,
                     filesha1=checksum,
                     filesize=file_size,
-                    partsize=-1,
+                    partsize=upload_part_size(file_size),
                     max_retries=0,
                 )
             check_response(response)
@@ -190,7 +205,7 @@ class P115UploadService(OwnerDelegator):
                 filename=target_name,
                 filesha1=checksum.upper(),
                 filesize=file_size,
-                partsize=-1,
+                partsize=upload_part_size(file_size),
                 reporthook=report,
                 max_retries=0,
             )

@@ -1,7 +1,9 @@
 """
 历史记录重试与现场补偿执行服务。
 """
+import copy
 import re
+from threading import Lock, Thread
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -19,9 +21,114 @@ from ...core.media import (
     tmdb_id_of,
 )
 
+_retry_inflight_lock = Lock()
+_retry_inflight_keys: set = set()
+
 
 class HistoryRetryService(OwnerDelegator):
     """负责对历史失败或中断的记录进行就地重试与上下文还原。"""
+
+    def _find_history_record(
+            self, record_time: str, share_url: str, file_name: str
+    ) -> Optional[Dict[str, Any]]:
+        history = (self._get_data("history") or []) if self._get_data else []
+        return next(
+            (
+                item for item in history
+                if str(item.get("time") or "") == str(record_time or "")
+                   and str(item.get("share_url") or "") == str(share_url or "")
+                   and str(item.get("file_name") or "") == str(file_name or "")
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _history_retry_key(record_time: str, share_url: str, file_name: str) -> str:
+        return "|".join(
+            (str(record_time or ""), str(share_url or ""), str(file_name or ""))
+        )
+
+    def submit_history_retry(
+            self, record_time: str, share_url: str, file_name: str
+    ) -> Dict[str, Any]:
+        """校验后立即返回，把耗时的重试放到后台线程执行，防止前端页面卡死。"""
+        record = self._find_history_record(record_time, share_url, file_name)
+        if not record:
+            raise ValueError("未找到对应的转存历史记录")
+        can_retry, retry_title = self._history_retry_state(record)
+        if not can_retry:
+            raise ValueError(retry_title)
+
+        key = self._history_retry_key(record_time, share_url, file_name)
+        with _retry_inflight_lock:
+            if key in _retry_inflight_keys:
+                raise ValueError("该记录正在重试中，请稍候")
+            _retry_inflight_keys.add(key)
+
+        try:
+            processing = copy.deepcopy(record)
+            processing["status"] = (
+                "下载中"
+                if self._is_ed2k_url(str(processing.get("share_url") or ""))
+                else "处理中"
+            )
+            processing.pop("failure_reason", None)
+            self.append_history_records([processing], reopen_terminal=True)
+            if self._history_changed:
+                self._history_changed()
+        except Exception:
+            with _retry_inflight_lock:
+                _retry_inflight_keys.discard(key)
+            raise
+
+        Thread(
+            target=self._run_history_retry,
+            args=(key, str(record_time or ""), str(share_url or ""), str(file_name or "")),
+            daemon=True,
+            name="cloudsubscribe-history-retry",
+        ).start()
+        return {"status": "处理中"}
+
+    def _run_history_retry(
+            self, key: str, record_time: str, share_url: str, file_name: str
+    ) -> None:
+        try:
+            self.retry_history_record(
+                record_time, share_url, file_name, force=True
+            )
+        except Exception as error:
+            logger.error(f"后台重试历史记录失败：{error}")
+            self._mark_history_retry_failed(
+                record_time, share_url, file_name, str(error) or "重试失败"
+            )
+        finally:
+            with _retry_inflight_lock:
+                _retry_inflight_keys.discard(key)
+            if self._history_changed:
+                self._history_changed()
+
+    def _mark_history_retry_failed(
+            self, record_time: str, share_url: str, file_name: str, reason: str
+    ) -> None:
+        """后台重试异常时把记录落回失败态，避免界面一直停在「处理中」。"""
+        history = (self._get_data("history") or []) if self._get_data else []
+        record = next(
+            (
+                item for item in history
+                if str(item.get("time") or "") == str(record_time or "")
+                   and str(item.get("share_url") or "") == str(share_url or "")
+                   and str(item.get("file_name") or "") == str(file_name or "")
+            ),
+            None,
+        )
+        if not record or str(record.get("status") or "") == "成功":
+            return
+        record["status"] = "失败"
+        record["failure_reason"] = reason
+        record.pop("retrying", None)
+        record.pop("finalize_key", None)
+        if self._save_data:
+            self._save_data("history", history)
 
     @staticmethod
     def _find_share_file_for_history(files: List[dict], source_sha1: str, source_name: str) -> Optional[dict]:
@@ -56,7 +163,13 @@ class HistoryRetryService(OwnerDelegator):
                 return matched
         return leaf_files[0] if len(leaf_files) == 1 else None
 
-    def retry_history_record(self, record_time: str, share_url: str, file_name: str) -> Dict[str, Any]:
+    def retry_history_record(
+            self,
+            record_time: str,
+            share_url: str,
+            file_name: str,
+            force: bool = False,
+    ) -> Dict[str, Any]:
         """按持久化历史中的精确记录重新执行平台命名和完整后处理。"""
         history = (self._get_data("history") or []) if self._get_data else []
         record = next(
@@ -70,9 +183,12 @@ class HistoryRetryService(OwnerDelegator):
         )
         if not record:
             raise ValueError("未找到对应的转存历史记录")
-        can_retry, retry_title = self._history_retry_state(record)
-        if not can_retry:
-            raise ValueError(retry_title)
+        if not force:
+            can_retry, retry_title = self._history_retry_state(record)
+            if not can_retry:
+                raise ValueError(retry_title)
+        else:
+            record.pop("retrying", None)
 
         source_sha1 = str(record.get("source_sha1") or "").strip()
         source_name = str(
@@ -258,19 +374,6 @@ class HistoryRetryService(OwnerDelegator):
         record["source_file_name"] = source_name
         record["source_sha1"] = source_sha1
         record["tmdb_id"] = mediainfo.tmdb_id
-        effective_title = str(
-            getattr(subscribe, "name", None)
-            or getattr(target_subscribe, "name", None)
-            or getattr(mediainfo, "title", None)
-            or record.get("title")
-            or ""
-        ).strip()
-        if effective_title:
-            record["title"] = effective_title
-        if getattr(target_subscribe, "year", None) or getattr(mediainfo, "year", None):
-            record["year"] = str(getattr(target_subscribe, "year", None) or mediainfo.year)
-        if getattr(mediainfo, "get_poster_image", None) and mediainfo.get_poster_image():
-            record["image"] = mediainfo.get_poster_image()
         record.pop("failure_reason", None)
         if cached_source and self._cross_transfer_manager:
             record.update(self._cross_transfer_manager.cache_info(
@@ -278,6 +381,7 @@ class HistoryRetryService(OwnerDelegator):
                 cached_source,
                 verify_checksum=False,
             ))
+        # 终态关联先落定，再做装饰性字段更新：避免装饰性异常阻断后处理终态写入
         if pending_key:
             record["finalize_key"] = pending_key
             record["status"] = (
@@ -291,6 +395,28 @@ class HistoryRetryService(OwnerDelegator):
                 mediainfo=mediainfo,
                 file_name=target_name,
             )
+        try:
+            target_sub = subscribe or SimpleNamespace(
+                name=str(record.get("title") or getattr(mediainfo, "title", "") or ""),
+                year=str(record.get("year") or getattr(mediainfo, "year", "") or ""),
+            )
+            effective_title = str(
+                getattr(subscribe, "name", None)
+                or getattr(target_sub, "name", None)
+                or getattr(mediainfo, "title", None)
+                or record.get("title")
+                or ""
+            ).strip()
+            if effective_title:
+                record["title"] = effective_title
+            if getattr(target_sub, "year", None) or getattr(mediainfo, "year", None):
+                record["year"] = str(
+                    getattr(target_sub, "year", None) or mediainfo.year
+                )
+            if getattr(mediainfo, "get_poster_image", None) and mediainfo.get_poster_image():
+                record["image"] = mediainfo.get_poster_image()
+        except Exception as error:
+            logger.debug(f"历史记录重试元数据更新失败：{error}")
 
         if subscribe and not pending_key:
             success_episodes = [1]

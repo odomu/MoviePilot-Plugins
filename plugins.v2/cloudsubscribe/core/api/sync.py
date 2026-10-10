@@ -6,13 +6,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from app.core.metainfo import MetaInfo
+from app.core.metainfo import MetaInfo
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.schemas.types import MediaType
 
 from .. import CloudDriveCapability, OwnerDelegator, SearchCapability
-from ..media import recognize_media, tmdb_id_of
+from ..media import media_identity, recognize_media, tmdb_id_of
 from ...search.matching import positive_ints
 from ...search.types import (
     normalize_resource_type,
@@ -25,6 +26,10 @@ from ...utils.cache import create_platform_ttl_cache
 _RECENT_MANUAL_SUBMITS = create_platform_ttl_cache(
     "sync:manual_submits", maxsize=256, ttl=4
 )
+
+_MEDIA_SOURCE_ALIASES = frozenset({
+    "douban", "bangumi", "anilist", "tmdb", "themoviedb", "imdb", "tvdb",
+})
 
 
 class SyncApi(OwnerDelegator):
@@ -50,12 +55,66 @@ class SyncApi(OwnerDelegator):
             raise ValueError(f"TMDB 媒体不存在：{tmdb_id}")
         return mediainfo
 
+    def _resolve_manual_media_by_identity(
+            self,
+            raw_media: Dict[str, Any],
+            media_type: str,
+    ) -> Optional[Any]:
+        """TMDB 认不出这部片时，按豆瓣 / Bangumi / AniList 等身份兜底识别。"""
+        resolved_type = MediaType.TV if media_type == "tv" else MediaType.MOVIE
+        title = str(raw_media.get("title") or "").strip()
+        year = str(raw_media.get("year") or "").strip()
+        media_source = str(raw_media.get("media_source") or "").strip() or None
+        media_id = str(raw_media.get("media_id") or "").strip() or None
+        if media_id and ":" in media_id:
+            prefix, _, tail = media_id.partition(":")
+            if tail.strip() and prefix.strip().casefold() in _MEDIA_SOURCE_ALIASES:
+                media_source = media_source or prefix.strip().casefold()
+                media_id = tail.strip()
+        douban_id = raw_media.get("douban_id")
+        bangumi_id = raw_media.get("bangumi_id")
+        anilist_id = raw_media.get("anilist_id")
+        allow_title = bool(title) and bool(raw_media.get("seek_by_title"))
+        if not any([media_id, douban_id, bangumi_id, anilist_id, allow_title]):
+            return None
+        meta = None
+        if title and allow_title:
+            try:
+                meta = MetaInfo(title)
+                meta.type = resolved_type
+                if year.isdigit():
+                    meta.year = year
+            except Exception:
+                meta = None
+        try:
+            mediainfo = recognize_media(
+                self.chain,
+                meta=meta,
+                mtype=resolved_type,
+                media_source=media_source,
+                media_id=media_id,
+                douban_id=douban_id,
+                bangumi_id=bangumi_id,
+                anilist_id=anilist_id,
+                cache=True,
+            )
+        except Exception as error:
+            logger.debug(f"兜底识别手动转存媒体失败：{error}")
+            return None
+        if not mediainfo:
+            return None
+        resolved_from_media = (
+            "tv" if getattr(mediainfo, "type", None) == MediaType.TV else
+            "movie" if getattr(mediainfo, "type", None) == MediaType.MOVIE else ""
+        )
+        return mediainfo, resolved_from_media or media_type
+
     @staticmethod
     def _manual_resource_type(link: str, default: str) -> str:
         return (
-            resource_type_from_url(link)
-            or resource_type_from_text(link)
-            or default
+                resource_type_from_url(link)
+                or resource_type_from_text(link)
+                or default
         )
 
     def _manual_share_service(self, resource_type: str):
@@ -350,14 +409,21 @@ class SyncApi(OwnerDelegator):
             except (TypeError, ValueError):
                 return {"success": False, "message": "TMDB 媒体信息格式错误"}
             if tmdb_id <= 0 or media_type not in {"movie", "tv"}:
-                return {"success": False, "message": "请选择订阅或有效的 TMDB 媒体"}
-            try:
-                canonical_media = self._resolve_manual_tmdb_media(
-                    tmdb_id=tmdb_id,
-                    media_type=media_type,
-                )
-            except Exception as error:
-                return {"success": False, "message": f"读取 TMDB 媒体信息失败：{error}"}
+                if media_type not in {"movie", "tv"}:
+                    return {"success": False, "message": "请选择订阅或有效的 TMDB 媒体"}
+                resolved = self._resolve_manual_media_by_identity(raw_media, media_type)
+                if resolved is None:
+                    return {"success": False, "message": "请选择订阅或有效的 TMDB 媒体"}
+                canonical_media, media_type = resolved
+                tmdb_id = int(tmdb_id_of(canonical_media) or 0)
+            else:
+                try:
+                    canonical_media = self._resolve_manual_tmdb_media(
+                        tmdb_id=tmdb_id,
+                        media_type=media_type,
+                    )
+                except Exception as error:
+                    return {"success": False, "message": f"读取 TMDB 媒体信息失败：{error}"}
             canonical_title = str(getattr(canonical_media, "title", "") or "").strip()
             if not canonical_title:
                 return {"success": False, "message": "TMDB 媒体缺少规范标题"}
@@ -399,10 +465,13 @@ class SyncApi(OwnerDelegator):
                     seasons = [1]
                 if seasons[-1] > 999:
                     return {"success": False, "message": "请选择 1 到 999 之间的季"}
+            canonical_source, canonical_id = media_identity(canonical_media)
             media_target = {
-                "tmdb_id": tmdb_id,
+                "tmdb_id": tmdb_id or None,
                 "douban_id": raw_media.get("douban_id"),
                 "bangumi_id": raw_media.get("bangumi_id"),
+                "media_source": canonical_source or raw_media.get("media_source"),
+                "media_id": canonical_id or raw_media.get("media_id"),
                 "media_type": media_type,
                 "title": canonical_title,
                 "year": getattr(canonical_media, "year", None) or raw_media.get("year"),
@@ -449,7 +518,7 @@ class SyncApi(OwnerDelegator):
             # 付费资源仍需先解锁；已解锁、零积分及其它延迟解析渠道，在提交转存时统一由后端解析为真实链接。
             if supports_unlock:
                 can_resolve = can_resolve and (
-                    bool(item.get("is_unlocked")) or unlock_points <= 0
+                        bool(item.get("is_unlocked")) or unlock_points <= 0
                 )
             if can_resolve:
                 try:
@@ -729,8 +798,8 @@ class SyncApi(OwnerDelegator):
                         "resource_ref", "provider_data", "media_page_url",
                         "is_unlocked", "preview_episodes", "target_season",
                         "target_episodes", "supports_file_preview",
+                        "target_file_ids", "target_file_names",
                     )
-                    if metadata.get(key) is not None
                 },
                 **(
                     {"magnet_metadata": magnet_info["metadata"]}

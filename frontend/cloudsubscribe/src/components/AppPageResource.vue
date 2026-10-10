@@ -355,6 +355,7 @@ const {
   searchChannel,
   onChannelTabChange,
   getChannelCount,
+  closeMediaDetail,
   syncAvailableChannels,
 } = useMediaDetail({
   api: resourceApi,
@@ -936,6 +937,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  closeMediaDetail();
   if (isHeaderTabInjected.value) {
     clearDynamicHeaderTab();
   }

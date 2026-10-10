@@ -158,7 +158,7 @@ export function createTransferSection(options) {
             label: "下载线程数",
             type: "number",
             min: 1,
-            max: 10,
+            max: 256,
             cols: 4,
             show: enabled("cross_transfer_enabled"),
           },

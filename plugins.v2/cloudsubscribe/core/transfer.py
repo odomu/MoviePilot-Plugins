@@ -15,6 +15,8 @@ from threading import Event, Lock, Semaphore, Thread
 from typing import Callable, Optional
 
 import requests
+from app.log import logger
+from requests.adapters import HTTPAdapter
 
 from .cloud import (
     CloudDriveCapability,
@@ -66,6 +68,44 @@ def file_checksum(path: str, algorithm: str) -> str:
     return digest.hexdigest()
 
 
+class _LinkRefresher:
+    """按需刷新源盘直链，长任务直链可能被限速或过期，片读取失败后重新取链，并对刷新做节流"""
+
+    def __init__(
+            self,
+            resolver: Callable[[], tuple[str, dict]],
+            refresh_interval: float = 30.0,
+            max_age: float = 20 * 60.0,
+    ):
+        self._resolver = resolver
+        self._refresh_interval = max(0.0, float(refresh_interval))
+        self._max_age = max(self._refresh_interval, float(max_age))
+        self._url = ""
+        self._headers: dict = {}
+        self._resolved_at = 0.0
+        self._lock = Lock()
+
+    def get(self, refresh: bool = False) -> tuple[str, dict]:
+        with self._lock:
+            now = time.time()
+            age = now - self._resolved_at
+            should_refresh = (
+                    not self._url
+                    or age >= self._max_age
+                    or (refresh and age >= self._refresh_interval)
+            )
+            if should_refresh:
+                url, headers = self._resolver()
+                if url:
+                    self._url = str(url)
+                    self._headers = dict(headers or {})
+                    self._headers.setdefault("Accept-Encoding", "identity")
+                    self._resolved_at = now
+                elif not self._url:
+                    self._resolved_at = now
+            return self._url, dict(self._headers)
+
+
 class HttpFileDownloadService:
     """把 Provider 的临时下载地址解析器适配为流式文件下载能力。"""
 
@@ -78,7 +118,7 @@ class HttpFileDownloadService:
     ):
         self._resolver = resolver
         self._timeout = timeout
-        self._concurrency = max(1, min(int(concurrency or 5), 10))
+        self._concurrency = max(1, min(int(concurrency or 5), 256))
         self._part_size = max(1024 * 1024, int(part_size or 0))
 
     @property
@@ -128,12 +168,28 @@ class HttpFileDownloadService:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return set()
 
+    def _create_session(self) -> requests.Session:
+        """复用连接的下载 session，连接池上限夹住最大活跃 socket，防止容器文件描述符耗尽。"""
+        session = requests.Session()
+        pool_size = max(4, min(self._concurrency * 2, 64))
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=0,
+            pool_block=False,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
     def _download_serial(
-            self, url: str, headers: dict, file_item: CloudFile, target: Path,
+            self, refresher: _LinkRefresher, session: requests.Session,
+            file_item: CloudFile, target: Path,
             progress_callback=None, stop_requested=None,
     ) -> str:
         done = 0
-        with requests.get(
+        url, headers = refresher.get()
+        with session.get(
                 url,
                 headers=headers,
                 stream=True,
@@ -158,7 +214,8 @@ class HttpFileDownloadService:
         return str(target)
 
     def _download_parallel(
-            self, url: str, headers: dict, total: int, target: Path,
+            self, refresher: _LinkRefresher, session: requests.Session,
+            total: int, target: Path,
             progress_callback=None, stop_requested=None,
     ) -> str:
         ranges = [
@@ -168,6 +225,10 @@ class HttpFileDownloadService:
         worker_count = min(self._concurrency, len(ranges))
         if worker_count <= 1:
             raise _RangeDownloadUnsupported
+        logger.debug(
+            f"分段下载启用：{worker_count} 并发连接 × "
+            f"{self._part_size // (1024 * 1024)}MB 分片 → {target.name}"
+        )
 
         progress_lock = Lock()
         abort_event = Event()
@@ -195,18 +256,26 @@ class HttpFileDownloadService:
         def download_part(byte_range: tuple[int, int]) -> None:
             nonlocal downloaded
             start, end = byte_range
-            request_headers = dict(headers)
-            request_headers["Range"] = f"bytes={start}-{end}"
             for attempt in range(3):
                 received = 0
+                url, headers = refresher.get(refresh=attempt > 0)
+                request_headers = dict(headers)
+                request_headers["Range"] = f"bytes={start}-{end}"
                 try:
-                    with requests.get(
+                    with session.get(
                             url,
                             headers=request_headers,
                             stream=True,
                             timeout=self._request_timeout,
                     ) as response:
                         if response.status_code != 206:
+                            if (
+                                    response.status_code >= 500
+                                    or response.status_code in (401, 403, 404, 410, 429)
+                            ):
+                                raise requests.RequestException(
+                                    f"HTTP {response.status_code}"
+                                )
                             raise _RangeDownloadUnsupported(
                                 f"HTTP {response.status_code}"
                             )
@@ -278,13 +347,15 @@ class HttpFileDownloadService:
     def download_file(self, file_item: CloudFile, local_path: str,
                       progress_callback=None, stop_requested=None,
                       preserve_partial: bool = False) -> str:
-        url, headers = self._resolver(file_item)
-        if not url:
+        refresher = _LinkRefresher(
+            lambda: self._resolver(file_item),
+            refresh_interval=30.0,
+            max_age=20 * 60.0,
+        )
+        if not refresher.get()[0]:
             raise RuntimeError("源网盘未返回下载地址")
         target = Path(local_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        request_headers = dict(headers or {})
-        request_headers.setdefault("Accept-Encoding", "identity")
         total = int(file_item.size or 0)
         reported = 0
 
@@ -294,23 +365,25 @@ class HttpFileDownloadService:
             if progress_callback:
                 progress_callback(reported, current_total)
 
+        session = self._create_session()
         try:
             if self._concurrency > 1 and total > self._part_size:
                 try:
                     return self._download_parallel(
-                        url,
-                        request_headers,
+                        refresher,
+                        session,
                         total,
                         target,
                         report,
                         stop_requested,
                     )
                 except _RangeDownloadUnsupported:
+                    refresher.get(refresh=True)
                     target.unlink(missing_ok=True)
                     self._parts_path(target).unlink(missing_ok=True)
             return self._download_serial(
-                url,
-                request_headers,
+                refresher,
+                session,
                 file_item,
                 target,
                 report,
@@ -321,7 +394,8 @@ class HttpFileDownloadService:
                 target.unlink(missing_ok=True)
                 self._parts_path(target).unlink(missing_ok=True)
             raise
-
+        finally:
+            session.close()
 
 class LocalRapidUploadAdapter:
     """把现有 Provider 的上传服务暴露为统一能力。
@@ -435,7 +509,7 @@ class CrossTransferTaskManager:
                  on_change: Optional[Callable[[], None]] = None):
         self._provider_resolver = provider_resolver
         self._download_path = str(download_path or "").strip()
-        self._download_threads = max(1, min(int(download_threads or 5), 10))
+        self._download_threads = max(1, min(int(download_threads or 5), 256))
         self._transfer_slots = Semaphore(max(1, min(int(max_concurrent or 2), 10)))
         self._tasks: dict[str, dict] = {}
         self._lock = Lock()
@@ -1224,6 +1298,8 @@ class CrossTransferTaskManager:
                     transfer_checksum = file_checksum(
                         source_path, transfer_algorithm
                     )
+            if source_path and not Path(source_path).is_file():
+                raise RuntimeError("本地中继缓存文件已被清理，点击重试重新开始下载")
             result = CrossDriveTransfer().transfer(
                 source_path, target, target_path, target_name,
                 transfer_algorithm, transfer_checksum,
@@ -1264,6 +1340,7 @@ class CrossTransferTaskManager:
             ):
                 self._delete_cache_path(Path(temporary_path))
             self._update(task_id, status="failed", phase="failed", message="跨盘传输失败",
-                         error=str(error), speed_bytes_per_second=0.0, finished_at=time.time())
+                         error="容器可用文件描述符耗尽, 请在 Docker 运行参数中增加--ulimit nofile=65535:65535, 适当调低下载并发线程数",
+                         speed_bytes_per_second=0.0, finished_at=time.time())
         finally:
             self._transfer_slots.release()

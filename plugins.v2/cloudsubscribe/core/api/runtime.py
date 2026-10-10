@@ -157,14 +157,18 @@ class RuntimeApi(OwnerDelegator):
         if not self._sync_handler:
             return {"success": False, "message": "同步处理器未初始化"}
         try:
-            result = self._sync_handler.retry_history_record(
+            result = self._sync_handler.submit_history_retry(
                 record_time=str((payload or {}).get("time") or ""),
                 share_url=str((payload or {}).get("share_url") or ""),
                 file_name=str((payload or {}).get("file_name") or ""),
             )
-            return {"success": True, "message": "历史记录已重新处理", "data": result}
+            return {
+                "success": True,
+                "message": "已提交重试任务，正在后台处理",
+                "data": result,
+            }
         except Exception as error:
-            logger.error(f"重新处理历史记录异常：{error}")
+            logger.error(f"提交历史记录重试异常：{error}")
             return {"success": False, "message": str(error)}
 
     _CACHE_CATEGORIES = frozenset({

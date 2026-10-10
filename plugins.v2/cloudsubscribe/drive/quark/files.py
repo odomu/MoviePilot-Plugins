@@ -87,33 +87,48 @@ class QuarkFileService(CloudDriveFileServiceBase):
         )
 
     def resolve_download_link(self, file_item: CloudFile) -> tuple[str, dict]:
+        """取夸克直链，夸克对下载请求会 按 User-Agent 做限速分级"""
+
         entry = {}
-        response = {}
-        download_user_agent = self.DOWNLOAD_WEB_USER_AGENT
-        for user_agent in (
-                self.DOWNLOAD_WEB_USER_AGENT,
-                self.DOWNLOAD_DESKTOP_USER_AGENT,
+        response: Dict[str, Any] = {}
+        download_url = ""
+        download_user_agent = self.DOWNLOAD_DESKTOP_USER_AGENT
+        for channel, base_url, params, user_agent in (
+                ("drive-pc/PC-UA", self.client.BASE_URL, None,
+                 self.DOWNLOAD_DESKTOP_USER_AGENT),
+                ("drive/PC-UA", self.client.SHARE_BASE_URL, self.DOWNLOAD_PARAMS,
+                 self.DOWNLOAD_DESKTOP_USER_AGENT),
+                ("drive/网页-UA", self.client.SHARE_BASE_URL, self.DOWNLOAD_PARAMS,
+                 self.DOWNLOAD_WEB_USER_AGENT),
         ):
-            response = self.client.request(
-                "POST", "file/download",
-                params=self.DOWNLOAD_PARAMS,
-                json_data={"fids": [file_item.id]},
-                base_url=self.client.SHARE_BASE_URL,
-                request_headers={"user-agent": user_agent},
-            )
+            try:
+                response = self.client.request(
+                    "POST", "file/download",
+                    params=params,
+                    json_data={"fids": [file_item.id]},
+                    base_url=base_url,
+                    request_headers={"user-agent": user_agent},
+                )
+            except Exception as error:  # noqa: BLE001 - 单个通道异常不应中断取链
+                logger.warning(f"夸克取链通道 {channel} 请求异常：{error}")
+                continue
             data = self.client.data(response) or []
             entry = data[0] if isinstance(data, list) and data else {}
-            download_user_agent = user_agent
-            if entry.get("download_url"):
+            download_url = str(entry.get("download_url") or "")
+            if download_url:
+                download_user_agent = user_agent
+                logger.info(f"夸克取链成功：{channel}")
                 break
-            if int(response.get("code") or 0) != 23018:
-                break
-        if not entry.get("download_url"):
+            logger.info(
+                f"夸克取链通道 {channel} 未返回地址："
+                f"code={response.get('code')} {response.get('message') or ''}".strip()
+            )
+        if not download_url:
             raise RuntimeError(
                 response.get("message") or "夸克未返回文件下载地址"
             )
         return (
-            str(entry["download_url"]),
+            download_url,
             self.client.download_headers({"user-agent": download_user_agent}),
         )
 

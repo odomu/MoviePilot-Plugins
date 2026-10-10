@@ -304,6 +304,7 @@
 import {computed, ref, watch} from "vue";
 import {useDisplay} from "vuetify";
 import DirectoryDialog from "./DirectoryDialog.vue";
+import {isCancellationError} from "../../composables/useMediaDetail";
 
 const props = defineProps({
   modelValue: Boolean,
@@ -705,7 +706,9 @@ async function resolveCloudPathMedia(path, revision) {
     }
     applyRecognizedMedia(matchedMedia, parsedSeasons.value);
   } catch (e) {
-    if (revision === cloudMediaResolveRevision) error.value = e.message || "网盘路径媒体识别失败";
+    if (!isCancellationError(e) && props.modelValue && revision === cloudMediaResolveRevision) {
+      error.value = e.message || "网盘路径媒体识别失败";
+    }
   } finally {
     if (revision === cloudMediaResolveRevision) searchingTmdb.value = false;
   }
@@ -874,7 +877,9 @@ async function searchMediaContents(tmdb = null) {
     mediaContents.value = result.data?.items || []
     selectedMediaItems.value = []
   } catch (e) {
-    error.value = e.message || "搜索媒体库失败"
+    if (!isCancellationError(e) && props.modelValue) {
+      error.value = e.message || "搜索媒体库失败";
+    }
   } finally {
     loadingMedia.value = false
   }
@@ -896,7 +901,9 @@ async function matchUpgradeTmdb() {
     upgradeTmdbCandidates.value = result.data?.items || []
     selectedUpgradeTmdb.value = upgradeTmdbCandidates.value.length === 1 ? upgradeTmdbCandidates.value[0] : null
   } catch (e) {
-    error.value = e.message || "TMDB 匹配失败"
+    if (!isCancellationError(e) && props.modelValue) {
+      error.value = e.message || "TMDB 匹配失败";
+    }
   } finally {
     matchingUpgradeTmdb.value = false
   }
@@ -910,7 +917,9 @@ async function searchTmdb() {
     tmdbCandidates.value = await requestTmdbCandidates(targetSearch.value.trim());
     if (tmdbCandidates.value.length === 1) applyRecognizedMedia(tmdbCandidates.value[0], parsedSeasons.value);
   } catch (e) {
-    error.value = e.message || "TMDB 搜索失败"
+    if (!isCancellationError(e) && props.modelValue) {
+      error.value = e.message || "TMDB 搜索失败";
+    }
   } finally {
     searchingTmdb.value = false
   }

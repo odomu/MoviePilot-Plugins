@@ -100,7 +100,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.6.8"
+    plugin_version = "1.6.9"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -400,9 +400,27 @@ class CloudSubscribe(_PluginBase):
         logger.warning(f"未知消息通知类型：{configured}，已回退为插件")
         return NotificationType.Plugin
 
+    @staticmethod
+    def _raise_file_limit(target: int = 65535) -> None:
+        """把进程的软 nofile 上限抬到 target，避免容器内并发跨盘下载耗尽 socket 报 Errno 24。"""
+        try:
+            import resource
+
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft >= target:
+                return
+            new_soft = min(target, hard) if hard > 0 else target
+            if new_soft > soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+                logger.info(
+                    f"已提升进程文件描述符上限：soft {soft} -> {new_soft}（hard={hard}）"
+                )
+        except Exception as error:
+            logger.debug(f"调整文件描述符限制跳过（非 Linux 环境或无权限）：{error}")
 
     def init_plugin(self, config: dict = None):
         """宿主加载或重载插件时初始化完整运行环境。"""
+        self._raise_file_limit()
         self._offline_monitor_lock = RLock()
         self._offline_scheduler_lock = RLock()
         # 初始化独立数据库并修复历史分组键。
@@ -607,8 +625,8 @@ class CloudSubscribe(_PluginBase):
                 func=self._run_auto_subscribe_once,
                 trigger="date",
                 run_date=(
-                    datetime.datetime.now(tz=pytz.timezone(settings.TZ))
-                    + datetime.timedelta(seconds=3)
+                        datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+                        + datetime.timedelta(seconds=3)
                 ),
             )
             self._auto_subscribe_onlyonce = False

@@ -1,4 +1,4 @@
-import {computed, ref, watch} from "vue";
+import {computed, onUnmounted, ref, watch} from "vue";
 import {
   getChannelDefaultIcon,
   getNormalizedResourceType,
@@ -22,6 +22,24 @@ function getMediaCacheKey(media) {
   const year = String(media.year || "").trim();
   const type = String(media.media_type || "movie").trim();
   return `${type}:${id}:${title}:${year}`;
+}
+
+export function isCancellationError(error) {
+  if (!error) return false;
+  if (error.name === "AbortError" || error.name === "CanceledError") return true;
+  if (error.code === "ERR_CANCELED" || error.__CANCEL__ || error.isAxiosCancel) return true;
+  const msg = String(error.message || error || "").toLowerCase();
+  return (
+    msg.includes("cancel") ||
+    msg.includes("abort") ||
+    msg.includes("canceled") ||
+    msg.includes("cancelled") ||
+    msg.includes("http cancel") ||
+    msg.includes("err_canceled") ||
+    msg.includes("user aborted") ||
+    msg.includes("请求已取消") ||
+    msg.includes("操作已取消")
+  );
 }
 
 
@@ -56,6 +74,18 @@ export function useMediaDetail({api, pluginId, pluginConfig, showMessage}) {
   const channelSearched = ref({});
   const channelElapsed = ref({});
   let requestToken = 0;
+  const channelAbortControllers = new Map();
+
+  function abortAllActiveSearches() {
+    for (const controller of channelAbortControllers.values()) {
+      try {
+        controller.abort();
+      } catch (_) {
+      }
+    }
+    channelAbortControllers.clear();
+  }
+
 
 
   function getItemFansub(item) {
@@ -249,6 +279,7 @@ export function useMediaDetail({api, pluginId, pluginConfig, showMessage}) {
 
   async function searchChannel(channelKey, force = false) {
     if (!channelKey || !activeMedia.value || (!force && channelSearched.value[channelKey])) return;
+    if (!detailVisible.value) return;
     if (force) {
       const mKey = getMediaCacheKey(activeMedia.value);
       if (mKey && mediaSearchMemoryCache.has(mKey)) {
@@ -258,27 +289,46 @@ export function useMediaDetail({api, pluginId, pluginConfig, showMessage}) {
         delete entry.elapsed?.[channelKey];
       }
     }
+
+    // 中止该渠道之前的检索，避免重复堆叠请求
+    if (channelAbortControllers.has(channelKey)) {
+      try {
+        channelAbortControllers.get(channelKey).abort();
+      } catch (_) {
+      }
+      channelAbortControllers.delete(channelKey);
+    }
+    const controller = new AbortController();
+    channelAbortControllers.set(channelKey, controller);
+
     channelLoading.value = {...channelLoading.value, [channelKey]: true};
     try {
       const media = activeMedia.value;
-      const response = await api.value.post(`plugin/${pluginId.value}/resource/search_resources`, {
-        source: channelKey,
-        force: Boolean(force),
-        force_refresh: Boolean(force),
-        title: media.title,
-        original_title: media.original_title || "",
-        year: media.year || "",
-        media_type: media.media_type || "movie",
-        tmdb_id: media.tmdb_id || 0,
-        imdb_id: media.imdb_id || "",
-        tvdb_id: media.tvdb_id || 0,
-        douban_id: media.douban_id || 0,
-        bangumi_id: media.bangumi_id || 0,
-        anilist_id: media.anilist_id || 0,
-        anidb_id: media.anidb_id || 0,
-        media_source: media.media_source || "",
-        media_id: media.media_id || "",
-      });
+      const response = await api.value.post(
+        `plugin/${pluginId.value}/resource/search_resources`,
+        {
+          source: channelKey,
+          force: Boolean(force),
+          force_refresh: Boolean(force),
+          title: media.title,
+          original_title: media.original_title || "",
+          year: media.year || "",
+          media_type: media.media_type || "movie",
+          tmdb_id: media.tmdb_id || 0,
+          imdb_id: media.imdb_id || "",
+          tvdb_id: media.tvdb_id || 0,
+          douban_id: media.douban_id || 0,
+          bangumi_id: media.bangumi_id || 0,
+          anilist_id: media.anilist_id || 0,
+          anidb_id: media.anidb_id || 0,
+          media_source: media.media_source || "",
+          media_id: media.media_id || "",
+        },
+        {
+          signal: controller.signal,
+        },
+      );
+      if (!detailVisible.value) return;
       const result = unwrapApiResponse(response);
       channelResults.value = {...channelResults.value, [channelKey]: result?.success ? responseItems(result) : []};
       channelElapsed.value = {...channelElapsed.value, [channelKey]: result?.data?.elapsed ?? null};
@@ -301,10 +351,16 @@ export function useMediaDetail({api, pluginId, pluginConfig, showMessage}) {
           mediaSearchMemoryCache.set(mKey, entry);
         }
       } else {
-        showMessage?.(result?.message || `${getSourceName(channelKey)} 检索失败`, "warning");
+        if (detailVisible.value) {
+          showMessage?.(result?.message || `${getSourceName(channelKey)} 检索失败`, "warning");
+        }
       }
     } catch (error) {
       channelResults.value = {...channelResults.value, [channelKey]: []};
+      if (!detailVisible.value || isCancellationError(error)) {
+        // 弹窗已关闭或主动取消请求：静默处理，避免弹出无意义的 http cancel 错误提示
+        return;
+      }
       const unavailable = error?.response?.status === 502 || String(error?.message || "").includes("502");
       showMessage?.(
         unavailable
@@ -313,12 +369,15 @@ export function useMediaDetail({api, pluginId, pluginConfig, showMessage}) {
         "warning",
       );
     } finally {
+      channelAbortControllers.delete(channelKey);
       channelLoading.value = {...channelLoading.value, [channelKey]: false};
-      channelSearched.value = {...channelSearched.value, [channelKey]: true};
+      if (detailVisible.value) {
+        channelSearched.value = {...channelSearched.value, [channelKey]: true};
+      }
     }
   }
-
   async function openMediaDetail(item) {
+    abortAllActiveSearches();
     const key = getMediaCacheKey(item);
     const cached = mediaSearchMemoryCache.get(key);
     if (cached && Date.now() - cached.time < MEDIA_SEARCH_CACHE_TTL) {
@@ -367,12 +426,21 @@ export function useMediaDetail({api, pluginId, pluginConfig, showMessage}) {
 
   function closeMediaDetail() {
     detailVisible.value = false;
+    abortAllActiveSearches();
+    channelLoading.value = {};
   }
 
   watch(detailVisible, (visible) => {
     if (visible) return;
     requestToken += 1;
     detailLoading.value = false;
+    abortAllActiveSearches();
+    channelLoading.value = {};
+  });
+
+  onUnmounted(() => {
+    abortAllActiveSearches();
+    channelLoading.value = {};
   });
 
   watch(

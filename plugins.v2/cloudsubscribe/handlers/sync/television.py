@@ -89,6 +89,9 @@ class TelevisionSyncProcessor(OwnerDelegator):
                 logger.warn(f"无法识别媒体信息：{subscribe.name}")
                 return transferred_count
 
+            correct_count = getattr(self, "_correct_bangumi_episode_total", None)
+            if callable(correct_count) and not transient_target:
+                correct_count(subscribe, mediainfo)
             self._set_task_phase(subscribe, "核对播出范围", 20)
             season = normalize_season(subscribe.season)
             cloud_drive_name = self._cloud_drive_name()

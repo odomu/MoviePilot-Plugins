@@ -32,6 +32,34 @@ from ...utils.cache import normalize_platform_cache_key
 class SyncMetadataService(OwnerDelegator):
     """负责 TMDB 刮削、季页面解析、日历与 TMDBID 修复。"""
 
+    def _correct_bangumi_episode_total(self, subscribe: Any, mediainfo: Any) -> None:
+        """纠正 Bangumi 混合了 OP/ED/SP 的条目总集数，避免 TMDB S01 产生虚假缺集。"""
+        bangumi_id = getattr(subscribe, "bangumiid", None)
+        current = getattr(subscribe, "total_episode", None)
+        season = normalize_season(getattr(subscribe, "season", 1))
+        if not bangumi_id or season != 1 or media_identity(mediainfo)[0] != "themoviedb":
+            return
+        episodes = (getattr(mediainfo, "seasons", None) or {}).get(season)
+        if not isinstance(episodes, (list, tuple, set)) or not episodes:
+            return
+        try:
+            numbers = {int(value) for value in episodes}
+            main = max(numbers)
+            if numbers != set(range(1, main + 1)) or int(current or 0) <= main:
+                return
+            from app.modules.bangumi import BangumiModule
+            subject = BangumiModule().bangumi_info(bangumiid=int(bangumi_id))
+            if not isinstance(subject, dict):
+                return
+            bgm_main = int(subject.get("eps") or 0)
+            mixed = int(subject.get("total_episodes") or 0)
+            if 0 < main == bgm_main < mixed == int(current or 0):
+                from app.db.subscribe_oper import SubscribeOper
+                if SubscribeOper().update(subscribe.id, {"total_episode": main}):
+                    subscribe.total_episode = main
+        except Exception as error:
+            logger.debug(f"Bangumi 正片集数交叉核对未完成，保持原配置：{error}")
+
     @staticmethod
     def _calendar_date(value: Any) -> Optional[datetime.date]:
         normalized = str(value or "").strip()[:10]
@@ -94,6 +122,7 @@ class SyncMetadataService(OwnerDelegator):
                     return dict(entry)
                 self._subscribe_defer_cache.delete(cache_key)
         return None
+
     def get_tv_subscribe_calendar(
             self,
             subscribe: Any,

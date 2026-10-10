@@ -6,7 +6,7 @@ import re
 import threading
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, quote, urljoin
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 from .security import SeedHubSecurity
 from ..http_client import RequestGate, normalize_proxies
@@ -262,6 +262,7 @@ class SeedHubClient:
             seed_id: str = "",
             path: str = "",
             host: str = "",
+            **kwargs: Any,
     ) -> Dict[str, str]:
         """解析测试列表中用户选中的单条 SeedHub 资源。"""
         kind = str(kind or "").strip().lower()

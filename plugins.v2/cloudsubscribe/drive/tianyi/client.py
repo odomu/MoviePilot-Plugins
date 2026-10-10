@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from app.log import logger
 from app.utils.string import StringUtils
 
 from ..common import DriveRateLimiter
