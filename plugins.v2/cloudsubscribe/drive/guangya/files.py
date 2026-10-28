@@ -108,7 +108,7 @@ class GuangyaFileService(CloudDriveFileServiceBase):
             )
         data = self.client.data(response) or {}
         url = str(
-            data.get("signedUrl") or data.get("downloadUrl")
+            data.get("signedURL") or data.get("signedUrl") or data.get("downloadUrl")
             or data.get("url") or data.get("fileDownloadUrl") or ""
         ).strip()
         if not url:
