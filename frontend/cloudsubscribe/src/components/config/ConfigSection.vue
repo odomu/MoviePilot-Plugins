@@ -521,7 +521,9 @@
                       density="compact"
                       variant="outlined"
                       hide-details="auto">
-                      <template v-if="field.scanProvider || getAssociatedTestSource(group, field)" #append-inner>
+                      <template
+                        v-if="field.scanProvider || field.type === 'password' || getAssociatedTestSource(group, field)"
+                        #append-inner>
                         <v-btn
                           v-if="field.scanProvider"
                           icon="mdi-qrcode-scan"
@@ -530,6 +532,15 @@
                           size="small"
                           title="扫码登录"
                           @click="emit('scan', field.scanProvider)" />
+                        <v-btn
+                          v-if="field.type === 'password'"
+                          icon="mdi-content-copy"
+                          variant="text"
+                          color="primary"
+                          size="small"
+                          title="复制"
+                          :disabled="!hasText(config[field.key])"
+                          @click="emit('copy-text', String(config[field.key] || ''), field.label || 'Cookie')" />
                         <v-btn
                           v-if="getAssociatedTestSource(group, field)"
                           icon="mdi-flask-outline"
