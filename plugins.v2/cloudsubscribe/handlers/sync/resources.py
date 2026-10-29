@@ -672,6 +672,7 @@ class ResourceTransferService(OwnerDelegator):
             share_url: str,
             resource_label: str = "分享链接",
             log_prefix: str = "",
+            strict: bool = False,
     ) -> bool:
         """使用对应 Provider 的统一能力校验资源链接。"""
         provider = self._resource_provider_for_url(share_url)
@@ -687,10 +688,11 @@ class ResourceTransferService(OwnerDelegator):
         if status.is_valid:
             return True
         prefix = f"{log_prefix} " if log_prefix else ""
-        logger.debug(
+        message = (
             f"{prefix}{resource_label}无效："
             f"{self._resource_log_reference(share_url)}，原因：{status.status_text}"
         )
+        (logger.warning if strict else logger.debug)(message)
         return False
 
     @staticmethod
@@ -765,8 +767,13 @@ class ResourceTransferService(OwnerDelegator):
             log_prefix: str = "",
             target_file_ids: Optional[List[str]] = None,
             target_file_names: Optional[List[str]] = None,
+            strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        """校验分享并读取文件列表，供电影、剧集和洗版共同使用。"""
+        """校验分享并读取文件列表，供电影、剧集和洗版共同使用。
+
+        ``strict`` 用于用户手动提交的资源：失败原因升到 WARNING，避免整条同步
+        只留下「共转存 0 个文件」而看不到任何原因。
+        """
         if self._is_cloud_resource_url(share_url):
             files = self._list_cloud_resource_files(
                 self._cloud_resource_path(share_url),
@@ -799,7 +806,8 @@ class ResourceTransferService(OwnerDelegator):
             return copy.deepcopy(cached)
 
         if not self._validate_resource_url(
-                share_url, resource_label="分享链接", log_prefix=log_prefix
+                share_url, resource_label="分享链接", log_prefix=log_prefix,
+                strict=strict,
         ):
             return []
         kwargs = {}
@@ -823,9 +831,8 @@ class ResourceTransferService(OwnerDelegator):
         files = list(MediaFileParser.iter_files(files))
         if not files:
             label = resource_title or self._resource_log_reference(share_url)
-            logger.debug(
-                f"{log_prefix + ' ' if log_prefix else ''}分享链接无内容：{label}"
-            )
+            message = f"{log_prefix + ' ' if log_prefix else ''}分享链接无内容：{label}"
+            (logger.warning if strict else logger.debug)(message)
         files = self._filter_files_by_explicit_selection(
             files,
             target_file_ids=target_file_ids,

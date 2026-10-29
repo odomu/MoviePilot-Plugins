@@ -43,7 +43,11 @@ _RESOURCE_TYPE_META: Dict[str, Dict[str, Any]] = {
     },
     "uc": {
         "name": "UC网盘", "icon": "mdi-cloud-download-outline",
-        "color": "deep-orange", "previewable": True,
+        "color": "deep-orange",
+        "hosts": ("drive.uc.cn", "fast.uc.cn"),
+        "previewable": True, "preview_provider": "uc",
+        "password_param": "pwd", "aliases": ("ucpan",),
+        "markers": ("UC网盘", "drive.uc.cn"),
     },
     "tianyi": {
         "name": "天翼云盘", "icon": "mdi-cloud-check-outline", "color": "teal",
@@ -104,8 +108,8 @@ _RESOURCE_TYPE_META: Dict[str, Dict[str, Any]] = {
 
 #: 资源类型排序。
 RESOURCE_TYPE_ORDER = (
-    "115", "123", "quark", "guangya", "tianyi", "yun139", "alipan", "baidu",
-    "ed2k", "magnet",
+    "115", "123", "quark", "uc", "guangya", "tianyi", "yun139", "alipan",
+    "baidu", "ed2k", "magnet",
 )
 SUPPORTED_RESOURCE_TYPES = frozenset(RESOURCE_TYPE_ORDER)
 RESOURCE_TYPE_PRIORITY = {

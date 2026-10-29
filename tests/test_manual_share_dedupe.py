@@ -159,7 +159,8 @@ class FakeOwner:
     def _is_ed2k_url(self, url):
         return False
 
-    def _validated_resource_files(self, url, resource_title="", target_season=None, log_prefix=""):
+    def _validated_resource_files(self, url, resource_title="", target_season=None,
+                                  log_prefix="", strict=False):
         return _share_files()
 
     def _summarize_share_episodes(self, files, season, mediainfo=None):
@@ -281,7 +282,8 @@ class ManualUpgradeScopeTest(unittest.TestCase):
                 return True, {5: old_file}, "/电视剧/国剧/兰香如故 (2026)/Season 01"
 
             def _validated_resource_files(self, url, resource_title="",
-                                          target_season=None, log_prefix=""):
+                                          target_season=None, log_prefix="",
+                                          strict=False):
                 return [
                     {"id": "5", "name": "兰香如故.S01E05.mkv", "size": 5_100_000_000},
                     {"id": "6", "name": "兰香如故.S01E06.mkv", "size": 5_100_000_000},
