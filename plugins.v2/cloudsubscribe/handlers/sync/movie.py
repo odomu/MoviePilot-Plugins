@@ -8,10 +8,10 @@ from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
+from .utils import candidate_progress
 from ...core import OwnerDelegator
 from ...core.media import get_transfer_history_by, media_identity, tmdb_id_of
 from ...drive.common import format_size
-from .utils import candidate_progress
 
 
 class MovieSyncProcessor(OwnerDelegator):
@@ -506,6 +506,7 @@ class MovieSyncProcessor(OwnerDelegator):
                     share_files = self._validated_resource_files(
                         share_url,
                         resource_title=resource_title,
+                        strict=bool(manual_resources),
                         **val_kwargs,
                     )
                     if not share_files:
