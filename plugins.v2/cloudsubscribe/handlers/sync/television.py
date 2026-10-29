@@ -508,6 +508,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
                                 resource_title=resource_title,
                                 target_season=dir_target_season,
                                 log_prefix=search_prefix,
+                                strict=bool(manual_resources),
                                 **val_kwargs,
                             ))
                             continue

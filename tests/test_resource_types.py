@@ -36,6 +36,7 @@ class ResourceTypeDefinitionTest(unittest.TestCase):
                 "115": "115",
                 "123": "123",
                 "quark": "quark",
+                "uc": "uc",
                 "alipan": "alipan",
                 "baidu": "baidu",
                 "tianyi": "tianyi",
@@ -45,7 +46,10 @@ class ResourceTypeDefinitionTest(unittest.TestCase):
         )
         self.assertEqual(
             types.SHARE_PASSWORD_QUERY_KEYS,
-            {"115": "password", "123": "pwd", "baidu": "pwd", "guangya": "code"},
+            {
+                "115": "password", "123": "pwd", "baidu": "pwd",
+                "uc": "pwd", "guangya": "code",
+            },
         )
         self.assertEqual(
             types.TEXT_PASSWORD_TYPES,

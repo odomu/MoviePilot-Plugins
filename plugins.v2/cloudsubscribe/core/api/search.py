@@ -23,6 +23,7 @@ from ...search.matching import extract_resource_tags
 from ...search.scanner import SearchSourceRegistry
 from ...search.types import (
     PREVIEW_PROVIDER_KEYS,
+    append_share_password,
     PREVIEW_RESOURCE_TYPES,
     RESOURCE_TYPE_ORDER,
     RESOURCE_TYPE_PRIORITY,
@@ -875,10 +876,16 @@ class SearchApi(OwnerDelegator):
                 "tags": self._display_tags(item),
                 "description": str(item.get("description") or "").strip(),
                 "source_url": source_url,
-                "url": str(
-                    item.get("url") or item.get("share_url")
-                    or ""
-                ).strip(),
+                "url": append_share_password(
+                    resource_type,
+                    str(item.get("url") or item.get("share_url") or "").strip(),
+                    str(
+                        item.get("password")
+                        or item.get("share_password")
+                        or (provider_data or {}).get("password")
+                        or ""
+                    ),
+                ),
                 "resource_ref": str(item.get("resource_ref") or "").strip(),
                 "provider_data": provider_data,
                 "media_page_url": str(item.get("media_page_url") or "").strip(),
