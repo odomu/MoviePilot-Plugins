@@ -346,7 +346,7 @@ class PanSouSearchService:
 
         if not response or response.get("error"):
             reason = response.get("error") if response else "接口未返回结果"
-            logger.debug(f"{prefix} 搜索失败：关键词 '{keyword}'，原因：{reason}")
+            logger.warning(f"{prefix} 搜索失败：关键词 '{keyword}'，原因：{reason}")
             return []
 
         strict_year = media_type != MediaType.TV or season == 1
@@ -380,8 +380,10 @@ class PanSouSearchService:
                )
                and self._media_type_matches(resource, media_type)
         ]
-        logger.debug(
+        logger.info(
             f"{prefix} 渠道统计：原始条目={int(response.get('raw_count') or 0)}，"
+            f"网盘筛选后={int(response.get('filtered_count') or 0)}，"
+            f"截断后={int(response.get('processed_count') or 0)}，"
             f"匹配链接={sum(len(group) for group in groups.values())}，"
             f"有效返回={len(usable)}"
         )

@@ -1,0 +1,34 @@
+name: Pansou 搜索回归测试
+
+on:
+  pull_request:
+    paths:
+      - plugins.v2/cloudsubscribe/search/**
+      - tests/test_pansou_search.py
+      - tests/test_search_resource_types.py
+      - .github/workflows/pansou-search-tests.yml
+  push:
+    branches:
+      - dev/fix-pansou-filter-before-limit
+    paths:
+      - plugins.v2/cloudsubscribe/search/**
+      - tests/test_pansou_search.py
+      - tests/test_search_resource_types.py
+      - .github/workflows/pansou-search-tests.yml
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: 验证网盘筛选、截断顺序与资源类型映射
+        run: |
+          python -m unittest discover -s tests -p test_pansou_search.py -v
+          python -m unittest discover -s tests -p test_search_resource_types.py -v
