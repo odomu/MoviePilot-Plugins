@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.log import logger
 
-from ..types import PANSOU_RESOURCE_TYPES
+from ..types import PANSOU_RESOURCE_TYPES, normalize_resource_type
 from ...utils.http_client import (
     RequestGate,
     gated_request,
@@ -25,6 +25,31 @@ class PanSouClient:
     MAX_RAW_RESULTS = 100
     _SESSION_DATA_KEY = "pansou_auth_session"
     _LOGIN_LOCK = threading.RLock()
+
+    @staticmethod
+    def _wire_resource_type(value: Any) -> str:
+        resource_type = normalize_resource_type(str(value or "").strip().lower())
+        return "aliyun" if resource_type == "alipan" else resource_type
+
+    @classmethod
+    def _filter_result_rows(cls, rows: list, allowed_types: List[str]) -> list:
+        """先筛选链接，再限制记录数，避免其他网盘占满候选。"""
+        allowed = set(allowed_types)
+        filtered = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            links = []
+            for link in row.get("links") or []:
+                if not isinstance(link, dict):
+                    continue
+                resource_type = cls._wire_resource_type(link.get("type"))
+                if allowed and resource_type not in allowed:
+                    continue
+                links.append({**link, "type": resource_type})
+            if links:
+                filtered.append({**row, "links": links})
+        return filtered
 
     @staticmethod
     def _sanitize_json_strings(value: Any) -> Any:
@@ -272,9 +297,9 @@ class PanSouClient:
             effective_concurrency = None
         requested_cloud_types = cloud_types or []
         effective_cloud_types = list(dict.fromkeys(
-            str(item).strip().lower()
+            self._wire_resource_type(item)
             for item in requested_cloud_types
-            if str(item).strip().lower() in PANSOU_RESOURCE_TYPES
+            if self._wire_resource_type(item) in PANSOU_RESOURCE_TYPES
         ))
 
         try:
@@ -377,13 +402,22 @@ class PanSouClient:
             results_list = data.get("results", [])
             if not isinstance(results_list, list):
                 results_list = []
+            raw_count = len(results_list)
             if str(response_mode).strip().lower() == "merge" and isinstance(merged_by_type, dict):
                 # merge 响应按网盘分类轮询，避免磁力等大分类占满总上限。
-                typed_rows = {
-                    resource_type: [item for item in values if isinstance(item, dict)]
-                    for resource_type, values in merged_by_type.items()
-                    if isinstance(values, list)
-                }
+                raw_count = sum(len(values) for values in merged_by_type.values()
+                                if isinstance(values, list))
+                typed_rows = {}
+                for resource_type, values in merged_by_type.items():
+                    resource_type = self._wire_resource_type(resource_type)
+                    if not isinstance(values, list) or (
+                            effective_cloud_types and resource_type not in effective_cloud_types
+                    ):
+                        continue
+                    typed_rows.setdefault(resource_type, []).extend(
+                        item for item in values if isinstance(item, dict)
+                    )
+                filtered_count = sum(len(values) for values in typed_rows.values())
                 results_list = []
                 while typed_rows and len(results_list) < self.MAX_RAW_RESULTS:
                     for resource_type in list(typed_rows):
@@ -406,7 +440,9 @@ class PanSouClient:
                         })
                         if len(results_list) >= self.MAX_RAW_RESULTS:
                             break
-            raw_count = len(results_list)
+            else:
+                results_list = self._filter_result_rows(results_list, effective_cloud_types)
+                filtered_count = len(results_list)
             results_list = results_list[:self.MAX_RAW_RESULTS]
             processed_count = len(results_list)
 
@@ -414,6 +450,7 @@ class PanSouClient:
                 "keyword": keyword,
                 "total": total,
                 "raw_count": raw_count,
+                "filtered_count": filtered_count,
                 "processed_count": processed_count,
                 "elapsed_ms": int(elapsed * 1000),
                 "results": results_list,
