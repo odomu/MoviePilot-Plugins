@@ -192,6 +192,7 @@ class UCShareService:
                                 if parent_path else item.name
                             )
                             stack.append((item.id, sub_parent))
+                        else:
                             share_items[item.id] = {
                                 "token": str(raw.get("share_fid_token") or ""),
                                 "parent_id": str(raw.get("pdir_fid") or parent_id),
