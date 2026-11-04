@@ -1,6 +1,7 @@
 """STRM 播放代理：短链跳转，以及需要认证请求头的夸克流式中转。"""
 
 import json
+import re
 import socket
 import sys
 import types
@@ -17,6 +18,63 @@ from starlette import status
 
 from .. import CloudDriveCapability, CloudFile, OwnerDelegator
 from ...utils.strm import StrmGenerator
+
+
+_RELAY_CHUNK_SIZE = 4 * 1024 * 1024
+_CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+
+
+class _RangeStream:
+    """把连续的小范围响应拼成单一字节流，避免夸克开放范围请求低速。"""
+
+    def __init__(self, upstream: Any, url: str, headers: Dict[str, str],
+                 start: int, part_end: int, end: int, total: int):
+        self._upstream = upstream
+        self._url = url
+        self._headers = dict(headers)
+        validator = upstream.headers.get("ETag", "")
+        if not validator or validator.startswith("W/"):
+            validator = upstream.headers.get("Last-Modified")
+        if validator:
+            self._headers["If-Range"] = validator
+        self._remaining = part_end - start + 1
+        self._next = part_end + 1
+        self._end = end
+        self._total = total
+        self._closed = False
+
+    def read(self, size: int = 256 * 1024) -> bytes:
+        if self._closed or size == 0:
+            return b""
+        if not self._remaining:
+            if self._next > self._end:
+                return b""
+            self._upstream.close()
+            end = min(self._next + _RELAY_CHUNK_SIZE - 1, self._end)
+            headers = {**self._headers, "Range": f"bytes={self._next}-{end}"}
+            try:
+                upstream = urlopen(Request(self._url, headers=headers), timeout=30)
+            except HTTPError as error:
+                error.close()
+                self._closed = True
+                raise OSError("上游分段请求失败") from None
+            self._upstream = upstream
+            match = _CONTENT_RANGE.fullmatch(upstream.headers.get("Content-Range", ""))
+            if upstream.status != 206 or not match or tuple(map(int, match.groups())) != (
+                    self._next, end, self._total):
+                self.close()
+                raise OSError("夸克分段响应范围或文件版本变化")
+            self._remaining = end - self._next + 1
+            self._next = end + 1
+        data = self._upstream.read(min(max(1, size), self._remaining))
+        if not data:
+            raise OSError("夸克分段响应提前结束")
+        self._remaining -= len(data)
+        return data
+
+    def close(self) -> None:
+        self._closed = True
+        self._upstream.close()
 
 
 def content_disposition(file_name: str) -> str:
@@ -118,11 +176,29 @@ class StrmProxyApi(OwnerDelegator):
         if method not in {"GET", "HEAD"}:
             return ProxyResult(status_code=405, headers={"Allow": "GET, HEAD"})
         headers = {k: v for k, v in (download_headers or {}).items()
-                   if k.lower() not in {"host", "content-length", "accept-encoding"}}
+                   if k.lower() not in {"host", "content-length", "accept-encoding", "range", "if-range"}}
         headers["Accept-Encoding"] = "identity"
-        for key, value in (request_headers or {}).items():
-            if key.lower() in {"range", "if-range"}:
-                headers[key] = value
+        client_headers = {k.lower(): v for k, v in (request_headers or {}).items()}
+        range_value = client_headers.get("range", "")
+        if range_value:
+            headers["Range"] = range_value
+        if client_headers.get("if-range"):
+            headers["If-Range"] = client_headers["if-range"]
+        range_match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_value.strip(), re.IGNORECASE)
+        segmented = method == "GET" and (not range_value or bool(range_match))
+        start, requested_end = 0, None
+        if segmented:
+            if range_match:
+                start = int(range_match.group(1))
+                requested_end = int(range_match.group(2)) if range_match.group(2) else None
+            # 无效范围交由上游按原样返回 416。
+            if requested_end is not None and requested_end < start:
+                segmented = False
+            else:
+                part_end = start + _RELAY_CHUNK_SIZE - 1
+                if requested_end is not None:
+                    part_end = min(part_end, requested_end)
+                headers["Range"] = f"bytes={start}-{part_end}"
         try:
             upstream = urlopen(Request(url, headers=headers, method=method), timeout=30)
         except HTTPError as error:
@@ -135,6 +211,24 @@ class StrmProxyApi(OwnerDelegator):
                    "etag", "last-modified"}
         response_headers = {k: v for k, v in upstream.headers.items() if k.lower() in allowed}
         response_headers["Cache-Control"] = "no-store"
+        if segmented and upstream.status == 206:
+            match = _CONTENT_RANGE.fullmatch(upstream.headers.get("Content-Range", ""))
+            if not match:
+                upstream.close()
+                return error_result("夸克分段响应缺少有效范围", 502)
+            actual_start, actual_end, total = map(int, match.groups())
+            end = min(requested_end, total - 1) if requested_end is not None else total - 1
+            if actual_start != start or actual_end != min(part_end, total - 1) or end < start:
+                upstream.close()
+                return error_result("夸克分段响应范围不匹配", 502)
+            response_headers = {k: v for k, v in response_headers.items()
+                                if k.lower() not in {"content-length", "content-range"}}
+            response_headers["Content-Length"] = str(end - start + 1)
+            if range_value:
+                response_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            stream = _RangeStream(upstream, url, headers, start, actual_end, end, total)
+            return ProxyResult(status_code=206 if range_value else 200,
+                               headers=response_headers, upstream=stream)
         return ProxyResult(status_code=upstream.status, headers=response_headers, upstream=upstream)
 
     def short_params(self, path: str, query: Any = None) -> Dict[str, str]:

@@ -8,7 +8,7 @@ import unittest
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from types import SimpleNamespace
 
 from plugin_env import (
@@ -261,6 +261,48 @@ class TestProxyTemplateSelection(unittest.TestCase):
         self.assertEqual(base, "http://mp:9527")
 
 
+class TestRangeStreamFailure(unittest.TestCase):
+    def make_stream(self):
+        first = Mock(headers={"ETag": '"v1"'})
+        first.read.return_value = b"abcd"
+        stream = _proxy._RangeStream(first, "http://upstream/video", {}, 0, 3, 7, 8)
+        self.assertEqual(stream.read(), b"abcd")
+        return first, stream
+
+    def test_changed_file_stops_and_closes_next_response(self):
+        first, stream = self.make_stream()
+        second = Mock(status=200, headers={})
+        with patch.object(_proxy, "urlopen", return_value=second):
+            with self.assertRaises(OSError):
+                stream.read()
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
+    def test_http_error_response_is_closed(self):
+        _, stream = self.make_stream()
+        from urllib.error import HTTPError
+        error = HTTPError("http://upstream/video", 412, "changed", {}, Mock())
+        with patch.object(_proxy, "urlopen", side_effect=error), patch.object(error, "close") as close:
+            with self.assertRaises(OSError):
+                stream.read()
+            close.assert_called_once()
+
+    def test_disconnect_does_not_fetch_more(self):
+        first, stream = self.make_stream()
+        stream.close()
+        with patch.object(_proxy, "urlopen") as open_next:
+            self.assertEqual(stream.read(), b"")
+            open_next.assert_not_called()
+        first.close.assert_called_once()
+
+    def test_truncated_part_is_rejected(self):
+        first, stream = self.make_stream()
+        stream._remaining = 1
+        first.read.return_value = b""
+        with self.assertRaises(OSError):
+            stream.read()
+
+
 class TestQuarkRelay(unittest.TestCase):
     """真实 HTTP 链路验证：认证只发上游，Range/HEAD 与错误码保持一致。"""
 
@@ -361,6 +403,26 @@ class TestQuarkRelay(unittest.TestCase):
         code, headers, body = self.fetch("HEAD")
         self.assertEqual((code, body), (200, b""))
         self.assertEqual(int(headers["Content-Length"]), len(self.payload))
+
+    def test_segmented_requests_preserve_complete_client_range(self):
+        for value, start, end in [(None, 0, 35), ("bytes=2-", 2, 35),
+                                  ("bytes=3-25", 3, 25)]:
+            with self.subTest(range=value), patch.object(_proxy, "_RELAY_CHUNK_SIZE", 8):
+                self.received.clear()
+                code, headers, body = self.fetch(headers={"Range": value} if value else {})
+                self.assertEqual(code, 206 if value else 200)
+                self.assertEqual(body, self.payload[start:end + 1])
+                self.assertEqual(int(headers["Content-Length"]), end - start + 1)
+                if value:
+                    self.assertEqual(headers["Content-Range"], f"bytes {start}-{end}/36")
+                else:
+                    self.assertNotIn("Content-Range", headers)
+                expected = [f"bytes={low}-{min(low + 7, end)}"
+                            for low in range(start, end + 1, 8)]
+                self.assertEqual([h["Range"] for h in self.received], expected)
+                for request in self.received[1:]:
+                    self.assertEqual(request["If-Range"], '"version-one"')
+
 
     def test_unsatisfiable_range_keeps_416(self):
         code, headers, body = self.fetch(headers={"Range": "bytes=999-"})
