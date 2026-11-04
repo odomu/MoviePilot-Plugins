@@ -1,4 +1,4 @@
-"""STRM 播放代理：自有监听端口把短链解析为网盘直链并 302 跳转。"""
+"""STRM 播放代理：短链跳转，以及需要认证请求头的夸克流式中转。"""
 
 import json
 import socket
@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import RLock, Thread
 from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from app.log import logger
 from starlette import status
@@ -29,11 +31,12 @@ def content_disposition(file_name: str) -> str:
 
 @dataclass(frozen=True)
 class ProxyResult:
-    """传输无关的代理响应：302 跳转或错误 JSON。"""
+    """代理响应：跳转、错误 JSON，或需要调用方关闭的上游流。"""
 
     status_code: int
     headers: Dict[str, str] = field(default_factory=dict)
     body: bytes = b""
+    upstream: Any = field(default=None, repr=False, compare=False)
 
 
 def error_result(message: str, status_code: int) -> ProxyResult:
@@ -78,9 +81,10 @@ class StrmProxyApi(OwnerDelegator):
         }
 
     def handle_request(
-            self, params: Mapping[str, Any], method: str = "GET"
+            self, params: Mapping[str, Any], method: str = "GET",
+            request_headers: Optional[Mapping[str, str]] = None,
     ) -> ProxyResult:
-        """传输无关的核心：按参数解析目标文件并返回 302 结果。"""
+        """按参数解析文件；夸克保留取链认证头，其余网盘继续跳转。"""
         if not self._proxy_enabled:
             return error_result("STRM 播放代理未启用", status.HTTP_503_SERVICE_UNAVAILABLE)
         downloader = self._file_downloader()
@@ -90,7 +94,7 @@ class StrmProxyApi(OwnerDelegator):
         if not file_item:
             return error_result("未找到目标文件", status.HTTP_404_NOT_FOUND)
         try:
-            url, _headers = downloader.resolve_download_link(file_item)
+            url, download_headers = downloader.resolve_download_link(file_item)
         except Exception as error:
             logger.warning(f"STRM 播放代理解析直链失败：{file_item.name} - {error}")
             return error_result(
@@ -99,8 +103,39 @@ class StrmProxyApi(OwnerDelegator):
         url = str(url or "").strip()
         if not url:
             return error_result("网盘未返回可用直链", status.HTTP_502_BAD_GATEWAY)
+        drive_key = str(getattr(self, "_cloud_drive_key", "") or
+                        (getattr(self, "_applied_config", None) or {}).get("cloud_drive", ""))
+        if drive_key == "quark":
+            return self._relay_result(url, download_headers, method, request_headers)
         logger.info(f"STRM 播放代理跳转：{file_item.name} -> {url.split('?')[0]}")
         return self._redirect_result(url, file_item.name, method)
+
+    @staticmethod
+    def _relay_result(url: str, download_headers: Mapping[str, str], method: str,
+                      request_headers: Optional[Mapping[str, str]]) -> ProxyResult:
+        """有界内存转发，认证只发给上游，允许播放器定位字节范围。"""
+        method = str(method).upper()
+        if method not in {"GET", "HEAD"}:
+            return ProxyResult(status_code=405, headers={"Allow": "GET, HEAD"})
+        headers = {k: v for k, v in (download_headers or {}).items()
+                   if k.lower() not in {"host", "content-length", "accept-encoding"}}
+        headers["Accept-Encoding"] = "identity"
+        for key, value in (request_headers or {}).items():
+            if key.lower() in {"range", "if-range"}:
+                headers[key] = value
+        try:
+            upstream = urlopen(Request(url, headers=headers, method=method), timeout=30)
+        except HTTPError as error:
+            upstream = error
+        except Exception as error:
+            # 异常文本可能含带签名的 URL，不回显认证信息。
+            logger.warning(f"夸克播放中转连接失败：{type(error).__name__}")
+            return error_result("夸克播放中转连接失败", 502)
+        allowed = {"content-type", "content-length", "content-range", "accept-ranges",
+                   "etag", "last-modified"}
+        response_headers = {k: v for k, v in upstream.headers.items() if k.lower() in allowed}
+        response_headers["Cache-Control"] = "no-store"
+        return ProxyResult(status_code=upstream.status, headers=response_headers, upstream=upstream)
 
     def short_params(self, path: str, query: Any = None) -> Dict[str, str]:
         """把短链 ``/d/<标识>``（含 CloudDrive2 风格 ``?/<文件名>``）解析为查询参数。"""
@@ -338,12 +373,16 @@ class StrmProxyServer:
                     result = server._api.handle_request(
                         server._api.short_params(parsed.path, _query_pairs(parsed.query)),
                         method,
+                        self.headers,
                     )
                 else:
                     result = error_result("未找到目标文件", status.HTTP_404_NOT_FOUND)
                 self._respond(result, method)
 
             def _respond(self, result: ProxyResult, method: str) -> None:
+                if result.upstream is not None:
+                    self._relay(result, method)
+                    return
                 body = b"" if method == "HEAD" else result.body
                 self.send_response(result.status_code)
                 for key, value in result.headers.items():
@@ -352,6 +391,28 @@ class StrmProxyServer:
                 self.end_headers()
                 if body:
                     self.wfile.write(body)
+
+            def _relay(self, result: ProxyResult, method: str) -> None:
+                # 上游无长度时以关闭连接结束响应，禁止错误地复用连接。
+                self.close_connection = True
+                try:
+                    self.send_response(result.status_code)
+                    for key, value in result.headers.items():
+                        self.send_header(key, value)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    if method != "HEAD":
+                        while True:
+                            chunk = result.upstream.read(256 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # 播放器探测、跳播或停止时正常断开。
+                except Exception as error:
+                    logger.warning(f"夸克播放中转读取中断：{type(error).__name__}")
+                finally:
+                    result.upstream.close()
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logger.debug(f"STRM 播放代理：{fmt % args}")
