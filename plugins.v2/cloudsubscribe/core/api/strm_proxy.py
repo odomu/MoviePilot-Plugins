@@ -6,10 +6,12 @@ import socket
 import sys
 import time
 import types
+from io import BytesIO
+from collections import OrderedDict
 from queue import Empty, Full, Queue
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 from urllib.error import HTTPError
@@ -32,6 +34,12 @@ _RELAY_REFRESH_STATUS = frozenset({401, 403, 404, 410, 412})  # 直链失效：�
 _RELAY_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})    # 瞬时错误：退避重试
 _RELAY_MAX_REFRESHS = 2             # 单条响应最多重新取链次数，避免重取链风暴
 _RELAY_PREFETCH_ITEMS = 8           # 预取缓冲的队列深度（片），隔离上游抖动与客户端消费速度差
+_RELAY_TAIL_CACHE = 2 * 1024 * 1024  # 尾部缓存上限（字节）；置 0 即一键关闭，回到第一批行为
+_RELAY_TAIL_TRIGGER = 16 * 1024 * 1024  # 起点落在文件末尾此窗口内，才认为是"尾部/索引"请求
+_RELAY_TAIL_TTL = 30 * 60          # 缓存有效期（秒）
+_RELAY_TAIL_WAIT = 1.5             # 预热进行中时，请求最多等待的秒数
+_RELAY_TAIL_DEADLINE = 120.0       # 后台补读的硬墙钟上限（秒）
+_RELAY_TAIL_CACHE_FILES = 4        # LRU 最多保留的文件数（每个 ≤ _RELAY_TAIL_CACHE）
 _KEEP_RESPONSE_HEADERS = frozenset({
     "content-type", "content-length", "content-range", "accept-ranges",
     "etag", "last-modified",
@@ -331,6 +339,228 @@ class _PrefetchReader:
                 break
 
 
+_TAIL_REGISTRY_KEY = "cloudsubscribe.strm_proxy.tail_cache"
+
+
+def _parse_client_range(range_value: str, total: int) -> Optional[Tuple[int, int]]:
+    """把显式起点的 Range 换算成绝对 [start, end]；后缀形式保持原链路直通。"""
+    match = re.fullmatch(r"bytes=(\d+)-(\d*)", str(range_value or "").strip(), re.IGNORECASE)
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) else total - 1
+    end = min(end, total - 1)
+    if start >= total or end < start:
+        return None
+    return start, end
+
+
+class _TailCache:
+    """进程级尾部缓存：只保存"客户端本来就要读"的那段响应字节，不额外发请求。
+
+    与"主动预热"的区别：后台线程续读的是**同一条已在途的上游响应**，
+    客户端超时断开后不丢弃已读字节，也不新建 Range 请求。
+    """
+
+    def __init__(self):
+        self._lock = RLock()
+        self._hints: Dict[Tuple[str, str], Tuple[int, str, Dict[str, str], float]] = {}
+        self._entries: "OrderedDict[Tuple, Tuple[bytes, int, float]]" = OrderedDict()
+        self._pending: Dict[Tuple, Event] = {}
+
+    def note_size(self, file_key, total: int, validator: str, base_headers: Dict[str, str]) -> None:
+        """每次 206 都核对文件版本；total / validator 变化即作废旧字节。"""
+        with self._lock:
+            old = self._hints.get(file_key)
+            if old and (old[0] != total or old[1] != validator):
+                self._drop(file_key)
+            self._hints[file_key] = (total, validator, dict(base_headers), time.monotonic())
+
+    def _drop(self, file_key) -> None:
+        for key in list(self._entries):
+            if key[:2] == file_key:
+                self._entries.pop(key, None)
+        for key in list(self._pending):
+            if key[:2] == file_key:
+                self._signal(key)
+
+    def _signal(self, key) -> None:
+        event = self._pending.pop(key, None)
+        if event is not None:
+            event.set()
+
+    def begin(self, key) -> None:
+        with self._lock:
+            if key not in self._pending:
+                self._pending[key] = Event()
+
+    def publish(self, key, data: bytes, start: int) -> None:
+        with self._lock:
+            self._entries[key] = (data, start, time.monotonic())
+            self._entries.move_to_end(key)
+            while len(self._entries) > _RELAY_TAIL_CACHE_FILES:
+                self._entries.popitem(last=False)
+            self._signal(key)
+
+    def abort(self, key) -> None:
+        with self._lock:
+            self._signal(key)
+
+    def clear(self) -> None:
+        """测试/热重载：取消在途预热并清空缓存。"""
+        with self._lock:
+            for key in list(self._pending):
+                self._signal(key)
+            self._entries.clear()
+            self._hints.clear()
+
+    def _entry_key(self, file_key, total, validator):
+        return (file_key[0], file_key[1], total, validator)
+
+    def _slice(self, key, start, end, total, base_headers):
+        with self._lock:
+            entry = self._entries.get(key)
+            if not entry:
+                return None
+            data, base_start, created = entry
+            if (time.monotonic() - created > _RELAY_TAIL_TTL
+                    or base_start > start or end >= base_start + len(data)):
+                return None
+            chunk = bytes(data[start - base_start: end - base_start + 1])
+            self._entries.move_to_end(key)
+        headers = dict(base_headers)
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        headers["Content-Length"] = str(len(chunk))
+        headers["Cache-Control"] = "no-store"
+        headers.setdefault("Accept-Ranges", "bytes")
+        logger.info(f"夸克播放中转尾部命中：bytes={len(chunk)}")
+        return ProxyResult(status_code=206, headers=headers, upstream=BytesIO(chunk))
+
+    def hit(self, file_key, method: str, request_headers) -> "Optional[ProxyResult]":
+        """纯内存、零上游、零取链；预热进行中时最多等 _RELAY_TAIL_WAIT 秒。"""
+        if _RELAY_TAIL_CACHE <= 0 or method not in {"GET", "HEAD"}:
+            return None
+        with self._lock:
+            hint = self._hints.get(file_key)
+            if not hint or time.monotonic() - hint[3] > _RELAY_TAIL_TTL:
+                return None
+            total, validator, base_headers, _ = hint
+            headers = {k.lower(): v for k, v in (request_headers or {}).items()}
+            parsed = _parse_client_range(headers.get("range", ""), total)
+            if (not parsed or total <= _RELAY_TAIL_TRIGGER
+                    or parsed[0] < total - _RELAY_TAIL_TRIGGER):
+                return None
+            start, end = parsed
+            if end - start + 1 > _RELAY_TAIL_CACHE:
+                return None
+            if headers.get("if-range") and headers["if-range"] != validator:
+                return None
+            key = self._entry_key(file_key, total, validator)
+            result = self._slice(key, start, end, total, base_headers)
+            if result is not None:
+                return result
+            event = self._pending.get(key)
+        if event is not None:
+            event.wait(_RELAY_TAIL_WAIT)
+            return self._slice(key, start, end, total, base_headers)
+        return None
+
+
+def _tail_cache() -> _TailCache:
+    """与监听器注册表同样的进程级 holder，插件热重载后缓存仍然可用。"""
+    holder = sys.modules.get(_TAIL_REGISTRY_KEY)
+    if holder is None:
+        holder = types.ModuleType(_TAIL_REGISTRY_KEY)
+        holder.cache = _TailCache()
+        sys.modules[_TAIL_REGISTRY_KEY] = holder
+    return holder.cache
+
+
+class _TailCapture:
+    """旁路记录一次尾部响应；客户端断开后由后台线程把同一条流读完再发布。
+
+    预取是优化：任何失败都静默吞掉，绝不改变交给客户端的字节与异常语义。
+    """
+
+    def __init__(self, upstream, cache: _TailCache, key, start: int, length: int):
+        self._upstream = upstream
+        self._cache = cache
+        self._key = key
+        self._start = start
+        self._limit = min(length, _RELAY_TAIL_CACHE)
+        self._buf = bytearray()
+        self._eof = False
+        self._failed = False
+        self._closed = False
+        cache.begin(key)
+
+    def read(self, size: int = _RELAY_READ_SIZE) -> bytes:
+        if self._closed:
+            return b""
+        try:
+            chunk = self._upstream.read(size)
+        except Exception:
+            self._failed = True
+            raise
+        if chunk:
+            room = self._limit - len(self._buf)
+            if room > 0:
+                self._buf.extend(chunk[:room])
+        else:
+            self._eof = True
+        return chunk
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._failed and not self._eof and len(self._buf) < self._limit:
+            Thread(target=self._drain, name="strm-tail-warm", daemon=True).start()
+            return
+        self._finish()
+
+    def _drain(self) -> None:
+        deadline = time.monotonic() + _RELAY_TAIL_DEADLINE
+        try:
+            while (not self._eof and len(self._buf) < self._limit
+                   and time.monotonic() < deadline):
+                chunk = self._upstream.read(_RELAY_READ_SIZE)
+                if not chunk:
+                    self._eof = True
+                    break
+                room = self._limit - len(self._buf)
+                self._buf.extend(chunk[:room])
+        except Exception:  # noqa: BLE001 - 预热失败不能影响任何客户端
+            pass
+        finally:
+            self._finish()
+
+    def _finish(self) -> None:
+        try:
+            # 读满即视为完整（后台补读可能在读完最后一块时还没观察到 EOF）。
+            if len(self._buf) == self._limit:
+                self._cache.publish(self._key, bytes(self._buf), self._start)
+            else:
+                self._cache.abort(self._key)
+        finally:
+            try:
+                self._upstream.close()
+            except Exception:
+                pass
+
+
+def _wrap_tail(stream, file_key, method: str, start: int, end: int,
+               total: int, validator: str):
+    """只对"落在文件尾部的 GET 响应"挂旁路记录，其余路径一行不变。"""
+    length = end - start + 1
+    if (not file_key or method != "GET" or _RELAY_TAIL_CACHE <= 0
+            or start <= 0 or total <= _RELAY_TAIL_TRIGGER
+            or start < total - _RELAY_TAIL_TRIGGER or length > _RELAY_TAIL_CACHE):
+        return stream
+    key = (file_key[0], file_key[1], total, validator)
+    return _TailCapture(stream, _tail_cache(), key, start, length)
+
+
 def content_disposition(file_name: str) -> str:
     """按 RFC 5987 生成兼容中文文件名的下载头。"""
     name = str(file_name or "").strip() or "download"
@@ -405,6 +635,13 @@ class StrmProxyApi(OwnerDelegator):
         file_item = self._resolve_file(params)
         if not file_item:
             return error_result("未找到目标文件", status.HTTP_404_NOT_FOUND)
+        drive_key = str(getattr(self, "_cloud_drive_key", "") or
+                        (getattr(self, "_applied_config", None) or {}).get("cloud_drive", ""))
+        file_key = (drive_key, str(getattr(file_item, "id", "") or ""))
+        if drive_key == "quark":
+            cached = _tail_cache().hit(file_key, str(method).upper(), request_headers)
+            if cached is not None:
+                return cached
         try:
             url, download_headers = downloader.resolve_download_link(file_item)
         except Exception as error:
@@ -415,18 +652,18 @@ class StrmProxyApi(OwnerDelegator):
         url = str(url or "").strip()
         if not url:
             return error_result("网盘未返回可用直链", status.HTTP_502_BAD_GATEWAY)
-        drive_key = str(getattr(self, "_cloud_drive_key", "") or
-                        (getattr(self, "_applied_config", None) or {}).get("cloud_drive", ""))
         if drive_key == "quark":
             def resolver(_downloader=downloader, _item=file_item):
                 return _downloader.resolve_download_link(_item)
-            return self._relay_result(url, download_headers, method, request_headers, resolver)
+            return self._relay_result(url, download_headers, method, request_headers,
+                                      resolver, file_key)
         logger.info(f"STRM 播放代理跳转：{file_item.name} -> {url.split('?')[0]}")
         return self._redirect_result(url, file_item.name, method)
 
     def _relay_result(self, url: str, download_headers: Mapping[str, str], method: str,
                       request_headers: Optional[Mapping[str, str]],
-                      resolver: Optional[Callable[..., Tuple[str, Mapping[str, str]]]] = None
+                      resolver: Optional[Callable[..., Tuple[str, Mapping[str, str]]]] = None,
+                      file_key: Optional[Tuple[str, str]] = None
                       ) -> ProxyResult:
         """有界内存转发，认证只发给上游，允许播放器定位字节范围。"""
         method = str(method).upper()
@@ -491,9 +728,16 @@ class StrmProxyApi(OwnerDelegator):
             validator = upstream.headers.get("ETag", "")
             if not validator or validator.startswith("W/"):
                 validator = upstream.headers.get("Last-Modified")
+            base_headers = {k: v for k, v in response_headers.items()
+                            if k.lower() not in {"content-length", "content-range"}}
+            if file_key and _RELAY_TAIL_CACHE > 0:
+                _tail_cache().note_size(file_key, total, validator or "", base_headers)
             stream = _PrefetchReader.wrap(_RangeStream(
                 upstream, link, start, actual_end, end, total,
                 if_range=validator or ""))
+            if file_key:
+                stream = _wrap_tail(stream, file_key, method, start, end,
+                                    total, validator or "")
             return ProxyResult(status_code=206 if range_value else 200,
                                headers=response_headers, upstream=stream)
         return ProxyResult(status_code=status, headers=response_headers, upstream=upstream)

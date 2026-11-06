@@ -717,6 +717,46 @@ class TestQuarkRelay(unittest.TestCase):
         self.assertTrue(int(headers["Content-Length"]) > 0)
         self.assertEqual(self.received[-1]["If-Range"], '"version-one"')
 
+    def test_tail_cache_hits_without_upstream_or_link_resolve(self):
+        """尾部响应读完一次后，同范围请求零上游、零取链直接命中。"""
+        cache = _proxy._tail_cache()
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.payload = b"x" * (64 * 1024)
+        tail_start, tail_size = 48 * 1024, 16 * 1024
+        calls = []
+        original = self.owner._cloud_drive.resolve_download_link
+
+        def counting(item):
+            calls.append(item)
+            return original(item)
+
+        self.owner._cloud_drive.resolve_download_link = counting
+        with patch.object(_proxy, "_RELAY_TAIL_CACHE", tail_size), \
+                patch.object(_proxy, "_RELAY_TAIL_TRIGGER", 32 * 1024):
+            first = self.fetch(headers={"Range": f"bytes={tail_start}-"})
+            self.assertEqual((first[0], len(first[2])), (206, tail_size))
+            self.assertEqual(first[2], self.payload[tail_start:])
+            received_after_first = len(self.received)
+            calls_after_first = len(calls)
+            second = self.fetch(headers={"Range": f"bytes={tail_start}-"})
+            self.assertEqual((second[0], second[2]), (206, self.payload[tail_start:]))
+            self.assertEqual(second[1]["Content-Range"], f"bytes {tail_start}-65535/65536")
+            self.assertEqual(len(self.received), received_after_first)   # 零上游
+            self.assertEqual(len(calls), calls_after_first)              # 零取链
+
+    def test_tail_cache_switch_can_be_turned_off(self):
+        """部署配置默认启用；把开关置 0 即完全旁路，一键回到第一批行为。"""
+        cache = _proxy._tail_cache()
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.assertGreater(_proxy._RELAY_TAIL_CACHE, 0)
+        with patch.object(_proxy, "_RELAY_TAIL_CACHE", 0):
+            stream = Mock()
+            self.assertIs(_proxy._wrap_tail(stream, ("quark", "fid"), "GET",
+                                            1024, 2047, 4096, '"v1"'), stream)
+            self.assertIsNone(cache.hit(("quark", "fid"), "GET", {"Range": "bytes=1024-"}))
+
     def spy_logger(self):
         logger = logging.Logger("strm-relay-e2e", level=logging.WARNING)
         logger.propagate = False
@@ -790,6 +830,114 @@ class TestQuarkRelay(unittest.TestCase):
             code, _, body = self.fetch()
         self.assertEqual(code, 502)
         self.assertNotIn(b"private-signed-url", body)
+
+
+class TestTailCache(unittest.TestCase):
+    """尾部缓存：纯内存命中、版本失效、If-Range 校验与 LRU 上限。"""
+
+    def setUp(self):
+        self.cache = _proxy._TailCache()
+        self.file_key = ("quark", "fid-1")
+        self.base = {"Content-Type": "video/mp4", "ETag": '"v1"',
+                     "Accept-Ranges": "bytes"}
+        self.cache.note_size(self.file_key, 1000, '"v1"', self.base)
+        patcher = patch.object(_proxy, "_RELAY_TAIL_CACHE", 64)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        trigger = patch.object(_proxy, "_RELAY_TAIL_TRIGGER", 128)
+        trigger.start()
+        self.addCleanup(trigger.stop)
+
+    def key(self, total=1000, validator='"v1"'):
+        return self.cache._entry_key(self.file_key, total, validator)
+
+    def test_publish_then_hit_serves_exact_bytes(self):
+        key = self.key()
+        self.cache.begin(key)
+        self.cache.publish(key, b"0123456789", start=990)
+        result = self.cache.hit(self.file_key, "GET", {"Range": "bytes=992-999"})
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status_code, 206)
+        self.assertEqual(result.headers["Content-Range"], "bytes 992-999/1000")
+        self.assertEqual(result.headers["Content-Length"], "8")
+        self.assertEqual(result.upstream.read(), b"23456789")
+
+    def test_hit_outside_cached_window_misses(self):
+        self.cache.publish(self.key(), b"0123456789", start=990)
+        self.assertIsNone(self.cache.hit(self.file_key, "GET", {"Range": "bytes=980-"}))
+
+    def test_if_range_mismatch_misses(self):
+        self.cache.publish(self.key(), b"0123456789", start=990)
+        self.assertIsNone(self.cache.hit(
+            self.file_key, "GET", {"Range": "bytes=995-", "If-Range": '"v2"'}))
+
+    def test_file_version_change_drops_old_bytes(self):
+        self.cache.publish(self.key(), b"0123456789", start=990)
+        self.cache.note_size(self.file_key, 1000, '"v2"', self.base)
+        self.assertIsNone(self.cache.hit(self.file_key, "GET", {"Range": "bytes=995-"}))
+
+    def test_pending_request_waits_for_warm_to_finish(self):
+        key = self.key()
+        self.cache.begin(key)
+
+        def finish():
+            time.sleep(0.05)
+            self.cache.publish(key, b"0123456789", start=990)
+
+        worker = Thread(target=finish, daemon=True)
+        worker.start()
+        result = self.cache.hit(self.file_key, "GET", {"Range": "bytes=995-"})
+        worker.join(timeout=2)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.upstream.read(), b"56789")
+
+    def test_lru_caps_cached_files(self):
+        with patch.object(_proxy, "_RELAY_TAIL_CACHE_FILES", 2):
+            for number in range(3):
+                self.cache.publish(("quark", f"f{number}", 1000, '"v1"'),
+                                   b"0123456789", start=990)
+            self.assertEqual(len(self.cache._entries), 2)
+            self.assertNotIn(("quark", "f0", 1000, '"v1"'), self.cache._entries)
+
+
+class TestTailCapture(unittest.TestCase):
+    """客户端断开后由后台线程把同一条响应读完，失败静默、不改变播放语义。"""
+
+    def setUp(self):
+        patcher = patch.object(_proxy, "_RELAY_TAIL_CACHE", 8)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cache = _proxy._TailCache()
+        self.key = ("quark", "fid", 1000, '"v1"')
+
+    def test_disconnect_keeps_reading_same_response(self):
+        class Upstream:
+            def __init__(self):
+                self.parts = iter([b"abcd", b"efgh", b""])
+
+            def read(self, size):
+                return next(self.parts)
+
+            def close(self):
+                pass
+
+        capture = _proxy._TailCapture(Upstream(), self.cache, self.key, 990, 8)
+        self.assertEqual(capture.read(), b"abcd")       # 客户端只拿到一半就断开
+        capture.close()                                 # 模拟 _relay 的 finally
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and self.key not in self.cache._entries:
+            time.sleep(0.01)
+        self.assertIn(self.key, self.cache._entries)
+        self.assertEqual(self.cache._entries[self.key][0], b"abcdefgh")
+
+    def test_failure_is_silent_and_does_not_publish(self):
+        upstream = Mock()
+        upstream.read.side_effect = OSError("upstream reset")
+        capture = _proxy._TailCapture(upstream, self.cache, self.key, 990, 8)
+        with self.assertRaises(OSError):
+            capture.read()
+        capture.close()
+        self.assertNotIn(self.key, self.cache._entries)
 
 
 class TestSharedPlaybackReference(unittest.TestCase):
