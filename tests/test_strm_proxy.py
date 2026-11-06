@@ -262,10 +262,11 @@ class TestProxyTemplateSelection(unittest.TestCase):
 
 
 class TestRangeStreamFailure(unittest.TestCase):
-    def make_stream(self):
-        first = Mock(headers={"ETag": '"v1"'})
+    def make_stream(self, resolver=None, first_headers=None):
+        first = Mock(headers=first_headers or {"ETag": '"v1"'})
         first.read.return_value = b"abcd"
-        stream = _proxy._RangeStream(first, "http://upstream/video", {}, 0, 3, 7, 8)
+        link = _proxy._LinkResolver("http://upstream/video", {}, resolver)
+        stream = _proxy._RangeStream(first, link, 0, 3, 7, 8)
         self.assertEqual(stream.read(), b"abcd")
         return first, stream
 
@@ -295,19 +296,169 @@ class TestRangeStreamFailure(unittest.TestCase):
             open_next.assert_not_called()
         first.close.assert_called_once()
 
-    def test_truncated_part_is_rejected(self):
-        first, stream = self.make_stream()
-        stream._remaining = 1
-        first.read.return_value = b""
-        with self.assertRaises(OSError):
-            stream.read()
+    def test_truncated_part_retries_then_raises(self):
+        """分片提前 EOF：同窗口同偏移重试，耗尽后报提前结束。"""
+        _, stream = self.make_stream()
+        # 重开的窗口必须从同一偏移继续（offset=4，上一窗口 0-3 已读完）。
+        after = Mock(status=206, headers={"Content-Range": "bytes 4-7/8"})
+        after.read.return_value = b""
+        with patch.object(_proxy, "urlopen", return_value=after) as open_next, \
+                patch.object(_proxy.time, "sleep"):
+            with self.assertRaises(OSError):
+                stream.read()
+        self.assertEqual(open_next.call_count, _proxy._RELAY_ATTEMPTS)
+        self.assertTrue(all(
+            call.args[0].get_header("Range") == "bytes=4-7"
+            for call in open_next.call_args_list
+        ))
+
+
+class TestRangeStreamResume(unittest.TestCase):
+    """分片中途被重置：从精确偏移续传，窗口不重叠。"""
+
+    def test_midpart_reset_resumes_at_exact_offset(self):
+        first = Mock(headers={"ETag": '"v1"'})
+        first.read = Mock(side_effect=[b"ab", ConnectionResetError()])
+        link = _proxy._LinkResolver("http://upstream/video", {}, None)
+        stream = _proxy._RangeStream(first, link, 0, 3, 7, 8)
+        resumed = Mock(status=206, headers={"Content-Range": "bytes 2-3/8"})
+        resumed.read = Mock(side_effect=[b"cd"])
+        following = Mock(status=206, headers={"Content-Range": "bytes 4-7/8"})
+        following.read = Mock(side_effect=[b"ef", b"gh"])
+        with patch.object(_proxy, "urlopen", side_effect=[resumed, following]) as open_next, \
+                patch.object(_proxy.time, "sleep"):
+            self.assertEqual(stream.read(size=2), b"ab")
+            self.assertEqual(stream.read(size=2), b"cd")
+            self.assertEqual(stream.read(size=2), b"ef")
+            self.assertEqual(stream.read(size=2), b"gh")
+            self.assertEqual(stream.read(size=2), b"")
+        ranges = [call.args[0].get_header("Range") for call in open_next.call_args_list]
+        self.assertEqual(ranges, ["bytes=2-3", "bytes=4-7"])
+
+
+class TestOpenSegmentRetry(unittest.TestCase):
+    """分段打开器：传输层重试、状态码分类与重新取链。"""
+
+    def setUp(self):
+        patcher = patch.object(_proxy.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def ok_response(content_range="bytes 0-7/8"):
+        return Mock(status=206, headers={"Content-Range": content_range})
+
+    def test_transport_error_retries_same_arguments(self):
+        from urllib.error import URLError
+
+        link = _proxy._LinkResolver("http://up/video", {"Cookie": "s"}, None)
+        good = self.ok_response()
+        with patch.object(_proxy, "urlopen",
+                          side_effect=[URLError("reset"), URLError("again"), good]) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {"Range": "bytes=0-7"})
+        self.assertIs(upstream, good)
+        self.assertEqual(status, 206)
+        self.assertEqual(open_next.call_count, 3)
+        for call in open_next.call_args_list:
+            self.assertEqual(call.args[0].full_url, "http://up/video")
+            self.assertEqual(call.args[0].get_header("Range"), "bytes=0-7")
+
+    def test_transport_error_exhausted_raises_abort(self):
+        from urllib.error import URLError
+
+        link = _proxy._LinkResolver("http://up/video", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=URLError("down")) as open_next:
+            with self.assertRaises(_proxy._RelayAbort):
+                _proxy._relay_open_segment(link, {})
+        self.assertEqual(open_next.call_count, 3)
+
+    def test_retry_status_backs_off_then_succeeds(self):
+        from urllib.error import HTTPError
+
+        link = _proxy._LinkResolver("http://up/video", {}, None)
+        good = self.ok_response()
+        limited = HTTPError("http://up/video", 429, "too many", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=[limited, good]) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertEqual(status, 206)
+        self.assertEqual(open_next.call_count, 2)
+        good.close.assert_not_called()
+
+    def test_refresh_status_without_resolver_is_terminal(self):
+        from urllib.error import HTTPError
+
+        link = _proxy._LinkResolver("http://up/video", {}, None)
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=denied) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertIs(upstream, denied)
+        self.assertEqual(status, 403)
+        self.assertEqual(open_next.call_count, 1)
+
+    def test_403_refreshes_download_link(self):
+        from urllib.error import HTTPError
+
+        resolved = []
+
+        def resolver():
+            resolved.append(True)
+            return "http://new/video", {"Cookie": "s2"}
+
+        link = _proxy._LinkResolver("http://up/video", {"Cookie": "s"}, resolver)
+        good = self.ok_response()
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=[denied, good]) as open_next:
+            upstream, status = _proxy._relay_open_segment(
+                link, {"Range": "bytes=0-7", "If-Range": '"v9"'})
+        self.assertEqual(status, 206)
+        self.assertEqual(resolved, [True])
+        self.assertEqual(link.refreshs, 1)
+        self.assertEqual(open_next.call_count, 2)
+        self.assertEqual(open_next.call_args_list[1].args[0].full_url, "http://new/video")
+        self.assertIsNone(open_next.call_args_list[1].args[0].get_header("If-Range"))
+
+    def test_refresh_is_capped_per_response(self):
+        from urllib.error import HTTPError
+
+        resolved = []
+
+        def resolver():
+            resolved.append(True)
+            return "http://new/video", {}
+
+        link = _proxy._LinkResolver("http://up/video", {}, resolver)
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=denied) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertEqual(status, 403)
+        self.assertEqual(resolved, [True] * _proxy._RELAY_MAX_REFRESHS)
+        self.assertEqual(link.refreshs, _proxy._RELAY_MAX_REFRESHS)
+        self.assertEqual(open_next.call_count, 1 + _proxy._RELAY_MAX_REFRESHS)
+
+    def test_resolver_failure_falls_back_to_terminal(self):
+        from urllib.error import HTTPError
+
+        def resolver():
+            raise RuntimeError("sleepy")
+
+        link = _proxy._LinkResolver("http://up/video", {}, resolver)
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=denied) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertEqual(status, 403)
+        self.assertEqual(open_next.call_count, 1)
 
 
 class TestQuarkRelay(unittest.TestCase):
     """真实 HTTP 链路验证：认证只发上游，Range/HEAD 与错误码保持一致。"""
 
     def setUp(self):
+        # 缩短重试退避的等待：用例只关心行为，不关心真实退避时长
+        self._sleeps = patch.object(_proxy.time, "sleep")
+        self._sleeps.start()
+        self.addCleanup(self._sleeps.stop)
         self.payload = b"0123456789abcdefghijklmnopqrstuvwxyz"
+        self.truncated_range = None
         self.received = []
         test = self
 
@@ -336,6 +487,9 @@ class TestQuarkRelay(unittest.TestCase):
                     self.send_response(code)
                     self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}" if code == 206 else f"bytes */{len(data)}")
                     data = data[start:end + 1] if code == 206 else b""
+                    if code == 206 and range_value == test.truncated_range:
+                        # 模拟 CDN 连接在分片中途提前断开
+                        data = data[:4]
                 else:
                     self.send_response(code)
                 self.send_header("Content-Length", str(len(data)))
@@ -433,6 +587,18 @@ class TestQuarkRelay(unittest.TestCase):
         self.owner._cloud_drive.resolve_download_link = lambda item: (self.owner._cloud_drive.url, {})
         code, _, body = self.fetch()
         self.assertEqual((code, body), (412, b""))
+
+    def test_truncated_upstream_resumes_mid_part(self):
+        """上游在分片中途断开（11-05 的 URLError/截断场景）：同窗口断点续传，字节完整。"""
+        first_range = f"bytes=8-{8 + _proxy._RELAY_CHUNK_SIZE - 1}"
+        self.truncated_range = first_range
+        code, headers, body = self.fetch(headers={"Range": "bytes=8-"})
+        self.assertEqual(code, 206)
+        self.assertEqual(body, self.payload[8:])
+        ranges = [h["Range"] for h in self.received]
+        self.assertEqual(ranges, [first_range, "bytes=12-35"])
+        self.assertTrue(int(headers["Content-Length"]) > 0)
+        self.assertEqual(self.received[-1]["If-Range"], '"version-one"')
 
     def test_connection_error_returns_502_without_private_url(self):
         with patch.object(_proxy, "urlopen", side_effect=OSError("private-signed-url")):
