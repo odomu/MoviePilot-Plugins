@@ -764,14 +764,22 @@ class StrmProxyServer:
                     self.end_headers()
                     if method != "HEAD":
                         while True:
-                            chunk = result.upstream.read(256 * 1024)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
+                            try:
+                                chunk = result.upstream.read(256 * 1024)
+                                if not chunk:
+                                    break
+                            except Exception as error:  # noqa: BLE001 - 上游读取失败（含重试耗尽）
+                                # 上游彻底失败才说话；客户端断开不算事故。
+                                logger.warning(f"夸克播放中转读取中断：{type(error).__name__}")
+                                return
+                            try:
+                                self.wfile.write(chunk)
+                            except (BrokenPipeError, ConnectionResetError):
+                                return  # 播放器探测、跳播或停止时正常断开。
                 except (BrokenPipeError, ConnectionResetError):
-                    pass  # 播放器探测、跳播或停止时正常断开。
+                    return  # 响应头阶段客户端断开，同样属正常。
                 except Exception as error:
-                    logger.warning(f"夸克播放中转读取中断：{type(error).__name__}")
+                    logger.warning(f"夸克播放中转响应异常：{type(error).__name__}")
                 finally:
                     result.upstream.close()
 

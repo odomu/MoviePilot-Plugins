@@ -6,7 +6,12 @@
 
 import unittest
 import http.client
+import logging
+import socket
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from threading import Thread
 from unittest.mock import patch, Mock
 from types import SimpleNamespace
@@ -511,6 +516,56 @@ class TestOpenSegmentRetry(unittest.TestCase):
         self.assertEqual(open_next.call_count, 1)
 
 
+class TestRelayErrorSplit(unittest.TestCase):
+    """_relay 读写异常分离：写侧客户端断开静默；读侧失败才记“读取中断”。"""
+
+    def setUp(self):
+        self.logger = logging.Logger("strm-relay-test", level=logging.WARNING)
+        self.logger.propagate = False
+        patcher = patch.object(_proxy, "logger", self.logger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_stub(self, upstream, wfile=None):
+        handler_cls = _proxy.StrmProxyServer._make_handler(SimpleNamespace())
+        stub = object.__new__(handler_cls)
+        stub.request_version = "HTTP/1.1"
+        stub.command = "GET"
+        stub.path = "/d/x"
+        stub.requestline = "GET /d/x HTTP/1.1"
+        stub.close_connection = False
+        stub.wfile = wfile if wfile is not None else BytesIO()
+        return stub
+
+    def relay(self, upstream, wfile=None):
+        self.make_stub(upstream, wfile)._relay(
+            _proxy.ProxyResult(status_code=206, upstream=upstream), "GET")
+        upstream.close.assert_called_once()  # finally 必收尾
+
+    def test_write_disconnect_is_silent(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"chunk-1", b"chunk-2"])
+        wfile = Mock()
+        wfile.write.side_effect = [None, ConnectionResetError()]  # 首次写头部成功，随后直言正文失败
+        self.relay(upstream, wfile)
+        self.assertEqual(upstream.read.call_count, 1)  # 断开后不再读上游
+
+    def test_header_phase_disconnect_is_silent(self):
+        upstream = Mock()
+        wfile = Mock()
+        wfile.write.side_effect = BrokenPipeError()
+        self.relay(upstream, wfile)
+        upstream.read.assert_not_called()
+
+    def test_read_failure_only_logs_read_line(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=OSError("exhausted"))
+        with self.assertLogs(_proxy.logger, level="WARNING") as captured:
+            self.relay(upstream)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("夸克播放中转读取中断：OSError", captured.output[0])
+
+
 class TestQuarkRelay(unittest.TestCase):
     """真实 HTTP 链路验证：认证只发上游，Range/HEAD 与错误码保持一致。"""
 
@@ -661,6 +716,74 @@ class TestQuarkRelay(unittest.TestCase):
         self.assertEqual(ranges, [first_range, "bytes=12-35"])
         self.assertTrue(int(headers["Content-Length"]) > 0)
         self.assertEqual(self.received[-1]["If-Range"], '"version-one"')
+
+    def spy_logger(self):
+        logger = logging.Logger("strm-relay-e2e", level=logging.WARNING)
+        logger.propagate = False
+        patcher = patch.object(_proxy, "logger", logger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return logger
+
+    def test_upstream_read_failure_logs_read_line(self):
+        """上游谎报范围：续传总失败，客户端收到截断响应，日志只记“读取中断”。"""
+        logger = self.spy_logger()
+        # 模拟 CDN 对每次请求都声称同一范围、只给 4 字节正文：首发通过校验，
+        # 续传偏移与声称范围不匹配 → 重试耗尽 → OSError。
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.bind(("127.0.0.1", 0))
+        raw.listen(5)
+        raw.settimeout(0.5)
+        stop = threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    conn, _ = raw.accept()
+                except (socket.timeout, OSError):
+                    continue
+                try:
+                    try:
+                        conn.recv(65536)
+                    except OSError:
+                        pass
+                    response = (b"HTTP/1.1 206 Partial Content\r\n"
+                                b"Content-Range: bytes 0-37/38\r\n"
+                                b"Content-Length: 4\r\n"
+                                b"ETag: \"version-one\"\r\n"
+                                b"Content-Type: video/mp4\r\n"
+                                b"Accept-Ranges: bytes\r\n\r\n0123")
+                    conn.sendall(response)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+            raw.close()
+
+        worker = Thread(target=serve, daemon=True)
+        worker.start()
+        self.owner._cloud_drive.resolve_download_link = lambda item: (
+            f"http://127.0.0.1:{raw.getsockname()[1]}/video",
+            {"Cookie": "session=secret", "User-Agent": "Quark-PC"})
+        self.addCleanup(stop.set)
+        self.addCleanup(worker.join, timeout=2)
+        with self.assertLogs(logger, level="WARNING") as captured:
+            with self.assertRaises(http.client.IncompleteRead):
+                self.fetch()
+        self.assertTrue(any("夸克播放中转读取中断" in m for m in captured.output))
+
+    def test_client_disconnect_is_silent(self):
+        """播放器停止/跳播断开连接：写侧静默，无任何 WARNING 日志。"""
+        logger = self.spy_logger()
+        self.payload = b"0" * (32 * 1024 * 1024)
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=10)
+        try:
+            conn.request("GET", "/d/file-id")
+            conn.getresponse().read(4096)  # 读完头部后立即放弃
+        finally:
+            conn.close()
+        with self.assertNoLogs(logger, level="WARNING"):
+            time.sleep(2.0)  # 给服务端循环留出发送/触错的时间
 
     def test_connection_error_returns_502_without_private_url(self):
         with patch.object(_proxy, "urlopen", side_effect=OSError("private-signed-url")):
