@@ -6,6 +6,7 @@ import socket
 import sys
 import time
 import types
+from queue import Empty, Full, Queue
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import RLock, Thread
@@ -30,6 +31,7 @@ _RELAY_RETRY_BACKOFF = (0.5, 1.0, 2.0)
 _RELAY_REFRESH_STATUS = frozenset({401, 403, 404, 410, 412})  # 直链失效：重新取链
 _RELAY_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})    # 瞬时错误：退避重试
 _RELAY_MAX_REFRESHS = 2             # 单条响应最多重新取链次数，避免重取链风暴
+_RELAY_PREFETCH_ITEMS = 8           # 预取缓冲的队列深度（片），隔离上游抖动与客户端消费速度差
 _KEEP_RESPONSE_HEADERS = frozenset({
     "content-type", "content-length", "content-range", "accept-ranges",
     "etag", "last-modified",
@@ -255,6 +257,80 @@ class _RangeStream:
         self._drop_upstream()
 
 
+class _PrefetchReader:
+    """单生产者预取缓冲：在上游流外侧加一层有界队列，吸收播放器消费的节奏抖动。
+
+    生产者线程持续按固定片读取上游，消费者 ``read`` 从队列取片；一个片即一次
+    上游读取的结果（可能比请求长度短），调用方按片消费即可。异常对象作为哨兵
+    入队，由消费端原样抛出；``b""`` 为正常 EOF 哨兵。``close`` 立即停止生产并
+    关闭底层流，生产者卡在 ``put`` 时靠超时轮询 ``_closed`` 自行退出（守护线程）。
+    """
+
+    _PUT_POLL = 0.5   # 生产者 put 轮询 _closed 的间隔（秒）
+    _GET_POLL = 0.5   # 消费者 get 轮询 _closed 的间隔（秒）
+
+    def __init__(self, upstream: Any):
+        self._upstream = upstream
+        self._queue: Queue = Queue(maxsize=_RELAY_PREFETCH_ITEMS)
+        self._closed = False
+        self._worker = Thread(target=self._produce, name="strm-prefetch", daemon=True)
+
+    @classmethod
+    def wrap(cls, upstream: Any) -> "_PrefetchReader":
+        """包装上游流并启动生产者线程。"""
+        reader = cls(upstream)
+        reader._worker.start()
+        return reader
+
+    def _produce(self) -> None:
+        # 生产者只读不关：关闭统一由 close() 收尾，避免与消费端竞态。
+        while not self._closed:
+            try:
+                chunk = self._upstream.read(_RELAY_READ_SIZE)
+            except Exception as error:  # noqa: BLE001 - 传输层异常原样转交消费端
+                if not self._closed:
+                    self._put(error)
+                return
+            self._put(chunk if chunk else b"")
+            if not chunk:
+                return
+
+    def _put(self, item: Any) -> None:
+        while not self._closed:
+            try:
+                self._queue.put(item, timeout=self._PUT_POLL)
+                return
+            except Full:
+                continue
+
+    def read(self, size: int = _RELAY_READ_SIZE) -> bytes:
+        while True:
+            if self._closed:
+                return b""
+            try:
+                item = self._queue.get(timeout=self._GET_POLL)
+            except Empty:
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return item  # b"" 即 EOF
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._upstream.close()
+        except Exception as error:  # noqa: BLE001 - 关闭失败不影响响应收尾
+            logger.debug(f"STRM 预取缓冲关闭上游异常：{error}")
+        # 清空未消费的缓冲，让卡在 put 的生产者立即退出
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                break
+
+
 def content_disposition(file_name: str) -> str:
     """按 RFC 5987 生成兼容中文文件名的下载头。"""
     name = str(file_name or "").strip() or "download"
@@ -415,8 +491,9 @@ class StrmProxyApi(OwnerDelegator):
             validator = upstream.headers.get("ETag", "")
             if not validator or validator.startswith("W/"):
                 validator = upstream.headers.get("Last-Modified")
-            stream = _RangeStream(upstream, link, start, actual_end, end, total,
-                                  if_range=validator or "")
+            stream = _PrefetchReader.wrap(_RangeStream(
+                upstream, link, start, actual_end, end, total,
+                if_range=validator or ""))
             return ProxyResult(status_code=206 if range_value else 200,
                                headers=response_headers, upstream=stream)
         return ProxyResult(status_code=status, headers=response_headers, upstream=upstream)

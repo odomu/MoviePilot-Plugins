@@ -336,6 +336,68 @@ class TestRangeStreamResume(unittest.TestCase):
         self.assertEqual(ranges, ["bytes=2-3", "bytes=4-7"])
 
 
+class TestPrefetchReader(unittest.TestCase):
+    """预取缓冲：顺序交付、EOF、异常重抛与 close 停止生产。"""
+
+    def wrap(self, upstream):
+        stream = _proxy._PrefetchReader.wrap(upstream)
+        self.addCleanup(stream.close)
+        return stream
+
+    def test_sequential_order_and_eof(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"ab", b"cd", b""])
+        stream = self.wrap(upstream)
+        self.assertEqual(stream.read(1), b"ab")
+        self.assertEqual(stream.read(1), b"cd")
+        self.assertEqual(stream.read(1), b"")
+        stream._worker.join(timeout=2)
+        self.assertEqual(upstream.read.call_count, 3)  # EOF 后生产者立即退出
+
+    def test_exception_is_reraised_to_consumer(self):
+        error = RuntimeError("gap")
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"ab", error])
+        stream = self.wrap(upstream)
+        self.assertEqual(stream.read(1), b"ab")
+        with self.assertRaises(RuntimeError) as context:
+            stream.read(1)
+        self.assertIs(context.exception, error)  # 抛出的正是生产者遇到的那个异常对象
+        stream._worker.join(timeout=2)
+
+    def test_short_chunks_are_delivered_asis(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"a", b"b", b""])
+        stream = self.wrap(upstream)
+        self.assertEqual([stream.read(8), stream.read(8), stream.read(8)],
+                         [b"a", b"b", b""])
+
+    def test_close_stops_producer(self):
+        state = SimpleNamespace(reads=0)
+        import time as _time
+
+        class EndlessUpstream:
+            def read(self, size):
+                state.reads += 1
+                return b"c" * size
+
+            def close(self):
+                state.closed = True
+
+        stream = self.wrap(EndlessUpstream())
+        # 等队列填满（生产者卡在 put 轮询）
+        for _ in range(100):
+            if stream._queue.qsize() >= _proxy._RELAY_PREFETCH_ITEMS:
+                break
+            _time.sleep(0.02)
+        stream.close()
+        reads_before = state.reads
+        self.assertEqual(stream.read(8), b"")       # close 后 read 立即 EOF
+        _time.sleep(0.2)
+        self.assertEqual(state.reads, reads_before)  # 不再生产
+        self.assertTrue(state.closed)
+
+
 class TestOpenSegmentRetry(unittest.TestCase):
     """分段打开器：传输层重试、状态码分类与重新取链。"""
 
