@@ -3,7 +3,7 @@
 负责订阅状态检查、完成、站点更新等逻辑
 """
 import ast
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any, Callable, List, Optional
 
 from app.chain.subscribe import SubscribeChain
@@ -18,7 +18,11 @@ from app.schemas.types import MediaType, SystemConfigKey
 
 
 class SubscribeCompletionChain(SubscribeChain):
-    """逐字段渲染完成通知，避免媒体文本中的引号破坏模板 JSON。"""
+    """逐字段渲染完成通知，避免媒体文本中的引号破坏模板 JSON。
+
+    通知发送放到守护线程：通知渠道重试可能持续数十秒，若占用订阅完成流程
+    会耗尽平台完成凭证（OutboxLeaseLostError），导致订阅无法标记完成。
+    """
 
     def post_message(
             self,
@@ -53,14 +57,42 @@ class SubscribeCompletionChain(SubscribeChain):
                 title_year = getattr(mediainfo, "title_year", None) or getattr(mediainfo, "title", "")
                 message.title = f"{title_year} 已完成{kwargs.get('msgstr', '订阅')}"
 
-        return super().post_message(
-            message=message,
-            meta=meta,
-            mediainfo=mediainfo,
-            torrentinfo=torrentinfo,
-            transferinfo=transferinfo,
-            **kwargs
-        )
+        send_message = super().post_message
+        try:
+            Thread(
+                target=self._send_message_async,
+                args=(send_message, message, meta, mediainfo, torrentinfo, transferinfo, kwargs),
+                daemon=True,
+                name="cloudsubscribe-finish-notify",
+            ).start()
+        except RuntimeError as error:
+            logger.warning(f"订阅完成通知线程启动失败（不影响订阅完成）：{error}")
+
+    @staticmethod
+    def _send_message_async(
+            sender,
+            message,
+            meta,
+            mediainfo,
+            torrentinfo,
+            transferinfo,
+            kwargs,
+    ) -> None:
+        """后台发送通知；失败只记日志，绝不回传订阅完成流程。"""
+        try:
+            sender(
+                message=message,
+                meta=meta,
+                mediainfo=mediainfo,
+                torrentinfo=torrentinfo,
+                transferinfo=transferinfo,
+                **kwargs,
+            )
+        except Exception as error:
+            logger.warning(
+                f"订阅完成通知发送失败（不影响订阅完成）："
+                f"{type(error).__name__}: {error}"
+            )
 
 
 class SubscribeHandler:
