@@ -1,4 +1,4 @@
-"""STRM 播放代理：短链跳转，以及需要认证请求头的夸克流式中转。"""
+"""STRM 播放代理：短链跳转，以及需要认证请求头的网盘流式中转。"""
 
 import json
 import re
@@ -44,7 +44,17 @@ _KEEP_RESPONSE_HEADERS = frozenset({
     "content-type", "content-length", "content-range", "accept-ranges",
     "etag", "last-modified",
 })
+# 302 跳转无法携带凭据头，播放器会 401/403；带这些头的直链必须走中转。
+_RELAY_AUTH_HEADERS = frozenset({"cookie", "authorization"})
 _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+
+
+def _needs_relay(download_headers: Any) -> bool:
+    """直链返回凭据头时必须由服务端中转，302 无法把这些头传给播放器。"""
+    return any(
+        str(name).strip().lower() in _RELAY_AUTH_HEADERS
+        for name in (download_headers or {})
+    )
 
 
 class _RelayAbort(Exception):
@@ -102,7 +112,7 @@ class _LinkResolver:
         try:
             new_url, new_headers = self._resolver()
         except Exception as error:  # noqa: BLE001 - 取链失败仅记录类型，避免泄漏凭据
-            logger.warning(f"夸克播放中转重取直链失败：{type(error).__name__}")
+            logger.warning(f"STRM 播放中转重取直链失败：{type(error).__name__}")
             return False
         new_url = str(new_url or "").strip()
         if not new_url:
@@ -150,7 +160,7 @@ def _relay_open_segment(link: _LinkResolver, extra: Dict[str, str], *,
             continue
         if cancelled is not None and cancelled.is_set():
             upstream.close()
-            raise _RelayAbort("夸克分段请求已取消")
+            raise _RelayAbort("STRM 中转分段请求已取消")
         if status == 206:
             return upstream, 206
         kind = _relay_status_kind(status)
@@ -158,7 +168,7 @@ def _relay_open_segment(link: _LinkResolver, extra: Dict[str, str], *,
         if not done and kind == "refresh" and link.refresh():
             upstream.close()
             upstream = None
-            logger.info(f"夸克播放中转直链已刷新（第 {link.refreshs} 次）")
+            logger.info(f"STRM 播放中转直链已刷新（第 {link.refreshs} 次）")
             continue
         if not done and kind == "retry":
             upstream.close()  # 瞬时错误只需重试，不透传中间响应
@@ -168,7 +178,7 @@ def _relay_open_segment(link: _LinkResolver, extra: Dict[str, str], *,
         last = str(status)
         break  # 终态 / 最后一次尝试：原样交回调用方
     if upstream is None:
-        raise _RelayAbort(f"夸克分段请求失败：{last}")
+        raise _RelayAbort(f"STRM 中转分段请求失败：{last}")
     return upstream, status
 
 
@@ -202,7 +212,7 @@ class _RangeStream:
         window_end = min(self._window_end, self._end)
         self._drop_upstream()
         if self._cancelled.is_set():
-            raise _RelayAbort("夸克分段请求已取消")
+            raise _RelayAbort("STRM 中转分段请求已取消")
         extra: Dict[str, str] = {"Range": f"bytes={self._offset}-{window_end}"}
         if self._if_range:
             extra["If-Range"] = self._if_range
@@ -210,7 +220,7 @@ class _RangeStream:
             self._link, extra, deadline=self._retry_deadline, cancelled=self._cancelled)
         if self._cancelled.is_set():
             upstream.close()
-            raise _RelayAbort("夸克分段请求已取消")
+            raise _RelayAbort("STRM 中转分段请求已取消")
         match = (_CONTENT_RANGE.fullmatch(
             upstream.headers.get("Content-Range", "")) if status == 206 else None)
         validator = upstream.headers.get("ETag", "")
@@ -220,7 +230,7 @@ class _RangeStream:
                 self._offset, window_end, self._total)
                 or (self._if_range and validator != self._if_range)):
             upstream.close()
-            raise OSError("夸克分段响应范围或文件版本变化")
+            raise OSError("STRM 中转分段响应范围或文件版本变化")
         with self._state_lock:
             accepted = not self._cancelled.is_set()
             if accepted:
@@ -228,7 +238,7 @@ class _RangeStream:
                 self._remaining = window_end - self._offset + 1
         if not accepted:
             upstream.close()
-            raise _RelayAbort("夸克分段请求已取消")
+            raise _RelayAbort("STRM 中转分段请求已取消")
 
     def _retry(self, label: str) -> bool:
         """同一绝对偏移、同一窗口重试：退避后重开窗口。
@@ -240,7 +250,7 @@ class _RangeStream:
             return False
         self._failures += 1
         if self._failures >= _RELAY_ATTEMPTS:
-            logger.warning(f"夸克分段重试放弃：{label}")
+            logger.warning(f"STRM 中转分段重试放弃：{label}")
             return False
         deadline = self._retry_deadline or (time.monotonic() + _RELAY_RETRY_BUDGET)
         self._retry_deadline = deadline
@@ -253,7 +263,7 @@ class _RangeStream:
             self._open_window()
         except (OSError, _RelayAbort) as error:
             if not self._cancelled.is_set():
-                logger.warning(f"夸克分段重试失败：{label} 第 {self._failures} 次：{type(error).__name__}")
+                logger.warning(f"STRM 中转分段重试失败：{label} 第 {self._failures} 次：{type(error).__name__}")
             return False
         return time.monotonic() < deadline
 
@@ -286,22 +296,22 @@ class _RangeStream:
                     return b""
                 self._drop_upstream()
                 label = f"读取中断 offset={self._offset} {type(error).__name__}"
-                logger.warning(f"夸克分段{label}，将重试")
+                logger.warning(f"STRM 中转分段{label}，将重试")
                 if not self._retry(label):
                     if self._cancelled.is_set():
                         return b""
-                    raise OSError("夸克分段响应提前结束") from None
+                    raise OSError("STRM 中转分段响应提前结束") from None
                 continue
             if not data:  # 提前 EOF（对端正常关闭）
                 if self._cancelled.is_set():
                     return b""
                 self._drop_upstream()
                 label = f"响应提前结束 offset={self._offset}"
-                logger.warning(f"夸克分段{label}，将重试")
+                logger.warning(f"STRM 中转分段{label}，将重试")
                 if not self._retry(label):
                     if self._cancelled.is_set():
                         return b""
-                    raise OSError("夸克分段响应提前结束") from None
+                    raise OSError("STRM 中转分段响应提前结束") from None
                 continue
             self._remaining -= len(data)
             self._offset += len(data)
@@ -539,7 +549,7 @@ class _TailCache:
         headers["Content-Length"] = str(len(chunk))
         headers["Cache-Control"] = "no-store"
         headers.setdefault("Accept-Ranges", "bytes")
-        logger.info(f"夸克播放中转尾部命中：bytes={len(chunk)}")
+        logger.info(f"STRM 播放中转尾部命中：bytes={len(chunk)}")
         return ProxyResult(status_code=206, headers=headers, upstream=BytesIO(chunk))
 
     def hit(self, file_key, method: str, request_headers) -> "Optional[ProxyResult]":
@@ -749,7 +759,7 @@ class StrmProxyApi(OwnerDelegator):
             self, params: Mapping[str, Any], method: str = "GET",
             request_headers: Optional[Mapping[str, str]] = None,
     ) -> ProxyResult:
-        """按参数解析文件；夸克保留取链认证头，其余网盘继续跳转。"""
+        """按参数解析文件；需要认证头的网盘走中转，其余网盘继续跳转。"""
         if not self._proxy_enabled:
             return error_result("STRM 播放代理未启用", status.HTTP_503_SERVICE_UNAVAILABLE)
         downloader = self._file_downloader()
@@ -761,10 +771,9 @@ class StrmProxyApi(OwnerDelegator):
         drive_key = str(getattr(self, "_cloud_drive_key", "") or
                         (getattr(self, "_applied_config", None) or {}).get("cloud_drive", ""))
         file_key = (drive_key, str(getattr(file_item, "id", "") or ""))
-        if drive_key == "quark":
-            cached = _tail_cache().hit(file_key, str(method).upper(), request_headers)
-            if cached is not None:
-                return cached
+        cached = _tail_cache().hit(file_key, str(method).upper(), request_headers)
+        if cached is not None:
+            return cached
         try:
             url, download_headers = downloader.resolve_download_link(file_item)
         except Exception as error:
@@ -775,7 +784,7 @@ class StrmProxyApi(OwnerDelegator):
         url = str(url or "").strip()
         if not url:
             return error_result("网盘未返回可用直链", status.HTTP_502_BAD_GATEWAY)
-        if drive_key == "quark":
+        if _needs_relay(download_headers):
             def resolver(_downloader=downloader, _item=file_item):
                 return _downloader.resolve_download_link(_item)
             return self._relay_result(url, download_headers, method, request_headers,
@@ -818,8 +827,8 @@ class StrmProxyApi(OwnerDelegator):
             try:
                 upstream, status = _relay_open_segment(link, extra)
             except _RelayAbort as error:
-                logger.warning(f"夸克播放中转连接失败：{error}")
-                return error_result("夸克播放中转连接失败", 502)
+                logger.warning(f"STRM 播放中转连接失败：{error}")
+                return error_result("STRM 播放中转连接失败", 502)
         else:
             headers = {**link.headers, **extra}
             try:
@@ -828,8 +837,8 @@ class StrmProxyApi(OwnerDelegator):
             except HTTPError as error:
                 upstream, status = error, error.code
             except Exception as error:  # noqa: BLE001 - 异常文本可能含带签名 URL，不回显
-                logger.warning(f"夸克播放中转连接失败：{type(error).__name__}")
-                return error_result("夸克播放中转连接失败", 502)
+                logger.warning(f"STRM 播放中转连接失败：{type(error).__name__}")
+                return error_result("STRM 播放中转连接失败", 502)
         response_headers = {k: v for k, v in upstream.headers.items()
                             if k.lower() in _KEEP_RESPONSE_HEADERS}
         response_headers["Cache-Control"] = "no-store"
@@ -837,12 +846,12 @@ class StrmProxyApi(OwnerDelegator):
             match = _CONTENT_RANGE.fullmatch(upstream.headers.get("Content-Range", ""))
             if not match:
                 upstream.close()
-                return error_result("夸克分段响应缺少有效范围", 502)
+                return error_result("STRM 中转分段响应缺少有效范围", 502)
             actual_start, actual_end, total = map(int, match.groups())
             end = min(requested_end, total - 1) if requested_end is not None else total - 1
             if actual_start != start or actual_end != min(part_end, total - 1) or end < start:
                 upstream.close()
-                return error_result("夸克分段响应范围不匹配", 502)
+                return error_result("STRM 中转分段响应范围不匹配", 502)
             response_headers = {k: v for k, v in response_headers.items()
                                 if k.lower() not in {"content-length", "content-range"}}
             response_headers["Content-Length"] = str(end - start + 1)
@@ -1137,7 +1146,7 @@ class StrmProxyServer:
                                     break
                             except Exception as error:  # noqa: BLE001 - 上游读取失败（含重试耗尽）
                                 # 上游彻底失败才说话；客户端断开不算事故。
-                                logger.warning(f"夸克播放中转读取中断：{type(error).__name__}")
+                                logger.warning(f"STRM 播放中转读取中断：{type(error).__name__}")
                                 return
                             try:
                                 self.wfile.write(chunk)
@@ -1146,7 +1155,7 @@ class StrmProxyServer:
                 except (BrokenPipeError, ConnectionResetError):
                     return  # 响应头阶段客户端断开，同样属正常。
                 except Exception as error:
-                    logger.warning(f"夸克播放中转响应异常：{type(error).__name__}")
+                    logger.warning(f"STRM 播放中转响应异常：{type(error).__name__}")
                 finally:
                     result.upstream.close()
 

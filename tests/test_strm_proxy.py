@@ -563,7 +563,7 @@ class TestRelayErrorSplit(unittest.TestCase):
         with self.assertLogs(_proxy.logger, level="WARNING") as captured:
             self.relay(upstream)
         self.assertEqual(len(captured.output), 1)
-        self.assertIn("夸克播放中转读取中断：OSError", captured.output[0])
+        self.assertIn("STRM 播放中转读取中断：OSError", captured.output[0])
 
 
 class TestQuarkRelay(unittest.TestCase):
@@ -659,6 +659,29 @@ class TestQuarkRelay(unittest.TestCase):
         self.assertNotIn("secret", str(headers))
         self.assertEqual(self.received[0]["Accept-Encoding"], "identity")
 
+    def test_non_quark_drive_with_credentials_is_relayed(self):
+        """Cookie/Authorization 头无法随 302 传递，任意网盘都应走中转。"""
+        self.owner._applied_config["cloud_drive"] = "uc"
+
+        code, headers, body = self.fetch()
+
+        self.assertEqual((code, body), (200, self.payload))
+        self.assertNotIn("Location", headers)
+        self.assertTrue(self.received)
+
+    def test_link_without_credentials_still_redirects(self):
+        """只有 Referer/UA 等非凭据头时保持 302，避免无谓的中转带宽。"""
+        self.owner._applied_config["cloud_drive"] = "uc"
+        self.owner._cloud_drive.resolve_download_link = lambda item: (
+            self.owner._cloud_drive.url, {"Referer": "https://example.com/"}
+        )
+
+        code, headers, body = self.fetch()
+
+        self.assertEqual(code, 302)
+        self.assertIn("Location", headers)
+        self.assertFalse(self.received)
+
     def test_range_and_if_range_are_forwarded(self):
         for value, expected in [("bytes=2-5", self.payload[2:6]), ("bytes=8-", self.payload[8:]),
                                 ("bytes=-5", self.payload[-5:])]:
@@ -701,7 +724,9 @@ class TestQuarkRelay(unittest.TestCase):
         self.assertEqual(headers["Content-Range"], f"bytes */{len(self.payload)}")
 
     def test_rejected_upstream_is_not_reported_as_success(self):
-        self.owner._cloud_drive.resolve_download_link = lambda item: (self.owner._cloud_drive.url, {})
+        self.owner._cloud_drive.resolve_download_link = lambda item: (
+            self.owner._cloud_drive.url, {"Cookie": "wrong"}
+        )
         code, _, body = self.fetch()
         self.assertEqual((code, body), (412, b""))
 
@@ -810,7 +835,7 @@ class TestQuarkRelay(unittest.TestCase):
         with self.assertLogs(logger, level="WARNING") as captured:
             with self.assertRaises(http.client.IncompleteRead):
                 self.fetch()
-        self.assertTrue(any("夸克播放中转读取中断" in m for m in captured.output))
+        self.assertTrue(any("STRM 播放中转读取中断" in m for m in captured.output))
 
     def test_client_disconnect_is_silent(self):
         """播放器停止/跳播断开连接：写侧静默，无任何 WARNING 日志。"""
