@@ -113,26 +113,32 @@ class _LinkResolver:
         return True
 
 
-def _relay_open_segment(link: _LinkResolver, extra: Dict[str, str]) -> Tuple[Any, int]:
+def _relay_open_segment(link: _LinkResolver, extra: Dict[str, str], *,
+                        deadline: Optional[float] = None,
+                        cancelled: Optional[Event] = None) -> Tuple[Any, int]:
     """打开一条上游分段请求：状态分类 + 退避重试 + 重新取链（同偏移续传由调用方保证）。
 
     返回 ``(upstream, status)``：``206`` 与无法继续的终态原样交回调用方判断
     （如 ``416`` 透传、``200`` 视为版本变化）；传输层错误耗尽抛 ``_RelayAbort``。
-    换链后丢弃 ``If-Range``（旧校验器对新直链无效），改由调用方做范围精确校验。
+    换链后仍保留 ``If-Range``，调用方同时校验范围和文件版本。
+    deadline 由同一轮恢复共享；同步取链本身受网盘客户端的超时控制。
     日志只记录异常类型/状态码，不回显带签名的 URL。
     """
-    deadline = time.monotonic() + _RELAY_RETRY_BUDGET
+    if deadline is None:
+        deadline = time.monotonic() + _RELAY_RETRY_BUDGET
     last = "连接失败"
     upstream, status = None, None
     for attempt in range(1, _RELAY_ATTEMPTS + 1):
-        if attempt > 1 and time.monotonic() >= deadline:
+        if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= deadline:
             break
         upstream, status = None, None
         try:
             headers = {**link.headers, **extra}
-            if link.refreshs:
-                headers.pop("If-Range", None)
-            upstream = urlopen(Request(link.url, headers=headers), timeout=_RELAY_OPEN_TIMEOUT)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            upstream = urlopen(Request(link.url, headers=headers),
+                               timeout=min(_RELAY_OPEN_TIMEOUT, remaining))
             status = upstream.status
         except HTTPError as error:
             upstream, status = error, error.code
@@ -142,12 +148,16 @@ def _relay_open_segment(link: _LinkResolver, extra: Dict[str, str]) -> Tuple[Any
                 break
             _relay_backoff(deadline, attempt)
             continue
+        if cancelled is not None and cancelled.is_set():
+            upstream.close()
+            raise _RelayAbort("夸克分段请求已取消")
         if status == 206:
             return upstream, 206
         kind = _relay_status_kind(status)
         done = attempt == _RELAY_ATTEMPTS or time.monotonic() >= deadline
-        if kind == "refresh" and link.refresh():
+        if not done and kind == "refresh" and link.refresh():
             upstream.close()
+            upstream = None
             logger.info(f"夸克播放中转直链已刷新（第 {link.refreshs} 次）")
             continue
         if not done and kind == "retry":
@@ -177,29 +187,48 @@ class _RangeStream:
         self._remaining = max(0, part_end - start + 1)
         self._closed = False
         self._failures = 0            # 连续无进展失败次数（交付字节后清零）
+        self._cancelled = Event()
+        self._state_lock = RLock()
         self._retry_deadline: Optional[float] = None
 
     def _drop_upstream(self) -> None:
-        if self._upstream is not None:
-            self._upstream.close()
-            self._upstream = None
+        with self._state_lock:
+            upstream, self._upstream = self._upstream, None
+        if upstream is not None:
+            upstream.close()
 
     def _open_window(self) -> None:
         """打开当前窗口的分段；分片内重试时窗口保持不变，续传不重叠、不重发。"""
         window_end = min(self._window_end, self._end)
         self._drop_upstream()
+        if self._cancelled.is_set():
+            raise _RelayAbort("夸克分段请求已取消")
         extra: Dict[str, str] = {"Range": f"bytes={self._offset}-{window_end}"}
-        if self._link.refreshs == 0 and self._if_range:
+        if self._if_range:
             extra["If-Range"] = self._if_range
-        upstream, status = _relay_open_segment(self._link, extra)
+        upstream, status = _relay_open_segment(
+            self._link, extra, deadline=self._retry_deadline, cancelled=self._cancelled)
+        if self._cancelled.is_set():
+            upstream.close()
+            raise _RelayAbort("夸克分段请求已取消")
         match = (_CONTENT_RANGE.fullmatch(
             upstream.headers.get("Content-Range", "")) if status == 206 else None)
-        if status != 206 or not match or tuple(map(int, match.groups())) != (
-                self._offset, window_end, self._total):
+        validator = upstream.headers.get("ETag", "")
+        if not validator or validator.startswith("W/"):
+            validator = upstream.headers.get("Last-Modified", "")
+        if (status != 206 or not match or tuple(map(int, match.groups())) != (
+                self._offset, window_end, self._total)
+                or (self._if_range and validator != self._if_range)):
             upstream.close()
             raise OSError("夸克分段响应范围或文件版本变化")
-        self._upstream = upstream
-        self._remaining = window_end - self._offset + 1
+        with self._state_lock:
+            accepted = not self._cancelled.is_set()
+            if accepted:
+                self._upstream = upstream
+                self._remaining = window_end - self._offset + 1
+        if not accepted:
+            upstream.close()
+            raise _RelayAbort("夸克分段请求已取消")
 
     def _retry(self, label: str) -> bool:
         """同一绝对偏移、同一窗口重试：退避后重开窗口。
@@ -207,6 +236,8 @@ class _RangeStream:
         失败按“无进展”跨循环累计：分片能打开但内容 EOF 时不会无限循环，
         只有真正交付字节（``_offset`` 前进）才清零；重试共用同一条墙钟预算。
         """
+        if self._cancelled.is_set():
+            return False
         self._failures += 1
         if self._failures >= _RELAY_ATTEMPTS:
             logger.warning(f"夸克分段重试放弃：{label}")
@@ -217,9 +248,12 @@ class _RangeStream:
             return False
         try:
             _relay_backoff(deadline, self._failures)
+            if self._cancelled.is_set():
+                return False
             self._open_window()
         except (OSError, _RelayAbort) as error:
-            logger.warning(f"夸克分段重试失败：{label} 第 {self._failures} 次：{error}")
+            if not self._cancelled.is_set():
+                logger.warning(f"夸克分段重试失败：{label} 第 {self._failures} 次：{type(error).__name__}")
             return False
         return time.monotonic() < deadline
 
@@ -227,6 +261,8 @@ class _RangeStream:
         if self._closed or size == 0:
             return b""
         while True:
+            if self._cancelled.is_set():
+                return b""
             if self._upstream is None or not self._remaining:
                 if not self._remaining:
                     if self._offset > self._end:
@@ -234,24 +270,37 @@ class _RangeStream:
                     if self._offset == self._window_end + 1:
                         # 上一个分片恰好读完：推进到下一个分片窗口（保持与起点对齐的网格）
                         self._window_end = min(self._window_end + _RELAY_CHUNK_SIZE, self._end)
-                self._open_window()
+                try:
+                    self._open_window()
+                except (OSError, _RelayAbort):
+                    if self._cancelled.is_set():
+                        return b""
+                    raise
             want = min(max(1, size), self._remaining, self._end - self._offset + 1)
             if want <= 0:
                 return b""
             try:
                 data = self._upstream.read(want)
             except Exception as error:  # noqa: BLE001 - 传输层异常统一重试
+                if self._cancelled.is_set():
+                    return b""
                 self._drop_upstream()
                 label = f"读取中断 offset={self._offset} {type(error).__name__}"
                 logger.warning(f"夸克分段{label}，将重试")
                 if not self._retry(label):
+                    if self._cancelled.is_set():
+                        return b""
                     raise OSError("夸克分段响应提前结束") from None
                 continue
             if not data:  # 提前 EOF（对端正常关闭）
+                if self._cancelled.is_set():
+                    return b""
                 self._drop_upstream()
                 label = f"响应提前结束 offset={self._offset}"
                 logger.warning(f"夸克分段{label}，将重试")
                 if not self._retry(label):
+                    if self._cancelled.is_set():
+                        return b""
                     raise OSError("夸克分段响应提前结束") from None
                 continue
             self._remaining -= len(data)
@@ -261,7 +310,9 @@ class _RangeStream:
             return data
 
     def close(self) -> None:
-        self._closed = True
+        with self._state_lock:
+            self._closed = True
+            self._cancelled.set()
         self._drop_upstream()
 
 
@@ -281,6 +332,8 @@ class _PrefetchReader:
         self._upstream = upstream
         self._queue: Queue = Queue(maxsize=_RELAY_PREFETCH_ITEMS)
         self._closed = False
+        self._eof = False
+        self._buffer = b""
         self._worker = Thread(target=self._produce, name="strm-prefetch", daemon=True)
 
     @classmethod
@@ -311,17 +364,38 @@ class _PrefetchReader:
             except Full:
                 continue
 
-    def read(self, size: int = _RELAY_READ_SIZE) -> bytes:
+    def read(self, size: int = _RELAY_READ_SIZE, *, deadline: Optional[float] = None,
+             cancelled: Optional[Event] = None) -> bytes:
+        if size == 0:
+            return b""
+        size = size if size > 0 else _RELAY_READ_SIZE
         while True:
             if self._closed:
                 return b""
+            if cancelled is not None and cancelled.is_set():
+                raise OSError("STRM 预取读取已取消")
+            if self._buffer:
+                result, self._buffer = self._buffer[:size], self._buffer[size:]
+                return result
+            if self._eof:
+                return b""
+            timeout = self._GET_POLL
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("STRM 预取读取预算耗尽")
+                timeout = min(timeout, remaining)
             try:
-                item = self._queue.get(timeout=self._GET_POLL)
+                item = self._queue.get(timeout=timeout)
             except Empty:
                 continue
             if isinstance(item, BaseException):
+                self._eof = True
                 raise item
-            return item  # b"" 即 EOF
+            if not item:
+                self._eof = True
+                return b""
+            self._buffer = item
 
     def close(self) -> None:
         if self._closed:
@@ -340,6 +414,7 @@ class _PrefetchReader:
 
 
 _TAIL_REGISTRY_KEY = "cloudsubscribe.strm_proxy.tail_cache"
+_TAIL_INIT_LOCK = RLock()
 
 
 def _parse_client_range(range_value: str, total: int) -> Optional[Tuple[int, int]]:
@@ -358,25 +433,38 @@ def _parse_client_range(range_value: str, total: int) -> Optional[Tuple[int, int
 class _TailCache:
     """进程级尾部缓存：只保存"客户端本来就要读"的那段响应字节，不额外发请求。
 
-    与"主动预热"的区别：后台线程续读的是**同一条已在途的上游响应**，
-    客户端超时断开后不丢弃已读字节，也不新建 Range 请求。
+    后台线程续读已有中转流，不另起独立探测；中转流仍可按原策略重试或刷新直链。
     """
 
     def __init__(self):
         self._lock = RLock()
-        self._hints: Dict[Tuple[str, str], Tuple[int, str, Dict[str, str], float]] = {}
+        self.schema_version = 2
+        self._hints: OrderedDict = OrderedDict()
         self._entries: "OrderedDict[Tuple, Tuple[bytes, int, float]]" = OrderedDict()
         self._pending: Dict[Tuple, Event] = {}
+        # 取消后仍占用名额，直到捕获线程真正退出，避免驱逐期间无限创建后台任务。
+        self._captures = set()
+
+    def _prune(self) -> None:
+        now = time.monotonic()
+        for file_key, hint in list(self._hints.items()):
+            if now - hint[3] > _RELAY_TAIL_TTL:
+                self._drop(file_key)
 
     def note_size(self, file_key, total: int, validator: str, base_headers: Dict[str, str]) -> None:
         """每次 206 都核对文件版本；total / validator 变化即作废旧字节。"""
         with self._lock:
+            self._prune()
             old = self._hints.get(file_key)
             if old and (old[0] != total or old[1] != validator):
                 self._drop(file_key)
             self._hints[file_key] = (total, validator, dict(base_headers), time.monotonic())
+            self._hints.move_to_end(file_key)
+            while len(self._hints) > _RELAY_TAIL_CACHE_FILES:
+                self._drop(next(iter(self._hints)))
 
     def _drop(self, file_key) -> None:
+        self._hints.pop(file_key, None)
         for key in list(self._entries):
             if key[:2] == file_key:
                 self._entries.pop(key, None)
@@ -389,22 +477,40 @@ class _TailCache:
         if event is not None:
             event.set()
 
-    def begin(self, key) -> None:
+    def begin(self, key) -> Optional[Event]:
         with self._lock:
-            if key not in self._pending:
-                self._pending[key] = Event()
+            self._prune()
+            hint = self._hints.get(key[:2])
+            if (not hint or not key[3] or hint[:2] != key[2:]
+                    or key in self._pending or len(self._captures) >= _RELAY_TAIL_CACHE_FILES):
+                return None
+            owner = Event()
+            self._pending[key] = owner
+            self._captures.add(owner)
+            return owner
 
-    def publish(self, key, data: bytes, start: int) -> None:
+    def publish(self, key, data: bytes, start: int, *, owner: Event) -> None:
         with self._lock:
+            self._captures.discard(owner)
+            self._prune()
+            hint = self._hints.get(key[:2])
+            if (owner.is_set() or self._pending.get(key) is not owner
+                    or not hint or hint[:2] != key[2:]
+                    or not 0 < len(data) <= _RELAY_TAIL_CACHE):
+                self.abort(key, owner=owner)
+                return
             self._entries[key] = (data, start, time.monotonic())
             self._entries.move_to_end(key)
             while len(self._entries) > _RELAY_TAIL_CACHE_FILES:
                 self._entries.popitem(last=False)
             self._signal(key)
 
-    def abort(self, key) -> None:
+    def abort(self, key, *, owner: Event) -> None:
         with self._lock:
-            self._signal(key)
+            self._captures.discard(owner)
+            if self._pending.get(key) is owner:
+                self._signal(key)
+            owner.set()
 
     def clear(self) -> None:
         """测试/热重载：取消在途预热并清空缓存。"""
@@ -441,6 +547,7 @@ class _TailCache:
         if _RELAY_TAIL_CACHE <= 0 or method not in {"GET", "HEAD"}:
             return None
         with self._lock:
+            self._prune()
             hint = self._hints.get(file_key)
             if not hint or time.monotonic() - hint[3] > _RELAY_TAIL_TTL:
                 return None
@@ -468,12 +575,15 @@ class _TailCache:
 
 def _tail_cache() -> _TailCache:
     """与监听器注册表同样的进程级 holder，插件热重载后缓存仍然可用。"""
-    holder = sys.modules.get(_TAIL_REGISTRY_KEY)
-    if holder is None:
-        holder = types.ModuleType(_TAIL_REGISTRY_KEY)
-        holder.cache = _TailCache()
-        sys.modules[_TAIL_REGISTRY_KEY] = holder
-    return holder.cache
+    with _TAIL_INIT_LOCK:
+        holder = sys.modules.get(_TAIL_REGISTRY_KEY)
+        if holder is None or getattr(getattr(holder, "cache", None), "schema_version", None) != 2:
+            if holder is not None and getattr(holder, "cache", None) is not None:
+                holder.cache.clear()
+            holder = types.ModuleType(_TAIL_REGISTRY_KEY)
+            holder.cache = _TailCache()
+            sys.modules[_TAIL_REGISTRY_KEY] = holder
+        return holder.cache
 
 
 class _TailCapture:
@@ -482,17 +592,18 @@ class _TailCapture:
     预取是优化：任何失败都静默吞掉，绝不改变交给客户端的字节与异常语义。
     """
 
-    def __init__(self, upstream, cache: _TailCache, key, start: int, length: int):
+    def __init__(self, upstream, cache: _TailCache, key, start: int, length: int,
+                 owner: Optional[Event] = None):
         self._upstream = upstream
         self._cache = cache
         self._key = key
         self._start = start
-        self._limit = min(length, _RELAY_TAIL_CACHE)
+        self._owner = owner if owner is not None else cache.begin(key)
+        self._limit = min(length, _RELAY_TAIL_CACHE) if self._owner is not None else 0
         self._buf = bytearray()
         self._eof = False
         self._failed = False
         self._closed = False
-        cache.begin(key)
 
     def read(self, size: int = _RELAY_READ_SIZE) -> bytes:
         if self._closed:
@@ -514,8 +625,13 @@ class _TailCapture:
         if self._closed:
             return
         self._closed = True
-        if not self._failed and not self._eof and len(self._buf) < self._limit:
-            Thread(target=self._drain, name="strm-tail-warm", daemon=True).start()
+        if (self._owner is not None and not self._owner.is_set()
+                and not self._failed and not self._eof and len(self._buf) < self._limit):
+            try:
+                Thread(target=self._drain, name="strm-tail-warm", daemon=True).start()
+            except RuntimeError:
+                self._failed = True
+                self._finish()
             return
         self._finish()
 
@@ -523,8 +639,12 @@ class _TailCapture:
         deadline = time.monotonic() + _RELAY_TAIL_DEADLINE
         try:
             while (not self._eof and len(self._buf) < self._limit
-                   and time.monotonic() < deadline):
-                chunk = self._upstream.read(_RELAY_READ_SIZE)
+                   and not self._owner.is_set() and time.monotonic() < deadline):
+                if isinstance(self._upstream, _PrefetchReader):
+                    chunk = self._upstream.read(_RELAY_READ_SIZE, deadline=deadline,
+                                                cancelled=self._owner)
+                else:
+                    chunk = self._upstream.read(_RELAY_READ_SIZE)
                 if not chunk:
                     self._eof = True
                     break
@@ -538,10 +658,11 @@ class _TailCapture:
     def _finish(self) -> None:
         try:
             # 读满即视为完整（后台补读可能在读完最后一块时还没观察到 EOF）。
-            if len(self._buf) == self._limit:
-                self._cache.publish(self._key, bytes(self._buf), self._start)
-            else:
-                self._cache.abort(self._key)
+            if self._owner is not None:
+                if not self._failed and len(self._buf) == self._limit:
+                    self._cache.publish(self._key, bytes(self._buf), self._start, owner=self._owner)
+                else:
+                    self._cache.abort(self._key, owner=self._owner)
         finally:
             try:
                 self._upstream.close()
@@ -553,12 +674,14 @@ def _wrap_tail(stream, file_key, method: str, start: int, end: int,
                total: int, validator: str):
     """只对"落在文件尾部的 GET 响应"挂旁路记录，其余路径一行不变。"""
     length = end - start + 1
-    if (not file_key or method != "GET" or _RELAY_TAIL_CACHE <= 0
+    if (not file_key or not validator or method != "GET" or _RELAY_TAIL_CACHE <= 0
             or start <= 0 or total <= _RELAY_TAIL_TRIGGER
             or start < total - _RELAY_TAIL_TRIGGER or length > _RELAY_TAIL_CACHE):
         return stream
     key = (file_key[0], file_key[1], total, validator)
-    return _TailCapture(stream, _tail_cache(), key, start, length)
+    cache = _tail_cache()
+    owner = cache.begin(key)
+    return _TailCapture(stream, cache, key, start, length, owner) if owner is not None else stream
 
 
 def content_disposition(file_name: str) -> str:

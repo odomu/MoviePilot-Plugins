@@ -353,9 +353,9 @@ class TestPrefetchReader(unittest.TestCase):
         upstream = Mock()
         upstream.read = Mock(side_effect=[b"ab", b"cd", b""])
         stream = self.wrap(upstream)
-        self.assertEqual(stream.read(1), b"ab")
-        self.assertEqual(stream.read(1), b"cd")
-        self.assertEqual(stream.read(1), b"")
+        self.assertEqual(stream.read(2), b"ab")
+        self.assertEqual(stream.read(2), b"cd")
+        self.assertEqual(stream.read(2), b"")
         stream._worker.join(timeout=2)
         self.assertEqual(upstream.read.call_count, 3)  # EOF 后生产者立即退出
 
@@ -364,7 +364,7 @@ class TestPrefetchReader(unittest.TestCase):
         upstream = Mock()
         upstream.read = Mock(side_effect=[b"ab", error])
         stream = self.wrap(upstream)
-        self.assertEqual(stream.read(1), b"ab")
+        self.assertEqual(stream.read(2), b"ab")
         with self.assertRaises(RuntimeError) as context:
             stream.read(1)
         self.assertIs(context.exception, error)  # 抛出的正是生产者遇到的那个异常对象
@@ -482,7 +482,7 @@ class TestOpenSegmentRetry(unittest.TestCase):
         self.assertEqual(link.refreshs, 1)
         self.assertEqual(open_next.call_count, 2)
         self.assertEqual(open_next.call_args_list[1].args[0].full_url, "http://new/video")
-        self.assertIsNone(open_next.call_args_list[1].args[0].get_header("If-Range"))
+        self.assertEqual(open_next.call_args_list[1].args[0].get_header("If-range"), '"v9"')
 
     def test_refresh_is_capped_per_response(self):
         from urllib.error import HTTPError
@@ -851,10 +851,14 @@ class TestTailCache(unittest.TestCase):
     def key(self, total=1000, validator='"v1"'):
         return self.cache._entry_key(self.file_key, total, validator)
 
+    def publish(self, key, data, start):
+        owner = self.cache.begin(key)
+        self.assertIsNotNone(owner)
+        self.cache.publish(key, data, start, owner=owner)
+
     def test_publish_then_hit_serves_exact_bytes(self):
         key = self.key()
-        self.cache.begin(key)
-        self.cache.publish(key, b"0123456789", start=990)
+        self.publish(key, b"0123456789", start=990)
         result = self.cache.hit(self.file_key, "GET", {"Range": "bytes=992-999"})
         self.assertIsNotNone(result)
         self.assertEqual(result.status_code, 206)
@@ -863,26 +867,26 @@ class TestTailCache(unittest.TestCase):
         self.assertEqual(result.upstream.read(), b"23456789")
 
     def test_hit_outside_cached_window_misses(self):
-        self.cache.publish(self.key(), b"0123456789", start=990)
+        self.publish(self.key(), b"0123456789", start=990)
         self.assertIsNone(self.cache.hit(self.file_key, "GET", {"Range": "bytes=980-"}))
 
     def test_if_range_mismatch_misses(self):
-        self.cache.publish(self.key(), b"0123456789", start=990)
+        self.publish(self.key(), b"0123456789", start=990)
         self.assertIsNone(self.cache.hit(
             self.file_key, "GET", {"Range": "bytes=995-", "If-Range": '"v2"'}))
 
     def test_file_version_change_drops_old_bytes(self):
-        self.cache.publish(self.key(), b"0123456789", start=990)
+        self.publish(self.key(), b"0123456789", start=990)
         self.cache.note_size(self.file_key, 1000, '"v2"', self.base)
         self.assertIsNone(self.cache.hit(self.file_key, "GET", {"Range": "bytes=995-"}))
 
     def test_pending_request_waits_for_warm_to_finish(self):
         key = self.key()
-        self.cache.begin(key)
+        owner = self.cache.begin(key)
 
         def finish():
             time.sleep(0.05)
-            self.cache.publish(key, b"0123456789", start=990)
+            self.cache.publish(key, b"0123456789", start=990, owner=owner)
 
         worker = Thread(target=finish, daemon=True)
         worker.start()
@@ -894,8 +898,9 @@ class TestTailCache(unittest.TestCase):
     def test_lru_caps_cached_files(self):
         with patch.object(_proxy, "_RELAY_TAIL_CACHE_FILES", 2):
             for number in range(3):
-                self.cache.publish(("quark", f"f{number}", 1000, '"v1"'),
-                                   b"0123456789", start=990)
+                file_key = ("quark", f"f{number}")
+                self.cache.note_size(file_key, 1000, '"v1"', self.base)
+                self.publish((*file_key, 1000, '"v1"'), b"0123456789", start=990)
             self.assertEqual(len(self.cache._entries), 2)
             self.assertNotIn(("quark", "f0", 1000, '"v1"'), self.cache._entries)
 
@@ -909,6 +914,7 @@ class TestTailCapture(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.cache = _proxy._TailCache()
         self.key = ("quark", "fid", 1000, '"v1"')
+        self.cache.note_size(self.key[:2], 1000, '"v1"', {})
 
     def test_disconnect_keeps_reading_same_response(self):
         class Upstream:
