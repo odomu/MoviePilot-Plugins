@@ -35,6 +35,11 @@ install_app_mocks(
 )
 MediaType = set_media_type(movie="movie", tv="tv")
 
+_step_share_expiry = ensure_package("cloudsubscribe.utils.share_expiry")
+_step_share_expiry.is_share_expired = lambda url: False
+_step_share_expiry.mark_share_expired = lambda *args, **kwargs: None
+_step_share_expiry.is_expired_share_error = lambda *args, **kwargs: False
+
 mock_notif = ensure_package("cloudsubscribe.handlers.notification")
 mock_notif.MediaServerNotifier = MagicMock()
 mock_notif.MediaServerResolver = MagicMock()

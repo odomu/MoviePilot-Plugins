@@ -23,6 +23,7 @@ from ...search.types import (
     resource_type_name,
 )
 from ...utils import MediaFileParser, parse_magnet_metadata
+from ...utils.share_expiry import is_share_expired
 
 
 class ResourceTransferService(OwnerDelegator):
@@ -585,8 +586,15 @@ class ResourceTransferService(OwnerDelegator):
             log_prefix: str = "",
     ) -> str:
         """统一处理积分搜索源的延迟解锁，并展开一次返回的多条链接。"""
+        resource_ref = str(resource.get("resource_ref") or "").strip()
+        if resource_ref and self._is_resource_ref_blacklisted(resource_ref):
+            prefix = f"{log_prefix} " if log_prefix else ""
+            logger.debug(f"{prefix}跳过已加入黑名单的资源：{resource_ref}")
+            return ""
         share_url = str(resource.get("url") or "").strip()
         if share_url:
+            if self._drop_expired_resource_link(share_url, resource_ref, log_prefix):
+                return ""
             return self._expand_resource_urls(
                 resources, resource_index, resource, share_url
             )
@@ -594,7 +602,6 @@ class ResourceTransferService(OwnerDelegator):
                 resource.get("need_unlock") or resource.get("need_access")
         ):
             return ""
-        resource_ref = str(resource.get("resource_ref") or "").strip()
         if not resource_ref:
             return ""
         source = str(resource.get("source") or "").strip().lower()
@@ -663,9 +670,30 @@ class ResourceTransferService(OwnerDelegator):
                     f"{prefix}未能取得 {source_label} 资源链接：{resource_title}"
                 )
             return ""
-        return self._expand_resource_urls(
+        resolved_url = self._expand_resource_urls(
             resources, resource_index, resource, unlocked
         )
+        if self._drop_expired_resource_link(resolved_url, resource_ref, log_prefix):
+            return ""
+        return resolved_url
+
+    def _drop_expired_resource_link(
+            self,
+            share_url: str,
+            resource_ref: str,
+            log_prefix: str = "",
+    ) -> bool:
+        """分享已确认过期时拉黑 resource_ref 并跳过，避免每轮重复解锁转存。"""
+        if not self._is_expired_share_link(share_url):
+            return False
+        if resource_ref:
+            self._add_resource_ref_blacklist(resource_ref, "分享链接已过期")
+        prefix = f"{log_prefix} " if log_prefix else ""
+        logger.info(
+            f"{prefix}分享链接已确认过期，已加入黑名单跳过："
+            f"{self._resource_log_reference(share_url)}"
+        )
+        return True
 
     def _validate_resource_url(
             self,
@@ -675,6 +703,14 @@ class ResourceTransferService(OwnerDelegator):
             strict: bool = False,
     ) -> bool:
         """使用对应 Provider 的统一能力校验资源链接。"""
+        prefix = f"{log_prefix} " if log_prefix else ""
+        if is_share_expired(share_url):
+            message = (
+                f"{prefix}{resource_label}已确认失效（24小时内跳过）："
+                f"{self._resource_log_reference(share_url)}"
+            )
+            (logger.warning if strict else logger.debug)(message)
+            return False
         provider = self._resource_provider_for_url(share_url)
         share_service = (
             provider.require(CloudDriveCapability.SHARE_TRANSFER)

@@ -90,6 +90,12 @@ register_mock("cloudsubscribe.core.transfer")
 
 register_package("cloudsubscribe.utils")
 register_mock("cloudsubscribe.utils.cache", create_platform_ttl_cache=MagicMock())
+register_mock(
+    "cloudsubscribe.utils.share_expiry",
+    is_share_expired=lambda url: False,
+    mark_share_expired=lambda *args, **kwargs: None,
+    is_expired_share_error=lambda *args, **kwargs: False,
+)
 
 register_package("cloudsubscribe.search")
 register_module("cloudsubscribe.search.types", RESOURCE_TYPE_DISPLAY={

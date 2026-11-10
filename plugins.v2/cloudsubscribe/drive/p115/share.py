@@ -11,6 +11,11 @@ from app.log import logger
 from ..common import DRIVE_RETRY_EXCEPTIONS, should_skip_season_dir
 from ...core.cloud import ShareLinkStatus
 from ...core.delegation import OwnerDelegator
+from ...utils.share_expiry import (
+    is_expired_share_error,
+    is_share_expired,
+    mark_share_expired,
+)
 
 try:
     from p115client.tool.iterdir import share_iterdir, share_search_iter
@@ -89,6 +94,16 @@ class ShareService(OwnerDelegator):
             }
             return status
 
+        # 先检查转存阶段确认过的失效记录：share_snap 仍可能返回有效
+        if is_share_expired(share_url):
+            status.is_expired = True
+            status.error_code = 4100018
+            status.error_message = "分享链接已过期（转存时确认）"
+            return status
+        info = self.extract_share_info(share_url)
+        share_code = info.get("share_code")
+        receive_code = info.get("receive_code")
+
         cached = self._share_status_cache.get(share_url)
         if isinstance(cached, dict):
             logger.debug(f"复用115分享状态缓存：{share_url}")
@@ -97,11 +112,6 @@ class ShareService(OwnerDelegator):
         if not self.client:
             status.error_message = "客户端未初始化"
             return status
-
-        # 解析分享链接
-        info = self.extract_share_info(share_url)
-        share_code = info.get("share_code")
-        receive_code = info.get("receive_code")
 
         if not share_code:
             status.error_message = "无效的分享链接格式"
@@ -188,6 +198,11 @@ class ShareService(OwnerDelegator):
         """
         status = self.check_share_status(share_url)
         return status.is_valid
+
+    @staticmethod
+    def _is_share_expired_error(error_code: Any, error_msg: Any) -> bool:
+        """识别“链接已过期/分享失效”类错误。"""
+        return is_expired_share_error(error_code, error_msg)
 
     def list_share_files(
             self,
@@ -456,7 +471,8 @@ class ShareService(OwnerDelegator):
             receive_code=receive_code,
             file_id="0",
             parent_id=parent_id,
-            save_path=save_path
+            save_path=save_path,
+            share_url=share_url,
         )
 
     def transfer_file(
@@ -490,6 +506,7 @@ class ShareService(OwnerDelegator):
             file_id=str(file_id),
             parent_id=parent_id,
             save_path=save_path,
+            share_url=share_url,
         ) is not False
 
     def transfer_files_batch(
@@ -585,6 +602,7 @@ class ShareService(OwnerDelegator):
                     file_id=",".join(page_ids),
                     parent_id=parent_id,
                     save_path=save_path,
+                    share_url=share_url,
             ) is not False:
                 success_ids.extend(page_ids)
             else:
@@ -603,7 +621,8 @@ class ShareService(OwnerDelegator):
             file_id: str,
             parent_id: int,
             save_path: str,
-            max_retries: int = None
+            max_retries: int = None,
+            share_url: str = "",
     ) -> bool:
         """
         执行实际转存操作（带重试）
@@ -618,6 +637,9 @@ class ShareService(OwnerDelegator):
         """
         if max_retries is None:
             max_retries = self.DEFAULT_MAX_RETRIES
+        if is_share_expired(share_url):
+            logger.warning(f"115 分享已确认失效，跳过转存：{share_url}")
+            return False
 
         payload = {
             "share_code": share_code,
@@ -664,6 +686,10 @@ class ShareService(OwnerDelegator):
                             logger.debug(f"遇到限流，{wait_time}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
                             time.sleep(wait_time)
                             continue
+
+                    if self._is_share_expired_error(error_code, error_msg):
+                        mark_share_expired(share_url, str(error_msg), error_code)
+                        return False
 
                     logger.error(f"转存失败: {error_msg} (错误码: {error_code})")
                     return False

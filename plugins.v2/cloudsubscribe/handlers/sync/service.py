@@ -75,6 +75,11 @@ from ...core.media import (
 from ...drive.scanner import get_driver_definitions
 from ...utils import StrmGenerator, StrmTemplateError
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.share_expiry import (
+    is_expired_share_error,
+    is_share_expired,
+    mark_share_expired,
+)
 
 _COMPONENT_TYPES = (
     MovieSyncProcessor,
@@ -270,6 +275,11 @@ class SyncHandler:
         self._share_transfer_blocked_until: Dict[str, float] = {}
         self._offline_blacklist = create_platform_ttl_cache(
             "offline_blacklist",
+            ttl=86400,
+            maxsize=10000,
+        )
+        self._resource_ref_blacklist = create_platform_ttl_cache(
+            "resource_ref_blacklist",
             ttl=86400,
             maxsize=10000,
         )
@@ -1072,6 +1082,9 @@ class SyncHandler:
                             recheck_set = set(recheck_success)
                             failed_ids = [fid for fid in failed_ids if fid not in recheck_set]
 
+                    if failed_ids and self._confirm_expired_share(share_url):
+                        self._blacklist_transfer_resources(selected_items)
+
                 if (
                         failed_ids and not success_ids
                         and bool(getattr(
@@ -1081,6 +1094,9 @@ class SyncHandler:
                     self._activate_share_transfer_cooldown(provider_key)
         except Exception as error:
             message = str(error)
+            if is_expired_share_error(message=message):
+                mark_share_expired(share_url, message)
+                self._blacklist_transfer_resources(selected_items)
             if any(marker in message.lower() for marker in (
                     "风控", "封禁", "受限", "频繁", "rate limit", "too many", "429",
             )):
@@ -1427,6 +1443,74 @@ class SyncHandler:
             if task_id and (task_id in self._offline_blacklist or task_id.upper() in self._offline_blacklist):
                 return True
         return False
+
+    def _is_expired_share_link(self, share_url: str) -> bool:
+        """判断分享是否已被登记为失效（本地缓存，零远端请求）。"""
+        return is_share_expired(share_url)
+
+    def _confirm_expired_share(self, share_url: str, error_message: str = "") -> bool:
+        """转存失败后确认分享是否失效：错误文本 → 本地登记 → 远端状态校验。"""
+        if not share_url:
+            return False
+        if is_share_expired(share_url):
+            return True
+        if error_message and is_expired_share_error(message=error_message):
+            mark_share_expired(share_url, error_message)
+            return True
+        checker = getattr(self._share_transfer, "check_share_status", None)
+        if not callable(checker):
+            return False
+        try:
+            status = self._timed_sync_call("share_validation", checker, share_url)
+        except Exception as error:
+            logger.debug(f"校验分享失效状态失败：{error}")
+            return False
+        if status is None or getattr(status, "is_valid", True):
+            return False
+        status_text = getattr(status, "status_text", "") or ""
+        flagged = any(
+            getattr(status, flag, False)
+            for flag in ("is_expired", "is_cancelled", "is_deleted")
+        )
+        if not flagged and not is_expired_share_error(message=status_text):
+            logger.debug(
+                f"分享转存失败但状态未判定为失效，暂不拉黑：{status_text or '未知'}"
+            )
+            return False
+        mark_share_expired(
+            share_url,
+            status_text or "分享链接不可用",
+            getattr(status, "error_code", None),
+        )
+        return True
+
+    def _blacklist_transfer_resources(self, items: Iterable[Dict[str, Any]]) -> None:
+        """把失效分享对应的 resource_ref 拉黑，避免下一轮重复解锁。"""
+        for item in items or []:
+            resource_ref = str(
+                (item.get("resource") or {}).get("resource_ref") or ""
+            ).strip()
+            if resource_ref:
+                self._add_resource_ref_blacklist(
+                    resource_ref, "分享链接已失效"
+                )
+
+    def _add_resource_ref_blacklist(self, resource_ref: str, reason: str = "") -> None:
+        """将失效分享对应的 resource_ref 加入黑名单（1天TTL），避免每轮重复解锁。"""
+        cache = getattr(self, "_resource_ref_blacklist", None)
+        norm_key = self._normalize_offline_key(resource_ref)
+        if cache is None or not norm_key:
+            return
+        cache[norm_key] = {
+            "reason": reason,
+            "time": time.time(),
+        }
+        logger.info(f"🚫 资源已加入黑名单（1天过期）：{norm_key}，原因：{reason}")
+
+    def _is_resource_ref_blacklisted(self, resource_ref: str) -> bool:
+        cache = getattr(self, "_resource_ref_blacklist", None)
+        norm_key = self._normalize_offline_key(resource_ref)
+        return bool(norm_key and cache is not None and norm_key in cache)
 
     @classmethod
     def _is_same_media_target(
@@ -2864,6 +2948,8 @@ class SyncHandler:
             ):
                 logger.debug(f"单文件转存返回失败但转存目录复核已存在，自愈复用：{save_path}/{target_check_name}")
                 return True
+        if not success and not cross_provider:
+            self._confirm_expired_share(share_url)
         return success
 
     @staticmethod

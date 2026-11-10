@@ -13,6 +13,11 @@ from .files import cloud_file
 from ..common import iter_transfer_batches, safe_int
 from ...core.cloud import ShareLinkStatus
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.share_expiry import (
+    is_expired_share_error,
+    is_share_expired,
+    mark_share_expired,
+)
 
 
 class GuangyaShareService:
@@ -229,6 +234,9 @@ class GuangyaShareService:
     def _restore_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str
     ) -> bool:
+        if is_share_expired(share_url):
+            logger.warning("光鸭分享已确认失效，24 小时内跳过转存")
+            return False
         info, token = self._share_access(share_url)
         lookup = self._files.resolve_directory(save_path, create=True)
         if not lookup.checked or lookup.directory_id is None:
@@ -247,6 +255,12 @@ class GuangyaShareService:
         response = self._restore(token, normalized, lookup.directory_id)
         success = self.client.is_success(response)
         if not success:
+            message = str(
+                response.get("msg") or response.get("error")
+                or response.get("message") or ""
+            )
+            if is_expired_share_error(message=message):
+                mark_share_expired(share_url, message)
             with self._share_token_lock:
                 self._share_token_cache.delete(
                     f"{info['share_id']}|{info['password']}"

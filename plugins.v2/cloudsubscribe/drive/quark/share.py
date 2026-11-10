@@ -13,6 +13,11 @@ from .files import cloud_file, list_data
 from ..common import safe_int, should_skip_season_dir
 from ...core.cloud import ShareLinkStatus
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.share_expiry import (
+    is_expired_share_error,
+    is_share_expired,
+    mark_share_expired,
+)
 
 
 class QuarkShareService:
@@ -290,6 +295,9 @@ class QuarkShareService:
     def _save_share(
             self, share_url: str, file_ids: Iterable[str], save_path: str
     ) -> bool:
+        if is_share_expired(share_url):
+            logger.warning("夸克分享已确认失效，24 小时内跳过转存")
+            return False
         if time.monotonic() < self._transfer_blocked_until:
             logger.warning(
                 f"夸克转存已熔断，暂不重试：{self._transfer_block_reason}"
@@ -338,6 +346,8 @@ class QuarkShareService:
         )
         if not success:
             message = str(result.get("message") or result.get("msg") or "")
+            if is_expired_share_error(message=message):
+                mark_share_expired(share_url, message)
             if any(marker in message for marker in ("封禁", "风控", "限制", "频繁")):
                 self._transfer_block_reason = message or "账号转存受限"
                 self._transfer_blocked_until = time.monotonic() + max(

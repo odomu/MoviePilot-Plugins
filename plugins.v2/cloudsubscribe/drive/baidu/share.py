@@ -16,6 +16,11 @@ from .files import wait_task
 from ..common import safe_int, should_skip_season_dir
 from ...core.cloud import ShareLinkStatus
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.share_expiry import (
+    is_expired_share_error,
+    is_share_expired,
+    mark_share_expired,
+)
 
 
 class BaiduShareService:
@@ -300,6 +305,8 @@ class BaiduShareService:
     ) -> List[str]:
         if self.transfer_risk_blocked:
             raise RuntimeError("百度分享转存处于风控冷却期，请稍后重试")
+        if is_share_expired(share_url):
+            raise RuntimeError("百度分享已确认失效，24小时内跳过转存")
         info, context = self._access(share_url)
         if not file_ids:
             file_ids = [item["id"] for item in self._directory(share_url)]
@@ -350,9 +357,10 @@ class BaiduShareService:
         try:
             if not self.client.is_success(response):
                 self._handle_risk(response)
-                raise RuntimeError(
-                    response.get("message") or "百度分享转存失败"
-                )
+                message = str(response.get("message") or "百度分享转存失败")
+                if is_expired_share_error(message=message):
+                    mark_share_expired(share_url, message)
+                raise RuntimeError(message)
             task_id = str(
                 response.get("taskid") or response.get("task_id") or ""
             ).strip()
@@ -404,6 +412,8 @@ class BaiduShareService:
             return True
         except (ValueError, RuntimeError) as error:
             self.last_error = str(error)
+            if is_expired_share_error(message=self.last_error):
+                mark_share_expired(share_url, self.last_error)
             logger.warning(f"百度网盘单文件转存失败：{error}")
             if target_name and self._files.find_file(save_path, target_name):
                 return True
@@ -433,6 +443,8 @@ class BaiduShareService:
                 succeeded.extend(self._save(share_url, batch, save_path))
             except (ValueError, RuntimeError) as error:
                 self.last_error = str(error)
+                if is_expired_share_error(message=self.last_error):
+                    mark_share_expired(share_url, self.last_error)
                 failed.extend(batch)
                 if self.transfer_risk_blocked:
                     failed.extend(values[offset + size:])

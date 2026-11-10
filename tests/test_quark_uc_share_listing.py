@@ -37,6 +37,12 @@ def load_services():
         PREFIX + ".utils.cache": package(
             PREFIX + ".utils.cache", create_platform_ttl_cache=lambda *a, **kw: MagicMock(),
         ),
+        PREFIX + ".utils.share_expiry": package(
+            PREFIX + ".utils.share_expiry",
+            is_share_expired=lambda url: False,
+            mark_share_expired=lambda *args, **kwargs: None,
+            is_expired_share_error=lambda *args, **kwargs: False,
+        ),
     })
     services = []
     for drive, class_name in [("quark", "QuarkShareService"), ("uc", "UCShareService")]:
