@@ -6,7 +6,12 @@
 
 import unittest
 import http.client
+import logging
+import socket
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from threading import Thread
 from unittest.mock import patch, Mock
 from types import SimpleNamespace
@@ -262,10 +267,11 @@ class TestProxyTemplateSelection(unittest.TestCase):
 
 
 class TestRangeStreamFailure(unittest.TestCase):
-    def make_stream(self):
-        first = Mock(headers={"ETag": '"v1"'})
+    def make_stream(self, resolver=None, first_headers=None):
+        first = Mock(headers=first_headers or {"ETag": '"v1"'})
         first.read.return_value = b"abcd"
-        stream = _proxy._RangeStream(first, "http://upstream/video", {}, 0, 3, 7, 8)
+        link = _proxy._LinkResolver("http://upstream/video", {}, resolver)
+        stream = _proxy._RangeStream(first, link, 0, 3, 7, 8)
         self.assertEqual(stream.read(), b"abcd")
         return first, stream
 
@@ -295,19 +301,281 @@ class TestRangeStreamFailure(unittest.TestCase):
             open_next.assert_not_called()
         first.close.assert_called_once()
 
-    def test_truncated_part_is_rejected(self):
-        first, stream = self.make_stream()
-        stream._remaining = 1
-        first.read.return_value = b""
-        with self.assertRaises(OSError):
-            stream.read()
+    def test_truncated_part_retries_then_raises(self):
+        """分片提前 EOF：同窗口同偏移重试，耗尽后报提前结束。"""
+        _, stream = self.make_stream()
+        # 重开的窗口必须从同一偏移继续（offset=4，上一窗口 0-3 已读完）。
+        after = Mock(status=206, headers={"Content-Range": "bytes 4-7/8"})
+        after.read.return_value = b""
+        with patch.object(_proxy, "urlopen", return_value=after) as open_next, \
+                patch.object(_proxy.time, "sleep"):
+            with self.assertRaises(OSError):
+                stream.read()
+        self.assertEqual(open_next.call_count, _proxy._RELAY_ATTEMPTS)
+        self.assertTrue(all(
+            call.args[0].get_header("Range") == "bytes=4-7"
+            for call in open_next.call_args_list
+        ))
+
+
+class TestRangeStreamResume(unittest.TestCase):
+    """分片中途被重置：从精确偏移续传，窗口不重叠。"""
+
+    def test_midpart_reset_resumes_at_exact_offset(self):
+        first = Mock(headers={"ETag": '"v1"'})
+        first.read = Mock(side_effect=[b"ab", ConnectionResetError()])
+        link = _proxy._LinkResolver("http://upstream/video", {}, None)
+        stream = _proxy._RangeStream(first, link, 0, 3, 7, 8)
+        resumed = Mock(status=206, headers={"Content-Range": "bytes 2-3/8"})
+        resumed.read = Mock(side_effect=[b"cd"])
+        following = Mock(status=206, headers={"Content-Range": "bytes 4-7/8"})
+        following.read = Mock(side_effect=[b"ef", b"gh"])
+        with patch.object(_proxy, "urlopen", side_effect=[resumed, following]) as open_next, \
+                patch.object(_proxy.time, "sleep"):
+            self.assertEqual(stream.read(size=2), b"ab")
+            self.assertEqual(stream.read(size=2), b"cd")
+            self.assertEqual(stream.read(size=2), b"ef")
+            self.assertEqual(stream.read(size=2), b"gh")
+            self.assertEqual(stream.read(size=2), b"")
+        ranges = [call.args[0].get_header("Range") for call in open_next.call_args_list]
+        self.assertEqual(ranges, ["bytes=2-3", "bytes=4-7"])
+
+
+class TestPrefetchReader(unittest.TestCase):
+    """预取缓冲：顺序交付、EOF、异常重抛与 close 停止生产。"""
+
+    def wrap(self, upstream):
+        stream = _proxy._PrefetchReader.wrap(upstream)
+        self.addCleanup(stream.close)
+        return stream
+
+    def test_sequential_order_and_eof(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"ab", b"cd", b""])
+        stream = self.wrap(upstream)
+        self.assertEqual(stream.read(2), b"ab")
+        self.assertEqual(stream.read(2), b"cd")
+        self.assertEqual(stream.read(2), b"")
+        stream._worker.join(timeout=2)
+        self.assertEqual(upstream.read.call_count, 3)  # EOF 后生产者立即退出
+
+    def test_exception_is_reraised_to_consumer(self):
+        error = RuntimeError("gap")
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"ab", error])
+        stream = self.wrap(upstream)
+        self.assertEqual(stream.read(2), b"ab")
+        with self.assertRaises(RuntimeError) as context:
+            stream.read(1)
+        self.assertIs(context.exception, error)  # 抛出的正是生产者遇到的那个异常对象
+        stream._worker.join(timeout=2)
+
+    def test_short_chunks_are_delivered_asis(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"a", b"b", b""])
+        stream = self.wrap(upstream)
+        self.assertEqual([stream.read(8), stream.read(8), stream.read(8)],
+                         [b"a", b"b", b""])
+
+    def test_close_stops_producer(self):
+        state = SimpleNamespace(reads=0)
+        import time as _time
+
+        class EndlessUpstream:
+            def read(self, size):
+                state.reads += 1
+                return b"c" * size
+
+            def close(self):
+                state.closed = True
+
+        stream = self.wrap(EndlessUpstream())
+        # 等队列填满（生产者卡在 put 轮询）
+        for _ in range(100):
+            if stream._queue.qsize() >= _proxy._RELAY_PREFETCH_ITEMS:
+                break
+            _time.sleep(0.02)
+        stream.close()
+        reads_before = state.reads
+        self.assertEqual(stream.read(8), b"")       # close 后 read 立即 EOF
+        _time.sleep(0.2)
+        self.assertEqual(state.reads, reads_before)  # 不再生产
+        self.assertTrue(state.closed)
+
+
+class TestOpenSegmentRetry(unittest.TestCase):
+    """分段打开器：传输层重试、状态码分类与重新取链。"""
+
+    def setUp(self):
+        patcher = patch.object(_proxy.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def ok_response(content_range="bytes 0-7/8"):
+        return Mock(status=206, headers={"Content-Range": content_range})
+
+    def test_transport_error_retries_same_arguments(self):
+        from urllib.error import URLError
+
+        link = _proxy._LinkResolver("http://up/video", {"Cookie": "s"}, None)
+        good = self.ok_response()
+        with patch.object(_proxy, "urlopen",
+                          side_effect=[URLError("reset"), URLError("again"), good]) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {"Range": "bytes=0-7"})
+        self.assertIs(upstream, good)
+        self.assertEqual(status, 206)
+        self.assertEqual(open_next.call_count, 3)
+        for call in open_next.call_args_list:
+            self.assertEqual(call.args[0].full_url, "http://up/video")
+            self.assertEqual(call.args[0].get_header("Range"), "bytes=0-7")
+
+    def test_transport_error_exhausted_raises_abort(self):
+        from urllib.error import URLError
+
+        link = _proxy._LinkResolver("http://up/video", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=URLError("down")) as open_next:
+            with self.assertRaises(_proxy._RelayAbort):
+                _proxy._relay_open_segment(link, {})
+        self.assertEqual(open_next.call_count, 3)
+
+    def test_retry_status_backs_off_then_succeeds(self):
+        from urllib.error import HTTPError
+
+        link = _proxy._LinkResolver("http://up/video", {}, None)
+        good = self.ok_response()
+        limited = HTTPError("http://up/video", 429, "too many", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=[limited, good]) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertEqual(status, 206)
+        self.assertEqual(open_next.call_count, 2)
+        good.close.assert_not_called()
+
+    def test_refresh_status_without_resolver_is_terminal(self):
+        from urllib.error import HTTPError
+
+        link = _proxy._LinkResolver("http://up/video", {}, None)
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=denied) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertIs(upstream, denied)
+        self.assertEqual(status, 403)
+        self.assertEqual(open_next.call_count, 1)
+
+    def test_403_refreshes_download_link(self):
+        from urllib.error import HTTPError
+
+        resolved = []
+
+        def resolver():
+            resolved.append(True)
+            return "http://new/video", {"Cookie": "s2"}
+
+        link = _proxy._LinkResolver("http://up/video", {"Cookie": "s"}, resolver)
+        good = self.ok_response()
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=[denied, good]) as open_next:
+            upstream, status = _proxy._relay_open_segment(
+                link, {"Range": "bytes=0-7", "If-Range": '"v9"'})
+        self.assertEqual(status, 206)
+        self.assertEqual(resolved, [True])
+        self.assertEqual(link.refreshs, 1)
+        self.assertEqual(open_next.call_count, 2)
+        self.assertEqual(open_next.call_args_list[1].args[0].full_url, "http://new/video")
+        self.assertEqual(open_next.call_args_list[1].args[0].get_header("If-range"), '"v9"')
+
+    def test_refresh_is_capped_per_response(self):
+        from urllib.error import HTTPError
+
+        resolved = []
+
+        def resolver():
+            resolved.append(True)
+            return "http://new/video", {}
+
+        link = _proxy._LinkResolver("http://up/video", {}, resolver)
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=denied) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertEqual(status, 403)
+        self.assertEqual(resolved, [True] * _proxy._RELAY_MAX_REFRESHS)
+        self.assertEqual(link.refreshs, _proxy._RELAY_MAX_REFRESHS)
+        self.assertEqual(open_next.call_count, 1 + _proxy._RELAY_MAX_REFRESHS)
+
+    def test_resolver_failure_falls_back_to_terminal(self):
+        from urllib.error import HTTPError
+
+        def resolver():
+            raise RuntimeError("sleepy")
+
+        link = _proxy._LinkResolver("http://up/video", {}, resolver)
+        denied = HTTPError("http://up/video", 403, "forbidden", {}, None)
+        with patch.object(_proxy, "urlopen", side_effect=denied) as open_next:
+            upstream, status = _proxy._relay_open_segment(link, {})
+        self.assertEqual(status, 403)
+        self.assertEqual(open_next.call_count, 1)
+
+
+class TestRelayErrorSplit(unittest.TestCase):
+    """_relay 读写异常分离：写侧客户端断开静默；读侧失败才记“读取中断”。"""
+
+    def setUp(self):
+        self.logger = logging.Logger("strm-relay-test", level=logging.WARNING)
+        self.logger.propagate = False
+        patcher = patch.object(_proxy, "logger", self.logger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_stub(self, upstream, wfile=None):
+        handler_cls = _proxy.StrmProxyServer._make_handler(SimpleNamespace())
+        stub = object.__new__(handler_cls)
+        stub.request_version = "HTTP/1.1"
+        stub.command = "GET"
+        stub.path = "/d/x"
+        stub.requestline = "GET /d/x HTTP/1.1"
+        stub.close_connection = False
+        stub.wfile = wfile if wfile is not None else BytesIO()
+        return stub
+
+    def relay(self, upstream, wfile=None):
+        self.make_stub(upstream, wfile)._relay(
+            _proxy.ProxyResult(status_code=206, upstream=upstream), "GET")
+        upstream.close.assert_called_once()  # finally 必收尾
+
+    def test_write_disconnect_is_silent(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=[b"chunk-1", b"chunk-2"])
+        wfile = Mock()
+        wfile.write.side_effect = [None, ConnectionResetError()]  # 首次写头部成功，随后直言正文失败
+        self.relay(upstream, wfile)
+        self.assertEqual(upstream.read.call_count, 1)  # 断开后不再读上游
+
+    def test_header_phase_disconnect_is_silent(self):
+        upstream = Mock()
+        wfile = Mock()
+        wfile.write.side_effect = BrokenPipeError()
+        self.relay(upstream, wfile)
+        upstream.read.assert_not_called()
+
+    def test_read_failure_only_logs_read_line(self):
+        upstream = Mock()
+        upstream.read = Mock(side_effect=OSError("exhausted"))
+        with self.assertLogs(_proxy.logger, level="WARNING") as captured:
+            self.relay(upstream)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("夸克播放中转读取中断：OSError", captured.output[0])
 
 
 class TestQuarkRelay(unittest.TestCase):
     """真实 HTTP 链路验证：认证只发上游，Range/HEAD 与错误码保持一致。"""
 
     def setUp(self):
+        # 缩短重试退避的等待：用例只关心行为，不关心真实退避时长
+        self._sleeps = patch.object(_proxy.time, "sleep")
+        self._sleeps.start()
+        self.addCleanup(self._sleeps.stop)
         self.payload = b"0123456789abcdefghijklmnopqrstuvwxyz"
+        self.truncated_range = None
         self.received = []
         test = self
 
@@ -336,6 +604,9 @@ class TestQuarkRelay(unittest.TestCase):
                     self.send_response(code)
                     self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}" if code == 206 else f"bytes */{len(data)}")
                     data = data[start:end + 1] if code == 206 else b""
+                    if code == 206 and range_value == test.truncated_range:
+                        # 模拟 CDN 连接在分片中途提前断开
+                        data = data[:4]
                 else:
                     self.send_response(code)
                 self.send_header("Content-Length", str(len(data)))
@@ -434,11 +705,245 @@ class TestQuarkRelay(unittest.TestCase):
         code, _, body = self.fetch()
         self.assertEqual((code, body), (412, b""))
 
+    def test_truncated_upstream_resumes_mid_part(self):
+        """上游在分片中途断开（11-05 的 URLError/截断场景）：同窗口断点续传，字节完整。"""
+        first_range = f"bytes=8-{8 + _proxy._RELAY_CHUNK_SIZE - 1}"
+        self.truncated_range = first_range
+        code, headers, body = self.fetch(headers={"Range": "bytes=8-"})
+        self.assertEqual(code, 206)
+        self.assertEqual(body, self.payload[8:])
+        ranges = [h["Range"] for h in self.received]
+        self.assertEqual(ranges, [first_range, "bytes=12-35"])
+        self.assertTrue(int(headers["Content-Length"]) > 0)
+        self.assertEqual(self.received[-1]["If-Range"], '"version-one"')
+
+    def test_tail_cache_hits_without_upstream_or_link_resolve(self):
+        """尾部响应读完一次后，同范围请求零上游、零取链直接命中。"""
+        cache = _proxy._tail_cache()
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.payload = b"x" * (64 * 1024)
+        tail_start, tail_size = 48 * 1024, 16 * 1024
+        calls = []
+        original = self.owner._cloud_drive.resolve_download_link
+
+        def counting(item):
+            calls.append(item)
+            return original(item)
+
+        self.owner._cloud_drive.resolve_download_link = counting
+        with patch.object(_proxy, "_RELAY_TAIL_CACHE", tail_size), \
+                patch.object(_proxy, "_RELAY_TAIL_TRIGGER", 32 * 1024):
+            first = self.fetch(headers={"Range": f"bytes={tail_start}-"})
+            self.assertEqual((first[0], len(first[2])), (206, tail_size))
+            self.assertEqual(first[2], self.payload[tail_start:])
+            received_after_first = len(self.received)
+            calls_after_first = len(calls)
+            second = self.fetch(headers={"Range": f"bytes={tail_start}-"})
+            self.assertEqual((second[0], second[2]), (206, self.payload[tail_start:]))
+            self.assertEqual(second[1]["Content-Range"], f"bytes {tail_start}-65535/65536")
+            self.assertEqual(len(self.received), received_after_first)   # 零上游
+            self.assertEqual(len(calls), calls_after_first)              # 零取链
+
+    def test_tail_cache_switch_can_be_turned_off(self):
+        """部署配置默认启用；把开关置 0 即完全旁路，一键回到第一批行为。"""
+        cache = _proxy._tail_cache()
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.assertGreater(_proxy._RELAY_TAIL_CACHE, 0)
+        with patch.object(_proxy, "_RELAY_TAIL_CACHE", 0):
+            stream = Mock()
+            self.assertIs(_proxy._wrap_tail(stream, ("quark", "fid"), "GET",
+                                            1024, 2047, 4096, '"v1"'), stream)
+            self.assertIsNone(cache.hit(("quark", "fid"), "GET", {"Range": "bytes=1024-"}))
+
+    def spy_logger(self):
+        logger = logging.Logger("strm-relay-e2e", level=logging.WARNING)
+        logger.propagate = False
+        patcher = patch.object(_proxy, "logger", logger)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return logger
+
+    def test_upstream_read_failure_logs_read_line(self):
+        """上游谎报范围：续传总失败，客户端收到截断响应，日志只记“读取中断”。"""
+        logger = self.spy_logger()
+        # 模拟 CDN 对每次请求都声称同一范围、只给 4 字节正文：首发通过校验，
+        # 续传偏移与声称范围不匹配 → 重试耗尽 → OSError。
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.bind(("127.0.0.1", 0))
+        raw.listen(5)
+        raw.settimeout(0.5)
+        stop = threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    conn, _ = raw.accept()
+                except (socket.timeout, OSError):
+                    continue
+                try:
+                    try:
+                        conn.recv(65536)
+                    except OSError:
+                        pass
+                    response = (b"HTTP/1.1 206 Partial Content\r\n"
+                                b"Content-Range: bytes 0-37/38\r\n"
+                                b"Content-Length: 4\r\n"
+                                b"ETag: \"version-one\"\r\n"
+                                b"Content-Type: video/mp4\r\n"
+                                b"Accept-Ranges: bytes\r\n\r\n0123")
+                    conn.sendall(response)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+            raw.close()
+
+        worker = Thread(target=serve, daemon=True)
+        worker.start()
+        self.owner._cloud_drive.resolve_download_link = lambda item: (
+            f"http://127.0.0.1:{raw.getsockname()[1]}/video",
+            {"Cookie": "session=secret", "User-Agent": "Quark-PC"})
+        self.addCleanup(stop.set)
+        self.addCleanup(worker.join, timeout=2)
+        with self.assertLogs(logger, level="WARNING") as captured:
+            with self.assertRaises(http.client.IncompleteRead):
+                self.fetch()
+        self.assertTrue(any("夸克播放中转读取中断" in m for m in captured.output))
+
+    def test_client_disconnect_is_silent(self):
+        """播放器停止/跳播断开连接：写侧静默，无任何 WARNING 日志。"""
+        logger = self.spy_logger()
+        self.payload = b"0" * (32 * 1024 * 1024)
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.server_port, timeout=10)
+        try:
+            conn.request("GET", "/d/file-id")
+            conn.getresponse().read(4096)  # 读完头部后立即放弃
+        finally:
+            conn.close()
+        with self.assertNoLogs(logger, level="WARNING"):
+            time.sleep(2.0)  # 给服务端循环留出发送/触错的时间
+
     def test_connection_error_returns_502_without_private_url(self):
         with patch.object(_proxy, "urlopen", side_effect=OSError("private-signed-url")):
             code, _, body = self.fetch()
         self.assertEqual(code, 502)
         self.assertNotIn(b"private-signed-url", body)
+
+
+class TestTailCache(unittest.TestCase):
+    """尾部缓存：纯内存命中、版本失效、If-Range 校验与 LRU 上限。"""
+
+    def setUp(self):
+        self.cache = _proxy._TailCache()
+        self.file_key = ("quark", "fid-1")
+        self.base = {"Content-Type": "video/mp4", "ETag": '"v1"',
+                     "Accept-Ranges": "bytes"}
+        self.cache.note_size(self.file_key, 1000, '"v1"', self.base)
+        patcher = patch.object(_proxy, "_RELAY_TAIL_CACHE", 64)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        trigger = patch.object(_proxy, "_RELAY_TAIL_TRIGGER", 128)
+        trigger.start()
+        self.addCleanup(trigger.stop)
+
+    def key(self, total=1000, validator='"v1"'):
+        return self.cache._entry_key(self.file_key, total, validator)
+
+    def publish(self, key, data, start):
+        owner = self.cache.begin(key)
+        self.assertIsNotNone(owner)
+        self.cache.publish(key, data, start, owner=owner)
+
+    def test_publish_then_hit_serves_exact_bytes(self):
+        key = self.key()
+        self.publish(key, b"0123456789", start=990)
+        result = self.cache.hit(self.file_key, "GET", {"Range": "bytes=992-999"})
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status_code, 206)
+        self.assertEqual(result.headers["Content-Range"], "bytes 992-999/1000")
+        self.assertEqual(result.headers["Content-Length"], "8")
+        self.assertEqual(result.upstream.read(), b"23456789")
+
+    def test_hit_outside_cached_window_misses(self):
+        self.publish(self.key(), b"0123456789", start=990)
+        self.assertIsNone(self.cache.hit(self.file_key, "GET", {"Range": "bytes=980-"}))
+
+    def test_if_range_mismatch_misses(self):
+        self.publish(self.key(), b"0123456789", start=990)
+        self.assertIsNone(self.cache.hit(
+            self.file_key, "GET", {"Range": "bytes=995-", "If-Range": '"v2"'}))
+
+    def test_file_version_change_drops_old_bytes(self):
+        self.publish(self.key(), b"0123456789", start=990)
+        self.cache.note_size(self.file_key, 1000, '"v2"', self.base)
+        self.assertIsNone(self.cache.hit(self.file_key, "GET", {"Range": "bytes=995-"}))
+
+    def test_pending_request_waits_for_warm_to_finish(self):
+        key = self.key()
+        owner = self.cache.begin(key)
+
+        def finish():
+            time.sleep(0.05)
+            self.cache.publish(key, b"0123456789", start=990, owner=owner)
+
+        worker = Thread(target=finish, daemon=True)
+        worker.start()
+        result = self.cache.hit(self.file_key, "GET", {"Range": "bytes=995-"})
+        worker.join(timeout=2)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.upstream.read(), b"56789")
+
+    def test_lru_caps_cached_files(self):
+        with patch.object(_proxy, "_RELAY_TAIL_CACHE_FILES", 2):
+            for number in range(3):
+                file_key = ("quark", f"f{number}")
+                self.cache.note_size(file_key, 1000, '"v1"', self.base)
+                self.publish((*file_key, 1000, '"v1"'), b"0123456789", start=990)
+            self.assertEqual(len(self.cache._entries), 2)
+            self.assertNotIn(("quark", "f0", 1000, '"v1"'), self.cache._entries)
+
+
+class TestTailCapture(unittest.TestCase):
+    """客户端断开后由后台线程把同一条响应读完，失败静默、不改变播放语义。"""
+
+    def setUp(self):
+        patcher = patch.object(_proxy, "_RELAY_TAIL_CACHE", 8)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cache = _proxy._TailCache()
+        self.key = ("quark", "fid", 1000, '"v1"')
+        self.cache.note_size(self.key[:2], 1000, '"v1"', {})
+
+    def test_disconnect_keeps_reading_same_response(self):
+        class Upstream:
+            def __init__(self):
+                self.parts = iter([b"abcd", b"efgh", b""])
+
+            def read(self, size):
+                return next(self.parts)
+
+            def close(self):
+                pass
+
+        capture = _proxy._TailCapture(Upstream(), self.cache, self.key, 990, 8)
+        self.assertEqual(capture.read(), b"abcd")       # 客户端只拿到一半就断开
+        capture.close()                                 # 模拟 _relay 的 finally
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and self.key not in self.cache._entries:
+            time.sleep(0.01)
+        self.assertIn(self.key, self.cache._entries)
+        self.assertEqual(self.cache._entries[self.key][0], b"abcdefgh")
+
+    def test_failure_is_silent_and_does_not_publish(self):
+        upstream = Mock()
+        upstream.read.side_effect = OSError("upstream reset")
+        capture = _proxy._TailCapture(upstream, self.cache, self.key, 990, 8)
+        with self.assertRaises(OSError):
+            capture.read()
+        capture.close()
+        self.assertNotIn(self.key, self.cache._entries)
 
 
 class TestSharedPlaybackReference(unittest.TestCase):
