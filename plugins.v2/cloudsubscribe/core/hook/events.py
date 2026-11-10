@@ -56,9 +56,6 @@ class PluginEventHandler(OwnerDelegator):
     ) -> bool:
         context = event_data.context
         torrent_info = context.torrent_info
-        if "magnet" not in (self._resource_type_order or []):
-            logger.debug("接管平台资源下载失败：资源类型优先级未启用 Magnet")
-            return False
 
         from app.chain.download import DownloadChain
 
@@ -928,12 +925,15 @@ class PluginEventHandler(OwnerDelegator):
                     )
                 except Exception as error:
                     logger.error(f"接管平台资源下载异常：{error}")
-            event_data.cancel = True
-            event_data.source = "CloudSubscribe-平台资源下载接管"
-            event_data.reason = (
-                "平台资源已提交插件离线下载"
-                if takeover_success else "平台资源下载接管失败，已阻止平台下载"
-            )
+            if takeover_success:
+                event_data.cancel = True
+                event_data.source = "CloudSubscribe-平台资源下载接管"
+                event_data.reason = "平台资源已提交插件离线下载"
+            else:
+                # 接管失败时放行平台下载：拦下只会导致订阅彻底没有下载来源。
+                logger.warning(
+                    f"平台资源下载接管失败，已放行平台下载：{torrent.title}"
+                )
             return
 
         if all_plugin_managed and policy == "block":
