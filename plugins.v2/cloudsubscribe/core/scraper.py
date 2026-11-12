@@ -1,7 +1,7 @@
 """基于TMDB 刮削器批量生成本地媒体元数据。"""
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Callable, Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Optional, Union
 
 from app.core.config import settings
 from app.core.metainfo import MetaInfoPath
@@ -34,11 +34,14 @@ class MediaScraper:
             if names:
                 logger.debug(f"{kind} {len(names)} 个：{names}")
 
-    def _write_missing(self, path: Path, content: bytes) -> bool:
+    def _write_missing(self, path: Path, content: Union[bytes, str]) -> bool:
         if path.exists():
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(f"{path.suffix}.tmp")
+        # MoviePilot v2 的 get_metadata_nfo 返回 bytes，v3 返回 str
+        if isinstance(content, str):
+            content = content.encode("utf-8")
         temp_path.write_bytes(content)
         temp_path.replace(path)
         self._note("元数据写入", path.name)
