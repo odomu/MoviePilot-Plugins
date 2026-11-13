@@ -2,6 +2,7 @@
 
 import io
 import re
+import time
 from threading import Thread
 from typing import Any, Dict, Optional, Tuple
 
@@ -213,6 +214,13 @@ class PluginEventHandler(OwnerDelegator):
             "buttons": buttons,
             "disable_web_page_preview": True,
         }
+        if buttons:
+            # 直发通道会丢弃内联按钮，带按钮时只能走消息队列。
+            try:
+                self.post_message(**message_args)
+                return
+            except Exception as error:
+                logger.warning(f"带按钮通知发送失败，回退直发：{error}")
         try:
             response = self.chain.send_direct_message(Notification(
                 **message_args,
@@ -277,26 +285,36 @@ class PluginEventHandler(OwnerDelegator):
             title: str,
             text: str,
             buttons: Optional[list] = None,
+            fallback_post: bool = False,
     ) -> bool:
+        """更新卡片/进度消息：等 Telegram 编辑间隔并重试，必要时补发带按钮消息。"""
         progress_message = event_data.get("progress_message") or {}
-        if not progress_message:
+        if progress_message:
+            metadata = dict(progress_message.get("metadata") or {})
+            # Telegram 单条消息编辑有 2 秒最小间隔；等待比直接失败更稳。
+            metadata.setdefault("telegram_wait_for_edit_interval", True)
+            for attempt in range(2):
+                try:
+                    if self.chain.edit_message(
+                            channel=progress_message.get("channel")
+                            or event_data.get("channel"),
+                            source=progress_message.get("source")
+                            or event_data.get("source"),
+                            message_id=progress_message.get("message_id"),
+                            chat_id=progress_message.get("chat_id"),
+                            title=title,
+                            text=text,
+                            buttons=buttons if buttons is not None else [],
+                            metadata=metadata,
+                    ):
+                        return True
+                except Exception as error:
+                    logger.debug(f"进度消息更新异常：{error}")
+                if attempt == 0:
+                    time.sleep(0.8)
+            logger.warning("进度消息更新失败")
+        if not fallback_post:
             return False
-        try:
-            edited = self.chain.edit_message(
-                channel=progress_message.get("channel") or event_data.get("channel"),
-                source=progress_message.get("source") or event_data.get("source"),
-                message_id=progress_message.get("message_id"),
-                chat_id=progress_message.get("chat_id"),
-                title=title,
-                text=text,
-                buttons=buttons if buttons is not None else [],
-                metadata=progress_message.get("metadata"),
-            )
-            if edited:
-                return True
-            logger.warning("Telegram 进度消息更新失败，将发送普通通知")
-        except Exception as error:
-            logger.warning(f"Telegram 进度消息更新异常，将发送普通通知：{error}")
         self._post_command_message(
             event_data,
             title,
@@ -510,12 +528,8 @@ class PluginEventHandler(OwnerDelegator):
         return items
 
     def on_message_action(self, event: Event) -> None:
-        """处理 Telegram TMDB 候选按钮回调。"""
-        if (
-                not event
-                or not self._enabled
-                or not self._direct_transfer_enabled
-        ):
+        """处理 Telegram TMDB 候选按钮与智能体搜索卡片回调。"""
+        if not event or not self._enabled:
             return
         event_data = event.event_data or {}
         plugin_id = str(event_data.get("plugin_id") or "").strip().lower()
@@ -523,6 +537,17 @@ class PluginEventHandler(OwnerDelegator):
         if plugin_id and plugin_id != own_plugin_id:
             return
         parts = str(event_data.get("text") or "").strip().split("|")
+        if len(parts) == 2 and parts[0] == "cc":
+            self._handle_card_close(event_data, parts)
+            return
+        if len(parts) == 3 and parts[0] in {"cs", "cx"}:
+            self._handle_agent_search_action(event_data, parts)
+            return
+        if len(parts) == 4 and parts[0] == "cm":
+            self._handle_media_selection_action(event_data, parts)
+            return
+        if not self._direct_transfer_enabled:
+            return
         if len(parts) != 4 or parts[0] != "cl":
             return
         media_type = {"m": "movie", "t": "tv"}.get(parts[2])
@@ -558,6 +583,181 @@ class PluginEventHandler(OwnerDelegator):
             daemon=True,
             name="cloudsubscribe-telegram-link-select",
         ).start()
+
+    def _handle_card_close(self, event_data: dict, parts: list) -> None:
+        """关闭卡片：回收缓存并删除原消息，不留下任何提示。"""
+        card_id = parts[1]
+        self.close_agent_card(card_id)
+        message_id = event_data.get("original_message_id")
+        chat_id = event_data.get("original_chat_id") or event_data.get("chat_id")
+        if message_id is not None and chat_id is not None:
+            try:
+                if self.chain.delete_message(
+                        channel=event_data.get("channel"),
+                        source=event_data.get("source"),
+                        message_id=message_id,
+                        chat_id=chat_id,
+                ):
+                    return
+            except Exception as error:
+                logger.warning(f"删除搜索卡片失败：{error}")
+        # 渠道不支持删除时退化为清空按钮的最小提示。
+        close_event = dict(event_data)
+        if message_id is not None and chat_id is not None:
+            close_event["progress_message"] = {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "channel": event_data.get("channel"),
+                "source": event_data.get("source"),
+                "metadata": event_data.get("metadata"),
+            }
+        self._edit_progress_message(
+            close_event,
+            "【网盘订阅】搜索候选",
+            "已关闭",
+            buttons=[],
+        )
+
+    def _handle_agent_search_action(self, event_data: dict, parts: list) -> None:
+        """处理智能体搜索卡片的翻页与候选提交按钮。"""
+        action, search_id, value = parts
+        progress_message = {
+            "message_id": event_data.get("original_message_id"),
+            "chat_id": event_data.get("original_chat_id") or event_data.get("chat_id"),
+            "channel": event_data.get("channel"),
+            "source": event_data.get("source"),
+            "metadata": event_data.get("metadata"),
+        }
+        submit_event = dict(event_data)
+        if (
+                progress_message["message_id"] is not None
+                and progress_message["chat_id"] is not None
+        ):
+            submit_event["progress_message"] = progress_message
+        if action == "cs":
+            try:
+                page_number = int(value)
+            except (TypeError, ValueError):
+                page_number = 1
+            page = self.render_agent_search_page(search_id, page_number)
+            self._edit_progress_message(
+                submit_event,
+                "【网盘订阅】搜索候选",
+                str(page.get("text") or page.get("message") or "候选已过期"),
+                buttons=page.get("buttons") or [],
+                fallback_post=True,
+            )
+            return
+        candidate_id = str(value or "").strip()
+        if not candidate_id:
+            return
+        if not self._direct_transfer_enabled:
+            self._edit_progress_message(
+                submit_event,
+                "【网盘订阅】搜索候选",
+                "平台下载接管已关闭，无法通过按钮提交候选。",
+                buttons=[],
+                fallback_post=True,
+            )
+            return
+        self._edit_progress_message(
+            submit_event,
+            "【网盘订阅】正在提交资源",
+            f"正在提交候选 {candidate_id}，请稍候。",
+            buttons=[],
+            fallback_post=True,
+        )
+        Thread(
+            target=self._submit_agent_candidate,
+            args=(submit_event, search_id, candidate_id),
+            daemon=True,
+            name="cloudsubscribe-agent-candidate",
+        ).start()
+
+    def _handle_media_selection_action(self, event_data: dict, parts: list) -> None:
+        """处理多义标题的媒体选择按钮，选定后继续搜索资源。"""
+        _, selection_id, media_code, tmdb_value = parts
+        if media_code not in {"m", "t"} or not str(tmdb_value).isdigit():
+            return
+        progress_message = {
+            "message_id": event_data.get("original_message_id"),
+            "chat_id": event_data.get("original_chat_id") or event_data.get("chat_id"),
+            "channel": event_data.get("channel"),
+            "source": event_data.get("source"),
+            "metadata": event_data.get("metadata"),
+        }
+        submit_event = dict(event_data)
+        if (
+                progress_message["message_id"] is not None
+                and progress_message["chat_id"] is not None
+        ):
+            submit_event["progress_message"] = progress_message
+        self._edit_progress_message(
+            submit_event,
+            "【网盘订阅】正在搜索候选",
+            "已确认媒体，正在搜索网盘资源，请稍候。",
+            buttons=[],
+            fallback_post=True,
+        )
+        Thread(
+            target=self._run_selected_media_search,
+            args=(submit_event, selection_id, int(tmdb_value)),
+            daemon=True,
+            name="cloudsubscribe-agent-media-select",
+        ).start()
+
+    def _run_selected_media_search(
+            self,
+            event_data: dict,
+            selection_id: str,
+            tmdb_id: int,
+    ) -> None:
+        try:
+            result = self.search_selected_media(selection_id, tmdb_id)
+        except Exception as error:
+            logger.error(f"按所选媒体搜索失败：{error}")
+            result = {"success": False, "message": f"搜索失败：{error}"}
+        if not result.get("success"):
+            self._edit_progress_message(
+                event_data,
+                "【网盘订阅】搜索候选",
+                str(result.get("message") or "搜索失败"),
+                buttons=[],
+                fallback_post=True,
+            )
+            return
+        page = self.render_agent_search_page(result.get("search_id"), 1)
+        self._edit_progress_message(
+            event_data,
+            "【网盘订阅】搜索候选",
+            str(page.get("text") or result.get("message") or "资源搜索完成"),
+            buttons=page.get("buttons") or [],
+            fallback_post=True,
+        )
+
+    def _submit_agent_candidate(
+            self,
+            event_data: dict,
+            search_id: str,
+            candidate_id: str,
+    ) -> None:
+        try:
+            result = self.submit_agent_candidate(search_id, [candidate_id])
+        except Exception as error:
+            logger.error(f"网盘候选按钮提交失败：{error}")
+            result = {"success": False, "message": f"提交失败：{error}"}
+        data = result.get("data") or {}
+        lines = [str(result.get("message") or "候选提交结果未知")]
+        candidate_ids = list(data.get("candidate_ids") or [])
+        if candidate_ids:
+            lines.append(f"候选：{', '.join(candidate_ids)}")
+        self._edit_progress_message(
+            event_data,
+            "【网盘订阅】资源提交",
+            "\n".join(lines),
+            buttons=[],
+            fallback_post=True,
+        )
 
     def _run_remote_checkin(
             self,

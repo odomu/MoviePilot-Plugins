@@ -17,7 +17,8 @@ from app.db import SessionFactory
 from app.db.models.subscribe import Subscribe
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
-from app.schemas.types import MediaType
+from app.schemas import Notification
+from app.schemas.types import MediaType, NotificationType
 from app.utils.string import StringUtils
 
 from ...core import CloudDriveCapability, OwnerDelegator
@@ -25,20 +26,27 @@ from ...core.media import (
     get_subscribe_by_media,
     legacy_media_ids,
     media_identity,
+    media_server_tmdb_filters,
     tmdb_id_of,
 )
+from ...search.matching import missing_episode_coverage
 from ...search.types import (
     PREVIEW_PROVIDER_KEYS,
     resource_type_from_url,
     resource_type_name,
 )
 from ...utils.cache import create_platform_ttl_cache
+from ...utils.episodes import format_episode_ranges, season_total_episodes
 
 
 class PlatformIntegrationService(OwnerDelegator):
     """统一服务于页面、仪表盘、命令、工作流与智能体。"""
 
     _OVERVIEW_TTL_SECONDS = 3.0
+    # 搜索结果卡片/候选缓存有效期，过期后按钮回调会提示重新搜索。
+    _AGENT_CARD_TTL_SECONDS = 30 * 60
+    # 智能体搜索的总时长预算：已有候选时不再等待剩余慢渠道。
+    _AGENT_SEARCH_BUDGET_SECONDS = 20.0
     _RESOURCE_LINK_PATTERN = re.compile(
         r"ed2k://\|file\|.*?\|/|magnet:\?\S+|https?://\S+",
         re.IGNORECASE,
@@ -56,7 +64,19 @@ class PlatformIntegrationService(OwnerDelegator):
             "platform:agent_resources",
             owner,
             maxsize=256,
-            ttl=30 * 60,
+            ttl=int(self._AGENT_CARD_TTL_SECONDS),
+        )
+        self._agent_card_cache = create_platform_ttl_cache(
+            "platform:agent_cards",
+            owner,
+            maxsize=256,
+            ttl=int(self._AGENT_CARD_TTL_SECONDS),
+        )
+        self._agent_selection_cache = create_platform_ttl_cache(
+            "platform:agent_selections",
+            owner,
+            maxsize=128,
+            ttl=int(self._AGENT_CARD_TTL_SECONDS),
         )
         self._link_selection_cache = create_platform_ttl_cache(
             "platform:link_selections",
@@ -310,6 +330,7 @@ class PlatformIntegrationService(OwnerDelegator):
             media_type: Optional[MediaType],
             season: Optional[int],
             latest_season: bool,
+            tmdb_id: Optional[int] = None,
     ) -> Tuple[Any, Optional[MediaType], Optional[int]]:
         if subscribe:
             mediainfo, resolved_type, resolved_season = (
@@ -328,9 +349,16 @@ class PlatformIntegrationService(OwnerDelegator):
         if season is not None:
             meta.begin_season = season
         mediainfo = self._sync_handler._recognize_media_once(
-            ("agent", media_type.value if media_type else "", title, season or 0),
+            (
+                "agent",
+                media_type.value if media_type else "",
+                title,
+                season or 0,
+                int(tmdb_id or 0),
+            ),
             meta=meta,
             mtype=media_type,
+            tmdbid=int(tmdb_id) if tmdb_id else None,
             cache=True,
         )
         if not mediainfo:
@@ -352,6 +380,280 @@ class PlatformIntegrationService(OwnerDelegator):
                 or 1
             )
         return mediainfo, resolved_type, resolved_season
+
+    @staticmethod
+    @staticmethod
+    def _tmdb_total_episodes(
+            mediainfo: Any,
+            season: Optional[int],
+            subscribe: Any = None,
+    ) -> int:
+        """识别结果缺季集信息时，回查 TMDB 该季实际集数，避免用错误的历史总集数。"""
+        if season is None:
+            return 0
+        source = mediainfo if mediainfo else subscribe
+        try:
+            tmdb_id = int(tmdb_id_of(source) or 0)
+        except (TypeError, ValueError):
+            tmdb_id = 0
+        if tmdb_id <= 0:
+            return 0
+        try:
+            from app.chain.tmdb import TmdbChain
+        except Exception:
+            return 0
+        try:
+            episodes = TmdbChain().tmdb_episodes(
+                tmdbid=tmdb_id,
+                season=int(season),
+                episode_group=getattr(subscribe, "episode_group", None),
+            )
+        except Exception as error:
+            logger.debug(f"查询 TMDB 季集信息失败：{error}")
+            return 0
+        numbers = [
+            int(getattr(episode, "episode_number", 0) or 0)
+            for episode in episodes or []
+        ]
+        numbers = [number for number in numbers if number > 0]
+        return max(numbers) if numbers else 0
+
+    @staticmethod
+    def _library_episodes(mediainfo: Any, season: Optional[int]) -> Optional[set]:
+        """查询媒体库实际已入库集号；库中没有该剧或查询失败时返回 None。"""
+        if not mediainfo or season is None:
+            return None
+        try:
+            tmdb_id = int(tmdb_id_of(mediainfo) or 0)
+        except (TypeError, ValueError):
+            tmdb_id = 0
+        if tmdb_id <= 0:
+            return None
+        try:
+            from app.db import SessionFactory
+            from app.db.models.mediaserver import MediaServerItem
+        except Exception:
+            return None
+        try:
+            with SessionFactory() as db:
+                rows = db.query(MediaServerItem).filter(
+                    *media_server_tmdb_filters(MediaServerItem, [tmdb_id])
+                ).all()
+        except Exception as error:
+            logger.debug(f"读取媒体库集数失败：{error}")
+            return None
+        if not rows:
+            return None
+        episodes: set = set()
+        for row in rows:
+            seasoninfo = getattr(row, "seasoninfo", None) or {}
+            if not isinstance(seasoninfo, dict):
+                continue
+            values = (
+                seasoninfo.get(season)
+                or seasoninfo.get(str(season))
+                or []
+            )
+            for value in values or []:
+                if str(value).isdigit():
+                    episodes.add(int(value))
+        return episodes or None
+
+    def _subscribe_missing_episodes(
+            self,
+            subscribe: Any,
+            mediainfo: Any = None,
+    ) -> List[int]:
+        """计算缺集：优先媒体库实际入库集，其次订阅已下载记录。"""
+        if not subscribe:
+            return []
+        if str(getattr(subscribe, "type", "")) != MediaType.TV.value:
+            return []
+        season = int(getattr(subscribe, "season", 0) or 1)
+        total = season_total_episodes(mediainfo, season)
+        total_source = "识别结果"
+        if total <= 0:
+            total = self._tmdb_total_episodes(mediainfo, season, subscribe)
+            total_source = "TMDB"
+        if total <= 0:
+            total = int(getattr(subscribe, "total_episode", 0) or 0)
+            total_source = "订阅记录"
+        if total <= 0:
+            return []
+        start = max(1, int(getattr(subscribe, "start_episode", 1) or 1))
+        expected = set(range(start, total + 1))
+        library = self._library_episodes(mediainfo, season)
+        if library:
+            existing = library
+        else:
+            raw_note = getattr(subscribe, "note", None) or []
+            if isinstance(raw_note, str):
+                raw_note = re.findall(r"\d+", raw_note)
+            existing = {
+                int(value) for value in raw_note if str(value).isdigit()
+            }
+        missing = sorted(expected - existing)
+        logger.info(
+            f"订阅缺集计算：{getattr(subscribe, 'name', '') or '未命名'}"
+            f" S{season:02d} 总集={total}（来源={total_source}）"
+            f" 已入库={len(existing & expected)} 缺={len(missing)}"
+        )
+        return missing
+
+    def _source_label(self, source: Any) -> str:
+        """返回搜索渠道的展示名，用于卡片按钮标记来源。"""
+        key = str(source or "").strip()
+        if not key:
+            return "未知渠道"
+        try:
+            name = self._search_handler.get_source_display_name(key)
+        except Exception:
+            name = ""
+        return str(name or key).strip() or key.upper()
+
+    @staticmethod
+    def _coverage_sort_key(
+            resource: Dict[str, Any],
+            season: Optional[int],
+            targets: set,
+    ) -> tuple:
+        """缺集优先：能补齐 > 部分/未知 > 不覆盖，其次按覆盖集数倒序。"""
+        rank, covered = missing_episode_coverage(resource, season, targets)
+        return rank, -len(covered)
+
+    @staticmethod
+    def _coverage_label(covered: Optional[set], targets: set) -> str:
+        if not targets or covered is None:
+            return ""
+        if not covered:
+            return "未覆盖缺集"
+        if covered >= targets:
+            return "补齐缺集"
+        return f"覆盖 {len(covered)}/{len(targets)} 集"
+
+    @staticmethod
+    def _search_media_raw(
+            chain: Any,
+            title: str,
+            media_type: Optional[MediaType],
+    ) -> List[Any]:
+        """调用平台媒体搜索；v2 不支持 mtype 参数时自动降级。"""
+        try:
+            _, medias = chain.search(title, mtype=media_type)
+            return list(medias or [])
+        except TypeError:
+            try:
+                _, medias = chain.search(title)
+                return list(medias or [])
+            except Exception as error:
+                logger.warning(f"预搜索媒体失败：{error}")
+                return []
+        except Exception as error:
+            logger.warning(f"预搜索媒体失败：{error}")
+            return []
+
+    @staticmethod
+    def _search_media_by_meta(chain: Any, title: str) -> List[Any]:
+        """v3 提供的按元数据搜索入口，作为标题搜索的补充。"""
+        search_medias = getattr(chain, "search_medias", None)
+        if not callable(search_medias):
+            return []
+        try:
+            return list(search_medias(meta=MetaInfo(title)) or [])
+        except Exception as error:
+            logger.debug(f"按元数据预搜索媒体失败：{error}")
+            return []
+
+    def _media_search_candidates(
+            self,
+            title: str,
+            media_type: Optional[MediaType] = None,
+            limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """先查数据源的媒体候选，多义标题交给用户确认，避免匹配错媒体。"""
+        title = str(title or "").strip()
+        if not title:
+            return []
+        try:
+            from app.chain.media import MediaChain
+        except ImportError:
+            return []
+        chain = MediaChain()
+        medias = self._search_media_raw(chain, title, media_type)
+        if len(medias) <= 1:
+            # 标题搜索可能只返回一条，补充 v3 的元数据搜索，避免漏掉同名多义结果。
+            medias.extend(self._search_media_by_meta(chain, title))
+        candidates = []
+        seen = set()
+        for item in medias:
+            resolved_type = self._agent_media_type(getattr(item, "type", None))
+            if media_type and resolved_type != media_type:
+                continue
+            try:
+                tmdb_id = int(tmdb_id_of(item) or 0)
+            except (TypeError, ValueError):
+                tmdb_id = 0
+            name = str(getattr(item, "title", "") or "").strip()
+            year = getattr(item, "year", None)
+            key = (
+                tmdb_id,
+                name,
+                year,
+                resolved_type.value if resolved_type else "",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "tmdb_id": tmdb_id,
+                "title": name or title,
+                "year": year,
+                "media_type": resolved_type.value if resolved_type else "",
+                "media_type_name": (
+                    "电影" if resolved_type == MediaType.MOVIE
+                    else "电视剧" if resolved_type == MediaType.TV
+                    else ""
+                ),
+            })
+            if len(candidates) >= max(1, int(limit or 8)):
+                break
+        if candidates:
+            brief = "、".join(
+                "{name}{year}/{mtype}#{tmdb}".format(
+                    name=item["title"],
+                    year="({})".format(item["year"]) if item["year"] else "",
+                    mtype=item["media_type"] or "未知",
+                    tmdb=item["tmdb_id"],
+                )
+                for item in candidates
+            )
+            logger.info(
+                f"智能体预搜索媒体候选：{title} → {len(candidates)} 个（{brief}）"
+            )
+        else:
+            logger.info(f"智能体预搜索媒体候选：{title} → 0 个")
+        return candidates
+
+    def search_selected_media(
+            self,
+            selection_id: str,
+            tmdb_id: int,
+    ) -> Dict[str, Any]:
+        """用户在多义标题中选定 TMDB 媒体后继续搜索。"""
+        selection_id = str(selection_id or "").strip()
+        payload = self._agent_selection_cache.get(selection_id)
+        if not isinstance(payload, dict):
+            return {"success": False, "message": "媒体选择已过期，请重新搜索"}
+        return self.search_platform_resources(
+            session_id=str(payload.get("session_id") or ""),
+            subscribe_id=None,
+            title=str(payload.get("title") or ""),
+            media_type=str(payload.get("media_type") or ""),
+            season=payload.get("season"),
+            latest_season=bool(payload.get("latest_season")),
+            limit=int(payload.get("limit") or 20),
+            tmdb_id=int(tmdb_id),
+        )
 
     @staticmethod
     def _candidate_reason(resource: Dict[str, Any], index: int) -> List[str]:
@@ -388,6 +690,7 @@ class PlatformIntegrationService(OwnerDelegator):
             season: Optional[int] = None,
             latest_season: bool = False,
             limit: int = 20,
+            tmdb_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """按订阅或媒体名称搜索候选，并保存完整结果供智能体分步选择。"""
         started = time.monotonic()
@@ -408,6 +711,7 @@ class PlatformIntegrationService(OwnerDelegator):
             }
         if not requested_type and (season is not None or latest_season):
             requested_type = MediaType.TV
+        missing_targets: set = set()
         try:
             if not self._search_handler:
                 return {"success": False, "message": "搜索服务尚未就绪"}
@@ -422,12 +726,41 @@ class PlatformIntegrationService(OwnerDelegator):
                 return {"success": False, "message": match_error}
             if subscribe and not title:
                 title = str(getattr(subscribe, "name", "") or "").strip()
+            if not subscribe and not tmdb_id:
+                media_candidates = self._media_search_candidates(
+                    title, requested_type
+                )
+                if len(media_candidates) == 1:
+                    # 唯一命中直接锁定该媒体，避免后续识别再挑错。
+                    tmdb_id = int(media_candidates[0].get("tmdb_id") or 0) or None
+                elif len(media_candidates) > 1:
+                    selection_id = uuid4().hex[:10]
+                    self._agent_selection_cache[selection_id] = {
+                        "session_id": session_id,
+                        "title": title,
+                        "media_type": requested_type.value if requested_type else "",
+                        "season": season,
+                        "latest_season": bool(latest_season),
+                        "limit": int(limit),
+                        "candidates": media_candidates,
+                    }
+                    return {
+                        "success": False,
+                        "selection_required": True,
+                        "selection_id": selection_id,
+                        "message": (
+                            f"「{title}」匹配到 {len(media_candidates)} 个媒体，"
+                            "请先确认是哪一个"
+                        ),
+                        "candidates": media_candidates,
+                    }
             mediainfo, resolved_type, resolved_season = self._recognize_agent_media(
                 subscribe=subscribe,
                 title=title,
                 media_type=requested_type,
                 season=season,
                 latest_season=latest_season,
+                tmdb_id=tmdb_id,
             )
             if not mediainfo:
                 return {"success": False, "message": f"无法识别媒体：{title}"}
@@ -450,16 +783,23 @@ class PlatformIntegrationService(OwnerDelegator):
                     resolved_type,
                     resolved_season,
                 )
-            sources = self._search_handler.get_enabled_sources()
+            missing_targets = set(
+                self._subscribe_missing_episodes(subscribe, mediainfo)
+            )
+            sources = self._search_handler.get_enabled_sources(resolved_type)
             if not sources:
                 return {"success": False, "message": "没有可用的搜索源"}
+            search_deadline = time.monotonic() + self._AGENT_SEARCH_BUDGET_SECONDS
             source_results = self._search_handler.search_sources(
                 sources=sources,
                 mediainfo=mediainfo,
                 media_type=resolved_type,
                 season=resolved_season,
+                target_episodes=sorted(missing_targets) or None,
                 subscribe=subscribe,
+                deadline=search_deadline,
             )
+            budget_exhausted = time.monotonic() >= search_deadline
             resources = []
             for source_priority, source in enumerate(sources, start=1):
                 for source_position, resource in enumerate(
@@ -470,7 +810,29 @@ class PlatformIntegrationService(OwnerDelegator):
                     item["source_priority"] = source_priority
                     item["source_position"] = source_position
                     resources.append(item)
-            resources = resources[: max(1, min(int(limit or 20), 50))]
+            if missing_targets:
+                # 命中缺集越多越靠前；其余保持原有来源优先级顺序（稳定排序）。
+                resources.sort(
+                    key=lambda item: self._coverage_sort_key(
+                        item, resolved_season, missing_targets
+                    )
+                )
+            # 同一标题/类型/大小的资源常被多个渠道同时搜到，只保留排序最靠前的一条。
+            deduped = []
+            seen_resources = set()
+            for item in resources:
+                dedupe_key = (
+                    self._normalize_agent_title(item.get("title")),
+                    str(
+                        item.get("resource_type") or item.get("pan_type") or ""
+                    ).lower(),
+                    str(item.get("size") or ""),
+                )
+                if dedupe_key in seen_resources:
+                    continue
+                seen_resources.add(dedupe_key)
+                deduped.append(item)
+            resources = deduped[: max(1, min(int(limit or 20), 50))]
         except Exception as error:
             logger.error(f"智能体搜索网盘资源失败：{error}")
             return {"success": False, "message": "搜索资源失败，请检查媒体信息和搜索源配置"}
@@ -503,6 +865,7 @@ class PlatformIntegrationService(OwnerDelegator):
                 "candidate_id": candidate_id,
                 "title": str(item.get("title") or "未知资源"),
                 "source": str(item.get("source") or "unknown"),
+                "source_name": self._source_label(item.get("source")),
                 "rank": index + 1,
                 "source_priority": int(item.get("source_priority") or 0),
                 "source_position": int(item.get("source_position") or 0),
@@ -521,6 +884,14 @@ class PlatformIntegrationService(OwnerDelegator):
                 "transferable": bool(bound_subscribe_id and available),
                 "recommendation_reasons": self._candidate_reason(item, index),
             }
+            covered = missing_episode_coverage(
+                item, resolved_season, missing_targets
+            )[1] if missing_targets else None
+            if missing_targets:
+                candidate["covered_missing"] = sorted(covered or [])
+                candidate["coverage_label"] = self._coverage_label(
+                    covered, missing_targets
+                )
             candidates.append(candidate)
             available_count += available
             transferable_count += candidate["transferable"]
@@ -562,16 +933,33 @@ class PlatformIntegrationService(OwnerDelegator):
             "latest_update_time": latest_update_time,
             "by_source": dict(source_counts),
             "by_resource_type": dict(resource_type_counts),
+            "partial": bool(budget_exhausted),
+        }
+        missing_episodes = sorted(missing_targets)
+        if missing_episodes:
+            summary["missing_count"] = len(missing_episodes)
+            summary["missing_text"] = format_episode_ranges(missing_episodes)
+        self._agent_card_cache[search_id] = {
+            "session_id": session_id,
+            "subscribe_id": bound_subscribe_id,
+            "media": media,
+            "candidates": candidates,
+            "summary": summary,
+            "missing_episodes": missing_episodes,
         }
         logger.info(
             f"智能体资源搜索完成：{media['title']}"
             f"{f' S{resolved_season:02d}' if resolved_season else ''}，"
             f"订阅 {bound_subscribe_id or '未绑定'}，候选 {len(candidates)} 个，"
             f"耗时 {int((time.monotonic() - started) * 1000)} ms"
+            + ("（部分渠道未在预算内返回）" if budget_exhausted else "")
         )
         return {
             "success": True,
-            "message": "资源搜索完成",
+            "message": (
+                "资源搜索完成，部分渠道未在预算内返回"
+                if budget_exhausted else "资源搜索完成"
+            ),
             "search_id": search_id,
             "media": media,
             "summary": summary,
@@ -645,6 +1033,259 @@ class PlatformIntegrationService(OwnerDelegator):
         data["candidate_ids"] = list(dict.fromkeys(candidate_ids))
         result["data"] = data
         return result
+
+    def _agent_card_payload(self, search_id: str) -> Optional[Dict[str, Any]]:
+        search_id = str(search_id or "").strip()
+        if not search_id:
+            return None
+        payload = self._agent_card_cache.get(search_id)
+        return payload if isinstance(payload, dict) else None
+
+    _DECORATION_RE = re.compile(
+        "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\uFE0F\u2728]"
+    )
+
+    @classmethod
+    def _clean_display_text(cls, value: Any) -> str:
+        """去掉标题里的装饰性表情与多余空白，避免卡片出现多余图标。"""
+        text = cls._DECORATION_RE.sub(" ", str(value or ""))
+        return " ".join(text.split())
+
+    @staticmethod
+    def _clip_button_text(value: str, limit: int = 60) -> str:
+        """Telegram 按钮文本上限 64 字符，这里留出余量并保持单行。"""
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit - 1]}…"
+
+    def close_agent_card(self, card_id: str) -> None:
+        """关闭卡片并回收候选缓存，避免过期按钮继续提交。"""
+        card_id = str(card_id or "").strip()
+        if not card_id:
+            return
+        payload = self._agent_card_cache.pop(card_id, None)
+        if isinstance(payload, dict):
+            session_id = str(payload.get("session_id") or "")
+            self._agent_resource_cache.pop(
+                self._agent_cache_key(session_id, card_id), None
+            )
+        self._agent_selection_cache.pop(card_id, None)
+
+    def render_media_selection(self, selection_id: str) -> Dict[str, Any]:
+        """渲染“多义标题”选择卡片：信息全部放在按钮上，正文只留一行提示。"""
+        selection_id = str(selection_id or "").strip()
+        payload = self._agent_selection_cache.get(selection_id)
+        if not isinstance(payload, dict):
+            return {
+                "success": False,
+                "expired": True,
+                "text": "媒体选择已过期，请重新搜索。",
+                "buttons": [],
+            }
+        candidates = list(payload.get("candidates") or [])
+        title = str(payload.get("title") or "目标媒体")
+        plugin_id = self._owner.__class__.__name__
+        buttons = []
+        for item in candidates[:10]:
+            year = f" ({item.get('year')})" if item.get("year") else ""
+            type_name = str(item.get("media_type_name") or "").strip()
+            name = f"{item.get('title')}{year}"
+            label = f"{type_name} · {name}" if type_name else name
+            code = (
+                "m" if item.get("media_type") == MediaType.MOVIE.value else "t"
+            )
+            try:
+                tmdb_id = int(item.get("tmdb_id") or 0)
+            except (TypeError, ValueError):
+                tmdb_id = 0
+            if tmdb_id <= 0:
+                continue
+            buttons.append([{
+                "text": self._clip_button_text(label),
+                "callback_data": (
+                    f"[PLUGIN]{plugin_id}|cm|{selection_id}|{code}|{tmdb_id}"
+                ),
+            }])
+        if not buttons:
+            return {
+                "success": False,
+                "text": "没有可用于确认的 TMDB 候选，请补充年份或 TMDB ID。",
+                "buttons": [],
+            }
+        buttons.append([{
+            "text": "关闭",
+            "callback_data": f"[PLUGIN]{plugin_id}|cc|{selection_id}",
+        }])
+        return {
+            "success": True,
+            "text": f"「{title}」匹配到 {len(buttons)} 个媒体，请点击选择",
+            "buttons": buttons,
+        }
+
+    def render_agent_search_page(
+            self,
+            search_id: str,
+            page: int = 1,
+            page_size: int = 5,
+    ) -> Dict[str, Any]:
+        """渲染分页候选卡片：候选详情全部落在按钮上，正文只保留一行状态。"""
+        payload = self._agent_card_payload(search_id)
+        if not payload:
+            return {
+                "success": False,
+                "expired": True,
+                "message": "候选已过期，请重新搜索",
+                "text": "候选已过期，请重新搜索。",
+                "buttons": [],
+            }
+        candidates = list(payload.get("candidates") or [])
+        summary = payload.get("summary") or {}
+        media = payload.get("media") or {}
+        page_size = max(1, int(page_size or 5))
+        total_pages = max(1, (len(candidates) + page_size - 1) // page_size)
+        page = min(max(1, int(page or 1)), total_pages)
+        start = (page - 1) * page_size
+        heading = str(media.get("title") or "未知媒体")
+        if media.get("season"):
+            heading += f" S{int(media['season']):02d}"
+        header = (
+            f"{heading} · {summary.get('total', len(candidates))} 个候选"
+            f" · 第 {page}/{total_pages} 页"
+        )
+        if summary.get("partial"):
+            header += " · 部分渠道未返回"
+        if not payload.get("subscribe_id"):
+            header += " · 未绑定订阅"
+        missing = list(payload.get("missing_episodes") or [])
+        if missing:
+            header += (
+                f"\n缺集：{format_episode_ranges(missing)}"
+                f" · 缺 {len(missing)} 集"
+            )
+        plugin_id = self._owner.__class__.__name__
+        buttons = []
+        for candidate in candidates[start:start + page_size]:
+            points = int(candidate.get("unlock_points") or 0)
+            cost = f"{points}积分" if points else ""
+            definition = str(
+                candidate.get("resolution") or candidate.get("quality") or ""
+            ).strip()
+            size = ""
+            try:
+                size_bytes = int(
+                    StringUtils.num_filesize(candidate.get("size")) or 0
+                )
+            except (TypeError, ValueError):
+                size_bytes = 0
+            if size_bytes > 0:
+                try:
+                    size = str(StringUtils.format_size(size_bytes) or "")
+                except Exception:
+                    size = ""
+            title = self._clean_display_text(
+                candidate.get("title") or "未知资源"
+            )
+            source_name = self._clean_display_text(
+                candidate.get("source_name") or candidate.get("source") or ""
+            )
+            prefix = f"[{source_name}] " if source_name else ""
+            extras = [
+                value
+                for value in (
+                    str(candidate.get("resource_type") or "").upper(),
+                    str(candidate.get("coverage_label") or "").strip(),
+                    definition,
+                    size,
+                    cost,
+                )
+                if value and value != "0 B"
+            ]
+            tail = " · ".join(extras)
+            budget = 56 - len(tail) - 3 - len(prefix)
+            if budget > 8:
+                label = f"{prefix}{self._clip_button_text(title, budget)} · {tail}"
+            else:
+                label = " · ".join([f"{prefix}{title}", *extras])
+            buttons.append([{
+                "text": self._clip_button_text(label, 60),
+                "callback_data": (
+                    f"[PLUGIN]{plugin_id}|cx|{search_id}|"
+                    f"{candidate.get('candidate_id')}"
+                ),
+            }])
+        if total_pages > 1:
+            nav = []
+            if page > 1:
+                nav.append({
+                    "text": "上一页",
+                    "callback_data": f"[PLUGIN]{plugin_id}|cs|{search_id}|{page - 1}",
+                })
+            nav.append({
+                "text": f"{page}/{total_pages}",
+                "callback_data": f"[PLUGIN]{plugin_id}|cs|{search_id}|{page}",
+            })
+            if page < total_pages:
+                nav.append({
+                    "text": "下一页",
+                    "callback_data": f"[PLUGIN]{plugin_id}|cs|{search_id}|{page + 1}",
+                })
+            buttons.append(nav)
+        buttons.append([{
+            "text": "关闭",
+            "callback_data": f"[PLUGIN]{plugin_id}|cc|{search_id}",
+        }])
+        return {
+            "success": True,
+            "text": header,
+            "buttons": buttons,
+            "page": page,
+            "total_pages": total_pages,
+        }
+
+    def submit_agent_candidate(
+            self,
+            search_id: str,
+            candidate_ids: List[str],
+    ) -> Dict[str, Any]:
+        """按钮回调提交候选：会话归属取自卡片缓存。"""
+        payload = self._agent_card_payload(search_id)
+        if not payload:
+            return {"success": False, "message": "候选已过期，请重新搜索"}
+        return self.select_platform_resources(
+            str(payload.get("session_id") or ""),
+            search_id,
+            candidate_ids,
+        )
+
+    def post_agent_card(
+            self,
+            channel: Any,
+            source: Any,
+            userid: Any,
+            username: Any,
+            text: str,
+            buttons: Optional[List[List[Dict[str, Any]]]] = None,
+            title: str = "网盘资源搜索",
+    ) -> bool:
+        """补发带按钮的卡片：编辑通道不可用时由消息队列发送普通通知（支持按钮）。"""
+        try:
+            self.chain.post_message(Notification(
+                mtype=NotificationType.Plugin,
+                channel=channel,
+                source=source,
+                title=title,
+                text=text,
+                userid=userid,
+                username=username,
+                buttons=buttons or None,
+                disable_web_page_preview=True,
+                save_history=False,
+            ))
+            return True
+        except Exception as error:
+            logger.warning(f"智能体搜索卡片补发失败：{error}")
+            return False
 
     def get_runtime_performance(self, include_tasks: bool = True) -> Dict[str, Any]:
         """汇总当前任务、搜索缓存和同步阶段性能指标。"""

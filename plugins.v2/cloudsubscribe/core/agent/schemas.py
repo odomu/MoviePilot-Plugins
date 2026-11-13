@@ -111,6 +111,11 @@ class CloudSubscribeResourceSearchInput(BaseModel):
         default=False,
         description="是否搜索电视剧最新季；用户说“最新季”时设为 true",
     )
+    tmdb_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="已确认的 TMDB ID；多义标题由用户选定后传入，避免匹配错媒体",
+    )
     limit: int = Field(
         default=20,
         ge=1,

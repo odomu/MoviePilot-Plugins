@@ -20,7 +20,6 @@ from .schemas import (
     CloudSubscribeStatusInput,
     CloudSubscribeSyncInput,
 )
-from ...drive.common import format_size
 
 
 def _plugin():
@@ -203,13 +202,10 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
         ToolTag.Recommendation,
     ]
     description: str = (
-        "按媒体名称或订阅 ID 直接搜索网盘候选资源，支持指定电视剧季号或最新季，"
-        "返回候选列表、来源与类型汇总、"
-        "MoviePilot规则优先级、清晰度、大小、更新时间、解锁成本和推荐候选ID。"
-        "用户只提供媒体名称时直接调用本工具，不要先查询全部订阅。必须先调用本工具"
-        "再做AI筛选或推荐，并使用中文展示候选和解释推荐理由。"
-        "用户要手动选择时，支持按钮的渠道应调用 ask_user_choice，按钮值保留候选ID，"
-        "收到选择后使用本工具返回的 search_id 调用 cloudsubscribe_select_resources。"
+        "按媒体名称或订阅 ID 直接搜索网盘候选资源，支持指定电视剧季号或最新季。"
+        "会先按标题匹配媒体：命中多个时向用户发按钮确认，选定后才搜索资源；"
+        "结果以带按钮的分页卡片直接发给用户（每条候选一个按钮，⬅️➡️ 翻页），"
+        "用户点按钮即可提交。调用后只用一两句中文说明结论，禁止罗列候选或重复链接。"
         "未关联现有订阅的搜索只能展示和推荐，不能直接转存。"
     )
     args_schema: Type[BaseModel] = CloudSubscribeResourceSearchInput
@@ -223,50 +219,6 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
             season = f"第 {kwargs.get('season')} 季"
         return f"正在搜索 {target}{season} 的网盘候选资源"
 
-    @classmethod
-    def _format_search_message(cls, result: dict) -> str:
-        if not result.get("success"):
-            return str(result.get("message") or "网盘资源搜索失败")
-
-        media = result.get("media") or {}
-        summary = result.get("summary") or {}
-        candidates = result.get("candidates") or []
-        season = media.get("season")
-        heading = str(media.get("title") or "未知媒体")
-        if season:
-            heading += f" S{int(season):02d}"
-        lines = [
-            f"{heading}：找到 {summary.get('total', len(candidates))} 个网盘候选。"
-        ]
-        for item in candidates[:20]:
-            details = [
-                str(item.get("resource_type") or "unknown").upper(),
-                str(item.get("source") or "unknown"),
-            ]
-            definition = str(item.get("resolution") or item.get("quality") or "").strip()
-            if definition:
-                details.append(definition)
-            size = format_size(item.get("size"), default="未知")
-            if size != "未知":
-                details.append(size)
-            if item.get("update_time"):
-                details.append(str(item.get("update_time")))
-            points = int(item.get("unlock_points") or 0)
-            details.append(f"{points}积分" if points else "免费")
-            lines.append(
-                f"{item.get('candidate_id')}｜{item.get('title') or '未知资源'}\n"
-                f"  {' · '.join(details)}"
-            )
-
-        recommended = result.get("recommended_candidate_ids") or []
-        if recommended:
-            lines.append(f"推荐候选：{', '.join(recommended)}")
-        if media.get("subscribe_id"):
-            lines.append("回复要处理的候选 ID；也可以要求我比较后再选择。")
-        else:
-            lines.append("当前媒体未绑定订阅，只能查看候选，不能直接转存。")
-        return "\n\n".join(lines)
-
     async def run(
             self,
             subscribe_id: Optional[int] = None,
@@ -274,6 +226,7 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
             media_type: Optional[str] = None,
             season: Optional[int] = None,
             latest_season: bool = False,
+            tmdb_id: Optional[int] = None,
             limit: int = 20,
             **kwargs,
     ) -> str:
@@ -298,14 +251,59 @@ class CloudSubscribeResourceSearchTool(MoviePilotTool):
             season,
             latest_season,
             limit,
+            tmdb_id=tmdb_id,
         )
-        await self.send_tool_message(
-            self._format_search_message(result),
-            title="网盘资源搜索",
-        )
+        if result.get("selection_required"):
+            selection = plugin.render_media_selection(result.get("selection_id"))
+            text = str(selection.get("text") or result.get("message") or "请选择媒体")
+            buttons = selection.get("buttons") or []
+            reply = {
+                "success": False,
+                "selection_required": True,
+                "selection_id": result.get("selection_id"),
+                "candidates": result.get("candidates") or [],
+                "next_step": (
+                    "已向用户发出媒体选择按钮，请等待点击；不要自行猜测媒体，"
+                    "也不要重复输出候选列表。"
+                ),
+            }
+        elif not result.get("success"):
+            text = str(result.get("message") or "资源搜索失败")
+            buttons = []
+            reply = result
+        else:
+            page = plugin.render_agent_search_page(result.get("search_id"), 1)
+            text = str(page.get("text") or result.get("message") or "资源搜索完成")
+            buttons = page.get("buttons") or []
+            reply = result
+        posted = await self._deliver_card(plugin, text, buttons)
+        if not posted:
+            await self.send_tool_message(text, title="网盘资源搜索")
         self._agent_context["user_reply_sent"] = True
         self._agent_context["reply_mode"] = "cloudsubscribe_search"
-        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        return json.dumps(
+            reply,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    async def _deliver_card(self, plugin, text: str, buttons: list) -> bool:
+        """用消息队列直发带按钮的卡片：send_direct_message 不带按钮，只能走 post_message。"""
+        channel = getattr(self, "_channel", None)
+        source = getattr(self, "_source", None)
+        if not (channel and source):
+            return False
+        return bool(await self.run_blocking(
+            "web",
+            plugin.post_agent_card,
+            channel=channel,
+            source=source,
+            userid=self._user_id,
+            username=self._username,
+            text=text,
+            buttons=buttons,
+        ))
 
 
 class CloudSubscribeResourceSelectTool(MoviePilotTool):
@@ -344,7 +342,12 @@ class CloudSubscribeResourceSelectTool(MoviePilotTool):
             search_id,
             candidate_ids,
         )
-        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        return json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
 
 
 class CloudSubscribeCacheClearTool(MoviePilotTool):
@@ -387,7 +390,11 @@ class CloudSubscribePerformanceTool(MoviePilotTool):
         plugin = _plugin()
         if not plugin:
             return "网盘订阅助手未运行或智能体功能已关闭"
-        result = plugin.get_runtime_performance(include_tasks=include_tasks)
+        result = await self.run_blocking(
+            "default",
+            plugin.get_runtime_performance,
+            include_tasks=include_tasks,
+        )
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 
