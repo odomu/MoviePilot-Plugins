@@ -36,8 +36,8 @@ from ...core.cloud import DirectoryReadOperations
 from ...core.media import media_identity
 from ...utils import FileMatcher, MediaFileParser
 from .baseline import normalize_platform_cache_key
+from ...utils.episodes import format_episode_ranges
 from .utils import (
-    format_episode_ranges,
     is_upgrade_backup_name,
     strip_upgrade_backup_suffix,
 )

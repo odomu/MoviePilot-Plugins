@@ -1,12 +1,8 @@
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import unquote
 
-try:
-    from app.domain.episode import format_ranges as platform_format_ranges
-except Exception:
-    platform_format_ranges = None
 
 
 def extract_ed2k_filename(url: str) -> str:
@@ -43,32 +39,6 @@ def strip_upgrade_backup_suffix(file_name: str) -> str:
     if not _UPGRADE_BACKUP_RE.search(name):
         return ""
     return re.sub(r"-[A-Za-z0-9]{10}$", "", Path(name).stem)
-
-
-def format_episode_ranges(episodes: Iterable[Any]) -> str:
-    """把集数集合压缩为 E01-E03、E05 形式，优先使用平台原生 format_ranges。"""
-    if not episodes:
-        return "无"
-    numbers = sorted({int(ep) for ep in episodes if str(ep).isdigit() or isinstance(ep, int)})
-    if not numbers:
-        return "无"
-    if platform_format_ranges:
-        try:
-            result = platform_format_ranges(numbers)
-            if result:
-                return result
-        except Exception:
-            pass
-    ranges = []
-    start = previous = numbers[0]
-    for number in numbers[1:]:
-        if number == previous + 1:
-            previous = number
-            continue
-        ranges.append(f"E{start:02d}" if start == previous else f"E{start:02d}-E{previous:02d}")
-        start = previous = number
-    ranges.append(f"E{start:02d}" if start == previous else f"E{start:02d}-E{previous:02d}")
-    return "、".join(ranges)
 
 
 def normalize_season(value: Any, default: int = 1) -> int:

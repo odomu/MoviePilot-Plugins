@@ -96,6 +96,46 @@ def positive_ints(values: Iterable[object]) -> set:
     return result
 
 
+def resource_preview_episodes(
+        resource: Any,
+        season: Optional[int],
+) -> Optional[set]:
+    """返回资源预览覆盖的集号；渠道未提供预览时返回 None。"""
+    preview = (resource or {}).get("preview_episodes")
+    if not preview or not isinstance(preview, dict):
+        return None
+    if season is None:
+        values = [
+            episode
+            for episodes in preview.values()
+            for episode in (episodes or [])
+        ]
+    else:
+        season_key = str(int(season))
+        if season_key not in preview:
+            return set()
+        values = preview.get(season_key) or []
+    return positive_ints(values)
+
+
+def missing_episode_coverage(
+        resource: Any,
+        season: Optional[int],
+        targets: Iterable[int],
+) -> Tuple[int, set]:
+    """按缺集覆盖给资源分级：0 全部覆盖，1 部分或未知，2 未覆盖。"""
+    target_set = positive_ints(targets)
+    preview = resource_preview_episodes(resource, season)
+    if preview is None:
+        return 1, set()
+    covered = preview & target_set
+    if not covered:
+        return 2, set()
+    if covered >= target_set:
+        return 0, covered
+    return 1, covered
+
+
 def normalize_title(value: object) -> str:
     """生成忽略空白、标点和大小写的标题指纹。"""
     text = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).casefold()

@@ -53,7 +53,8 @@ from .rule_scoring import UpgradeRuleScoringService
 from .subtitles import SubtitleService
 from .television import TelevisionSyncProcessor
 from .upgrade import UpgradeService
-from .utils import extract_ed2k_filename, format_episode_ranges
+from ...utils.episodes import format_episode_ranges
+from .utils import extract_ed2k_filename
 from ...search.magnet import extract_magnet_hash
 from ..notification import MediaServerNotifier, MediaServerResolver
 from ..search import SearchHandler

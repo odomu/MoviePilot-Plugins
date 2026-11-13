@@ -9,6 +9,7 @@ from app.utils.string import StringUtils
 
 from .utils import candidate_progress, normalize_season
 from ...core import OwnerDelegator
+from ...utils.episodes import season_total_episodes
 
 
 class TelevisionSyncProcessor(OwnerDelegator):
@@ -104,20 +105,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
             total_ep = subscribe.total_episode or 0
             start_ep = subscribe.start_episode or 1
             if total_ep <= 0 and mediainfo:
-                season_episodes = (getattr(mediainfo, "seasons", None) or {}).get(season)
-                if season_episodes and isinstance(season_episodes, (list, tuple, set)):
-                    total_ep = max([int(x) for x in season_episodes if str(x).isdigit()] or [0])
-                if total_ep <= 0 and hasattr(mediainfo, "season_info"):
-                    for s_info in (mediainfo.season_info or []):
-                        s_num = getattr(s_info, "season_number", None) if not isinstance(s_info, dict) else s_info.get(
-                            "season_number")
-                        if s_num == season:
-                            ep_count = getattr(s_info, "episode_count", None) if not isinstance(s_info,
-                                                                                                dict) else s_info.get(
-                                "episode_count")
-                            if ep_count and int(ep_count) > 0:
-                                total_ep = int(ep_count)
-                                break
+                total_ep = season_total_episodes(mediainfo, season)
             expected_episodes = set(range(start_ep, total_ep + 1)) if total_ep >= start_ep else set()
             discover_manual_episodes = bool(
                 manual_resources and transient_target and not expected_episodes
