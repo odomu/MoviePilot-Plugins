@@ -581,15 +581,17 @@ class PlatformIntegrationService(OwnerDelegator):
                 "官组、可直接访问状态、更新时间和解锁积分保持稳定顺序"
             ),
             "recommended_candidate_ids": [
-                item["candidate_id"] for item in available[:3]
-            ],
+                candidate["candidate_id"]
+                for candidate in candidates
+                if candidate["available"]
+            ][:3],
             "candidates": candidates,
             "next_step": (
-                    "请使用中文汇总候选，并结合规则优先级、官组、清晰度、"
-                    "资源大小、更新时间和解锁成本说明推荐理由。"
+                    "候选已通过带按钮的分页卡片展示给用户，请勿再次罗列候选；"
+                    "只用一两句中文说明推荐理由与下一步。"
                     + (
-                        "用户需要手动选择时，优先调用 ask_user_choice 展示候选 ID；"
-                        "收到选择后使用 search_id 调用 cloudsubscribe_select_resources。"
+                        "用户点按钮即可提交；也接受用户直接回复候选 ID 后调用 "
+                        "cloudsubscribe_select_resources。"
                         if bound_subscribe_id else
                         "本次搜索未绑定现有订阅，只能展示和推荐；需要转存时先创建或选择订阅，"
                         "再使用订阅 ID 重新搜索。"
