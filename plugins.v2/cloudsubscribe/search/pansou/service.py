@@ -65,7 +65,7 @@ class PanSouSearchService:
         self._refresh = bool(
             refresh
             if refresh is not None
-            else getattr(self._owner, "_pansou_refresh", True)
+            else getattr(self._owner, "_pansou_refresh", False)
         )
     _PUNCT_GAP_RE = re.compile(
         r"[\s\u3000:：·•.,，。!！?？（）【】\[\]/／\\＼-]+"
@@ -328,7 +328,9 @@ class PanSouSearchService:
         )
         raw_items = (response or {}).get("results") or []
         pure_title = str(mediainfo.title or "").strip()
-        if (not raw_items) and keyword != pure_title and pure_title:
+        # 接口本身报错时不要再发一次纯标题请求，否则慢渠道的等待时间直接翻倍。
+        request_failed = bool(response) and bool(response.get("error"))
+        if (not raw_items) and not request_failed and keyword != pure_title and pure_title:
             logger.debug(f"{prefix} 带年份关键词 '{keyword}' 无结果，降级尝试纯标题 '{pure_title}'")
             fallback_res = client.request_search(
                 keyword=pure_title,

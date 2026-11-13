@@ -28,7 +28,12 @@ from ...core.media import is_subscribe_best_version, tmdb_id_of
 from ...search.dian115 import Dian115SearchService
 from ...search.hdhaven import HDHavenSearchService
 from ...search.hdhive import HDHiveSearchService
-from ...search.matching import is_anime_media, positive_ints
+from ...search.matching import (
+    is_anime_media,
+    missing_episode_coverage,
+    positive_ints,
+    resource_preview_episodes,
+)
 from ...search.mikan.service import filter_fansubs
 from ...search.pansou import PanSouSearchService
 from ...search.registry import create_search_registry
@@ -864,6 +869,7 @@ class SearchHandler:
             force_refresh: bool = False,
             result_limit: Optional[int] = None,
             progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+            deadline: Optional[float] = None,
     ) -> Dict[str, List[Dict]]:
         """并发查询相互独立的来源；各来源内部仍遵守限流与熔断，实时反馈进度与渠道详情。"""
         ordered_sources = list(dict.fromkeys(sources or []))
@@ -1014,6 +1020,28 @@ class SearchHandler:
                     break
 
                 now = time.monotonic()
+                if (
+                        deadline is not None
+                        and now >= deadline
+                        and any(results.get(source) for source in ordered_sources)
+                ):
+                    # 已有可用候选时不再为剩余慢渠道等待，返回部分结果。
+                    for future in list(pending):
+                        source = futures[future]
+                        abandoned_sources.add(source)
+                        with channels_lock:
+                            if channels_state[source]["status"] in {"pending", "searching"}:
+                                channels_state[source]["status"] = "timeout"
+                                channels_state[source]["error"] = "总时长预算用尽"
+                        pending.discard(future)
+                        future.cancel()
+                    logger.info(
+                        f"⏹️ [{search_label}] 搜索总时长预算已用尽，"
+                        f"先返回已完成的 {sum(1 for v in results.values() if v)} 个渠道结果"
+                    )
+                    emit_progress(active=False)
+                    break
+
                 with source_started_lock:
                     started_snapshot = dict(source_started_at)
                 timed_out_futures = [
@@ -1169,23 +1197,7 @@ class SearchHandler:
     def _resource_preview_episode_set(
             resource: Dict[str, Any], season: Optional[int]
     ) -> Optional[set]:
-        preview = resource.get("preview_episodes")
-        if not preview:
-            return None
-        if not isinstance(preview, dict):
-            return None
-        if season is None:
-            values = [
-                episode
-                for episodes in preview.values()
-                for episode in (episodes or [])
-            ]
-        else:
-            season_key = str(int(season))
-            if season_key not in preview:
-                return set()
-            values = preview.get(season_key) or []
-        return positive_ints(values)
+        return resource_preview_episodes(resource, season)
 
     @classmethod
     def _resource_target_coverage(
@@ -1196,15 +1208,9 @@ class SearchHandler:
     ) -> tuple:
         if not targets:
             return 0, 0
-        preview = cls._resource_preview_episode_set(resource, season)
-        if preview is None:
-            return 2, 0
-        covered = targets & preview
-        if not covered:
-            return 3, 0
-        if covered == targets:
-            return 0, -len(covered)
-        return 1, -len(covered)
+        rank, covered = missing_episode_coverage(resource, season, targets)
+        # 旧的未覆盖级别是 3，保留筛选阈值语义（coverage[0] >= 3 视为不覆盖）。
+        return (3 if rank == 2 else rank), -len(covered)
 
     def _resource_type_order(self, resource: Dict[str, Any]) -> int:
         """按配置的资源类型优先级排序。"""

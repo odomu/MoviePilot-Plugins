@@ -227,18 +227,29 @@ class PlatformRuleService(OwnerDelegator):
         raw_groups = getattr(subscribe, "filter_groups", None)
         if raw_groups and not hasattr(raw_groups, "_mock_return_value"):
             return list(raw_groups)
+        # 全局规则组在一次搜索内被每个搜索源各读一次，短 TTL 缓存避免重复读库。
+        cache = self.__dict__.get("_platform_rule_groups_cache")
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_platform_rule_groups_cache", cache)
+        config_key = (
+            SystemConfigKey.BestVersionFilterRuleGroups
+            if self._is_cloud_upgrade_subscribe(subscribe)
+            else SystemConfigKey.SubscribeFilterRuleGroups
+        )
+        cached = cache.get(config_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < 5.0:
+            return list(cached[1])
+        groups: List[str] = []
         try:
-            config_key = (
-                SystemConfigKey.BestVersionFilterRuleGroups
-                if self._is_cloud_upgrade_subscribe(subscribe)
-                else SystemConfigKey.SubscribeFilterRuleGroups
-            )
             val = SystemConfigOper().get(config_key)
             if val and not hasattr(val, "_mock_return_value"):
-                return list(val)
+                groups = list(val)
         except Exception:
             pass
-        return []
+        cache[config_key] = (now, groups)
+        return list(groups)
 
     def rank_file_candidates(
             self,

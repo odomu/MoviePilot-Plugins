@@ -130,9 +130,9 @@ class PanSouSourceDefinition(SearchSourceDefinition):
                     FieldSpec(
                         key="pansou_refresh",
                         label="强制刷新",
-                        hint="开启时绕过服务端缓存",
+                        hint="开启时绕过服务端缓存；关闭可显著加快搜索",
                         type="switch",
-                        default=True,
+                        default=False,
                         cols=12,
                     ),
                     FieldSpec(
@@ -260,7 +260,7 @@ class PanSouSourceDefinition(SearchSourceDefinition):
         except (TypeError, ValueError):
             concurrency = None
         result_limit = int(cls.config_value(config, "pansou_result_limit", 10) or 10)
-        refresh = bool(cls.config_value(config, "pansou_refresh", True))
+        refresh = bool(cls.config_value(config, "pansou_refresh", False))
 
         pansou_service = service or PanSouSearchService(
             client=client,
