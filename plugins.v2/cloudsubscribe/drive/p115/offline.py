@@ -2,6 +2,7 @@
 
 import re
 import time
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
@@ -85,11 +86,15 @@ class OfflineDownloadService(OwnerDelegator):
 
         try:
             rows = self.rate_limiter.call(
-                lambda: list(clouddownload_iter(
-                    self.client,
-                    cooldown=2,
-                    type="web",
-                    **self._ios_request_kwargs(app=False),
+                lambda: list(islice(
+                    clouddownload_iter(
+                        self.client,
+                        page_size=100,
+                        cooldown=2,
+                        type="web",
+                        **self._ios_request_kwargs(app=False),
+                    ),
+                    self._OFFLINE_TASK_CACHE_LIMIT,
                 ))
             )
             tasks = [
