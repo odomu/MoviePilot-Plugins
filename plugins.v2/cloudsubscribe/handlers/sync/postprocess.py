@@ -788,6 +788,15 @@ class PostprocessService(OwnerDelegator):
             if native_id and native_id not in task_map:
                 task_map[native_id] = task
 
+        # Pending magnet IDs also contain the subscription ID.
+        for pending_item in pending.values():
+            pending_id = str(pending_item.get("task_id") or "").upper()
+            parts = pending_id.split(":")
+            if len(parts) == 3 and parts[0] == "MAGNET":
+                native_task = task_map.get(parts[1])
+                if native_task is not None:
+                    task_map[pending_id] = native_task
+
         context = PostprocessBatchContext(
             pending=pending,
             pending_snapshot=pending_snapshot,
@@ -1511,10 +1520,13 @@ class PostprocessService(OwnerDelegator):
 
         # 2. 检查完成状态（任务标记完成 或 暂存目录中【本文件】已就位）
         staging_dir = str(item.get("staging_dir") or item.get("cloud_dir") or "/")
-        directory_valid, file_index = self._snapshot(ctx, staging_dir)
         task_done = bool(
             item.get("moved_at")
             or (task and task.get("completed"))
+        )
+        directory_valid, file_index = (
+            self._snapshot(ctx, staging_dir)
+            if not task_done and task is None else (False, {})
         )
         if not task_done and directory_valid and file_index:
             if self._task_type(item) == "magnet":
