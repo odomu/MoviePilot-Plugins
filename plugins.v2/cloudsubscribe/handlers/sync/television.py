@@ -216,7 +216,7 @@ class TelevisionSyncProcessor(OwnerDelegator):
             if not manual_resources:
                 series_id = getattr(mediainfo, "tmdb_id", None) or getattr(subscribe, "tmdb_id", None) or getattr(
                     mediainfo, "title", "")
-                series_search_key = f"{getattr(mediainfo, 'type', 'tv')}:{series_id}"
+                series_search_key = f"{getattr(mediainfo, 'type', 'tv')}:{series_id}:S{season:02d}"
                 cached_series_results = getattr(self, "_series_search_cache", {}).get(series_search_key)
                 if cached_series_results is not None:
                     prefetched_results = copy.deepcopy(cached_series_results)
