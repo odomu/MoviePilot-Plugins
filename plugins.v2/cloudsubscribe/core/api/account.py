@@ -226,7 +226,16 @@ class AccountApi(OwnerDelegator):
             )
             if cached_account:
                 _ACCOUNT_INFO_CACHE.set(normalized_key, cached_account)
-            if refresh and _ACCOUNT_REFRESH_GUARD.get(normalized_key):
+            # 快照只是上次失败（如热重载打断会话）时，不占用刷新冷却，允许立即重试
+            failed_snapshot = bool(
+                isinstance(cached_account, dict)
+                and not cached_account.get("connected")
+            )
+            if (
+                    refresh
+                    and not failed_snapshot
+                    and _ACCOUNT_REFRESH_GUARD.get(normalized_key)
+            ):
                 return cached_account or {
                     "connected": False,
                     "error": "账户信息正在冷却，请稍后再刷新",

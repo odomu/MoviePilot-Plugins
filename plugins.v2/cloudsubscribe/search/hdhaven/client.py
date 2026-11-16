@@ -54,27 +54,7 @@ class HDHavenClient:
         self._save_data_func = save_data_func
 
         self._proxies = normalize_proxies(proxy)
-        self._session = requests.Session(impersonate="chrome")
-        # 站点按 Chromium 专有 sec-fetch-*/sec-ch-ua* 头判定浏览器，缺失即 403
-        self._session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": f"{self.base_url}/",
-            "Origin": self.base_url,
-            "sec-ch-ua": '"Chromium";v="128", "Not(A:Brand";v="24", "Google Chrome";v="128"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-        })
+        self._session = self._create_session()
 
         self._lock = threading.RLock()
         self._turnstile_solver: Optional[HDHavenTurnstile] = None
@@ -99,6 +79,30 @@ class HDHavenClient:
             request_window_seconds=60.0,
         )
         self._restore_session()
+
+    def _create_session(self) -> requests.Session:
+        """创建带浏览器指纹的会话；站点按 sec-fetch-*/sec-ch-ua* 头判定浏览器，缺失即 403。"""
+        session = requests.Session(impersonate="chrome")
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": f"{self.base_url}/",
+            "Origin": self.base_url,
+            "sec-ch-ua": '"Chromium";v="128", "Not(A:Brand";v="24", "Google Chrome";v="128"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
+        })
+        return session
 
     def _restore_session(self) -> None:
         """从数据库恢复登录 Cookie 和 Token。"""
@@ -152,6 +156,36 @@ class HDHavenClient:
             )
         except Exception as error:
             logger.debug(f"HDHaven 持久化登录状态失败：{error}")
+
+    def _reset_session(self) -> None:
+        """清空内存与持久化登录态，迫使下一次请求重新登录。"""
+        self.token = ""
+        try:
+            self._session.cookies.clear()
+        except Exception:
+            pass
+        if self._save_data_func:
+            try:
+                self._save_data_func(self._SESSION_DATA_KEY, {})
+            except Exception as error:
+                logger.debug(f"HDHaven 清理持久化登录状态失败：{error}")
+
+    @staticmethod
+    def _response_snippet(resp: Any, limit: int = 160) -> str:
+        """截取响应正文用于诊断，避免整页 HTML 进入日志与签到记录。"""
+        try:
+            text = str(getattr(resp, "text", "") or "")
+        except Exception:
+            return ""
+        return " ".join(text.split())[:limit]
+
+    @staticmethod
+    def _retryable_transport(method: str, path: str) -> bool:
+        """仅幂等请求自动重试传输错误；赌狗签到会扣积分，不得重试。"""
+        verb = str(method or "").upper()
+        if verb in {"GET", "HEAD"}:
+            return True
+        return verb == "POST" and str(path or "").rstrip("/") == "/api/account/checkin"
 
     @property
     def cooldown_remaining(self) -> float:
@@ -250,6 +284,7 @@ class HDHavenClient:
             headers: Optional[Dict[str, str]] = None,
             timeout: int = 15,
             auto_login: bool = True,
+            _retried: bool = False,
     ) -> requests.Response:
         remaining = self.cooldown_remaining
         if remaining > 0:
@@ -285,20 +320,63 @@ class HDHavenClient:
         except RequestGateCancelled as err:
             raise HDHavenError("HDHaven 请求已取消", code="cancelled") from err
         except Exception as err:
+            if not _retried and isinstance(
+                    err, requests.exceptions.SessionClosed
+            ):
+                # 热重载等场景下会话对象已被关闭：重建会话并沿用 Cookie 后重试
+                logger.warning(f"HDHaven 会话已被关闭（{err}），重建会话后重试一次")
+                try:
+                    cookies = self._session.cookies.get_dict()
+                except Exception:
+                    cookies = {}
+                self._session = self._create_session()
+                for name, value in cookies.items():
+                    self._session.cookies.set(name, value)
+                return self.request(
+                    method, path, params, json_data, headers, timeout,
+                    auto_login=False, _retried=True,
+                )
+            if not _retried and self._retryable_transport(method, path):
+                logger.warning(f"HDHaven 请求失败（{err}），改用 Connection: close 重试一次")
+                return self.request(
+                    method,
+                    path,
+                    params,
+                    json_data,
+                    {**req_headers, "Connection": "close"},
+                    timeout,
+                    auto_login=False,
+                    _retried=True,
+                )
             raise HDHavenError(f"HDHaven 请求网络失败：{err}") from err
 
         if is_cloudflare_challenge(resp.text, resp.status_code, resp.headers):
             self._request_gate.activate_cooldown(120, status=resp.status_code, reason="接口触发Cloudflare质询")
             raise HDHavenError("HDHaven 触发 Cloudflare 质询拦截", code="cf_blocked", status_code=resp.status_code)
 
-        if (
-                resp.status_code == 403
-                and "BROWSER_REQUIRED" in str(getattr(resp, "text", "") or "")
-        ):
+        if resp.status_code == 403:
+            body = str(getattr(resp, "text", "") or "")
+            if "BROWSER_REQUIRED" in body:
+                raise HDHavenError(
+                    "HDHaven 网页接口已限制程序访问（BROWSER_REQUIRED）；"
+                    "站点要求改用 OPENAPI 授权（个人中心 /me#openapi），当前渠道暂不支持",
+                    code="browser_required",
+                    status_code=403,
+                )
+            snippet = self._response_snippet(resp)
+            if self.token and auto_login and self.username and self.password and not _retried:
+                logger.warning(
+                    f"HDHaven 接口返回 403（{snippet or '空响应'}），清空会话并重新登录后重试"
+                )
+                self._reset_session()
+                self.login(force=True)
+                return self.request(
+                    method, path, params, json_data, headers, timeout,
+                    auto_login=False, _retried=True,
+                )
             raise HDHavenError(
-                "HDHaven 网页接口已限制程序访问（BROWSER_REQUIRED）；"
-                "站点要求改用 OPENAPI 授权（个人中心 /me#openapi），当前渠道暂不支持",
-                code="browser_required",
+                f"HDHaven 请求被拒绝（HTTP 403）：{snippet or '空响应'}",
+                code="forbidden",
                 status_code=403,
             )
 
@@ -318,7 +396,12 @@ class HDHavenClient:
     def get_account_info(self) -> Dict[str, Any]:
         resp = self.request("GET", "/api/auth/me")
         if resp.status_code != 200:
-            raise HDHavenError(f"获取个人信息失败：HTTP {resp.status_code}", status_code=resp.status_code)
+            snippet = self._response_snippet(resp)
+            raise HDHavenError(
+                f"获取个人信息失败：HTTP {resp.status_code}"
+                + (f"：{snippet}" if snippet else ""),
+                status_code=resp.status_code,
+            )
         try:
             payload = resp.json() or {}
         except Exception as err:

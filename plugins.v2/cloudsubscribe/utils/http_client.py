@@ -17,6 +17,8 @@ TRANSIENT_REQUEST_EXCEPTIONS = (
     requests.exceptions.Timeout,
     requests.exceptions.ConnectionError,
     requests.exceptions.SSLError,
+    # 会话对象被热重载关闭后仍在途的请求，重建会话即可恢复
+    requests.exceptions.SessionClosed,
 )
 
 
