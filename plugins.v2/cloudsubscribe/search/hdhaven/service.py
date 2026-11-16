@@ -102,8 +102,7 @@ class HDHavenSearchService(OwnerDelegator):
                     request_interval=float(
                         getattr(self, "_hdhaven_request_interval", 2.0) or 2.0
                     ),
-                    get_data_func=getattr(self, "get_data", None),
-                    save_data_func=getattr(self, "save_data", None),
+                    **self.storage_hooks(),
                 )
                 object.__setattr__(self, "_client", client)
             return self._client

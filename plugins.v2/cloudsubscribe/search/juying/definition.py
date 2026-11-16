@@ -29,7 +29,6 @@ class JuyingSourceDefinition(SearchSourceDefinition):
     @classmethod
     def create_client(cls, config: Dict[str, Any], context: Optional[Any] = None) -> Any:
         ctx = context or {}
-        owner = ctx.get("storage_owner")
         username = str(cls.config_value(config, "juying_username", "") or "").strip()
         password = str(cls.config_value(config, "juying_password", "") or "")
         if not username or not password:
@@ -41,8 +40,7 @@ class JuyingSourceDefinition(SearchSourceDefinition):
             proxy=ctx.get("proxy"),
             request_timeout=int(cls.config_value(config, "juying_timeout", 60) or 60),
             request_interval=float(cls.config_value(config, "juying_request_interval", 1.0) or 1.0),
-            get_data_func=getattr(owner, "get_data", None),
-            save_data_func=getattr(owner, "save_data", None),
+            **cls.storage_hooks(ctx),
         )
 
     @classmethod

@@ -25,7 +25,6 @@ class PanSouSourceDefinition(SearchSourceDefinition):
         base_url = str(cls.config_value(config, "pansou_url", "") or "").strip()
         if not base_url:
             return None
-        owner = ctx.get("storage_owner")
         return PanSouClient(
             base_url=base_url,
             username=str(cls.config_value(config, "pansou_username", "") or ""),
@@ -33,8 +32,7 @@ class PanSouSourceDefinition(SearchSourceDefinition):
             auth_enabled=bool(cls.config_value(config, "pansou_auth_enabled", False)),
             proxy=ctx.get("proxy"),
             search_timeout=int(cls.config_value(config, "pansou_timeout", 60) or 60),
-            get_data_func=getattr(owner, "get_data", None),
-            save_data_func=getattr(owner, "save_data", None),
+            **cls.storage_hooks(ctx),
         )
 
     @classmethod

@@ -6,6 +6,8 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
+from .delegation import storage_hooks as _storage_hooks
+
 
 @dataclass
 class FieldSpec:
@@ -423,6 +425,13 @@ class SearchSourceDefinition:
         if value is None:
             value = config.get(key)
         return default if value is None else value
+
+    @classmethod
+    def storage_hooks(cls, context: Optional[Any] = None) -> Dict[str, Any]:
+        """返回客户端所需的存储读写钩子，统一解析真正的存储宿主。"""
+        ctx = context or {}
+        owner = ctx.get("storage_owner") if isinstance(ctx, Mapping) else ctx
+        return _storage_hooks(owner)
 
     @classmethod
     def get_config_groups(cls, context: Optional[Dict[str, Any]] = None) -> List[GroupSpec]:

@@ -228,7 +228,6 @@ class Dian115SourceDefinition(SearchSourceDefinition):
         password = str(cls.config_value(config, "dian115_password", "") or "").strip()
         if not email or not password:
             return None
-        owner = ctx.get("storage_owner")
         return Dian115Client(
             email=email,
             password=password,
@@ -236,8 +235,7 @@ class Dian115SourceDefinition(SearchSourceDefinition):
             request_interval=float(cls.config_value(config, "dian115_request_interval", 1.0) or 1.0),
             unlocks_per_minute=int(cls.config_value(config, "dian115_unlocks_per_minute", 6) or 6),
             timeout=int(cls.config_value(config, "dian115_timeout", 30) or 30),
-            get_data_func=getattr(owner, "get_data", None),
-            save_data_func=getattr(owner, "save_data", None),
+            **cls.storage_hooks(ctx),
             lottery_enabled=bool(cls.config_value(config, "dian115_lottery_enabled", False)),
             lottery_count=int(cls.config_value(config, "dian115_lottery_count", 0) or 0),
         )
