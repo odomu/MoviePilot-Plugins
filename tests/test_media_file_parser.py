@@ -77,6 +77,46 @@ class TestMediaFileParser(unittest.TestCase):
         self.assertEqual(MediaFileParser.extract_season_episode("Show.s01e12.mp4"), (1, 12))
         self.assertIsNone(MediaFileParser.extract_season_episode("Movie.2023.1080p.mkv"))
 
+    def test_extract_episode_number(self):
+        """解锁前预览必须识别分享目录里常见的集数写法。"""
+        self.assertEqual(
+            MediaFileParser.extract_episode_number("Show.S02E175.2160p.mkv"), (2, 175)
+        )
+        self.assertEqual(MediaFileParser.extract_episode_number("Show.E175.mkv"), (1, 175))
+        self.assertEqual(MediaFileParser.extract_episode_number("遮天 第175集.mp4"), (1, 175))
+        self.assertEqual(
+            MediaFileParser.extract_episode_number("遮天.2023.2160p.WEB-DL.175.mkv"), (1, 175)
+        )
+        self.assertEqual(MediaFileParser.extract_episode_number("遮天 - 176.mp4"), (1, 176))
+        self.assertIsNone(MediaFileParser.extract_episode_number("Movie.2023.1080p.mkv"))
+        self.assertIsNone(MediaFileParser.extract_episode_number("Show.2160p.mkv"))
+
+    def test_extract_episode_coverage(self):
+        """卡片 remark 的集数覆盖范围用于解锁前预筛，避免为不含缺集的资源扣积分。"""
+        self.assertEqual(
+            MediaFileParser.extract_episode_coverage("更新到127，长期更新"),
+            {"1": list(range(1, 128))},
+        )
+        self.assertEqual(MediaFileParser.extract_episode_coverage("128单集"), {"1": [128]})
+        self.assertEqual(
+            MediaFileParser.extract_episode_coverage("第一集到最新176集"),
+            {"1": list(range(1, 177))},
+        )
+        self.assertEqual(
+            MediaFileParser.extract_episode_coverage("S01E01-E12 4K"), {"1": list(range(1, 13))}
+        )
+        self.assertEqual(
+            MediaFileParser.extract_episode_coverage("第1-176集"), {"1": list(range(1, 177))}
+        )
+        self.assertEqual(
+            MediaFileParser.extract_episode_coverage("全176集"), {"1": list(range(1, 177))}
+        )
+        self.assertEqual(
+            MediaFileParser.extract_episode_coverage("第2季 更新到20集"), {"2": list(range(1, 21))}
+        )
+        self.assertEqual(MediaFileParser.extract_episode_coverage("长期追更，已整理"), {})
+        self.assertEqual(MediaFileParser.extract_episode_coverage("最新4K原盘"), {})
+
     def test_iter_files_tree_flattening(self):
         tree = [
             {

@@ -153,18 +153,9 @@ def preview_episodes_from_files(
         name = str(item.get("path") or item.get("name") or "").strip()
         if not name:
             continue
-
-        parsed = MediaFileParser.extract_season_episode(name)
+        parsed = MediaFileParser.extract_episode_number(name, fallback_season)
         if parsed:
-            season_num, ep_num = parsed
-            episodes.setdefault(str(season_num), set()).add(ep_num)
-            continue
-
-        match = re.search(r"(?i)(?:^|[^A-Za-z0-9])EP?0*(\d{1,4})(?!\d)", name)
-        if not match:
-            match = re.search(r"第\s*(\d{1,4})\s*集", name)
-        if match:
-            episodes.setdefault(str(fallback_season), set()).add(int(match.group(1)))
+            episodes.setdefault(str(parsed[0]), set()).add(parsed[1])
 
     return {
         season: sorted(list(values))
@@ -174,68 +165,11 @@ def preview_episodes_from_files(
 
 
 def parse_episode_range(text: str, fallback_season: Optional[int] = None) -> Dict[str, List[int]]:
-    target = str(text or "").strip()
-    if not target:
-        return {}
-    season = max(1, int(fallback_season or 1))
-    m_s = re.search(r"第\s*(\d+)\s*季", target)
-    if m_s:
-        season = int(m_s.group(1))
-    else:
-        m_s2 = re.search(r"(?i)\bS(\d+)\b", target)
-        if m_s2:
-            season = int(m_s2.group(1))
-
-    episodes = set()
-    m_range = re.search(r"第\s*(\d+)\s*-\s*(\d+)\s*集", target)
-    if m_range:
-        start_ep = int(m_range.group(1))
-        end_ep = int(m_range.group(2))
-        if start_ep <= end_ep:
-            episodes.update(range(start_ep, end_ep + 1))
-    else:
-        m_code_range = re.search(
-            r"(?i)\bS(\d+)\s*E(\d+)\s*(?:-|~|至)\s*(?:S\d+\s*)?E?(\d+)\b",
-            target,
-        )
-        if m_code_range:
-            season = int(m_code_range.group(1))
-            start_ep = int(m_code_range.group(2))
-            end_ep = int(m_code_range.group(3))
-            if start_ep <= end_ep:
-                episodes.update(range(start_ep, end_ep + 1))
-        else:
-            m_plain_range = re.search(r"(?<!\d)(\d+)\s*-\s*(\d+)\s*集", target)
-            if m_plain_range:
-                start_ep = int(m_plain_range.group(1))
-                end_ep = int(m_plain_range.group(2))
-                if start_ep <= end_ep:
-                    episodes.update(range(start_ep, end_ep + 1))
-            else:
-                m_updated = re.search(
-                    r"(?:更新至|已更至|已更新至|更至)\s*(\d+)\s*集", target
-                )
-                if m_updated:
-                    episodes.update(range(1, int(m_updated.group(1)) + 1))
-        if episodes:
-            return {str(season): sorted(list(episodes))}
-
-        m_single = re.search(r"第\s*(\d+)\s*集", target)
-        if m_single:
-            episodes.add(int(m_single.group(1)))
-        else:
-            m_code_range = re.search(r"(?i)\bE(\d{1,4})\s*-\s*E?(\d{1,4})\b", target)
-            if m_code_range:
-                start_ep = int(m_code_range.group(1))
-                end_ep = int(m_code_range.group(2))
-                if start_ep <= end_ep:
-                    episodes.update(range(start_ep, end_ep + 1))
-            else:
-                m_all = re.search(r"全\s*(\d{1,4})\s*集", target)
-                if m_all:
-                    episodes.update(range(1, int(m_all.group(1)) + 1))
-
-    return {str(season): sorted(list(episodes))} if episodes else {}
+    """解析资源标题/remark 的季集范围，与搜索源共用同一套发行写法。"""
+    return MediaFileParser.extract_episode_coverage(
+        str(text or ""),
+        fallback_season=max(1, int(fallback_season or 1)),
+    )
 
 
 class HDHavenResourceService:
@@ -282,10 +216,15 @@ class HDHavenResourceService:
                         raw_list = d
                     elif isinstance(d, dict):
                         raw_list = d.get("items") or d.get("resources") or []
-        except HDHavenError as err:
-            if getattr(err, "code", "") in {"rate_limited", "cancelled"}:
-                raise
-            logger.debug(f"HDHaven 请求影视关联资源失败：{err}")
+            elif resp.status_code >= 400:
+                raise HDHavenError(
+                    f"HDHaven 影视关联资源接口返回 HTTP {resp.status_code}",
+                    code="resource_query_failed",
+                    status_code=resp.status_code,
+                )
+        except HDHavenError:
+            # 交给搜索编排层统一记录失败原因，避免 403/登录失效被误当成“0 条结果”。
+            raise
         except Exception as err:
             logger.debug(f"HDHaven 请求影视关联资源失败：{err}")
 

@@ -233,17 +233,9 @@ def preview_episodes_from_files(
         if not isinstance(item, dict):
             continue
         name = str(item.get("path") or item.get("name") or "").strip()
-        parsed = MediaFileParser.extract_season_episode(name)
+        parsed = MediaFileParser.extract_episode_number(name, fallback_season)
         if parsed:
             episodes.setdefault(str(parsed[0]), set()).add(parsed[1])
-            continue
-        match = re.search(r"(?i)(?:^|[^A-Za-z0-9])EP?0*(\d{1,4})(?!\d)", name)
-        if not match:
-            match = re.search(r"第\s*(\d{1,4})\s*集", name)
-        if match:
-            episodes.setdefault(str(fallback_season), set()).add(
-                int(match.group(1))
-            )
     return {
         season: sorted(values)
         for season, values in episodes.items()
@@ -463,59 +455,14 @@ def resource_update_time(row: Dict[str, Any]) -> str:
     )
 
 
-def _episode_range(start: int, end: int) -> List[int]:
-    if start <= 0 or end < start or end - start > 500:
-        return []
-    return list(range(start, end + 1))
-
-
 def preview_episodes_from_row(
         row: Dict[str, Any], target_season: Optional[int]
 ) -> Dict[str, List[int]]:
     """从 HDHive 卡片 remark 提取季集范围。"""
-    text = str(row.get("remark") or "").strip()
-    if not text:
-        return {}
-    episodes: Dict[str, set] = {}
-    for match in re.finditer(
-            r"S(?P<season>\d{1,3})\s*E(?P<start>\d{1,4})"
-            r"(?:\s*(?:-|~|—|至)\s*(?:S(?P<end_season>\d{1,3})\s*)?"
-            r"E?(?P<end>\d{1,4}))?",
-            text,
-            re.I,
-    ):
-        season = int(match.group("season"))
-        end_season = int(match.group("end_season") or season)
-        if season <= 0 or season != end_season:
-            continue
-        start = int(match.group("start"))
-        values = _episode_range(start, int(match.group("end") or start))
-        if values:
-            episodes.setdefault(str(season), set()).update(values)
-    fallback_season = max(1, int(target_season or 1))
-    for match in re.finditer(
-            r"(?<![A-Za-z0-9])(?P<start>\d{1,4})\s*"
-            r"(?:-|~|—|至)\s*(?P<end>\d{1,4})\s*集",
-            text,
-    ):
-        values = _episode_range(
-            int(match.group("start")), int(match.group("end"))
-        )
-        if values:
-            episodes.setdefault(str(fallback_season), set()).update(values)
-    for match in re.finditer(r"(?:更新至|更至)\s*(\d{1,4})\s*集", text):
-        values = _episode_range(1, int(match.group(1)))
-        if values:
-            episodes.setdefault(str(fallback_season), set()).update(values)
-    for match in re.finditer(r"第\s*(\d{1,4})\s*集", text):
-        episode = int(match.group(1))
-        if episode > 0:
-            episodes.setdefault(str(fallback_season), set()).add(episode)
-    return {
-        season: sorted(values)
-        for season, values in episodes.items()
-        if values
-    }
+    return MediaFileParser.extract_episode_coverage(
+        str(row.get("remark") or ""),
+        fallback_season=max(1, int(target_season or 1)),
+    )
 
 
 def earliest_target_air_time(

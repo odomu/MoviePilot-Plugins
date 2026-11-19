@@ -601,7 +601,9 @@ class ResourceTransferService(OwnerDelegator):
         if not (
                 resource.get("need_unlock") or resource.get("need_access")
         ):
-            return ""
+            # 站点已标记解锁但卡片未内嵌分享链接时，仍需读取详情页取链接，否则“已解锁资源”会在每一轮被静默丢弃、无法转存新集。
+            if not (resource.get("is_unlocked") and resource_ref):
+                return ""
         if not resource_ref:
             return ""
         source = str(resource.get("source") or "").strip().lower()
@@ -636,6 +638,10 @@ class ResourceTransferService(OwnerDelegator):
             unlock_points = int(resource.get("unlock_points") or 0)
         except (TypeError, ValueError):
             unlock_points = 0
+        is_unlocked_resource = bool(resource.get("is_unlocked"))
+        if is_unlocked_resource:
+            # 已解锁资源只读取链接，不消耗积分。
+            unlock_points = 0
         prefix = f"{log_prefix} " if log_prefix else ""
         resource_title = str(resource.get("title") or "").strip()
         if not self._search_handler.can_unlock(source):
@@ -654,15 +660,25 @@ class ResourceTransferService(OwnerDelegator):
                 f"需要 {unlock_points} 积分，当前预算不足"
             )
             return ""
-        action_label = "获取免费资源链接" if unlock_points <= 0 else "消耗积分解锁"
+        action_label = (
+            "读取已解锁资源链接"
+            if is_unlocked_resource
+            else "获取免费资源链接"
+            if unlock_points <= 0
+            else "消耗积分解锁"
+        )
         media_page_url = str(resource.get("media_page_url") or "").strip()
         media_page_suffix = f"，媒体页：{media_page_url}" if media_page_url else ""
         logger.info(
             f"{prefix}遇到尚未取得链接的 {source_label} 资源 {resource_title} "
             f"(resource_ref: {resource_ref})，尝试{action_label}{media_page_suffix}"
         )
+        unlock_payload = (
+            {**resource, "need_access": True, "unlock_points": 0}
+            if is_unlocked_resource else resource
+        )
         unlocked = self._search_handler.unlock_resource(
-            source, resource, search_label=search_label
+            source, unlock_payload, search_label=search_label
         )
         if self._stop_requested() or not unlocked:
             if not self._stop_requested():

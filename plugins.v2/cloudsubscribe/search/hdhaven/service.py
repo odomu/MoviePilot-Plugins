@@ -128,7 +128,7 @@ class HDHavenSearchService(OwnerDelegator):
         search_prefix = f"[{format_search_label(mediainfo, media_type, season)}][HDHAVEN]"
 
         if not tmdb_id:
-            logger.debug(f"{search_prefix} 缺少 TMDB ID，跳过直达查询")
+            logger.warning(f"{search_prefix} 缺少 TMDB ID，跳过直达查询")
             return []
 
         if not self.available:
@@ -151,6 +151,16 @@ class HDHavenSearchService(OwnerDelegator):
         pan_targets = None if resource_list_mode else [
             t for t in self.resource_types if t in SUPPORTED_CLOUD_TYPES
         ]
+        query_magnets = bool(self._hdhaven_magnet_enabled and (
+                resource_list_mode or "magnet" in self.resource_types
+                or not self.resource_types
+        ))
+        if not resource_list_mode and not pan_targets and not query_magnets:
+            logger.warning(
+                f"{search_prefix} 网盘偏好中没有 HDHaven 可查询的网盘类型，"
+                "且磁力搜索未开启，已跳过查询"
+            )
+            return []
         try:
             if resource_list_mode or pan_targets:
                 results.extend(service.get_pan_resources(
@@ -159,9 +169,7 @@ class HDHavenSearchService(OwnerDelegator):
                     enabled_pan_types=pan_targets,
                 ))
 
-            if self._hdhaven_magnet_enabled and (
-                    resource_list_mode or "magnet" in self.resource_types or not self.resource_types
-            ):
+            if query_magnets:
                 results.extend(service.get_magnets(
                     tmdb_id=int(tmdb_id),
                     media_type=type_str,
