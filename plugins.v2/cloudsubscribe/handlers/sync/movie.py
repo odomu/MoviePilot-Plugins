@@ -86,7 +86,6 @@ class MovieSyncProcessor(OwnerDelegator):
 
             # 洗版电影需要先建立现有版本基线，否则同名文件只能被当作普通订阅完成。
             existing_movie = None
-            upgrade_target_exists = False
             if is_best_version:
                 media_server_has_size = False
                 manual_movie = (
@@ -182,7 +181,6 @@ class MovieSyncProcessor(OwnerDelegator):
                     mediainfo,
                 )
                 if existing_movie:
-                    upgrade_target_exists = True
                     existing_dir, existing_name, existing_file = existing_movie
                     if self._strm_generate_enabled:
                         existing_strm = self._generate_strm(
@@ -216,15 +214,24 @@ class MovieSyncProcessor(OwnerDelegator):
                         f"电影 {subscribe.name} 洗版中，"
                         f"现有平台优先级 {movie_history_score}"
                     )
-                else:
-                    movie_history_score = -1
+                elif movie_history_score < 0:
                     movie_history_size = 0
                     logger.info(
                         f"电影 {subscribe.name} 未找到真实网盘旧文件，"
+                        "且没有可用的媒体服务器/整理历史基线，"
                         "本轮无法建立洗版基线"
                     )
                     if manual_upgrade:
                         return transferred_count
+                else:
+                    # STRM 库只有媒体服务器条目、网盘源文件已删除时，沿用已算出的基线。
+                    logger.info(
+                        f"电影 {subscribe.name} 未找到真实网盘旧文件，"
+                        f"沿用媒体服务器/整理历史基线 {movie_history_score} 继续洗版比对"
+                    )
+
+            # 洗版比对以“已取得有效基线”为准，不再要求网盘必须存在实体文件。
+            has_upgrade_baseline = is_best_version and movie_history_score >= 0
 
             if not manual_resources:
                 release_date = self._calendar_date(mediainfo.release_date)
@@ -355,7 +362,7 @@ class MovieSyncProcessor(OwnerDelegator):
                 # 检查是否是刚搜索出尚未真正解锁的延期解锁资源
                 if (resource.get("need_unlock") or resource.get("need_access")) and not share_url:
                     resource_ref = resource.get("resource_ref")
-                    if resource_ref and upgrade_target_exists and movie_history_score >= 0:
+                    if resource_ref and has_upgrade_baseline:
                         preview_name = str(
                             getattr(self._search_handler, "_resource_filter_title", lambda value: "")(
                                 resource
@@ -448,7 +455,7 @@ class MovieSyncProcessor(OwnerDelegator):
                             or (resource.get("magnet_metadata") or {}).get("size")
                         )
                         magnet_upgrade = False
-                        if upgrade_target_exists and movie_history_score >= 0:
+                        if has_upgrade_baseline:
                             magnet_upgrade, magnet_reason = self._should_upgrade_candidate(
                                 movie_history_score,
                                 current_score,
@@ -543,7 +550,7 @@ class MovieSyncProcessor(OwnerDelegator):
                         is_upgrade = False
                         # 洗版模式下检查是否需要升级资源
                         upgrade_old_size = movie_history_size
-                        if upgrade_target_exists and movie_history_score >= 0:
+                        if has_upgrade_baseline:
                             candidate_size = self._resource_size_bytes(
                                 matched_file.get("size")
                             )
