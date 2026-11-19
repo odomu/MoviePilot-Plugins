@@ -45,16 +45,33 @@ class UpgradeRuleScoringService(OwnerDelegator):
             return False, f"评分降低 {old_score}→{new_score}"
 
         mode = self._upgrade_mode
+        threshold = max(
+            0, int(getattr(self, "_upgrade_size_threshold", 0) or 0)
+        )
         if mode == "largest":
             if old_size and new_size and new_size > old_size:
+                diff = new_size - old_size
+                if threshold and diff < threshold:
+                    return False, (
+                        f"同评分文件差异 {format_size(diff)} "
+                        f"未达到阈值 {format_size(threshold)}"
+                    )
                 return True, (
-                    f"同评分保留更大文件 {format_size(old_size)}→{format_size(new_size)}"
+                    f"同评分保留更大文件 {format_size(old_size)}→"
+                    f"{format_size(new_size)}（差异 {format_size(diff)}）"
                 )
             return False, "同评分且候选文件未更大"
         if mode == "smallest":
             if old_size and new_size and new_size < old_size:
+                diff = old_size - new_size
+                if threshold and diff < threshold:
+                    return False, (
+                        f"同评分文件差异 {format_size(diff)} "
+                        f"未达到阈值 {format_size(threshold)}"
+                    )
                 return True, (
-                    f"同评分保留更小文件 {format_size(old_size)}→{format_size(new_size)}"
+                    f"同评分保留更小文件 {format_size(old_size)}→"
+                    f"{format_size(new_size)}（差异 {format_size(diff)}）"
                 )
             return False, "同评分且候选文件未更小"
         return False, "同评分不执行替换"

@@ -36,6 +36,17 @@ export function createUpgradeSection(options) {
             hint: "评分更高时执行洗版；同评分时最大/最小模式按文件大小决定，默认保留最大文件。",
             cols: 4,
           },
+          {
+            key: "upgrade_size_threshold",
+            label: "同评分大小差异阈值（MB）",
+            type: "number",
+            min: 0,
+            hint: "仅“保留最大/最小文件”模式生效；大小差异达到该值才洗版，0 表示只要有差异就替换。默认 1024MB（1GB）。",
+            show: (config) => ["largest", "smallest"].includes(
+              String(config.upgrade_mode || "largest")
+            ),
+            cols: 4,
+          },
         ],
       },
       {

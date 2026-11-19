@@ -343,6 +343,12 @@ class SyncHandler:
         self._upgrade_mode = (
             raw_mode if raw_mode in {"coexist", "replace", "largest", "smallest"} else "largest"
         )
+        raw_threshold_mb = _get_val("upgrade_size_threshold", 1024)
+        try:
+            threshold_mb = float(raw_threshold_mb)
+        except (TypeError, ValueError):
+            threshold_mb = 1024.0
+        self._upgrade_size_threshold = max(0, int(round(threshold_mb * 1024 ** 2)))
         self._local_resource_path = str(_get_val("local_resource_path", "") or "").strip()
 
         paths = cloud_transfer_paths if cloud_transfer_paths is not None else self._configured_transfer_paths(plugin)

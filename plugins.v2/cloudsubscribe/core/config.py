@@ -188,6 +188,7 @@ class UIConfig:
             "enable_cloud_upgrade": False,
             "enable_pt_upgrade": False,
             "upgrade_mode": "largest",
+            "upgrade_size_threshold": 1024,
             "upgrade_subscribe_ids": [],
             "local_resource_path": "",
             "self_heal_interval": 10,

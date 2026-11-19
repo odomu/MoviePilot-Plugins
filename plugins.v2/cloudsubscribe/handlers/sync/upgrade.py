@@ -190,7 +190,10 @@ class UpgradeService(OwnerDelegator):
             if all_expected_episodes and target_episodes is None:
                 missing_eps = sorted(all_expected_episodes - set(local_scores.keys()))
                 if missing_eps:
-                    logger.debug(f"{upgrade_log_prefix} 缺失 {len(missing_eps)} 集：{missing_eps}")
+                    logger.info(
+                        f"{upgrade_log_prefix} 缺失 {len(missing_eps)} 集："
+                        f"{self._format_episode_ranges(set(missing_eps))}"
+                    )
                     episodes_to_search |= set(missing_eps)
 
             episodes_to_search = sorted(episodes_to_search)
@@ -200,7 +203,10 @@ class UpgradeService(OwnerDelegator):
                 logger.info(f"{upgrade_log_prefix} 无可搜索的集数")
                 return transferred_count
 
-            logger.debug(f"{upgrade_log_prefix} 待搜索 {len(episodes_to_search)} 集：{episodes_to_search}")
+            logger.info(
+                f"{upgrade_log_prefix} 待搜索 {len(episodes_to_search)} 集："
+                f"{self._format_episode_ranges(set(episodes_to_search))}"
+            )
 
             # 搜索并转存匹配资源
             enabled_sources = (
@@ -258,9 +264,10 @@ class UpgradeService(OwnerDelegator):
                     break
                 if not episodes_to_search:
                     break
-                logger.debug(
+                logger.info(
                     f"{upgrade_log_prefix} 使用 {source.upper()} 处理"
                     f"{'跨盘' if is_cross_batch else '目标网盘'}候选"
+                    f"（{len(candidate_resources)} 个，待比较 {len(episodes_to_search)} 集）"
                 )
 
                 for resource_index, resource in enumerate(candidate_resources):
@@ -481,7 +488,18 @@ class UpgradeService(OwnerDelegator):
                         )
 
                     # 匹配需要升级的集数
-                    self._set_upgrade_phase(subscribe, "比较版本", 65)
+                    mode_label = {
+                        "largest": "保留最大文件",
+                        "smallest": "保留最小文件",
+                        "replace": "直接替换",
+                        "coexist": "新旧共存",
+                    }.get(self._upgrade_mode, self._upgrade_mode)
+                    self._set_upgrade_phase(
+                        subscribe,
+                        f"比较版本：{len(pending_episodes)} 集待比对"
+                        f"（{mode_label}，基线 {len(baseline)} 集）",
+                        65,
+                    )
                     matched_items = []
                     matched_files = self._match_episode_files(
                         share_files,
@@ -526,7 +544,7 @@ class UpgradeService(OwnerDelegator):
                             upgrade_skip_reason = reason
                             continue
 
-                        logger.debug(
+                        logger.info(
                             f"{upgrade_log_prefix} E{episode:02d}：{reason}"
                         )
 
@@ -603,7 +621,7 @@ class UpgradeService(OwnerDelegator):
                         )
                         if len(upgrade_skip_episodes) > 20:
                             episodes_text += f", …(+{len(upgrade_skip_episodes) - 20})"
-                        logger.debug(
+                        logger.info(
                             f"{upgrade_log_prefix} 洗版候选跳过 "
                             f"[{episodes_text}]：{upgrade_skip_reason}"
                         )
@@ -611,7 +629,18 @@ class UpgradeService(OwnerDelegator):
                     if not matched_items:
                         continue
 
-                    self._set_upgrade_phase(subscribe, "提交替换", 80, clear_search=True)
+                    upgrade_replace_count = sum(
+                        1 for item in matched_items if item.get("is_upgrade")
+                    )
+                    self._set_upgrade_phase(
+                        subscribe,
+                        f"提交替换：{len(matched_items)} 集"
+                        f"（替换 {upgrade_replace_count} / "
+                        f"新增 {len(matched_items) - upgrade_replace_count}，"
+                        f"跳过 {len(upgrade_skip_episodes)}）",
+                        80,
+                        clear_search=True,
+                    )
                     transfer_results = self._transfer_episode_items(
                         matched_items,
                         share_url,
@@ -670,7 +699,7 @@ class UpgradeService(OwnerDelegator):
                                 batch_detail_episodes.append(episode)
                             batch_success_episodes.append(episode)
 
-                            logger.debug(
+                            logger.info(
                                 f"{upgrade_log_prefix} 转存成功 E{episode:02d}"
                                 f" {old_score}→{new_score}（{file_name}）"
                             )

@@ -197,6 +197,7 @@ class CloudSubscribe(_PluginBase):
     _enable_cloud_upgrade: bool = False
     _enable_pt_upgrade: bool = False
     _upgrade_mode: str = "largest"
+    _upgrade_size_threshold: int = 1024 ** 3  # 同评分洗版的最小文件差异（字节），默认 1GB
     _local_resource_path: str = ""
     _strm_generate_enabled: bool = True
     _nfo_scrape_enabled: bool = False
@@ -835,6 +836,12 @@ class CloudSubscribe(_PluginBase):
         self._upgrade_mode = str(config.get("upgrade_mode", "largest") or "largest").strip().lower()
         if self._upgrade_mode not in {"coexist", "replace", "largest", "smallest"}:
             self._upgrade_mode = "largest"
+        raw_threshold_mb = config.get("upgrade_size_threshold", 1024)
+        try:
+            threshold_mb = float(raw_threshold_mb)
+        except (TypeError, ValueError):
+            threshold_mb = 1024.0
+        self._upgrade_size_threshold = max(0, int(round(threshold_mb * 1024 ** 2)))
         self._local_resource_path = str(config.get("local_resource_path", "") or "").strip()
 
         self._organize_after_transfer = bool(config.get("organize_after_transfer", True))
