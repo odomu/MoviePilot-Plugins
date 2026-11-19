@@ -807,9 +807,18 @@ class SearchHandler:
             return []
         except Exception as error:
             err_msg = str(error)
+            # 认证失效、风控/限流属于可预期的渠道错误：只给一行可读提示，不打印完整堆栈。
+            error_code = str(getattr(error, "code", "") or "")
+            status_code = int(getattr(error, "status_code", 0) or 0)
+            expected_error = status_code in {401, 403, 429} or error_code in {
+                "rate_limited", "server_cooldown", "cf_blocked", "forbidden",
+                "unauthorized", "browser_required", "login_failed",
+                "turnstile_failed", "cancelled", "stopped",
+                "captcha_failed", "captcha_required", "captcha_retry_failed",
+            }
             logger.warning(
                 f"[{search_label}][{source.upper()}] 外部查询抛出异常：{error}",
-                exc_info=True,
+                exc_info=not expected_error,
             )
             is_banned = (
                     getattr(error, "code", "") in {"woniu_account_banned", "account_banned"}

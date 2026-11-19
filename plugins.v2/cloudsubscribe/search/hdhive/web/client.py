@@ -414,15 +414,23 @@ class HDHiveClient:
                 break
             response = self._raw_request(method, path, **kwargs)
         if response.status_code >= 400:
-            raise HDHiveWebError(
-                f"HDHive 网页请求失败（HTTP {response.status_code}）",
-                code=(
-                    "rate_limited"
-                    if response.status_code == 429
-                    else "request_failed"
-                ),
-                status_code=response.status_code,
-            )
+            status = response.status_code
+            if status == 429:
+                message = "HDHive 网页请求触发限流（HTTP 429），请稍后重试"
+                code = "rate_limited"
+            elif status == 401:
+                message = "HDHive 登录状态失效（HTTP 401），请检查账号密码或重新登录"
+                code = "unauthorized"
+            elif status == 403:
+                message = (
+                    "HDHive 拒绝访问（HTTP 403）：登录状态失效或触发站点风控，"
+                    "请检查账号或稍后重试"
+                )
+                code = "forbidden"
+            else:
+                message = f"HDHive 网页请求失败（HTTP {status}）"
+                code = "request_failed"
+            raise HDHiveWebError(message, code=code, status_code=status)
         return response
 
     def _refresh_auth_tokens(self) -> bool:
