@@ -2,14 +2,15 @@
   "CloudSubscribe": {
     "name": "网盘订阅助手",
     "description": "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容",
-    "labels": "订阅,网盘,转存,搜索,通知,刮削,签到,ed2k,magnet",
-    "version": "1.7.11",
+    "labels": "自动,订阅,网盘,转存,搜索,通知,刮削,签到,电驴,磁力,115,夸克,UC,百度",
+    "version": "1.7.12",
     "icon": "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "odomu",
     "level": 1,
     "release": true,
     "system_version": ">=2.14.6",
     "history": {
+      "v1.7.12": "修复电影洗版丢失媒体服务器基线、已解锁资源链接读取与集数覆盖解析；新增同评分大小差异阈值，细化洗版进度与403错误提示",
       "v1.7.11": "修复HDHaven 403与会话关闭自愈，按季隔离剧集缓存，关联115离线任务并按上限读取历史",
       "v1.7.10": "修复智能体搜索推荐候选崩溃，重构优化智能体搜索资源速度",
       "v1.7.9": "修复MoviePilot v3下批量元数据刮削NFO写入类型错误",
