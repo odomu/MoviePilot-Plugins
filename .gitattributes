@@ -1,0 +1,29 @@
+# Git 参数配置：统一换行符、二进制识别与生成文件标记。
+# 仓库内一律以 LF 存储；Windows 下仅在需要直接执行的脚本保留 CRLF。
+
+* text=auto eol=lf
+
+# Windows 脚本保留 CRLF，避免 PowerShell / cmd 解析异常
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 图片与二进制资源不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.bin binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+
+# 生成产物不参与代码审阅与 diff 统计
+**/dist/** -diff
+**/__pycache__/** -diff
+frontend/**/package-lock.json linguist-generated=true
