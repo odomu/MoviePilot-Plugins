@@ -248,6 +248,33 @@ class PlatformRuleService(OwnerDelegator):
                 groups = list(val)
         except Exception:
             pass
+        if not groups:
+            # MoviePilot 未选择订阅/洗版规则组时，评分会全部为 0，
+            # 回退到“用户规则组”，由规则库按媒体类型与分类自动筛选。
+            try:
+                user_groups = SystemConfigOper().get(
+                    SystemConfigKey.UserFilterRuleGroups
+                ) or []
+                groups = [
+                    str(group.get("name"))
+                    for group in user_groups
+                    if isinstance(group, dict) and group.get("name")
+                ]
+                if groups:
+                    logger.debug(
+                        f"未配置 {config_key}，回退使用用户规则组："
+                        f"{','.join(groups)}"
+                    )
+            except Exception:
+                pass
+        if not groups:
+            warned = self.__dict__.setdefault("_platform_rule_warned", set())
+            if config_key not in warned:
+                warned.add(config_key)
+                logger.warning(
+                    "未配置订阅/洗版规则组，所有候选评分将为 0，"
+                    "洗版只能按文件大小判断；请在 MoviePilot 设置中选择规则组"
+                )
         cache[config_key] = (now, groups)
         return list(groups)
 
